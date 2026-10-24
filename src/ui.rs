@@ -23,10 +23,10 @@ use crate::{
 };
 use chrome_ui::{h_flex, v_flex};
 use gpui::{
-    AnyWindowHandle, Bounds, ClickEvent, ClipboardItem, Context, Div, ElementId, Entity,
-    ExternalPaths, FocusHandle, Focusable, KeyDownEvent, MouseButton, ObjectFit, PathPromptOptions,
-    Pixels, RenderImage, SharedString, Stateful, Window, canvas, div, img, prelude::*, px,
-    relative, rgb, rgba,
+    Animation, AnimationExt, AnyWindowHandle, App, Bounds, ClickEvent, ClipboardItem, Context, Div,
+    ElementId, Entity, ExternalPaths, FocusHandle, Focusable, KeyDownEvent, MouseButton, ObjectFit,
+    PathPromptOptions, Pixels, RenderImage, SharedString, Stateful, Window, canvas, div, img,
+    prelude::*, px, relative, rgb, rgba,
 };
 use std::{
     cell::{Cell, RefCell},
@@ -43,6 +43,9 @@ const CONTROLS_TIMEOUT: Duration = Duration::from_millis(2500);
 /// Clicks that open a video can finish as a double-click on the new video
 /// surface. Ignore video double-clicks this soon after entering the player.
 const DOUBLE_CLICK_GRACE: Duration = Duration::from_millis(500);
+
+/// How long player controls take to fade in or out, unless motion is reduced.
+const FADE: Duration = Duration::from_millis(180);
 
 /// How long a keyboard action's status message stays on the video.
 const STATUS_TIMEOUT: Duration = Duration::from_millis(1500);
@@ -230,6 +233,11 @@ pub struct Flick {
     main_window: Option<AnyWindowHandle>,
     /// Frames presented since the last debug report.
     presented: (u32, Instant),
+    /// Counts control visibility changes, restarting their fade.
+    controls_changes: usize,
+    controls_changed_at: Instant,
+    /// Counts status messages, restarting their fade.
+    status_count: usize,
 }
 
 impl Flick {
@@ -368,6 +376,9 @@ impl Flick {
             pip: None,
             main_window: Some(window.window_handle()),
             presented: (0, Instant::now()),
+            controls_changes: 0,
+            controls_changed_at: Instant::now(),
+            status_count: 0,
         };
         this.apply_preferences();
         // Posters deleted from the cache are made again.
@@ -735,9 +746,16 @@ impl Flick {
             self.status = None;
             cx.notify();
         }
+        if !self.controls_shown
+            && self.controls_changed_at.elapsed() >= FADE
+            && self.controls_changed_at.elapsed() < FADE * 3
+        {
+            // Unmount controls once their fade-out ends.
+            cx.notify();
+        }
         let shown = self.controls_wanted();
         if shown != self.controls_shown {
-            self.controls_shown = shown;
+            self.set_controls_shown(shown);
             cx.notify();
         }
         let height = f32::from(self.video_bounds.get().size.height);
@@ -1035,6 +1053,20 @@ impl Flick {
 
     fn show_status(&mut self, text: impl Into<SharedString>) {
         self.status = Some((text.into(), Instant::now()));
+        self.status_count += 1;
+    }
+
+    fn set_controls_shown(&mut self, shown: bool) {
+        self.controls_shown = shown;
+        self.controls_changes += 1;
+        self.controls_changed_at = Instant::now();
+    }
+
+    /// Whether hidden controls are still fading out.
+    fn controls_fading(&self, cx: &App) -> bool {
+        !self.controls_shown
+            && !cx.theme().reduce_motion
+            && self.controls_changed_at.elapsed() < FADE
     }
 
     fn shortcut(&mut self, shortcut: Shortcut, window: &mut Window, cx: &mut Context<Self>) {
@@ -1376,7 +1408,7 @@ impl Render for Flick {
             .on_mouse_move(cx.listener(|this, _, _, cx| {
                 this.pointer_moved_at = Instant::now();
                 if !this.controls_shown {
-                    this.controls_shown = true;
+                    this.set_controls_shown(true);
                     cx.notify();
                 }
             }))

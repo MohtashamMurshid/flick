@@ -38,6 +38,17 @@ pub enum ContrastChoice {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
+pub enum MotionChoice {
+    /// Follow the operating system's reduced-motion setting.
+    #[default]
+    System,
+    /// Show controls and messages without fades or slides.
+    Reduced,
+    Full,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum SubtitleBackground {
     /// mpv's default outline and shadow.
     #[default]
@@ -177,6 +188,7 @@ pub struct Appearance {
     /// Multiple of each style's text sizes.
     pub text_scale: f32,
     pub contrast: ContrastChoice,
+    pub motion: MotionChoice,
     /// Show text beside toolbar icons instead of only in tooltips.
     pub show_labels: bool,
     pub subtitles: SubtitleStyle,
@@ -192,6 +204,7 @@ impl Default for Appearance {
             autoplay_next: true,
             text_scale: 1.,
             contrast: ContrastChoice::System,
+            motion: MotionChoice::System,
             show_labels: false,
             subtitles: SubtitleStyle::default(),
         }
@@ -212,6 +225,7 @@ impl Appearance {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct SystemPreferences {
     pub high_contrast: bool,
+    pub reduce_motion: bool,
 }
 
 impl Global for SystemPreferences {}
@@ -223,6 +237,7 @@ impl SystemPreferences {
         std::thread::spawn(move || {
             let _ = sender.send(Self {
                 high_contrast: system_high_contrast(),
+                reduce_motion: system_reduce_motion(),
             });
         });
         receiver
@@ -242,6 +257,36 @@ fn command_output(program: &str, args: &[&str]) -> Option<String> {
         .status
         .success()
         .then(|| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+}
+
+fn system_reduce_motion() -> bool {
+    if cfg!(target_os = "macos") {
+        command_output(
+            "defaults",
+            &["read", "com.apple.universalaccess", "reduceMotion"],
+        )
+        .is_some_and(|value| value == "1")
+    } else if cfg!(target_os = "windows") {
+        // Off when Windows' "Animation effects" setting disables window
+        // animations, which it records as MinAnimate 0.
+        command_output(
+            "reg",
+            &[
+                "query",
+                r"HKCU\Control Panel\Desktop\WindowMetrics",
+                "/v",
+                "MinAnimate",
+            ],
+        )
+        .and_then(|text| text.split_whitespace().last().map(str::to_owned))
+        .is_some_and(|value| value == "0")
+    } else {
+        command_output(
+            "gsettings",
+            &["get", "org.gnome.desktop.interface", "enable-animations"],
+        )
+        .is_some_and(|value| value == "false")
+    }
 }
 
 fn system_high_contrast() -> bool {
@@ -340,6 +385,8 @@ pub struct Theme {
     /// The user's text size, as a multiple of each style's sizes.
     pub text_scale: f32,
     pub high_contrast: bool,
+    /// Show changes without fades or slides.
+    pub reduce_motion: bool,
     /// Page content background.
     pub window: Rgba,
     /// Title bar and Windows Mica backdrop.
@@ -415,6 +462,13 @@ pub fn apply(cx: &mut App, appearance: &Appearance) {
     if high {
         theme.raise_contrast();
     }
+    theme.reduce_motion = match appearance.motion {
+        MotionChoice::Reduced => true,
+        MotionChoice::Full => false,
+        MotionChoice::System => cx
+            .try_global::<SystemPreferences>()
+            .is_some_and(|prefs| prefs.reduce_motion),
+    };
     cx.set_global(theme);
 }
 
@@ -615,6 +669,7 @@ impl Theme {
             text_size: if style == Style::Mac { 13. } else { 14. },
             text_scale: 1.,
             high_contrast: false,
+            reduce_motion: false,
             window: rgb(0),
             chrome: rgb(0),
             sidebar: rgb(0),
@@ -754,6 +809,7 @@ mod tests {
             autoplay_next: false,
             text_scale: 1.25,
             contrast: ContrastChoice::High,
+            motion: MotionChoice::Reduced,
             show_labels: true,
             subtitles: SubtitleStyle {
                 scale: 1.5,

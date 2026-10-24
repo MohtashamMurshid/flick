@@ -34,7 +34,7 @@ impl Flick {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let t = cx.theme().clone();
-        let show = self.controls_shown;
+        let show = self.controls_shown || self.controls_fading(cx);
         let controls_height = controls_height(t.style);
         let menu = self.menu_panel(cx);
         div()
@@ -42,9 +42,11 @@ impl Flick {
             .size_full()
             .bg(rgb(0x000000))
             .child(self.video_surface(cx))
-            .when(show, |d| d.child(self.player_titlebar(window, cx)))
+            .when(show, |d| {
+                d.child(self.fade("titlebar-fade", self.player_titlebar(window, cx), 0., cx))
+            })
             .when(show && self.file_loaded, |d| {
-                d.child(self.player_controls(window, cx))
+                d.child(self.fade("controls-fade", self.player_controls(window, cx), 8., cx))
             })
             .when_some(self.error.clone(), |d, error| {
                 d.child(
@@ -85,25 +87,60 @@ impl Flick {
                 )
             })
             .when_some(self.status.as_ref(), |d, (text, _)| {
-                d.child(
-                    h_flex()
-                        .absolute()
-                        .top(px(t.titlebar_height.max(44.) + 12.))
-                        .left_0()
-                        .right_0()
-                        .justify_center()
-                        .child(
-                            div()
-                                .px_3()
-                                .py_1p5()
-                                .rounded_full()
-                                .bg(rgba(0x000000b3))
-                                .text_color(rgb(ON_VIDEO))
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .child(text.clone()),
-                        ),
-                )
+                let pill = h_flex()
+                    .top(px(t.titlebar_height.max(44.) + 12.))
+                    .left_0()
+                    .right_0()
+                    .justify_center()
+                    .child(
+                        div()
+                            .px_3()
+                            .py_1p5()
+                            .rounded_full()
+                            .bg(rgba(0x000000b3))
+                            .text_color(rgb(ON_VIDEO))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(text.clone()),
+                    );
+                if t.reduce_motion {
+                    d.child(pill)
+                } else {
+                    d.child(pill.with_animation(
+                        ("status-fade", self.status_count),
+                        Animation::new(Duration::from_millis(140)),
+                        |pill, delta| pill.opacity(delta),
+                    ))
+                }
             })
+            .into_any_element()
+    }
+
+    /// Fades player chrome in or out and, with `slide`, moves it that many
+    /// pixels. Reduced motion shows and hides it at once.
+    fn fade(
+        &self,
+        key: &'static str,
+        element: impl IntoElement + 'static,
+        slide: f32,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        if cx.theme().reduce_motion {
+            return element.into_any_element();
+        }
+        let shown = self.controls_shown;
+        div()
+            .absolute()
+            .inset_0()
+            .child(element)
+            .with_animation(
+                (key, self.controls_changes),
+                Animation::new(super::FADE).with_easing(gpui::ease_in_out),
+                move |el, delta| {
+                    let visible = if shown { delta } else { 1. - delta };
+                    let offset = (1. - visible) * slide;
+                    el.opacity(visible).top(px(offset)).bottom(px(-offset))
+                },
+            )
             .into_any_element()
     }
 

@@ -8,8 +8,8 @@ use super::{
 use crate::{
     shortcuts::{Shortcut, display},
     theme::{
-        ACCENTS, ContrastChoice, Fonts, SUBTITLE_COLORS, SUBTITLE_POSITION, SUBTITLE_SCALE,
-        SchemeChoice, StyleChoice, SubtitleBackground, TEXT_SCALE,
+        ACCENTS, ContrastChoice, Fonts, MotionChoice, SUBTITLE_COLORS, SUBTITLE_POSITION,
+        SUBTITLE_SCALE, SchemeChoice, StyleChoice, SubtitleBackground, TEXT_SCALE,
     },
 };
 use gpui::{FontWeight, hsla, linear_color_stop, linear_gradient};
@@ -134,6 +134,17 @@ impl Flick {
             appearance.contrast,
             cx,
             |this, contrast, window, cx| this.set_appearance(|a| a.contrast = contrast, window, cx),
+        );
+        let motion = self.segmented(
+            "motion",
+            &[
+                (MotionChoice::System, "Auto"),
+                (MotionChoice::Reduced, "On"),
+                (MotionChoice::Full, "Off"),
+            ],
+            appearance.motion,
+            cx,
+            |this, motion, window, cx| this.set_appearance(|a| a.motion = motion, window, cx),
         );
         let labels = self.switch(
             "show-labels",
@@ -283,6 +294,14 @@ impl Flick {
                         "Contrast",
                         Some("Auto follows your system's increased-contrast setting".into()),
                         contrast,
+                    )
+                    .into_any_element(),
+                    row(
+                        &t,
+                        Some("monitor"),
+                        "Reduce motion",
+                        Some("Shows player controls without fades. Auto follows your system".into()),
+                        motion,
                     )
                     .into_any_element(),
                     row(
