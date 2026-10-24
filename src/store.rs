@@ -23,6 +23,27 @@ pub struct Settings {
     pub recent: Vec<RecentFile>,
     pub library: Vec<LibraryVideo>,
     pub appearance: crate::theme::Appearance,
+    pub shortcuts: crate::shortcuts::Bindings,
+    pub library_view: LibraryView,
+}
+
+/// How All Videos is sorted and laid out.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Deserialize, Serialize)]
+#[serde(default)]
+pub struct LibraryView {
+    pub sort: Sort,
+    pub list: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Sort {
+    /// Newest additions first.
+    #[default]
+    Added,
+    Title,
+    /// Most recently watched first, then videos never watched.
+    Watched,
 }
 
 impl Default for Settings {
@@ -34,6 +55,8 @@ impl Default for Settings {
             recent: Vec::new(),
             library: Vec::new(),
             appearance: crate::theme::Appearance::default(),
+            shortcuts: crate::shortcuts::Bindings::default(),
+            library_view: LibraryView::default(),
         }
     }
 }
@@ -45,6 +68,9 @@ pub struct RecentFile {
     pub title: String,
     pub position: f64,
     pub duration: f64,
+    /// Removed from Continue Watching until the video is played again. The
+    /// saved position is kept, so opening it still resumes.
+    pub dismissed: bool,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -91,9 +117,71 @@ impl Settings {
             title: file_title(path),
             position,
             duration,
+            dismissed: false,
         };
         file.sanitize();
         self.recent.insert(0, file);
+    }
+
+    /// Videos with a saved position that are not dismissed, newest first.
+    pub fn continue_watching(&self) -> impl Iterator<Item = &RecentFile> {
+        self.recent
+            .iter()
+            .filter(|file| !file.dismissed && self.resume_position(&file.path) > 0.0)
+    }
+
+    pub fn dismiss_from_continue(&mut self, path: &Path) {
+        if let Some(file) = self.recent.iter_mut().find(|file| file.path == path) {
+            file.dismissed = true;
+        }
+    }
+
+    /// Records the video as finished, keeping its place in history.
+    pub fn mark_watched(&mut self, path: &Path) {
+        let (index, duration) = self
+            .recent
+            .iter()
+            .position(|file| file.path == path)
+            .map_or((None, 0.0), |index| {
+                (Some(index), self.recent[index].duration)
+            });
+        let file = RecentFile {
+            path: path.to_owned(),
+            title: file_title(path),
+            position: duration,
+            duration,
+            dismissed: false,
+        };
+        match index {
+            Some(index) => self.recent[index] = file,
+            None => self.recent.insert(0, file),
+        }
+        self.add_video(path);
+    }
+
+    /// Forgets the video's history and saved position. It stays in the library.
+    pub fn mark_unwatched(&mut self, path: &Path) {
+        self.recent.retain(|file| file.path != path);
+    }
+
+    pub fn watched(&self, path: &Path) -> bool {
+        self.recent.iter().any(|file| file.path == path)
+    }
+
+    /// Library videos in the chosen order. Ties keep the order of addition.
+    pub fn sorted_library(&self, sort: Sort) -> Vec<&LibraryVideo> {
+        let mut videos = self.library.iter().rev().collect::<Vec<_>>();
+        match sort {
+            Sort::Added => {}
+            Sort::Title => videos.sort_by_cached_key(|video| video.title.to_lowercase()),
+            Sort::Watched => videos.sort_by_key(|video| {
+                self.recent
+                    .iter()
+                    .position(|file| file.path == video.path)
+                    .unwrap_or(usize::MAX)
+            }),
+        }
+        videos
     }
 
     pub fn resume_position(&self, path: &Path) -> f64 {
@@ -110,6 +198,8 @@ impl Settings {
     }
 
     fn sanitize(&mut self) {
+        self.shortcuts.sanitize();
+        self.appearance.sanitize();
         self.volume = finite_or(self.volume, 80.0).clamp(0.0, 100.0);
         self.speed = finite_or(self.speed, 1.0).clamp(0.25, 4.0);
         let mut seen = std::collections::HashSet::new();
@@ -384,6 +474,63 @@ mod tests {
     }
 
     #[test]
+    fn continue_watching_dismissal_and_watched_marks() {
+        let mut settings = Settings::default();
+        settings.remember(Path::new("a.mkv"), 30.0, 120.0);
+        settings.remember(Path::new("b.mkv"), 40.0, 120.0);
+        settings.add_video(Path::new("c.mkv"));
+        let continuing = |s: &Settings| {
+            s.continue_watching()
+                .map(|f| f.path.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            continuing(&settings),
+            [PathBuf::from("b.mkv"), "a.mkv".into()]
+        );
+        settings.dismiss_from_continue(Path::new("b.mkv"));
+        assert_eq!(continuing(&settings), [PathBuf::from("a.mkv")]);
+        // Dismissal keeps the resume position, and playing again restores it.
+        assert_eq!(settings.resume_position(Path::new("b.mkv")), 40.0);
+        settings.remember(Path::new("b.mkv"), 41.0, 120.0);
+        assert_eq!(continuing(&settings)[0], Path::new("b.mkv"));
+
+        settings.mark_watched(Path::new("a.mkv"));
+        assert_eq!(settings.resume_position(Path::new("a.mkv")), 0.0);
+        assert!(settings.watched(Path::new("a.mkv")));
+        settings.mark_watched(Path::new("c.mkv"));
+        assert!(settings.watched(Path::new("c.mkv")));
+        settings.mark_unwatched(Path::new("c.mkv"));
+        assert!(!settings.watched(Path::new("c.mkv")));
+        assert!(
+            settings
+                .library
+                .iter()
+                .any(|v| v.path == Path::new("c.mkv"))
+        );
+    }
+
+    #[test]
+    fn library_sorts_by_addition_title_and_last_watched() {
+        let mut settings = Settings::default();
+        for name in ["b.mkv", "C.mkv", "a.mkv"] {
+            settings.add_video(Path::new(name));
+        }
+        settings.remember(Path::new("C.mkv"), 1.0, 10.0);
+        settings.remember(Path::new("b.mkv"), 1.0, 10.0);
+        let order = |sort| {
+            settings
+                .sorted_library(sort)
+                .into_iter()
+                .map(|v| v.title.as_str())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(order(Sort::Added), ["a.mkv", "C.mkv", "b.mkv"]);
+        assert_eq!(order(Sort::Title), ["a.mkv", "b.mkv", "C.mkv"]);
+        assert_eq!(order(Sort::Watched), ["b.mkv", "C.mkv", "a.mkv"]);
+    }
+
+    #[test]
     fn resume_ignores_the_start_unknown_duration_and_near_end() {
         let mut settings = Settings::default();
         let path = Path::new("video.mkv");
@@ -414,12 +561,14 @@ mod tests {
                 title: String::new(),
                 position: 200.0,
                 duration: 100.0,
+                ..Default::default()
             },
             RecentFile {
                 path: "video.mkv".into(),
                 title: "duplicate".into(),
                 position: 25.0,
                 duration: 100.0,
+                ..Default::default()
             },
             RecentFile::default(),
         ];

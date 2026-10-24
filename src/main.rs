@@ -3,6 +3,7 @@ mod input;
 mod model;
 mod playback;
 mod services;
+mod shortcuts;
 mod smoke;
 mod store;
 mod theme;

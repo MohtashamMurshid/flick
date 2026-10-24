@@ -2,13 +2,23 @@
 
 use super::*;
 use gpui::{
-    AnyElement, CursorStyle, Decorations, ElementId, FontWeight, HitboxBehavior, Hsla, ResizeEdge,
-    Rgba, Tiling, WindowControlArea, hsla, linear_color_stop, linear_gradient, point,
+    AnyElement, App, CursorStyle, Decorations, FontWeight, HitboxBehavior, Hsla, ResizeEdge, Rgba,
+    Tiling, WindowControlArea, anchored, deferred, hsla, linear_color_stop, linear_gradient, point,
     transparent_black,
 };
 
 /// Shadow space around client-decorated Linux windows.
 const WINDOW_SHADOW: f32 = 10.;
+
+/// A slider's change handler.
+type ValueAction = dyn Fn(&mut Flick, f32, &mut Window, &mut Context<Flick>);
+
+/// Space between a control and its keyboard focus ring.
+const RING_GAP: f32 = 2.;
+
+/// Apple's minimum comfortable hit target. Small icon buttons keep their
+/// visual size and extend their hit area toward it.
+const MIN_HIT_TARGET: f32 = 44.;
 
 pub(super) fn h_flex() -> Div {
     div().flex().flex_row().items_center()
@@ -79,6 +89,83 @@ pub(super) fn thumbnail(title: &str, width: f32, height: f32, radius: f32) -> Di
 }
 
 impl Flick {
+    /// The focus handle that puts the control with this ID in the Tab order.
+    pub(super) fn control_handle(&self, id: &ElementId, cx: &App) -> FocusHandle {
+        self.control_focus
+            .borrow_mut()
+            .entry(id.clone())
+            .or_insert_with(|| cx.focus_handle().tab_stop(true))
+            .clone()
+    }
+
+    pub(super) fn is_control_handle(&self, handle: &FocusHandle) -> bool {
+        self.control_focus.borrow().values().any(|h| h == handle)
+    }
+
+    pub(super) fn control_has_focus(&self) -> bool {
+        self.focused
+            .as_ref()
+            .is_some_and(|focused| self.is_control_handle(focused))
+    }
+
+    /// Whether the control shows its focus ring and focus tooltip.
+    pub(super) fn keyboard_focused(&self, id: &ElementId, cx: &App) -> bool {
+        self.keyboard_nav && self.focused.as_ref() == Some(&self.control_handle(id, cx))
+    }
+
+    /// Puts a control in the Tab order. GPUI activates focused click targets
+    /// with Enter and Space. While navigating by keyboard, the focused control
+    /// shows a ring `offset` outside its bounds (negative for hit-area
+    /// padding) and its tooltip. Mouse presses keep focus on the window, so
+    /// Space keeps controlling playback after clicking a control.
+    pub(super) fn focusable(
+        &self,
+        el: Stateful<Div>,
+        id: &ElementId,
+        tooltip: Option<SharedString>,
+        radius: f32,
+        offset: (f32, f32),
+        cx: &Context<Self>,
+    ) -> Stateful<Div> {
+        let t = cx.theme();
+        let focused = self.keyboard_focused(id, cx);
+        let (x, y) = (offset.0 + RING_GAP, offset.1 + RING_GAP);
+        el.track_focus(&self.control_handle(id, cx))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, window, _| {
+                    this.control_pressed = true;
+                    window.prevent_default();
+                    this.focus.focus(window);
+                }),
+            )
+            .when(focused, |d| {
+                d.child(
+                    div()
+                        .absolute()
+                        .top(px(-y))
+                        .bottom(px(-y))
+                        .left(px(-x))
+                        .right(px(-x))
+                        .rounded(px(radius + RING_GAP))
+                        .border_2()
+                        .border_color(t.focus_ring),
+                )
+            })
+            .when_some(tooltip.filter(|_| focused), |d, tooltip| {
+                d.child(
+                    div().absolute().left_0().top(relative(1.)).child(
+                        deferred(
+                            anchored()
+                                .snap_to_window_with_margin(px(8.))
+                                .child(hint_box(t, tooltip).mt(px(4. - offset.1))),
+                        )
+                        .with_priority(2),
+                    ),
+                )
+            })
+    }
+
     /// A text button. Primary buttons use the accent color.
     pub(super) fn button(
         &self,
@@ -100,8 +187,10 @@ impl Flick {
             Style::Windows => 32.,
             Style::Gnome => 34.,
         };
-        div()
-            .id(id)
+        let id = id.into();
+        let el = div()
+            .id(id.clone())
+            .relative()
             .flex_none()
             .flex()
             .items_center()
@@ -129,7 +218,8 @@ impl Flick {
                 on_click(this, window, cx);
             }))
             .when_some(icon_name, |d, name| d.child(icon(name, 16., fg)))
-            .child(label.into())
+            .child(label.into());
+        self.focusable(el, &id, None, t.radius, (0., 0.), cx)
     }
 
     /// A borderless icon button with a tooltip.
@@ -154,11 +244,43 @@ impl Flick {
             size,
             t.text,
             t.control_hover,
+            None,
             cx,
             on_click,
         )
     }
 
+    /// An icon button that shows its pressed state, such as a search toggle.
+    pub(super) fn icon_toggle(
+        &self,
+        id: impl Into<ElementId>,
+        name: &'static str,
+        tooltip: impl Into<SharedString>,
+        on: bool,
+        cx: &Context<Self>,
+        on_click: impl Fn(&mut Self, &mut Window, &mut Context<Self>) + 'static,
+    ) -> Stateful<Div> {
+        let t = cx.theme();
+        let size = match t.style {
+            Style::Mac => 28.,
+            Style::Windows | Style::Gnome => 34.,
+        };
+        self.tinted_icon_button(
+            id,
+            name,
+            tooltip,
+            size,
+            t.text,
+            t.control_hover,
+            on.then(|| pressed(t).into()),
+            cx,
+            on_click,
+        )
+    }
+
+    /// An icon button with a tooltip. Its hit area extends vertically toward
+    /// [`MIN_HIT_TARGET`] and horizontally into the row gap, so neighbors
+    /// never overlap, while the visible button keeps its size.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn tinted_icon_button(
         &self,
@@ -168,27 +290,35 @@ impl Flick {
         size: f32,
         fg: impl Into<Hsla>,
         hover: impl Into<Hsla>,
+        fill: Option<Hsla>,
         cx: &Context<Self>,
         on_click: impl Fn(&mut Self, &mut Window, &mut Context<Self>) + 'static,
     ) -> Stateful<Div> {
         let t = cx.theme();
+        let id = id.into();
         let tooltip = tooltip.into();
         let hover = hover.into();
-        div()
-            .id(id)
+        let radius = if t.style == Style::Gnome {
+            8.
+        } else {
+            t.radius
+        };
+        let (pad_x, pad_y) = hit_padding(size);
+        let group = SharedString::from(format!("icon-button-{id}"));
+        let hint = tooltip.clone();
+        let el = div()
+            .id(id.clone())
+            .group(group.clone())
+            .relative()
             .flex_none()
-            .flex()
-            .items_center()
-            .justify_center()
-            .size(px(size))
-            .rounded(px(if t.style == Style::Gnome {
-                8.
-            } else {
-                t.radius
-            }))
+            .w(px(size + pad_x * 2.))
+            .h(px(size + pad_y * 2.))
+            .mx(px(-pad_x))
+            .my(px(-pad_y))
+            .px(px(pad_x))
+            .py(px(pad_y))
             .cursor_pointer()
-            .hover(move |s| s.bg(hover))
-            .tooltip(move |_, cx| cx.new(|_| Hint(tooltip.clone())).into())
+            .tooltip(move |_, cx| cx.new(|_| Hint(hint.clone())).into())
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, _, _, _| this.control_pressed = true),
@@ -197,7 +327,18 @@ impl Flick {
                 cx.stop_propagation();
                 on_click(this, window, cx);
             }))
-            .child(icon(name, (size * 0.53).round(), fg))
+            .child(
+                div()
+                    .size_full()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(radius))
+                    .when_some(fill, |d, fill| d.bg(fill))
+                    .group_hover(group, move |s| s.bg(hover))
+                    .child(icon(name, (size * 0.53).round(), fg)),
+            );
+        self.focusable(el, &id, Some(tooltip), radius, (-pad_x, -pad_y), cx)
     }
 
     /// Makes an element behave like a native title bar: drag to move and
@@ -403,7 +544,7 @@ impl Flick {
             .bg(t.control)
             .border_1()
             .border_color(t.border)
-            .text_size(px(t.text_size - 1.))
+            .text_size(t.font(t.text_size - 1.))
             .child(input.clone())
     }
 
@@ -429,8 +570,10 @@ impl Flick {
         for (index, (value, label)) in options.iter().copied().enumerate() {
             let on = value == selected;
             let on_select = on_select.clone();
+            let item_id = ElementId::from((id, index));
             let item = div()
-                .id((id, index))
+                .id(item_id.clone())
+                .relative()
                 .flex()
                 .items_center()
                 .justify_center()
@@ -444,12 +587,18 @@ impl Flick {
                     cx.stop_propagation();
                     on_select(this, value, window, cx);
                 }));
+            let radius = match t.style {
+                Style::Mac => 5.,
+                Style::Windows => 4.,
+                Style::Gnome => 8.,
+            };
+            let item = self.focusable(item, &item_id, None, radius, (0., 0.), cx);
             row = row.child(match t.style {
                 Style::Mac => item
                     .h(px(22.))
                     .px_3()
                     .rounded(px(5.))
-                    .text_size(px(12.))
+                    .text_size(t.font(12.))
                     .when(on, |d| d.bg(pressed(t)).shadow_xs())
                     .child(label),
                 Style::Windows => item
@@ -501,6 +650,7 @@ impl Flick {
             Style::Gnome => (46., 26., 22.),
         };
         let inset = (height - knob) / 2.;
+        let id = ElementId::from(id);
         let (track, knob_color) = match (t.style, on) {
             (_, true) => (
                 t.accent,
@@ -513,8 +663,9 @@ impl Flick {
             (Style::Windows, false) => (rgba(0x00000000), t.muted),
             (_, false) => (t.control_hover, rgb(0xffffff)),
         };
-        div()
-            .id(id)
+        let el = div()
+            .id(id.clone())
+            .relative()
             .flex_none()
             .flex()
             .items_center()
@@ -541,7 +692,119 @@ impl Flick {
                     .rounded_full()
                     .bg(knob_color)
                     .when(t.style != Style::Windows, |d| d.shadow_sm()),
+            );
+        self.focusable(el, &id, None, height / 2., (0., 0.), cx)
+    }
+
+    /// A horizontal slider stepping through `range` by `step`. Click or drag
+    /// the track, or use the arrow, Home, and End keys while it is focused.
+    /// `on_change` runs only when the stepped value changes.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn slider(
+        &self,
+        id: &'static str,
+        label: impl Into<SharedString>,
+        value: f32,
+        (min, max): (f32, f32),
+        step: f32,
+        width: f32,
+        cx: &Context<Self>,
+        on_change: impl Fn(&mut Self, f32, &mut Window, &mut Context<Self>) + 'static,
+    ) -> Stateful<Div> {
+        let t = cx.theme();
+        let bounds = self
+            .slider_bounds
+            .borrow_mut()
+            .entry(id)
+            .or_default()
+            .clone();
+        let measured = bounds.clone();
+        let snap = move |v: f32| ((v.clamp(min, max) - min) / step).round() * step + min;
+        let fraction = ((value - min) / (max - min)).clamp(0., 1.);
+        let at = move |x: Pixels| {
+            let b = bounds.get();
+            let width = f32::from(b.size.width).max(1.);
+            snap(min + (f32::from(x - b.origin.x) / width).clamp(0., 1.) * (max - min))
+        };
+        // Report only stepped changes, so dragging saves settings sparingly.
+        let on_change: Rc<ValueAction> = Rc::new(move |this, next, window, cx| {
+            if (next - value).abs() > step / 4. {
+                on_change(this, next, window, cx);
+            }
+        });
+        let (down, moved, keyed) = (on_change.clone(), on_change.clone(), on_change);
+        let at_move = at.clone();
+        let element_id = ElementId::from(id);
+        let knob = 16.;
+        let el = div()
+            .id(element_id.clone())
+            .relative()
+            .flex_none()
+            .w(px(width))
+            .h(px(24.))
+            .flex()
+            .items_center()
+            .cursor_pointer()
+            .child(
+                canvas(move |b, _, _| measured.set(b), |_, _, _, _| {})
+                    .absolute()
+                    .size_full(),
             )
+            .child(
+                div()
+                    .relative()
+                    .w_full()
+                    .h(px(4.))
+                    .rounded_full()
+                    .bg(t.control_hover)
+                    .child(
+                        div()
+                            .w(relative(fraction))
+                            .h_full()
+                            .rounded_full()
+                            .bg(t.accent),
+                    )
+                    .child(
+                        div()
+                            .absolute()
+                            .top(px(2. - knob / 2.))
+                            .left(relative(fraction))
+                            .ml(px(-knob / 2.))
+                            .size(px(knob))
+                            .rounded_full()
+                            .bg(rgb(0xffffff))
+                            .border_1()
+                            .border_color(t.border)
+                            .shadow_sm(),
+                    ),
+            )
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, e: &gpui::MouseDownEvent, window, cx| {
+                    this.dragging_slider = Some(id);
+                    down(this, at(e.position.x), window, cx);
+                }),
+            )
+            .on_mouse_move(
+                cx.listener(move |this, e: &gpui::MouseMoveEvent, window, cx| {
+                    if this.dragging_slider == Some(id) {
+                        moved(this, at_move(e.position.x), window, cx);
+                    }
+                }),
+            )
+            .on_key_down(cx.listener(move |this, e: &KeyDownEvent, window, cx| {
+                let next = match e.keystroke.key.as_str() {
+                    "left" | "down" => value - step,
+                    "right" | "up" => value + step,
+                    "home" => min,
+                    "end" => max,
+                    _ => return,
+                };
+                cx.stop_propagation();
+                this.keyboard_nav = true;
+                keyed(this, snap(next), window, cx);
+            }));
+        self.focusable(el, &element_id, Some(label.into()), 12., (2., -2.), cx)
     }
 
     /// Wraps the window in a shadow and resize border when Linux uses
@@ -705,7 +968,7 @@ pub(super) fn row(
                 .when_some(detail, |d, detail| {
                     d.child(
                         div()
-                            .text_size(px(t.text_size - 1.5))
+                            .text_size(t.font(t.text_size - 1.5))
                             .text_color(t.muted)
                             .overflow_hidden()
                             .whitespace_nowrap()
@@ -722,10 +985,12 @@ pub(super) fn section_title(t: &Theme, text: impl Into<SharedString>) -> Div {
     match t.style {
         Style::Mac => heading
             .px_1()
-            .text_size(px(13.))
+            .text_size(t.font(13.))
             .font_weight(FontWeight::SEMIBOLD),
-        Style::Windows => heading.text_size(px(14.)).font_weight(FontWeight::SEMIBOLD),
-        Style::Gnome => heading.text_size(px(15.)).font_weight(FontWeight::BOLD),
+        Style::Windows => heading
+            .text_size(t.font(14.))
+            .font_weight(FontWeight::SEMIBOLD),
+        Style::Gnome => heading.text_size(t.font(15.)).font_weight(FontWeight::BOLD),
     }
     .child(text.into())
 }
@@ -765,9 +1030,16 @@ pub(super) fn notice(t: &Theme, error: bool, text: impl Into<SharedString>) -> D
             div()
                 .flex_1()
                 .min_w(px(0.))
-                .text_size(px(t.text_size - 1.))
+                .text_size(t.font(t.text_size - 1.))
                 .child(text.into()),
         )
+}
+
+/// Hit-area padding for an icon button of `size`: up to [`MIN_HIT_TARGET`]
+/// vertically, and 2 px horizontally, which fits inside the narrowest row
+/// gap Flick uses between icon buttons.
+fn hit_padding(size: f32) -> (f32, f32) {
+    (2., ((MIN_HIT_TARGET - size) / 2.).max(0.))
 }
 
 fn resize_edge(
