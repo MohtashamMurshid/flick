@@ -228,6 +228,8 @@ pub struct Flick {
     /// The picture-in-picture window while it is open.
     pip: Option<pip_ui::PipHandle>,
     main_window: Option<AnyWindowHandle>,
+    /// Frames presented since the last debug report.
+    presented: (u32, Instant),
 }
 
 impl Flick {
@@ -278,10 +280,22 @@ impl Flick {
             });
         })
         .detach();
-        let (player, error) = match Player::new() {
+        let (mut player, mut error) = match Player::new() {
             Ok(player) => (Some(player), None),
             Err(error) => (None, Some(format!("Playback is unavailable. {error:#}"))),
         };
+        let frames = player
+            .as_mut()
+            .and_then(|player| match player.render_in_background() {
+                Ok(frames) => Some(frames),
+                Err(failure) => {
+                    error = Some(format!("Playback is unavailable. {failure:#}"));
+                    None
+                }
+            });
+        if frames.is_none() {
+            player = None;
+        }
         let focus = cx.focus_handle();
         focus.focus(window);
         let mut this = Self {
@@ -353,6 +367,7 @@ impl Flick {
             preview_image: None,
             pip: None,
             main_window: Some(window.window_handle()),
+            presented: (0, Instant::now()),
         };
         this.apply_preferences();
         // Posters deleted from the cache are made again.
@@ -383,10 +398,80 @@ impl Flick {
             }
         })
         .detach();
+        if let Some(mut frames) = frames {
+            cx.spawn_in(window, async move |this, cx| {
+                while let Some(mut message) = frames.recv().await {
+                    // Present only the newest of any frames that queued up.
+                    while let Ok(newer) = frames.try_recv() {
+                        message = newer;
+                    }
+                    if this
+                        .update_in(cx, |this, window, cx| this.present(message, window, cx))
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            })
+            .detach();
+        }
         if let Some(path) = path {
             this.open(path, window, cx);
         }
         this
+    }
+
+    /// Shows a frame from the render thread, unless it belongs to a file
+    /// that has since been replaced.
+    fn present(
+        &mut self,
+        (generation, frame): (u64, Result<crate::playback::VideoFrame, String>),
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(player) = &self.player else {
+            return;
+        };
+        if generation != player.frame_generation() {
+            return;
+        }
+        let frame = match frame {
+            Ok(frame) => frame,
+            Err(error) => {
+                if self.error.is_none() {
+                    self.error = Some(format!("Could not display this video. {error}"));
+                    cx.notify();
+                }
+                return;
+            }
+        };
+        let Some(buffer) = image::RgbaImage::from_raw(frame.width, frame.height, frame.pixels)
+        else {
+            return;
+        };
+        let next = Arc::new(RenderImage::new(vec![image::Frame::new(buffer)]));
+        if let Some(old) = self.frame.replace(next) {
+            self.drop_pip_image(&old, cx);
+            let _ = window.drop_image(old);
+        }
+        if let Some(started) = self.opened_at.take() {
+            tracing::info!(
+                elapsed_ms = started.elapsed().as_millis(),
+                hardware_decoder = ?player.hardware_decoder(),
+                "First video presentation submitted"
+            );
+        }
+        self.presented.0 += 1;
+        if self.presented.1.elapsed() >= Duration::from_secs(5) {
+            tracing::debug!(
+                frames = self.presented.0,
+                seconds = self.presented.1.elapsed().as_secs_f32(),
+                dropped_total = ?player.dropped_frames(),
+                "Presented video frames"
+            );
+            self.presented = (0, Instant::now());
+        }
+        cx.notify();
     }
 
     fn apply_preferences(&mut self) {
@@ -712,42 +797,18 @@ impl Flick {
             self.pip = None;
             changed = true;
         }
-        if self.file_loaded && (self.view == View::Player || pip_target.is_some()) {
+        // Frames arrive from the render thread; see `present`.
+        let target = if self.file_loaded && (self.view == View::Player || pip_target.is_some()) {
             let bounds = self.video_bounds.get();
             let width = f32::from(bounds.size.width).max(1.);
             let height = f32::from(bounds.size.height).max(1.);
-            let (w, h) = pip_target.unwrap_or_else(|| {
+            pip_target.unwrap_or_else(|| {
                 flick::presentation::target_size(width, height, window.scale_factor())
-            });
-            match player.render(w.max(1), h.max(1)) {
-                Ok(Some(frame)) => {
-                    if let Some(buffer) =
-                        image::RgbaImage::from_raw(frame.width, frame.height, frame.pixels)
-                    {
-                        let next = Arc::new(RenderImage::new(vec![image::Frame::new(buffer)]));
-                        if let Some(old) = self.frame.replace(next) {
-                            self.drop_pip_image(&old, cx);
-                            let _ = window.drop_image(old);
-                        }
-                        if let Some(started) = self.opened_at.take() {
-                            tracing::info!(
-                                elapsed_ms = started.elapsed().as_millis(),
-                                hardware_decoder = ?player.hardware_decoder(),
-                                "First video presentation submitted"
-                            );
-                        }
-                        changed = true;
-                    }
-                }
-                Ok(None) => {}
-                Err(error) => {
-                    if self.error.is_none() {
-                        self.error = Some(format!("Could not display this video. {error:#}"));
-                        changed = true;
-                    }
-                }
-            }
-        }
+            })
+        } else {
+            (0, 0)
+        };
+        player.set_render_target(target.0, target.1);
         let ended = self.snapshot.eof && self.file_loaded;
         if ended && !self.was_eof {
             self.up_next = self
@@ -784,8 +845,10 @@ impl Flick {
         if changed {
             cx.notify();
         }
+        // Frames no longer depend on this poll; it only follows playback
+        // state, controls, and the timeline.
         if self.playing() {
-            Duration::from_millis(16)
+            Duration::from_millis(50)
         } else {
             Duration::from_millis(150)
         }
