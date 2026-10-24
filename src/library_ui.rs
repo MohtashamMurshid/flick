@@ -32,6 +32,9 @@ impl Flick {
 
     pub(super) fn search(&mut self, cx: &mut Context<Self>) {
         let query = self.query.trim().to_owned();
+        if self.search_link(&query, cx) {
+            return;
+        }
         if query.starts_with("magnet:")
             || (query.len() == 40 && query.bytes().all(|b| b.is_ascii_hexdigit()))
         {
@@ -92,6 +95,10 @@ impl Flick {
                     }
                 }
                 ServiceEvent::Search { .. } => {}
+                ServiceEvent::Fetch { id, update } => self.fetch_event(id, update),
+                ServiceEvent::ArchiveResolved { identifier, result } => {
+                    self.archive_listed(identifier, result)
+                }
                 ServiceEvent::ResolveCancelled => {
                     self.resolving = false;
                     self.pending_torrent = None;
@@ -213,7 +220,7 @@ impl Flick {
         .detach();
     }
 
-    fn choose_download_folder(&mut self, window: &Window, cx: &mut Context<Self>) {
+    pub(super) fn choose_download_folder(&mut self, window: &Window, cx: &mut Context<Self>) {
         let receiver = cx.prompt_for_paths(PathPromptOptions {
             files: false,
             directories: true,
@@ -243,7 +250,7 @@ impl Flick {
                 ("plus", "Add Videos…", Control::AddVideos),
             ],
             Page::Downloads => &[
-                ("magnet", "Paste Magnet Link", Control::PasteMagnet),
+                ("magnet", "Paste Link", Control::PasteMagnet),
                 ("share-2", "Share Files…", Control::Share),
             ],
             Page::History | Page::Appearance | Page::Shortcuts => &[],
@@ -432,7 +439,8 @@ impl Flick {
                         | flick::torrent::TransferState::Checking
                 )
             })
-            .count();
+            .count()
+            + self.fetches.active();
         let badge = (active > 0).then(|| active.to_string());
         let item = |page: Page, name: &'static str, badge: Option<String>| {
             self.nav_item(page, name, badge, cx).into_any_element()
@@ -801,7 +809,7 @@ impl Flick {
                     .child(round(self.button(
                         "welcome-magnet",
                         Some("magnet"),
-                        "Paste Magnet Link",
+                        "Paste Link",
                         false,
                         cx,
                         |this, w, cx| this.handle(Control::PasteMagnet, w, cx),
@@ -812,7 +820,7 @@ impl Flick {
                     .mt_2()
                     .text_size(t.font(12.))
                     .text_color(t.muted)
-                    .child(format!("{command}K to search or paste a magnet link  ·  {command}, for Appearance")),
+                    .child(format!("{command}K to search or paste a link  ·  {command}, for Appearance")),
             )
     }
 
@@ -825,7 +833,12 @@ impl Flick {
         let mut rows = Vec::new();
         for (index, result) in results.items.iter().enumerate() {
             let source = result.clone();
-            let detail = if result.torrent_url.is_some() {
+            let detail = if result.archive_id.is_some() {
+                format!(
+                    "{} · Downloads over HTTPS · choose files first",
+                    result.source
+                )
+            } else if result.torrent_url.is_some() {
                 format!(
                     "{} · File sizes are shown before downloading",
                     result.source
@@ -850,7 +863,7 @@ impl Flick {
                         "Download",
                         false,
                         cx,
-                        move |this, _, cx| this.resolve(source.input(), cx),
+                        move |this, _, cx| this.download_result(&source, cx),
                     ),
                 )
                 .into_any_element(),
@@ -1701,6 +1714,7 @@ impl Flick {
                 .child(self.torrent_sheet(torrent, cx))
                 .child(div().h(px(28.)));
         }
+        page = page.child(self.link_downloads(cx));
         if let Some(magnet) = &self.shared_magnet {
             let magnet = magnet.clone();
             page = page.child(
@@ -1727,14 +1741,14 @@ impl Flick {
                     .child(self.read_only_field(&self.magnet_field, cx)),
             );
         }
-        if self.downloads.is_empty() {
+        if self.downloads.is_empty() && self.fetches.is_empty() {
             page = page.child(empty_state(
                 &t,
                 "download",
                 "No transfers yet",
-                "Search for a video, paste a magnet link, or share your own files.",
+                "Search for a video, paste a link, or share your own files.",
             ));
-        } else {
+        } else if !self.downloads.is_empty() {
             let rows = self
                 .downloads
                 .iter()
@@ -2029,7 +2043,7 @@ impl Flick {
 type MenuAction = dyn Fn(&mut Flick, &mut Window, &mut Context<Flick>);
 
 /// Rows inside grouped lists draw their focus ring inside the group.
-const RING_INSET: f32 = 4.;
+pub(super) const RING_INSET: f32 = 4.;
 
 /// Arrow-key movement within a card grid.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -2125,7 +2139,7 @@ fn empty_state(t: &Theme, name: &'static str, title: &'static str, detail: &'sta
         .child(div().max_w(px(380.)).text_color(t.muted).child(detail))
 }
 
-fn checkbox(t: &Theme, checked: bool) -> Div {
+pub(super) fn checkbox(t: &Theme, checked: bool) -> Div {
     let (size, radius) = match t.style {
         Style::Mac => (14., 4.),
         Style::Windows => (20., 4.),

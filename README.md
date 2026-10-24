@@ -6,7 +6,7 @@ A desktop video player built in Rust with GPUI and libmpv, now adding native tor
 
 Flick draws its interface in a macOS, Windows 11, or GNOME style and matches the running system by default. Each style has its own window chrome, sidebar, controls, typography, and player: a floating HUD on macOS, a transport bar on Windows, and a rounded OSD on GNOME. Choose the style, a light or dark scheme, and an accent color in **Appearance**. Icons come from the free Hugeicons set. The native style uses the platform UI font; other styles use the closest installed font or the bundled Inter. See [asset sources and licenses](assets/README.md).
 
-Flick opens to your library, with Continue watching, All videos, Shows, History, and Downloads. Shows groups episodes named like `Show S01E02`, `Show 1x02`, or `Show/Season 1/02`, and the next episode starts after a short countdown. Add videos or a folder, filter local titles, or search online for videos to download. Choose torrent files and a destination; completed verified videos join the library. Share a file or folder and copy its magnet link. The [development diagnostic](docs/TRANSFERS.md) uses the same native transfer backend. Watching during downloads follows later. The broad [headless agent proposal](docs/HEADLESS_PLAN.md) is deferred. See [PLAN.md](PLAN.md) for implemented versus planned work.
+Flick opens to your library, with Continue watching, All videos, Shows, History, and Downloads. Shows groups episodes named like `Show S01E02`, `Show 1x02`, or `Show/Season 1/02`, and the next episode starts after a short countdown. Add videos or a folder, filter local titles, or search online for videos to download. Choose torrent files and a destination; completed verified videos join the library. Paste a YouTube, X, or other video page link to download it with [yt-dlp](#downloading-from-web-links), or download Internet Archive results and links over HTTPS. Share a file or folder and copy its magnet link. The [development diagnostic](docs/TRANSFERS.md) uses the same native transfer backend. Watching during downloads follows later. The broad [headless agent proposal](docs/HEADLESS_PLAN.md) is deferred. See [PLAN.md](PLAN.md) for implemented versus planned work.
 
 This first prototype provides video inside the application window, play and pause, seeking, volume and mute, playback speed, fullscreen, audio/subtitle selection with audio delay, external subtitle loading, recent files, and resume positions. Playback controls appear after media loads. libmpv uses the platform's hardware decoder when available (`hwdec=auto-copy`; set `FLICK_HWDEC=no` to compare against software decoding) and renders into the frame GPUI uploads. The software frame-transfer path follows the display's physical video bounds with no fixed resolution or pixel-budget cap. Native dimension/allocator failures are reported instead of silently lowering resolution. Efficient native GPU video presentation is a separate milestone; this version makes no claim of being faster than VLC.
 
@@ -27,7 +27,18 @@ cargo run --locked -- "/path/to/video.mp4"
 
 If Rust was just installed and `cargo` is not on the current shell's path, open a new terminal or run `. "$HOME/.cargo/env"` on macOS/Linux first. On this development machine, `~/.cargo/bin/cargo` also works directly.
 
-A new library opens to a welcome page with **Open Video…**, **Add Folder…**, and **Paste Magnet Link**. Afterward, Flick opens to **Home**, with Continue Watching and Recently Added; the sidebar also has All Videos, History, Downloads, and Appearance. Use **Add Videos…** or **Add Folder…** to build the library, or drop files/folders into it. Click a video to play or continue it. The back arrow returns to the library and pauses playback. Passing a local path on the command line opens that video directly. Type in the search field to filter local videos; press Enter for download results, or paste a magnet link. Search uses TPB, Internet Archive, and YTS independently and reports unavailable sources. The Linux file picker uses the desktop portal; drag and drop and command-line paths remain available when no portal service is running. The captions icon opens **Audio & subtitles** to select tracks or load a subtitle file. While a video plays, its controls hide after 2.5 seconds without pointer movement, and subtitles move above the controls whenever they show. Turn hiding off in **Appearance**. Icon controls have descriptive tooltips.
+A new library opens to a welcome page with **Open Video…**, **Add Folder…**, and **Paste Link**. Afterward, Flick opens to **Home**, with Continue Watching and Recently Added; the sidebar also has All Videos, History, Downloads, and Appearance. Use **Add Videos…** or **Add Folder…** to build the library, or drop files/folders into it. Click a video to play or continue it. The back arrow returns to the library and pauses playback. Passing a local path on the command line opens that video directly. Type in the search field to filter local videos; press Enter for download results, or paste a magnet link or web address and press Enter to download it. Search uses TPB, Internet Archive, and YTS independently and reports unavailable sources. The Linux file picker uses the desktop portal; drag and drop and command-line paths remain available when no portal service is running. The captions icon opens **Audio & subtitles** to select tracks or load a subtitle file. While a video plays, its controls hide after 2.5 seconds without pointer movement, and subtitles move above the controls whenever they show. Turn hiding off in **Appearance**. Icon controls have descriptive tooltips.
+
+## Downloading from web links
+
+Type or paste an `http`/`https` address into the search field and press Enter, or copy it and choose **Paste Link** on the Downloads page. Downloads appear under **Link Downloads** with progress, speed, Cancel, errors, Try Again, and Play. Completed videos join the library. Files are saved to the current download folder: `FLICK_DOWNLOAD_DIR`, otherwise `Downloads/Flick` in your home folder. Download only videos you have the right to save.
+
+- **Video pages** such as YouTube or X posts need [yt-dlp](https://github.com/yt-dlp/yt-dlp#installation), an optional runtime dependency that Flick runs as a separate program. Keep it current; sites change often, and outdated releases fail. Flick uses `FLICK_YTDLP` if set to the program's full path, then `yt-dlp` (`yt-dlp.exe` on Windows) on `PATH`, then common install folders that apps opened from the desktop may not have on `PATH`: `/opt/homebrew/bin`, `/usr/local/bin`, and `/opt/local/bin` on macOS; `/usr/local/bin`, `/usr/bin`, `/snap/bin`, and `~/.local/bin` on Linux; and `%LOCALAPPDATA%\Microsoft\WinGet\Links` on Windows. Install with `brew install yt-dlp`, `winget install yt-dlp.yt-dlp`, `pipx install yt-dlp`, or the official standalone release. Distribution packages are often too old. A whole-playlist address downloads every entry.
+- **FFmpeg** is optional. Flick looks for it on `PATH`, beside yt-dlp, and in the same install folders, and passes its location to yt-dlp. With FFmpeg, yt-dlp merges the best video and audio; without it, Flick asks for the best single file that has both.
+- **Direct HTTPS video links**, whose address ends in a video file name, download without yt-dlp. If the address turns out to be a web page, yt-dlp handles it instead.
+- **Internet Archive** search results and `archive.org/details/…` links list the item's video files first, preselecting one copy of each video and preferring the uploaded original. Downloads go over HTTPS from archive.org into a folder named after the item, and are checked against the published size and SHA-1.
+
+Flick never overwrites an existing file: a different file with the same name gets a numbered name, and an identical Archive file is reused. Partial files use dot-prefixed names until a download finishes. Cancelling, a failure, or closing Flick removes them. An HTTPS download resumes after a dropped connection, and after a crash if started again.
 
 ## Keyboard controls
 
@@ -79,6 +90,20 @@ FLICK_AUDIO=null FLICK_TEST_VIDEO=/tmp/flick-test.mp4 \
   cargo test --locked playback::tests::real_playback -- --ignored --nocapture
 ```
 
+Try link downloads without the desktop. `get` prints one JSON update per line, and Ctrl+C cancels:
+
+```sh
+cargo run --locked --no-default-features --bin flick-fetch -- tools
+cargo run --locked --no-default-features --bin flick-fetch -- archive Nabisco_2
+cargo run --locked --no-default-features --bin flick-fetch -- get "https://archive.org/details/Nabisco_2" --dest /tmp/flick-links
+```
+
+Automated link-download tests use a generated stand-in for yt-dlp and loopback servers, never the Internet. An opt-in test drives the installed yt-dlp against a loopback server only:
+
+```sh
+cargo test --locked --no-default-features --lib installed_ytdlp -- --ignored
+```
+
 `FLICK_AUDIO=null` is for automated tests without an audio device. Omit it for normal audible playback. The CLI smoke test does not open a desktop window. Its first-frame timing describes a software presentation submission, not a measured display scanout time.
 
 GPUI 0.2.2 is pinned. Its transitive `xattr` dependency still uses the `ENOATTR` alias removed in libc 0.2.190, so this application temporarily pins libc 0.2.189. Revisit this compatibility pin when updating GPUI.
@@ -99,6 +124,9 @@ Windows, macOS, and Linux have native CI jobs configured. Only results actually 
 - `src/presentation.rs`: physical display sizing without fixed resolution limits.
 - `src/library_ui.rs`: library, history, search results, torrent selection, and Downloads views.
 - `src/catalog.rs`: independent native discovery providers with progressive results.
+- `src/fetch.rs`: link downloads without GPUI, separate from the torrent session: yt-dlp processes, HTTPS files, and Internet Archive file lists.
+- `src/fetch_ui.rs`: Link Downloads on the Downloads page and the Internet Archive file chooser.
+- `src/bin/flick-fetch.rs`: development diagnostic for link downloads.
 - `src/services.rs`: desktop background worker and transfer events.
 - `src/input.rs`: text fields with Unicode/IME and clipboard support, including selectable read-only values.
 - `src/shortcuts.rs`: rebindable player shortcuts.

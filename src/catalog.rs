@@ -12,6 +12,8 @@ pub struct SearchResult {
     pub size_bytes: u64,
     pub seeders: u64,
     pub source: String,
+    /// Internet Archive items download over HTTPS rather than by torrent.
+    pub archive_id: Option<String>,
 }
 impl SearchResult {
     pub fn input(&self) -> crate::torrent::TorrentInput {
@@ -224,6 +226,7 @@ fn parse_archive(value: serde_json::Value) -> Result<Vec<SearchResult>> {
             size_bytes: 0,
             seeders: 0,
             source: "Internet Archive".into(),
+            archive_id: Some(id.into()),
         });
     }
     Ok(items)
@@ -260,6 +263,7 @@ fn item(
         size_bytes,
         seeders,
         source: source.into(),
+        archive_id: None,
     })
 }
 #[cfg(test)]
@@ -349,6 +353,7 @@ mod tests {
             serde_json::json!({"response":{"docs":[{"identifier":"sample?x=1","title":"Sample"}]}}),
         )
         .unwrap();
+        assert_eq!(results[0].archive_id.as_deref(), Some("sample?x=1"));
         let url = reqwest::Url::parse(results[0].torrent_url.as_ref().unwrap()).unwrap();
         assert_eq!(url.host_str(), Some("archive.org"));
         assert!(url.query().is_none());
