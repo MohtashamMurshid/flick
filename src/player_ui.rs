@@ -216,7 +216,7 @@ impl Flick {
                 .child(div().flex_1())
                 .child(keys),
             Style::Windows => bar
-                .pl_2()
+                .pl(px(8. + traffic_light_space()))
                 .child(back)
                 .child(
                     div()
@@ -231,6 +231,7 @@ impl Flick {
                 .when_some(controls, |d, c| d.child(c)),
             Style::Gnome => bar
                 .px_1p5()
+                .pl(px(6. + traffic_light_space()))
                 .child(back)
                 .child(centered_title(FontWeight::BOLD))
                 .child(div().flex_1())
