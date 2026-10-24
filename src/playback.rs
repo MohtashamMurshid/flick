@@ -557,8 +557,8 @@ impl Player {
             return Ok(None);
         }
         ensure!(
-            width <= 8192 && height <= 8192,
-            "Video presentation target exceeds 8192 pixels on one side"
+            c_int::try_from(width).is_ok() && c_int::try_from(height).is_ok(),
+            "The requested video dimensions cannot be represented by libmpv"
         );
         let mut buffer = self.buffer.borrow_mut();
         let resized = buffer.width != width || buffer.height != height;
@@ -573,17 +573,25 @@ impl Player {
             return Ok(None);
         }
         if resized {
-            let stride = (width as usize * 4).next_multiple_of(64);
-            let blocks = stride * height as usize / 64;
-            buffer.blocks.clear();
+            let stride = (width as usize)
+                .checked_mul(4)
+                .and_then(|bytes| bytes.checked_add(63))
+                .map(|bytes| bytes / 64 * 64)
+                .context("Video row size exceeds this platform's address space")?;
+            let byte_count = stride
+                .checked_mul(height as usize)
+                .context("Video surface exceeds this platform's address space")?;
+            let blocks = byte_count / 64;
+            let additional = blocks.saturating_sub(buffer.blocks.len());
             buffer
                 .blocks
-                .try_reserve_exact(blocks)
+                .try_reserve_exact(additional)
                 .context("Allocate video presentation surface")?;
             buffer.blocks.resize(blocks, RenderBlock([0; 64]));
             buffer.width = width;
             buffer.height = height;
             buffer.stride = stride;
+            tracing::debug!(width, height, "Video presentation resized");
         }
         let mut dimensions = [width as c_int, height as c_int];
         let mut stride = buffer.stride; // MPV_RENDER_PARAM_SW_STRIDE is size_t*.
@@ -623,7 +631,14 @@ impl Player {
         let bytes =
             unsafe { std::slice::from_raw_parts(buffer.blocks.as_ptr().cast::<u8>(), byte_count) };
         let row_bytes = width as usize * 4;
-        let mut pixels = Vec::with_capacity(row_bytes * height as usize);
+        let mut pixels = Vec::new();
+        pixels
+            .try_reserve_exact(
+                row_bytes
+                    .checked_mul(height as usize)
+                    .context("Video frame size overflow")?,
+            )
+            .context("Allocate video frame at display resolution")?;
         for row in bytes.chunks_exact(buffer.stride) {
             pixels.extend_from_slice(&row[..row_bytes]);
         }
@@ -702,6 +717,27 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_file(&self.0);
         }
+    }
+
+    /// Exercise native output allocation above both former presentation limits.
+    #[test]
+    #[ignore = "requires native libmpv and FLICK_TEST_VIDEO"]
+    fn real_presentation_has_no_fixed_resolution_cap() -> Result<()> {
+        let clip = std::env::var("FLICK_TEST_VIDEO")?;
+        let player = Player::new()?;
+        player.load(&clip)?;
+        wait_for(&player, |p| {
+            p.file_loaded.get() && p.snapshot().duration > 0.
+        })?;
+        player.set_property("pause", "yes")?;
+        for (width, height) in [(10_000, 2), (7680, 4320)] {
+            let frame = player
+                .render(width, height)?
+                .context("Missing resized video frame")?;
+            assert_eq!((frame.width, frame.height), (width, height));
+            assert_eq!(frame.pixels.len(), width as usize * height as usize * 4);
+        }
+        Ok(())
     }
 
     /// A timeline update alone does not prove that paused seeking displayed

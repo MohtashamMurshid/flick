@@ -16,6 +16,38 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  transfers:
+    name: Transfers without desktop / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.99.0
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Verify transfer dependency isolation
+        shell: python
+        run: |
+          import subprocess
+          tree = subprocess.check_output([
+              'cargo', 'tree', '--locked', '--no-default-features',
+              '--edges', 'normal', '--prefix', 'none', '--format', '{p}'
+          ], text=True)
+          forbidden = ('gpui ', 'blade-graphics ', 'cocoa ', 'metal ', 'winit ')
+          assert not any(line.startswith(forbidden) for line in tree.splitlines()), tree
+      - name: Lint without desktop dependencies
+        run: cargo clippy --locked --no-default-features --all-targets -- -D warnings
+      - name: Test transfers using only loopback peers
+        run: cargo test --locked --no-default-features --all-targets
+
   validate:
     name: Rust / ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
@@ -58,6 +90,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
         with:
+          toolchain: 1.99.0
           components: rustfmt, clippy
 
       - uses: Swatinem/rust-cache@v2
