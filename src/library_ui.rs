@@ -296,7 +296,7 @@ impl Flick {
                             .child(title),
                     )
                     .child(self.action_icons(cx))
-                    .child(self.search_field(window, cx).w(px(220.)));
+                    .child(self.search_field(window, cx).w(t.font(220.)));
                 div()
                     .flex()
                     .size_full()
@@ -323,7 +323,7 @@ impl Flick {
                     .child(app_icon(16., 4.))
                     .child(div().flex_none().text_size(t.font(12.)).child("Flick"))
                     .child(div().flex_1())
-                    .child(self.search_field(window, cx).w(px(380.)).flex_shrink())
+                    .child(self.search_field(window, cx).w(t.font(380.)).flex_shrink())
                     .child(div().flex_1())
                     .when_some(controls, |d, c| d.child(c));
                 v_flex()
@@ -405,11 +405,9 @@ impl Flick {
                             .min_w(px(0.))
                             .child(self.titlebar_area(header, cx))
                             .when(search_visible, |d| {
-                                d.child(
-                                    h_flex().flex_none().justify_center().px_4().pb_2().child(
-                                        self.search_field(window, cx).w(px(420.)).flex_shrink(),
-                                    ),
-                                )
+                                d.child(h_flex().flex_none().justify_center().px_4().pb_2().child(
+                                    self.search_field(window, cx).w(t.font(420.)).flex_shrink(),
+                                ))
                             })
                             .child(body),
                     )

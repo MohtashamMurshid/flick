@@ -84,7 +84,7 @@ pub const TEXT_SCALE: (f32, f32) = (0.85, 1.5);
 
 impl SubtitleStyle {
     fn sanitize(&mut self) {
-        self.scale = finite_clamp(self.scale, SUBTITLE_SCALE, 1.);
+        self.scale = (finite_clamp(self.scale, SUBTITLE_SCALE, 1.) * 100.).round() / 100.;
         self.color &= 0xffffff;
         self.position = self
             .position
@@ -197,7 +197,9 @@ impl Default for Appearance {
 
 impl Appearance {
     pub fn sanitize(&mut self) {
-        self.text_scale = finite_clamp(self.text_scale, TEXT_SCALE, 1.);
+        // Sliders step in hundredths; drop accumulated float noise.
+        let hundredths = |v: f32| (v * 100.).round() / 100.;
+        self.text_scale = hundredths(finite_clamp(self.text_scale, TEXT_SCALE, 1.));
         self.accent = self.accent.map(|accent| accent & 0xffffff);
         self.subtitles.sanitize();
     }
@@ -399,6 +401,8 @@ pub fn apply(cx: &mut App, appearance: &Appearance) {
         cx.global::<Fonts>(),
     );
     theme.text_scale = appearance.text_scale;
+    // Labels in the sidebar keep fitting at larger text sizes.
+    theme.sidebar_width *= appearance.text_scale.max(1.);
     let high = match appearance.contrast {
         ContrastChoice::High => true,
         ContrastChoice::Standard => false,

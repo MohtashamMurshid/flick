@@ -279,8 +279,10 @@ impl Flick {
     }
 
     /// An icon button with a tooltip. Its hit area extends vertically toward
-    /// [`MIN_HIT_TARGET`] and horizontally into the row gap, so neighbors
-    /// never overlap, while the visible button keeps its size.
+    /// [`MIN_HIT_TARGET`] while the visible button keeps its size. Toolbars
+    /// and the player have room above and below their buttons; extending
+    /// sideways would overlap neighbors, and GPUI 0.2.2's layout collapses
+    /// flex rows whose children have negative horizontal margins.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn tinted_icon_button(
         &self,
@@ -303,7 +305,7 @@ impl Flick {
         } else {
             t.radius
         };
-        let (pad_x, pad_y) = hit_padding(size);
+        let pad_y = hit_padding(size);
         let group = SharedString::from(format!("icon-button-{id}"));
         let hint = tooltip.clone();
         let el = div()
@@ -311,11 +313,9 @@ impl Flick {
             .group(group.clone())
             .relative()
             .flex_none()
-            .w(px(size + pad_x * 2.))
+            .w(px(size))
             .h(px(size + pad_y * 2.))
-            .mx(px(-pad_x))
             .my(px(-pad_y))
-            .px(px(pad_x))
             .py(px(pad_y))
             .cursor_pointer()
             .tooltip(move |_, cx| cx.new(|_| Hint(hint.clone())).into())
@@ -338,7 +338,7 @@ impl Flick {
                     .group_hover(group, move |s| s.bg(hover))
                     .child(icon(name, (size * 0.53).round(), fg)),
             );
-        self.focusable(el, &id, Some(tooltip), radius, (-pad_x, -pad_y), cx)
+        self.focusable(el, &id, Some(tooltip), radius, (0., -pad_y), cx)
     }
 
     /// Makes an element behave like a native title bar: drag to move and
@@ -1035,11 +1035,10 @@ pub(super) fn notice(t: &Theme, error: bool, text: impl Into<SharedString>) -> D
         )
 }
 
-/// Hit-area padding for an icon button of `size`: up to [`MIN_HIT_TARGET`]
-/// vertically, and 2 px horizontally, which fits inside the narrowest row
-/// gap Flick uses between icon buttons.
-fn hit_padding(size: f32) -> (f32, f32) {
-    (2., ((MIN_HIT_TARGET - size) / 2.).max(0.))
+/// Vertical hit-area padding that brings an icon button of `size` to
+/// [`MIN_HIT_TARGET`].
+fn hit_padding(size: f32) -> f32 {
+    ((MIN_HIT_TARGET - size) / 2.).max(0.)
 }
 
 fn resize_edge(

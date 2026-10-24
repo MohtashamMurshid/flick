@@ -824,12 +824,22 @@ impl Flick {
                 }
             }
             Shortcut::LoopAb => {
-                self.command(&["ab-loop"], cx);
                 let s = &self.snapshot;
-                let text = match (s.loop_start, s.loop_end) {
-                    (Some(a), Some(b)) => format!("Loop {}–{}", format_time(a), format_time(b)),
-                    (Some(a), None) => format!("Loop from {}", format_time(a)),
-                    _ => "Loop off".into(),
+                let text = match loop_step(s.loop_start, s.loop_end, s.position) {
+                    LoopStep::Start(a) => {
+                        self.property("ab-loop-a", &a.to_string(), cx);
+                        format!("Loop from {}", format_time(a))
+                    }
+                    LoopStep::Span(a, b) => {
+                        self.property("ab-loop-a", &a.to_string(), cx);
+                        self.property("ab-loop-b", &b.to_string(), cx);
+                        format!("Loop {}–{}", format_time(a), format_time(b))
+                    }
+                    LoopStep::Clear => {
+                        self.property("ab-loop-a", "no", cx);
+                        self.property("ab-loop-b", "no", cx);
+                        "Loop off".into()
+                    }
                 };
                 self.show_status(text);
             }
@@ -980,6 +990,26 @@ impl Flick {
     }
 }
 
+/// What the A–B loop key does next.
+#[derive(Debug, PartialEq)]
+enum LoopStep {
+    Start(f64),
+    /// Start and end, in order.
+    Span(f64, f64),
+    Clear,
+}
+
+/// Sets the loop start, then the end (swapping so the loop runs forward),
+/// then clears the loop. An end too close to the start is ignored.
+fn loop_step(start: Option<f64>, end: Option<f64>, position: f64) -> LoopStep {
+    match (start, end) {
+        (None, _) => LoopStep::Start(position),
+        (Some(a), None) if (position - a).abs() < 0.1 => LoopStep::Start(a),
+        (Some(a), None) => LoopStep::Span(a.min(position), a.max(position)),
+        (Some(_), Some(_)) => LoopStep::Clear,
+    }
+}
+
 struct Hint(SharedString);
 impl Render for Hint {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1087,5 +1117,21 @@ impl Render for Flick {
             .child(content)
             .children(self.card_menu_panel(cx));
         self.window_frame(root.into_any_element(), window, cx)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn loop_key_sets_start_then_ordered_end_then_clears() {
+        assert_eq!(loop_step(None, None, 4.), LoopStep::Start(4.));
+        assert_eq!(loop_step(Some(4.), None, 9.), LoopStep::Span(4., 9.));
+        assert_eq!(loop_step(Some(4.), None, 1.), LoopStep::Span(1., 4.));
+        assert_eq!(loop_step(Some(4.), None, 4.05), LoopStep::Start(4.));
+        assert_eq!(loop_step(Some(1.), Some(4.), 2.), LoopStep::Clear);
+        // A stray end without a start starts over.
+        assert_eq!(loop_step(None, Some(4.), 2.), LoopStep::Start(2.));
     }
 }

@@ -100,7 +100,8 @@ impl Flick {
             .gap_3()
             .child(
                 div()
-                    .w(px(44.))
+                    .min_w(t.font(44.))
+                    .whitespace_nowrap()
                     .text_right()
                     .text_color(t.muted)
                     .child(percent(appearance.text_scale)),
@@ -137,7 +138,8 @@ impl Flick {
             .gap_3()
             .child(
                 div()
-                    .w(px(44.))
+                    .min_w(t.font(44.))
+                    .whitespace_nowrap()
                     .text_right()
                     .text_color(t.muted)
                     .child(percent(subtitles.scale)),
@@ -210,7 +212,8 @@ impl Flick {
             .gap_3()
             .child(
                 div()
-                    .w(px(64.))
+                    .min_w(t.font(64.))
+                    .whitespace_nowrap()
                     .text_right()
                     .text_color(t.muted)
                     .child(if raised == 0 {
