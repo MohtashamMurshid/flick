@@ -96,7 +96,7 @@ Performance:
 - [x] 12. Stop copying each frame twice. mpv renders into a 64-byte-aligned buffer, then every row is repacked into a new `Vec`. libmpv now renders directly into the frame GPUI receives.
 - [ ] 13. Native GPU presentation (stage 3): render through mpv's GPU API into a texture that GPUI draws directly. This is the real fix for 4K.
 - [x] 14. Use a separate render thread with callback-driven redraws instead of a fixed 16 ms UI poll, which fits neither 24 fps content nor 120 Hz displays and stalls the UI on a slow decode. A render thread owns the libmpv render context and is woken by its update callback; the UI presents frames as they arrive and polls playback state every 50 ms. The responsiveness gain has not been measured on an idle machine.
-- [ ] 15. Benchmark harness: CPU, dropped frames, and memory over a 5-minute 4K loop. Speed claims and regression checks depend on it.
+- [x] 15. Benchmark harness: CPU, dropped frames, and memory over a 5-minute 4K loop. Speed claims and regression checks depend on it.
 
 Features:
 

@@ -106,6 +106,17 @@ cargo test --locked --no-default-features --lib installed_ytdlp -- --ignored
 
 `FLICK_AUDIO=null` is for automated tests without an audio device. Omit it for normal audible playback. The CLI smoke test does not open a desktop window. Its first-frame timing describes a software presentation submission, not a measured display scanout time.
 
+Run a sustained release benchmark with a generated local 4K/30 fps fixture (FFmpeg with libx264 required):
+
+```sh
+FLICK_AUDIO=null bash scripts/benchmark.sh                 # 300 seconds at 3840x2160
+FLICK_AUDIO=null bash scripts/benchmark.sh 60 --size 1920x1080
+FLICK_AUDIO=null FLICK_HWDEC=no cargo run --locked --release --bin flick -- \
+  --benchmark /path/to/local-video.mp4 --seconds 300 --size 3840x2160 --interval-ms 16
+```
+
+The script removes its temporary 12-second H.264 clip on exit. Stdout is one JSON report; diagnostics go to stderr. The CLI loops the file through the real software renderer without a GPUI window. It reports CPU, RSS, mpv drop counters, source/decoder metadata, and render-call percentiles after the first frame. Frame counts describe software submissions; GPUI upload, display timing, and audible playback are outside this measurement. See the [performance gate](docs/VALIDATION.md#performance-gate) for units, counter limitations, and recorded results.
+
 GPUI 0.2.2 is pinned. Its transitive `xattr` dependency still uses the `ENOATTR` alias removed in libc 0.2.190, so this application temporarily pins libc 0.2.189. Revisit this compatibility pin when updating GPUI.
 
 ## Platform status

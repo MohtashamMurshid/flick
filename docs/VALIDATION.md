@@ -107,6 +107,130 @@ Fixed during this pass: the A–B key used mpv's three-state `ab-loop` cycle, wh
 
 Not verified: macOS and Windows, including macOS's `increaseContrast` and Windows' HighContrast flags read through `defaults` and `reg`; screen readers (GPUI 0.2.2 exposes no accessibility tree); audible output; and hardware decoding.
 
+### Benchmark harness on 2026-10-24
+
+Backlog item 15 uses the real `Player` software renderer in the desktop binary without opening GPUI or starting transfers. Environment: Ubuntu 24.04.5 x86_64, Linux 7.0.0-1011-gcp, four vCPUs, 15 GiB RAM, no GPU; pinned Rust 1.99.0 (`b940084d7`), GPUI 0.2.2, libmpv 0.37.0 at `/lib/x86_64-linux-gnu/libmpv.so.2`, FFmpeg 6.1.1. Standard release profile: thin LTO, one codegen unit, stripped debuginfo. Other work can run concurrently on this VM; load snapshots below label these as shared-VM observations rather than controlled performance comparisons.
+
+The fixtures are generated locally with no audio: 12-second H.264 `testsrc2`, yuv420p, 30 fps, 360 frames. `ffprobe` confirmed both dimensions, frame rate/count, codec, and duration after encoding completed. An earlier probe during encoding reported `moov atom not found`; probing the completed file passed. Encoding and compilation finish before the timed runs. The benchmark starts after its first software submission, loops with `loop-file=inf`, polls native events, and calls `Player::render` on 16 ms deadlines at the source resolution. Metrics and their limits are defined in the [performance gate](#performance-gate).
+
+Commands used to prepare the release binary and fixtures (`benchmark_dir` was `/tmp/flick-benchmark-validation.ZoKckK`):
+
+```sh
+cargo build --locked --release --bin flick
+benchmark_dir=$(mktemp -d /tmp/flick-benchmark-validation.XXXXXX)
+ffmpeg -hide_banner -loglevel warning -nostdin -n \
+  -f lavfi -i 'testsrc2=size=3840x2160:rate=30:duration=12' \
+  -an -c:v libx264 -preset veryfast -crf 23 -threads 4 -pix_fmt yuv420p \
+  -color_primaries bt709 -color_trc bt709 -colorspace bt709 \
+  -movflags +faststart -f mp4 "$benchmark_dir/4k.mp4"
+ffmpeg -hide_banner -loglevel warning -nostdin -n \
+  -f lavfi -i 'testsrc2=size=1920x1080:rate=30:duration=12' \
+  -an -c:v libx264 -preset veryfast -crf 23 -threads 4 -pix_fmt yuv420p \
+  -color_primaries bt709 -color_trc bt709 -colorspace bt709 \
+  -movflags +faststart -f mp4 "$benchmark_dir/1080p.mp4"
+```
+
+An initial timed attempt was stopped before completion after a sanity report exposed startup-only decoder reporting (`vulkan-copy` in an early sanity report despite no physical GPU). The harness was corrected to retain both initial and final decoder status, then rebuilt and rechecked before the recorded full run. That incomplete attempt is not a performance baseline. A subsequent 4K attempt received SIGTERM before completion while another desktop instance was restarted on the shared VM. To avoid process-name collisions, recorded measurements used a copy of the release executable named `measure`; `cmp` and SHA-256 confirmed identical bytes (`42d6cd91c84923eb3856953da9d23c517baf8c386b8cf343635f35eb44cd6e85`). Neither interrupted attempt produced a final JSON report or counts as a full run.
+
+Native measurements used these commands (`measure` is the byte-identical release executable), with `uptime` immediately before and after each process (UTC times and complete load lines follow):
+
+```sh
+cp -- target/release/flick "$benchmark_dir/measure"
+cmp -- target/release/flick "$benchmark_dir/measure"
+
+env -u FLICK_HWDEC FLICK_AUDIO=null FLICK_MPV_LIBRARY=/lib/x86_64-linux-gnu/libmpv.so.2 \
+  "$benchmark_dir/measure" --benchmark "$benchmark_dir/4k.mp4" \
+  --seconds 300 --size 3840x2160 --interval-ms 16
+env -u FLICK_HWDEC FLICK_AUDIO=null FLICK_MPV_LIBRARY=/lib/x86_64-linux-gnu/libmpv.so.2 \
+  "$benchmark_dir/measure" --benchmark "$benchmark_dir/1080p.mp4" \
+  --seconds 60 --size 1920x1080 --interval-ms 16
+FLICK_AUDIO=null FLICK_HWDEC=no FLICK_MPV_LIBRARY=/lib/x86_64-linux-gnu/libmpv.so.2 \
+  "$benchmark_dir/measure" --benchmark "$benchmark_dir/4k.mp4" \
+  --seconds 60 --size 3840x2160 --interval-ms 16
+```
+
+All three processes exited 0. Each reported `hardware_decoder_initial: null` and `hardware_decoder: null`: decoding ended in software with both default `auto-copy` and explicit `no`. CPU and memory figures are observations under varying contention, not a controlled decoder comparison. The default mode did not establish hardware acceleration on this VM.
+
+| Run | Wall seconds | Software submissions | Nominal source frames | CPU % (100% = one CPU) | Process peak RSS MiB | Average RSS MiB | Frame-producing render p95 ms | Observed VO drops |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 4K, default auto-copy, 300 s | 300.150 | 1965 | 9004.50 | 150.70 | 421.74 | 419.03 | 160.06 | 4226 |
+| 1080p, default auto-copy, 60 s | 60.000 | 1659 | 1800.01 | 84.90 | 209.61 | 206.93 | 32.76 | 116 |
+| 4K, hwdec=no, 60 s | 60.134 | 406 | 1804.02 | 150.60 | 343.33 | 336.64 | 141.52 | 874 |
+
+Decoder drop-counter increases were zero in all three runs. The nominal source-frame estimate is not an independent loss measurement. VO counters reset at loop boundaries; observed increases can undercount unsampled drops, as described below. Linux `/proc` RSS and `getrusage` peak RSS are independently sampled kernel readings and can differ slightly.
+
+UTC process times and raw `uptime` snapshots:
+
+4K, default auto-copy, 300 s: 2026-10-24T21:18:24.496103+00:00 → 2026-10-24T21:23:26.315653+00:00.
+
+```text
+before: 21:18:24 up 12 days, 10:53,  0 user,  load average: 10.73, 11.70, 10.87
+after:  21:23:26 up 12 days, 10:58,  0 user,  load average: 12.43, 12.85, 11.68
+```
+
+1080p, default auto-copy, 60 s: 2026-10-24T21:23:26.334058+00:00 → 2026-10-24T21:24:27.201214+00:00.
+
+```text
+before: 21:23:26 up 12 days, 10:58,  0 user,  load average: 12.43, 12.85, 11.68
+after:  21:24:27 up 12 days, 10:59,  0 user,  load average: 9.62, 11.92, 11.44
+```
+
+4K, hwdec=no, 60 s: 2026-10-24T21:24:27.210218+00:00 → 2026-10-24T21:25:28.078114+00:00.
+
+```text
+before: 21:24:27 up 12 days, 10:59,  0 user,  load average: 9.62, 11.92, 11.44
+after:  21:25:28 up 12 days, 11:00,  0 user,  load average: 12.63, 12.40, 11.64
+```
+
+Raw stdout JSON, unchanged (one document per completed measurement):
+
+4K, default auto-copy, 300 s:
+
+```json
+{"schema_version":1,"presentation":"headless-software-bgr0-submissions","build_profile":"release","os":"linux","arch":"x86_64","video":"/tmp/flick-benchmark-validation.ZoKckK/4k.mp4","requested_seconds":300,"elapsed_seconds":300.149863567,"startup_seconds":1.302696756,"interval_ms":16,"target_size":[3840,2160],"frames_presented":1965,"expected_frames":9004.495907010001,"skipped_tick_deadlines":16623,"source":{"width":3840,"height":2160,"fps":30.0,"fps_property":"container-fps","codec":"H.264 / AVC / MPEG-4 AVC / MPEG-4 part 10"},"hardware_decoder":null,"hardware_decoder_initial":null,"flick_hwdec":null,"effective_hwdec":"auto-copy","mpv_version":"mpv 0.37.0","flick_audio":"null","frame_drop_count":{"initial":0,"last":37,"observed_increase":4226,"observed_resets":17,"unavailable_samples":0},"decoder_frame_drop_count":{"initial":0,"last":0,"observed_increase":0,"observed_resets":0,"unavailable_samples":0},"render_call_ms":{"count":2137,"p50":93.59176,"p95":156.876228,"p99":347.332086,"max":636.003359},"frame_render_ms":{"count":1965,"p50":95.563071,"p95":160.058036,"p99":353.126377,"max":636.003359},"cpu":{"user_seconds":449.444793,"system_seconds":2.8861239999999997,"average_percent":150.7016900239336},"memory":{"process_peak_rss_bytes":442228736,"sampled_peak_rss_bytes":442523648,"time_weighted_average_rss_bytes":439389474.10235876,"samples":276,"covered_seconds":300.149863567}}
+```
+
+1080p, default auto-copy, 60 s:
+
+```json
+{"schema_version":1,"presentation":"headless-software-bgr0-submissions","build_profile":"release","os":"linux","arch":"x86_64","video":"/tmp/flick-benchmark-validation.ZoKckK/1080p.mp4","requested_seconds":60,"elapsed_seconds":60.000252412,"startup_seconds":0.602556541,"interval_ms":16,"target_size":[1920,1080],"frames_presented":1659,"expected_frames":1800.00757236,"skipped_tick_deadlines":1381,"source":{"width":1920,"height":1080,"fps":30.0,"fps_property":"container-fps","codec":"H.264 / AVC / MPEG-4 AVC / MPEG-4 part 10"},"hardware_decoder":null,"hardware_decoder_initial":null,"flick_hwdec":null,"effective_hwdec":"auto-copy","mpv_version":"mpv 0.37.0","flick_audio":"null","frame_drop_count":{"initial":0,"last":0,"observed_increase":116,"observed_resets":4,"unavailable_samples":0},"decoder_frame_drop_count":{"initial":0,"last":0,"observed_increase":0,"observed_resets":0,"unavailable_samples":0},"render_call_ms":{"count":2369,"p50":13.250145,"p95":30.550722,"p99":42.981763,"max":272.099101},"frame_render_ms":{"count":1659,"p50":16.229157,"p95":32.763816,"p99":53.194814,"max":272.099101},"cpu":{"user_seconds":50.433640999999994,"system_seconds":0.508305,"average_percent":84.90288615821164},"memory":{"process_peak_rss_bytes":219795456,"sampled_peak_rss_bytes":220164096,"time_weighted_average_rss_bytes":216987031.34934205,"samples":60,"covered_seconds":60.000252412}}
+```
+
+4K, hwdec=no, 60 s:
+
+```json
+{"schema_version":1,"presentation":"headless-software-bgr0-submissions","build_profile":"release","os":"linux","arch":"x86_64","video":"/tmp/flick-benchmark-validation.ZoKckK/4k.mp4","requested_seconds":60,"elapsed_seconds":60.133878383,"startup_seconds":0.549841166,"interval_ms":16,"target_size":[3840,2160],"frames_presented":406,"expected_frames":1804.01635149,"skipped_tick_deadlines":3326,"source":{"width":3840,"height":2160,"fps":30.0,"fps_property":"container-fps","codec":"H.264 / AVC / MPEG-4 AVC / MPEG-4 part 10"},"hardware_decoder":null,"hardware_decoder_initial":null,"flick_hwdec":"no","effective_hwdec":"no","mpv_version":"mpv 0.37.0","flick_audio":"null","frame_drop_count":{"initial":0,"last":140,"observed_increase":874,"observed_resets":3,"unavailable_samples":0},"decoder_frame_drop_count":{"initial":0,"last":0,"observed_increase":0,"observed_resets":0,"unavailable_samples":0},"render_call_ms":{"count":433,"p50":96.260296,"p95":141.069883,"p99":164.80947,"max":216.291837},"frame_render_ms":{"count":406,"p50":97.785993,"p95":141.51701,"p99":164.80947,"max":216.291837},"cpu":{"user_seconds":90.04964799999999,"system_seconds":0.5118699999999999,"average_percent":150.5998289736156},"memory":{"process_peak_rss_bytes":360009728,"sampled_peak_rss_bytes":360173568,"time_weighted_average_rss_bytes":352992668.19098395,"samples":57,"covered_seconds":60.133878383}}
+```
+
+Checks on the final implementation:
+
+- `cargo fmt --all -- --check`: passed.
+- `cargo clippy --locked --all-targets -- -D warnings`: passed.
+- `cargo clippy --locked --no-default-features --all-targets -- -D warnings`: passed.
+- `cargo test --locked --all-targets`: passed, 53 tests total (10 library, 39 desktop binary, 4 local transfer integration); 6 opt-in native tests ignored. The desktop tests include 5 new pure benchmark tests covering arguments, JSON shape, percentiles/CPU math, counter resets/RSS integration, and deadline skipping.
+- `cargo test --locked --no-default-features --all-targets`: passed, 14 tests (10 library, 4 local transfer integration). No desktop or libmpv dependency is initialized by this suite.
+- `cargo build --locked --release --bin flick`: passed. The initial build took 29m58s; the final relink took 5m18s. Cargo emitted an existing future-compatibility notice for `proc-macro-error2` 2.0.1; exit status was zero. No dependency was added or updated.
+- `FLICK_AUDIO=null FLICK_MPV_LIBRARY=/lib/x86_64-linux-gnu/libmpv.so.2 FLICK_TEST_VIDEO="$benchmark_dir/1080p.mp4" cargo test --locked --bin flick benchmark::tests::native_benchmark -- --ignored --nocapture`: passed, one real-libmpv test. Final corrected debug test: 53 software submissions in 2.000326136 s at 320×180; initial and final hardware decoder both `null`.
+- `bash -n scripts/benchmark.sh` and `bash scripts/benchmark.sh --help`: passed. Six script argument-error cases (unknown flag, zero seconds, odd target width, missing size, duplicate size, extra positional argument) returned exit 2 with empty stdout. The release CLI help and four invalid benchmark argument cases also passed without opening GPUI; invalid requests returned nonzero with empty stdout.
+- A two-second release sanity run at 320×180 preceded the recorded measurements. Each report was parsed as a single JSON document and checked for release profile, elapsed duration, frame/call count consistency, source size/fps/codec, populated mpv version/drop counters, and positive Linux CPU/RSS readings.
+
+End-to-end fixture script check:
+
+```sh
+env -u FLICK_HWDEC FLICK_AUDIO=null FLICK_MPV_LIBRARY=/lib/x86_64-linux-gnu/libmpv.so.2 \
+  bash scripts/benchmark.sh 2
+```
+
+Passed: generated a fresh local 4K fixture, ran the release binary for 2.063616042 s, produced one parseable stdout JSON document (16 software submissions), and removed its temporary fixture/directory. Diagnostics stayed on stderr. Raw stdout:
+
+```json
+{"schema_version":1,"presentation":"headless-software-bgr0-submissions","build_profile":"release","os":"linux","arch":"x86_64","video":"/tmp/flick-benchmark.xJ83UR/testsrc2-3840x2160-30fps.mp4","requested_seconds":2,"elapsed_seconds":2.063616042,"startup_seconds":1.1011311990000001,"interval_ms":16,"target_size":[3840,2160],"frames_presented":16,"expected_frames":61.90848126,"skipped_tick_deadlines":110,"source":{"width":3840,"height":2160,"fps":30.0,"fps_property":"container-fps","codec":"H.264 / AVC / MPEG-4 AVC / MPEG-4 part 10"},"hardware_decoder":null,"hardware_decoder_initial":null,"flick_hwdec":null,"effective_hwdec":"auto-copy","mpv_version":"mpv 0.37.0","flick_audio":"null","frame_drop_count":{"initial":1,"last":44,"observed_increase":43,"observed_resets":0,"unavailable_samples":0},"decoder_frame_drop_count":{"initial":0,"last":0,"observed_increase":0,"observed_resets":0,"unavailable_samples":0},"render_call_ms":{"count":18,"p50":76.844495,"p95":145.241529,"p99":145.241529,"max":145.241529},"frame_render_ms":{"count":16,"p50":77.32964100000001,"p95":145.241529,"p99":145.241529,"max":145.241529},"cpu":{"user_seconds":3.9602260000000005,"system_seconds":0.13266299999999998,"average_percent":198.3357813032547},"memory":{"process_peak_rss_bytes":430698496,"sampled_peak_rss_bytes":431112192,"time_weighted_average_rss_bytes":359625981.11761004,"samples":4,"covered_seconds":2.063616042}}
+```
+
+The separately prepared manual fixture videos and copied `measure` executable were removed after the completed runs; raw JSON and runner logs remained in the task-owned temporary directory during this session.
+
+These are headless native playback measurements and desktop compilation/unit-test evidence. No interactive playback, display scanout, GPUI upload, audible sound, A/V synchronization, native GPU path, or VLC/mpv comparison was tested in this pass. The synthetic fixtures exercise software conversion and allocation and do not represent every codec or real-world file. Generated media is not committed.
+
 ### Public discovery and listener comparison on 2026-10-24
 
 Environment: Ubuntu 24.04.5, x86_64, Linux 7.0.0-1011-gcp, four vCPUs (Intel Xeon at 2.20 GHz), 15 GiB RAM. Rust 1.99.0 (`b940084d7`), pinned librqbit 9.0.1, unoptimized development binary with debug symbols disabled. Other Rust compilation was running on this VM during the measurements; these are short public-swarm observations, not a controlled hardware benchmark or a general speed claim.
@@ -399,7 +523,15 @@ For a headless Linux smoke test, record exactly which interactions and frame obs
 
 Compare release builds of Flick, VLC, and mpv on the same machine, file, display resolution, output scaling, and decoder settings. Record cold and warm runs separately. Measure launch to first displayed frame, file open to first displayed frame, seek to stable playback, dropped frames, process memory, CPU use, and paused CPU use. Measure power consumption when supported by the machine. Include multiple runs and the range of results.
 
-Do not report FPS from a screen refresh callback as decoded FPS. Do not compare a CPU fallback on one player against hardware decoding on another without identifying the difference. No performance results have been recorded yet.
+The repeatable software-path baseline is `FLICK_AUDIO=null bash scripts/benchmark.sh`: it generates a local 12-second 3840×2160/30 fps H.264 `testsrc2` fixture, builds/runs the release desktop binary with `--locked`, loops for 300 seconds, and removes the media afterward. Use `bash scripts/benchmark.sh 60 --size 1920x1080` for a shorter comparison, or `target/release/flick --benchmark VIDEO --seconds 300 --size 3840x2160 --interval-ms 16` for an existing local file. Set `FLICK_HWDEC=no` for a software-decoder comparison; the default is `auto-copy`. Keep fixture encoding, target size, decoder, interval, release settings, and machine load fixed when checking regressions. Repeat runs on an idle machine before setting numeric regression thresholds.
+
+The measurement begins after the first software frame; startup is reported separately. Hardware-decoder status is captured both at that first submission and at the end, because initial auto-probing can report a candidate before falling back. The main `hardware_decoder` field is the final status. A deadline-based render tick defaults to 16 ms, skipping overdue ticks without catch-up bursts. `frames_presented` counts `Player::render` results containing a frame, not distinct decoded frames or visible display scanouts. `expected_frames` is source fps × measured wall time (an estimate for variable-rate sources); its difference from submissions is not an mpv dropped-frame counter. `render_call_ms` includes calls returning no frame, while `frame_render_ms` covers only frame-producing calls; both use nearest-rank p50/p95/p99/max. Rendering may overrun the requested duration by one call.
+
+JSON CPU user/system seconds are process `getrusage` deltas during measurement, including libmpv worker threads; 100% average CPU means one occupied logical CPU, so values may exceed 100%. Linux RSS comes from `/proc/self/status` at roughly one-second intervals and the endpoints: the average is a sample-and-hold time-weighted estimate, and its covered time is reported. Sampling retains the current output frame, but does not model GPUI retaining/uploading it. Process peak RSS comes from `getrusage` and includes startup; sampled peak covers the measured window. RSS is reported in bytes. Other Unix platforms retain CPU and peak RSS but report sampled/average RSS as unavailable; Windows resource metrics are unavailable. Unavailable values are JSON `null`, never invented zeroes. The build profile label follows the normal debug-assertions setting (standard Cargo debug/release builds).
+
+Drop counters include the initial and last mpv values, observed positive increases, observed decreases/resets, and unavailable-sample counts. Seeking/looping can reset mpv counters; per-tick accumulation preserves observed increases across detected resets but can miss drops at an unsampled boundary or a reset that catches up before the next sample. Treat these as observed lower bounds, not exact end-to-end frame loss. Property semantics follow the [mpv 0.37 manual](https://github.com/mpv-player/mpv/blob/v0.37.0/DOCS/man/input.rst).
+
+This harness measures decode, software scaling/composition, output allocation, and polling overhead. GPUI upload/composition, interactive responsiveness, display scanout, audio synchronization, paused CPU, seek latency, native GPU presentation, and power still require separate native measurements. The sustained Linux baseline is recorded above; no VLC/mpv comparison was measured. Do not report FPS from a screen refresh callback as decoded FPS, or compare a CPU fallback against hardware decoding without identifying the difference.
 
 ## Upstream references
 

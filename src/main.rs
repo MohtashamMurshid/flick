@@ -1,4 +1,5 @@
 mod assets;
+mod benchmark;
 mod input;
 mod model;
 mod playback;
@@ -18,6 +19,7 @@ use std::path::PathBuf;
 
 fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| "flick=info".into()),
@@ -27,7 +29,7 @@ fn main() -> anyhow::Result<()> {
     let first = args.next();
     if first.as_deref().is_some_and(|s| s == "--help" || s == "-h") {
         println!(
-            "Flick — desktop video player\n\nUsage: flick [VIDEO]\n       flick --smoke-test VIDEO\n\nShortcuts: Space play/pause · arrows seek/volume · F fullscreen · M mute\n           Ctrl/Cmd+O open · Ctrl/Cmd+L subtitles · ? shortcuts\n\nRequires libmpv. See README.md for installation."
+            "Flick — desktop video player\n\nUsage: flick [VIDEO]\n       flick --smoke-test VIDEO\n       flick --benchmark VIDEO [--seconds N] [--size WxH] [--interval-ms N]\n\nBenchmark defaults: 300 seconds, 3840x2160, 16 ms ticks; local video, no window.\n\nShortcuts: Space play/pause · arrows seek/volume · F fullscreen · M mute\n           Ctrl/Cmd+O open · Ctrl/Cmd+L subtitles · ? shortcuts\n\nRequires libmpv. See README.md for installation."
         );
         return Ok(());
     }
@@ -35,6 +37,9 @@ fn main() -> anyhow::Result<()> {
         return smoke::run(&PathBuf::from(args.next().ok_or_else(|| {
             anyhow::anyhow!("Supply a video path after --smoke-test")
         })?));
+    }
+    if first.as_deref().is_some_and(|s| s == "--benchmark") {
+        return benchmark::run(benchmark::Options::parse(args)?);
     }
     let path = first.map(PathBuf::from);
     Application::new()
