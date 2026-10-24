@@ -1,21 +1,33 @@
 //! Background search and one shared native transfer session for the desktop.
 use flick::{
     catalog::{self, SearchResults},
+    fetch::{self, FetchSource, FetchUpdate, archive::ArchiveItem},
     torrent::{
         ResolvedTorrent, SharedTorrent, TorrentInput, TransferConfig, TransferSession,
         TransferSnapshot,
     },
 };
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     path::PathBuf,
     sync::{Arc, mpsc},
     thread,
     time::Duration,
 };
 use tokio::{sync::mpsc as channel, task::JoinSet};
+use tokio_util::sync::CancellationToken;
 
 pub enum Command {
+    /// Download a web page's video with yt-dlp, or files over HTTPS. These
+    /// run apart from the torrent session.
+    Fetch {
+        id: u64,
+        source: FetchSource,
+        folder: PathBuf,
+    },
+    CancelFetch(u64),
+    /// List an Internet Archive item's video files.
+    ResolveArchive(String),
     Search {
         generation: u64,
         query: String,
@@ -35,6 +47,14 @@ pub enum Command {
     Shutdown,
 }
 pub enum Event {
+    Fetch {
+        id: u64,
+        update: FetchUpdate,
+    },
+    ArchiveResolved {
+        identifier: String,
+        result: Result<ArchiveItem, String>,
+    },
     Search {
         generation: u64,
         result: Result<SearchResults, String>,
@@ -148,11 +168,13 @@ async fn run(
     let mut search_task: Option<tokio::task::AbortHandle> = None;
     let mut completed = HashSet::new();
     let mut timer = tokio::time::interval(Duration::from_millis(700));
+    let mut fetches = Fetches::default();
     loop {
         tokio::select! {
             command = commands.recv() => {
                 let Some(command) = command else { break; };
                 if matches!(command, Command::Shutdown) { break; }
+                let Some(command) = fetches.handle(command, &events) else { continue; };
                 if matches!(command, Command::CancelSearch) { if let Some(task) = search_task.take() { task.abort(); } continue; }
                 if let Command::Search { generation, query } = command {
                     if let Some(task) = search_task.take() { task.abort(); }
@@ -217,10 +239,90 @@ async fn run(
             _ = tasks.join_next(), if !tasks.is_empty() => {}
         }
     }
+    fetches.shutdown().await;
     tasks.abort_all();
     if let Some(session) = session {
         session.shutdown().await;
     }
+}
+
+/// Link downloads, keyed by the identifier the UI chose.
+#[derive(Default)]
+struct Fetches {
+    jobs: HashMap<u64, (CancellationToken, tokio::task::JoinHandle<()>)>,
+}
+
+impl Fetches {
+    /// Starts or cancels link downloads. Returns any other command.
+    fn handle(&mut self, command: Command, events: &mpsc::Sender<Event>) -> Option<Command> {
+        self.jobs.retain(|_, (_, job)| !job.is_finished());
+        match command {
+            Command::Fetch { id, source, folder } => {
+                let cancel = CancellationToken::new();
+                let job = tokio::spawn(fetch_job(
+                    id,
+                    source,
+                    folder,
+                    cancel.clone(),
+                    events.clone(),
+                ));
+                if let Some((previous, _)) = self.jobs.insert(id, (cancel, job)) {
+                    previous.cancel();
+                }
+            }
+            Command::CancelFetch(id) => {
+                if let Some((cancel, _)) = self.jobs.get(&id) {
+                    cancel.cancel();
+                }
+            }
+            Command::ResolveArchive(identifier) => {
+                let events = events.clone();
+                tokio::spawn(async move {
+                    let result = fetch::archive::resolve(&identifier)
+                        .await
+                        .map_err(|e| format!("Could not list this Internet Archive item: {e:#}"));
+                    let _ = events.send(Event::ArchiveResolved { identifier, result });
+                });
+            }
+            command => return Some(command),
+        }
+        None
+    }
+
+    /// Cancels running downloads and waits briefly for their cleanup.
+    async fn shutdown(&mut self) {
+        for (cancel, _) in self.jobs.values() {
+            cancel.cancel();
+        }
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        for (_, (_, job)) in self.jobs.drain() {
+            let _ = tokio::time::timeout_at(deadline, job).await;
+        }
+    }
+}
+
+async fn fetch_job(
+    id: u64,
+    source: FetchSource,
+    folder: PathBuf,
+    cancel: CancellationToken,
+    events: mpsc::Sender<Event>,
+) {
+    let result = fetch::fetch(source, &folder, &cancel, |update| {
+        if let FetchUpdate::Saved(path) = &update
+            && flick::library::is_video(path)
+        {
+            let _ = events.send(Event::Completed(path.clone()));
+        }
+        let _ = events.send(Event::Fetch { id, update });
+    })
+    .await;
+    let update = match result {
+        Ok(_) => FetchUpdate::Done,
+        Err(_) if cancel.is_cancelled() => FetchUpdate::Cancelled,
+        Err(error) => FetchUpdate::Failed(format!("{error:#}")),
+    };
+    let _ = events.send(Event::Fetch { id, update });
 }
 
 #[cfg(test)]
@@ -258,6 +360,87 @@ mod tests {
         commands.send(Command::Shutdown)?;
         tokio::time::timeout(Duration::from_secs(5), job).await??;
         outcome??;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn link_downloads_work_and_cancel_when_the_torrent_session_cannot_start()
+    -> anyhow::Result<()> {
+        let root = tempfile::tempdir()?;
+        // A file where the state directory belongs, so the session fails.
+        let blocked = root.path().join("state");
+        std::fs::write(&blocked, b"")?;
+        let config = TransferConfig::local(root.path().join("downloads"), blocked);
+        let (commands, receiver) = channel::unbounded_channel();
+        let (events, output) = mpsc::channel();
+        let job = tokio::spawn(run(config, vec![], receiver, events));
+        // Accepts connections but never answers, so the download stays open.
+        let stalled = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let folder = root.path().join("links");
+        commands.send(Command::Load)?;
+        commands.send(Command::Fetch {
+            id: 1,
+            source: FetchSource::Page("ftp://example.com/video".into()),
+            folder: folder.clone(),
+        })?;
+        commands.send(Command::Fetch {
+            id: 2,
+            source: FetchSource::Files {
+                folder: None,
+                files: vec![fetch::RemoteFile {
+                    url: format!("https://{}/clip.mp4", stalled.local_addr()?),
+                    name: "clip.mp4".into(),
+                    size: None,
+                    sha1: None,
+                }],
+            },
+            folder: folder.clone(),
+        })?;
+        let outcome = tokio::time::timeout(Duration::from_secs(12), async {
+            let (mut unavailable, mut rejected, mut cancelled, mut cancelling) =
+                (false, false, false, false);
+            while !(unavailable && rejected && cancelled) {
+                match output.try_recv() {
+                    Ok(Event::Error(error)) => {
+                        assert!(error.contains("Downloads are unavailable"), "{error}");
+                        unavailable = true;
+                    }
+                    Ok(Event::Fetch {
+                        id: 1,
+                        update: FetchUpdate::Failed(error),
+                    }) => {
+                        assert!(error.contains("http and https"), "{error}");
+                        rejected = true;
+                    }
+                    Ok(Event::Fetch {
+                        id: 2,
+                        update: FetchUpdate::Progress(_),
+                    }) if !cancelling => {
+                        commands.send(Command::CancelFetch(2))?;
+                        cancelling = true;
+                    }
+                    Ok(Event::Fetch {
+                        id: 2,
+                        update: FetchUpdate::Cancelled,
+                    }) => cancelled = true,
+                    Ok(Event::Fetch {
+                        update: FetchUpdate::Failed(error),
+                        ..
+                    }) => anyhow::bail!(error),
+                    Ok(Event::Fetch {
+                        update: FetchUpdate::Saved(path),
+                        ..
+                    }) => anyhow::bail!("Unexpected download: {}", path.display()),
+                    _ => tokio::time::sleep(Duration::from_millis(10)).await,
+                }
+            }
+            Ok::<_, anyhow::Error>(())
+        })
+        .await;
+        commands.send(Command::Shutdown)?;
+        tokio::time::timeout(Duration::from_secs(5), job).await??;
+        outcome??;
+        assert_eq!(std::fs::read_dir(&folder)?.count(), 0);
         Ok(())
     }
 }

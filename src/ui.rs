@@ -1,5 +1,7 @@
 #[path = "chrome_ui.rs"]
 mod chrome_ui;
+#[path = "fetch_ui.rs"]
+mod fetch_ui;
 #[path = "library_ui.rs"]
 mod library_ui;
 #[path = "player_ui.rs"]
@@ -139,6 +141,8 @@ pub struct Flick {
     selected_files: HashSet<usize>,
     download_folder: PathBuf,
     shared_magnet: Option<String>,
+    /// Downloads from pasted web links.
+    fetches: fetch_ui::Fetches,
     importing: bool,
     /// Set when a control inside a title bar is pressed, so the title bar
     /// does not start a window move.
@@ -230,6 +234,7 @@ impl Flick {
             selected_files: HashSet::new(),
             download_folder,
             shared_magnet: None,
+            fetches: Default::default(),
             importing: false,
             control_pressed: false,
             should_move: false,
@@ -577,21 +582,7 @@ impl Flick {
             Control::AddVideos => self.pick_library(false, false, window, cx),
             Control::AddFolder => self.pick_library(true, false, window, cx),
             Control::Share => self.pick_library(true, true, window, cx),
-            Control::PasteMagnet => {
-                let text = cx
-                    .read_from_clipboard()
-                    .and_then(|item| item.text())
-                    .unwrap_or_default();
-                let text = text.trim();
-                if text.starts_with("magnet:") {
-                    self.resolve(flick::torrent::TorrentInput::Magnet(text.to_owned()), cx);
-                } else {
-                    self.error = Some(
-                        "Copy a magnet link first, then choose Paste Magnet Link again.".into(),
-                    );
-                    cx.notify();
-                }
-            }
+            Control::PasteMagnet => self.paste_link(cx),
             Control::Open => self.pick(false, window, cx),
             Control::Subtitle => self.pick(true, window, cx),
             Control::Play if self.path.is_some() => {
