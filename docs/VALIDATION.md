@@ -26,7 +26,7 @@ The debug build was run under Xvfb with Openbox and Mesa Lavapipe, using null au
 - Playback controls hid after 2.5 seconds without pointer movement.
 - Subtitles moved above visible controls and returned to the bottom when the controls hid.
 
-[Home in the macOS style](screenshots/flick-mac-dark-home.png), [Windows 11](screenshots/flick-windows-dark-home.png), and [GNOME](screenshots/flick-gnome-dark-home.png). Also: [playback in the Windows style](screenshots/flick-windows-dark-player.png), [Appearance in the GNOME style](screenshots/flick-gnome-dark-appearance.png), and [the macOS-style welcome page](screenshots/flick-mac-dark-first.png). Contact sheets show each style's first-run, Home, player, and Appearance screens: [macOS](screenshots/flick-styles-mac.png), [Windows 11](screenshots/flick-styles-windows.png), and [GNOME](screenshots/flick-styles-gnome.png). A fourth sheet shows [Home in light mode](screenshots/flick-styles-light.png) for each style. These captures crop the Openbox frame. Openbox provided server-side decorations, so Flick did not draw its own window controls.
+[Home in the macOS style](screenshots/flick-mac-dark-home.png), [Windows 11](screenshots/flick-windows-dark-home.png), and [GNOME](screenshots/flick-gnome-dark-home.png). Also: [playback in the Windows style](screenshots/flick-windows-dark-player.png), [Appearance in the GNOME style](screenshots/flick-gnome-dark-appearance.png), and [the macOS-style welcome page](screenshots/flick-mac-dark-first.png). These captures crop the Openbox frame. Openbox provided server-side decorations, so Flick did not draw its own window controls.
 
 Not verified:
 
