@@ -591,8 +591,9 @@ impl Flick {
         }
     }
 
-    /// A selectable, copyable value such as a magnet link or a path.
-    pub(super) fn read_only_field(&self, input: &Entity<TextInput>, cx: &Context<Self>) -> Div {
+    /// A text field's frame: an editable value, or a selectable read-only
+    /// one such as a magnet link or a path.
+    pub(super) fn text_field(&self, input: &Entity<TextInput>, cx: &Context<Self>) -> Div {
         let t = cx.theme();
         div()
             .flex()

@@ -106,6 +106,18 @@ struct CardMenu {
 enum Menu {
     Tracks,
     Keys,
+    /// OpenSubtitles search, reached from Tracks.
+    FindSubtitles,
+}
+
+/// The state of an OpenSubtitles search in the player.
+#[derive(Default)]
+struct SubtitleSearch {
+    generation: u64,
+    searching: bool,
+    results: Option<Result<Vec<flick::subtitles::SubtitleResult>, String>>,
+    /// The file being downloaded.
+    downloading: Option<u64>,
 }
 
 #[derive(Clone, Copy)]
@@ -163,6 +175,10 @@ pub struct Flick {
     /// Selectable read-only copies of the share magnet and download folder.
     magnet_field: Entity<TextInput>,
     folder_field: Entity<TextInput>,
+    subtitle_query: Entity<TextInput>,
+    subtitle_key_field: Entity<TextInput>,
+    subtitle_languages_field: Entity<TextInput>,
+    subtitle_search: SubtitleSearch,
     query: String,
     search_generation: u64,
     searching: bool,
@@ -248,6 +264,37 @@ impl Flick {
         let services = Services::start();
         let download_folder = services.download_dir.clone();
         let magnet_field = cx.new(TextInput::read_only);
+        let subtitle_query = cx.new(|cx| TextInput::with_placeholder(cx, "Title to search for"));
+        cx.subscribe(&subtitle_query, |this, _, event, cx| {
+            if matches!(event, InputEvent::Submit) {
+                this.search_subtitles(cx);
+            }
+        })
+        .detach();
+        let subtitle_key_field = cx.new(|cx| {
+            let mut field = TextInput::with_placeholder(cx, "Paste your API key");
+            field.set_value(store.data.opensubtitles_key.clone(), cx);
+            field
+        });
+        cx.subscribe(&subtitle_key_field, |this, input, event, cx| {
+            if matches!(event, InputEvent::Changed) {
+                this.store.data.opensubtitles_key = input.read(cx).value().trim().to_owned();
+                this.persist();
+            }
+        })
+        .detach();
+        let subtitle_languages_field = cx.new(|cx| {
+            let mut field = TextInput::with_placeholder(cx, "en");
+            field.set_value(store.data.subtitle_languages.clone(), cx);
+            field
+        });
+        cx.subscribe(&subtitle_languages_field, |this, input, event, cx| {
+            if matches!(event, InputEvent::Changed) {
+                this.store.data.subtitle_languages = input.read(cx).value().trim().to_owned();
+                this.persist();
+            }
+        })
+        .detach();
         let folder_field = cx.new(|cx| {
             let mut field = TextInput::read_only(cx);
             field.set_value(download_folder.to_string_lossy().into_owned(), cx);
@@ -332,6 +379,10 @@ impl Flick {
             search_input,
             magnet_field,
             folder_field,
+            subtitle_query,
+            subtitle_key_field,
+            subtitle_languages_field,
+            subtitle_search: SubtitleSearch::default(),
             query: String::new(),
             search_generation: 0,
             searching: false,
@@ -619,9 +670,16 @@ impl Flick {
 
     /// Whether a text field has keyboard focus, so typing must reach it.
     fn text_focused(&self, window: &Window, cx: &Context<Self>) -> bool {
-        [&self.search_input, &self.magnet_field, &self.folder_field]
-            .into_iter()
-            .any(|input| input.read(cx).focused(window))
+        [
+            &self.search_input,
+            &self.magnet_field,
+            &self.folder_field,
+            &self.subtitle_query,
+            &self.subtitle_key_field,
+            &self.subtitle_languages_field,
+        ]
+        .into_iter()
+        .any(|input| input.read(cx).focused(window))
     }
 
     /// Whether a video double-click should toggle fullscreen.
@@ -1049,6 +1107,68 @@ impl Flick {
             current,
             step,
         )
+    }
+
+    /// Opens the OpenSubtitles search with the video's title filled in.
+    fn find_subtitles(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let title = self.path.as_deref().map(file_title).unwrap_or_default();
+        let query = flick::subtitles::query_from_title(&title);
+        self.subtitle_query
+            .update(cx, |field, cx| field.set_value(query, cx));
+        self.menu = Some(Menu::FindSubtitles);
+        self.subtitle_query.focus_handle(cx).focus(window);
+        if self.subtitle_search.results.is_none() && !self.store.data.subtitle_key().is_empty() {
+            self.search_subtitles(cx);
+        }
+        cx.notify();
+    }
+
+    fn search_subtitles(&mut self, cx: &mut Context<Self>) {
+        let key = self.store.data.subtitle_key();
+        if key.is_empty() {
+            self.subtitle_search.results = Some(Err(
+                "Add an OpenSubtitles API key in Appearance › Subtitles to search.".into(),
+            ));
+            cx.notify();
+            return;
+        }
+        self.subtitle_search.generation += 1;
+        self.subtitle_search.searching = true;
+        self.subtitle_search.results = None;
+        let query = self.subtitle_query.read(cx).value().to_owned();
+        let command = ServiceCommand::SubtitleSearch {
+            generation: self.subtitle_search.generation,
+            key,
+            query,
+            video: self.path.clone(),
+            languages: self.store.data.subtitle_languages.clone(),
+        };
+        self.send(command, cx);
+    }
+
+    fn download_subtitle(
+        &mut self,
+        result: flick::subtitles::SubtitleResult,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(path) = self.path.clone() else {
+            return;
+        };
+        self.subtitle_search.downloading = Some(result.file_id);
+        let stem = path
+            .file_stem()
+            .map(|stem| stem.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "subtitles".into());
+        let command = ServiceCommand::SubtitleDownload {
+            key: self.store.data.subtitle_key(),
+            result,
+            folder: path.parent().map(PathBuf::from).unwrap_or_default(),
+            fallback: thumbnail_cache()
+                .and_then(|cache| cache.parent().map(|base| base.join("subtitles")))
+                .unwrap_or_else(|| std::env::temp_dir().join("flick-subtitles")),
+            stem,
+        };
+        self.send(command, cx);
     }
 
     fn show_status(&mut self, text: impl Into<SharedString>) {

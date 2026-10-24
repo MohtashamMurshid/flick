@@ -1017,6 +1017,124 @@ impl Flick {
         )
     }
 
+    /// OpenSubtitles search: query, results, and their state.
+    fn subtitle_search_view(&self, cx: &Context<Self>) -> Div {
+        let t = cx.theme();
+        let search = &self.subtitle_search;
+        let mut view = v_flex().gap_2().px_1().pb_1().child(
+            h_flex()
+                .gap_2()
+                .child(self.text_field(&self.subtitle_query, cx).flex_1())
+                .child(self.button(
+                    "subtitle-search",
+                    Some("search"),
+                    "Search",
+                    true,
+                    cx,
+                    |this, _, cx| this.search_subtitles(cx),
+                )),
+        );
+        let note = |text: String, color| {
+            div()
+                .px_1()
+                .text_size(t.font(12.))
+                .text_color(color)
+                .child(text)
+        };
+        match &search.results {
+            None if search.searching => view = view.child(note("Searching…".into(), t.muted)),
+            None => {}
+            Some(Err(error)) => {
+                view = view.child(note(error.clone(), t.danger));
+                if self.store.data.subtitle_key().is_empty() {
+                    view = view.child(self.button(
+                        "subtitle-settings",
+                        Some("palette"),
+                        "Open Appearance",
+                        false,
+                        cx,
+                        |this, w, cx| this.show_page(Page::Appearance, w, cx),
+                    ));
+                }
+            }
+            Some(Ok(results)) if results.is_empty() => {
+                view = view.child(note(
+                    "No subtitles found. Try another title or language.".into(),
+                    t.muted,
+                ));
+            }
+            Some(Ok(results)) => {
+                for (index, result) in results.iter().take(30).enumerate() {
+                    let id = ElementId::from(("subtitle-result", index));
+                    let downloading = search.downloading == Some(result.file_id);
+                    let choice = result.clone();
+                    let mut detail = vec![result.language.to_uppercase()];
+                    if result.hash_match {
+                        detail.push("Exact match".into());
+                    }
+                    if result.hearing_impaired {
+                        detail.push("SDH".into());
+                    }
+                    detail.push(format!("{} downloads", result.downloads));
+                    let row = v_flex()
+                        .id(id.clone())
+                        .relative()
+                        .px_2()
+                        .py_1p5()
+                        .rounded(px(t.radius))
+                        .cursor_pointer()
+                        .hover(|s| s.bg(t.selection))
+                        .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                            this.download_subtitle(choice.clone(), cx)
+                        }))
+                        .child(
+                            div()
+                                .overflow_hidden()
+                                .whitespace_nowrap()
+                                .child(result.release.clone()),
+                        )
+                        .child(
+                            div()
+                                .text_size(t.font(11.5))
+                                .text_color(if result.hash_match {
+                                    t.accent_text
+                                } else {
+                                    t.muted
+                                })
+                                .child(if downloading {
+                                    "Downloading…".to_owned()
+                                } else {
+                                    detail.join(" · ")
+                                }),
+                        );
+                    view = view.child(self.focusable(row, &id, None, t.radius, (-2., -2.), cx));
+                }
+            }
+        }
+        view.child(
+            h_flex()
+                .justify_between()
+                .pt_1()
+                .child(self.button(
+                    "subtitle-back",
+                    Some("arrow-left"),
+                    "Back",
+                    false,
+                    cx,
+                    |this, _, cx| {
+                        this.menu = Some(Menu::Tracks);
+                        cx.notify();
+                    },
+                ))
+                .child(
+                    div()
+                        .text_size(t.font(11.))
+                        .text_color(t.muted)
+                        .child("From OpenSubtitles.com"),
+                ),
+        )
+    }
+
     /// Audio delay, adjustable in 50 ms steps, with a reset.
     fn audio_delay_row(&self, cx: &Context<Self>) -> Div {
         let t = cx.theme();
@@ -1062,6 +1180,7 @@ impl Flick {
         let title = match menu {
             Menu::Tracks => "Audio & subtitles",
             Menu::Keys => "Keyboard shortcuts",
+            Menu::FindSubtitles => "Find subtitles",
         };
         let option = |id: SharedString, label: String, selected: bool| {
             let id = ElementId::from(id);
@@ -1158,15 +1277,29 @@ impl Flick {
                         .pb_1()
                         .border_t_1()
                         .border_color(t.border)
+                        .flex()
+                        .flex_wrap()
+                        .gap_2()
                         .child(self.button(
                             "load-subtitle",
                             Some("captions"),
-                            "Load Subtitle File…",
+                            "Load File…",
                             false,
                             cx,
                             |this, w, cx| this.handle(Control::Subtitle, w, cx),
+                        ))
+                        .child(self.button(
+                            "find-subtitles",
+                            Some("search"),
+                            "Find Online…",
+                            false,
+                            cx,
+                            |this, w, cx| this.find_subtitles(w, cx),
                         )),
                 );
+            }
+            Menu::FindSubtitles => {
+                panel = panel.child(self.subtitle_search_view(cx));
             }
             Menu::Keys => {
                 let bindings = &self.store.data.shortcuts;

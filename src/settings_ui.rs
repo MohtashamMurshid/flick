@@ -360,6 +360,24 @@ impl Flick {
                         subtitle_position,
                     )
                     .into_any_element(),
+                    row(
+                        &t,
+                        Some("search"),
+                        "OpenSubtitles API key",
+                        Some("Create a free key at opensubtitles.com to search from the player".into()),
+                        div().w(px(240.)).child(self.text_field(&self.subtitle_key_field, cx)),
+                    )
+                    .into_any_element(),
+                    row(
+                        &t,
+                        Some("search"),
+                        "Subtitle languages",
+                        Some("Comma-separated codes, such as en, es, pt-br".into()),
+                        div()
+                            .w(px(240.))
+                            .child(self.text_field(&self.subtitle_languages_field, cx)),
+                    )
+                    .into_any_element(),
                 ],
             ))
     }

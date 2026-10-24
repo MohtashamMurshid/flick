@@ -685,6 +685,14 @@ impl TextInput {
         }
     }
 
+    /// An editable field with its own placeholder.
+    pub fn with_placeholder(cx: &mut Context<Self>, placeholder: &'static str) -> Self {
+        Self {
+            placeholder: placeholder.into(),
+            ..Self::new(cx)
+        }
+    }
+
     /// A selectable, copyable field whose value only the application sets.
     pub fn read_only(cx: &mut Context<Self>) -> Self {
         Self {

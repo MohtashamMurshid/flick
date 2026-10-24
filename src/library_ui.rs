@@ -95,6 +95,26 @@ impl Flick {
                     }
                 }
                 ServiceEvent::Search { .. } => {}
+                ServiceEvent::Subtitles { generation, result }
+                    if generation == self.subtitle_search.generation =>
+                {
+                    self.subtitle_search.searching = false;
+                    self.subtitle_search.results = Some(result);
+                }
+                ServiceEvent::Subtitles { .. } => {}
+                ServiceEvent::SubtitleSaved(result) => {
+                    self.subtitle_search.downloading = None;
+                    match result {
+                        Ok(path) => {
+                            if let Some(path) = path.to_str() {
+                                self.command(&["sub-add", path, "select"], cx);
+                            }
+                            self.menu = None;
+                            self.show_status("Subtitle loaded");
+                        }
+                        Err(error) => self.subtitle_search.results = Some(Err(error)),
+                    }
+                }
                 ServiceEvent::Fetch { id, update } => self.fetch_event(id, update),
                 ServiceEvent::ArchiveResolved { identifier, result } => {
                     self.archive_listed(identifier, result)
@@ -1738,7 +1758,7 @@ impl Flick {
                             },
                         )),
                     )
-                    .child(self.read_only_field(&self.magnet_field, cx)),
+                    .child(self.text_field(&self.magnet_field, cx)),
             );
         }
         if self.downloads.is_empty() && self.fetches.is_empty() {
@@ -1982,11 +2002,7 @@ impl Flick {
                         |this, w, cx| this.choose_download_folder(w, cx),
                     ),
                 ))
-                .child(
-                    div()
-                        .px_3()
-                        .child(self.read_only_field(&self.folder_field, cx)),
-                )
+                .child(div().px_3().child(self.text_field(&self.folder_field, cx)))
                 .into_any_element(),
         );
         v_flex()

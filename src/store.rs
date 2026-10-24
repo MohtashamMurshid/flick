@@ -25,6 +25,11 @@ pub struct Settings {
     pub appearance: crate::theme::Appearance,
     pub shortcuts: crate::shortcuts::Bindings,
     pub library_view: LibraryView,
+    /// A personal OpenSubtitles API key, stored with other settings.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub opensubtitles_key: String,
+    /// Comma-separated ISO 639-1 codes for subtitle searches.
+    pub subtitle_languages: String,
 }
 
 /// How All Videos is sorted and laid out.
@@ -57,6 +62,8 @@ impl Default for Settings {
             appearance: crate::theme::Appearance::default(),
             shortcuts: crate::shortcuts::Bindings::default(),
             library_view: LibraryView::default(),
+            opensubtitles_key: String::new(),
+            subtitle_languages: "en".into(),
         }
     }
 }
@@ -124,6 +131,14 @@ impl LibraryVideo {
 }
 
 impl Settings {
+    /// The OpenSubtitles key from `FLICK_OPENSUBTITLES_KEY`, or settings.
+    pub fn subtitle_key(&self) -> String {
+        std::env::var("FLICK_OPENSUBTITLES_KEY")
+            .ok()
+            .filter(|key| !key.trim().is_empty())
+            .unwrap_or_else(|| self.opensubtitles_key.trim().to_owned())
+    }
+
     pub fn add_video(&mut self, path: &Path) {
         if !path.as_os_str().is_empty() && !self.library.iter().any(|v| v.path == path) {
             self.library.push(LibraryVideo::new(path.to_owned()));

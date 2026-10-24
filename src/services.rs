@@ -1,4 +1,5 @@
 //! Background search and one shared native transfer session for the desktop.
+use flick::subtitles::SubtitleResult;
 use flick::{
     catalog::{self, SearchResults},
     fetch::{self, FetchSource, FetchUpdate, archive::ArchiveItem},
@@ -28,6 +29,23 @@ pub enum Command {
     CancelFetch(u64),
     /// List an Internet Archive item's video files.
     ResolveArchive(String),
+    /// Search OpenSubtitles for a video, by title and file hash.
+    SubtitleSearch {
+        generation: u64,
+        key: String,
+        query: String,
+        video: Option<PathBuf>,
+        languages: String,
+    },
+    /// Download a subtitle next to its video, or into `fallback` when that
+    /// folder cannot be written.
+    SubtitleDownload {
+        key: String,
+        result: SubtitleResult,
+        folder: PathBuf,
+        fallback: PathBuf,
+        stem: String,
+    },
     Search {
         generation: u64,
         query: String,
@@ -56,6 +74,11 @@ pub enum Event {
         identifier: String,
         result: Result<ArchiveItem, String>,
     },
+    Subtitles {
+        generation: u64,
+        result: Result<Vec<SubtitleResult>, String>,
+    },
+    SubtitleSaved(Result<PathBuf, String>),
     Search {
         generation: u64,
         result: Result<SearchResults, String>,
@@ -183,6 +206,7 @@ async fn run(
                 let Some(command) = command else { break; };
                 if matches!(command, Command::Shutdown) { break; }
                 let Some(command) = fetches.handle(command, &events) else { continue; };
+                let Some(command) = subtitles(command, &events) else { continue; };
                 if matches!(command, Command::CancelSearch) { if let Some(task) = search_task.take() { task.abort(); } continue; }
                 if let Command::Search { generation, query } = command {
                     if let Some(task) = search_task.take() { task.abort(); }
@@ -266,6 +290,72 @@ async fn run(
     if let Some(session) = session {
         session.shutdown().await;
     }
+}
+
+/// Starts OpenSubtitles searches and downloads, which need no torrent
+/// session. Returns any other command.
+fn subtitles(command: Command, events: &mpsc::Sender<Event>) -> Option<Command> {
+    let events = events.clone();
+    match command {
+        Command::SubtitleSearch {
+            generation,
+            key,
+            query,
+            video,
+            languages,
+        } => {
+            tokio::spawn(async move {
+                let result = async {
+                    let client = flick::subtitles::Client::new(&key)?;
+                    // The hash reads 128 KiB; an unreadable file just
+                    // searches by title.
+                    let hash = match video {
+                        Some(video) => tokio::task::spawn_blocking(move || {
+                            flick::subtitles::movie_hash(&video).ok()
+                        })
+                        .await
+                        .ok()
+                        .flatten(),
+                        None => None,
+                    };
+                    client.search(&query, hash.as_deref(), &languages).await
+                }
+                .await
+                .map_err(|e| format!("{e:#}"));
+                let _ = events.send(Event::Subtitles { generation, result });
+            });
+        }
+        Command::SubtitleDownload {
+            key,
+            result,
+            folder,
+            fallback,
+            stem,
+        } => {
+            tokio::spawn(async move {
+                let saved = async {
+                    let client = flick::subtitles::Client::new(&key)?;
+                    match client.download(&result, &folder, &stem).await {
+                        Err(error)
+                            if error.chain().any(|cause| {
+                                cause.downcast_ref::<std::io::Error>().is_some_and(|e| {
+                                    e.kind() == std::io::ErrorKind::PermissionDenied
+                                })
+                            }) =>
+                        {
+                            client.download(&result, &fallback, &stem).await
+                        }
+                        saved => saved,
+                    }
+                }
+                .await
+                .map_err(|e| format!("Could not download the subtitle: {e:#}"));
+                let _ = events.send(Event::SubtitleSaved(saved));
+            });
+        }
+        command => return Some(command),
+    }
+    None
 }
 
 /// Link downloads, keyed by the identifier the UI chose.

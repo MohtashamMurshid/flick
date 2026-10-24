@@ -495,7 +495,7 @@ impl Flick {
         }
         // The torrent sheet may already show the shared folder field.
         let folder = if self.pending_torrent.is_none() {
-            self.read_only_field(&self.folder_field, cx)
+            self.text_field(&self.folder_field, cx)
         } else {
             div()
                 .text_size(t.font(12.))
