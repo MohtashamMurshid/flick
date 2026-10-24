@@ -104,6 +104,37 @@ Interactive observations under Xvfb:
 Fixed during this pass: picture in picture first crashed with "cannot read Flick while it is already being updated", because the new window's first render read the main view during its update. Opening is now deferred to the next turn of the event loop.
 
 Not verified: macOS floating panels and Windows tool windows for picture in picture; Wayland, where no always-on-top request exists; and macOS Reduce motion and Windows animation settings.
+### Transfer controls and torrent resume on 2026-10-24
+
+Backlog item 24 and the matching stage-2 implementation boxes are complete. Downloads adds an explicit file-list confirmation for permanent removal, upload activity, exact metainfo export through the native save picker, and Pause All / Resume All. Appearance has a Transfers group with a persisted seeding preference and live download/upload limits. The welcome page and Downloads request the seeding choice until answered; until then, verified completed downloads pause. Explicit shares remain active independently of this preference, including after restart. Torrent media binds to `(infohash, file index)` alongside its path-based history. No playback rendering or benchmark files changed; `src/ui.rs` only gained transfer UI state and the settings argument for service startup.
+
+Checking uses the engine's examined-byte counter and total separately from verified download progress. Initial share creation exposes no percentage in librqbit 9.0.1, so that phase shows “Checking files…” without inventing progress. Uploaded totals are the native live-state counter, not lifetime accounting. Empty folders remain after deletion. Arbitrary manually moved files need a torrent association before identity-based resume can apply.
+
+Environment: Linux x86_64, Rust `1.99.0 (b940084d7 2026-09-28)`, pinned GPUI 0.2.2 and librqbit 9.0.1. Executed checks:
+
+- `cargo check --locked --no-default-features --all-targets`: passed (4m 30s); backend checking, not a desktop build.
+- `cargo check --locked --all-targets`: passed (10m 14s); desktop checking, not interactive playback.
+- `cargo fmt --all -- --check`: passed. An initial `cargo fmt --all` during editing reported a match-arm syntax error, corrected before the final checks.
+- `cargo clippy --locked --all-targets -- -D warnings`: passed (5m 43s including a build-lock wait).
+- `cargo clippy --locked --no-default-features --all-targets -- -D warnings`: passed (10.63s).
+- `cargo test --locked --all-targets`: passed (6m 26s compile; 39 shared-library, 41 desktop, and eight local-transfer tests passed). Eight opt-in tests were ignored: one installed-yt-dlp test and seven native libmpv/thumbnail tests. This command also linked the desktop app binary used below.
+- `cargo test --locked --no-default-features --all-targets`: passed (1m 17s compile; 39 library and eight local-transfer tests passed, one installed-yt-dlp test ignored).
+
+The new integration fixtures cover guarded deletion with unrelated files in the same folder, symlink-parent refusal and preservation of outside content (Unix), exact shared/downloaded metainfo export and file-list/infohash round-trip, refusal to export over managed content, both configured and live bandwidth limits, automatic completion pause, restart verification with seeding disabled, global pause/resume, and persisted explicit-share identity. Store regressions cover path changes, independent file indices and hashes, preservation of old path/local history, watched/unwatched state, and backward-compatible transfer preferences. All automated transfer tests use generated local content, explicit loopback peers where needed, and no public trackers, DHT, or UPnP.
+
+Interactive transfer check: `target/debug/flick` (built by the full test command) ran under task-owned Xvfb `:98`, Openbox, Mesa Lavapipe (`VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.json`), and `FLICK_AUDIO=null`. `FLICK_SETTINGS_PATH`, `FLICK_DATA_DIR`, and `FLICK_DOWNLOAD_DIR` pointed into `/tmp/flick-gap-ui-okun7f8m`; `FLICK_LOCAL_TRANSFERS=1` disabled public discovery. A `flick-transfer` seed shared a generated 262,144-byte non-video fixture, and its explicit loopback listener was passed in `FLICK_INITIAL_PEERS`. Observed:
+
+- Shift+Tab reached **Pause When Complete** with a visible focus ring; Enter saved `seed_completed: false` and removed the first-run choice.
+- Entering the fixture's magnet in search resolved its metadata from the local seed. **Download Selected** saved byte-identical content and the row showed **Complete · sharing paused**, the upload fields, and the close-Flick note.
+- The Transfers settings switch saved `seed_completed: true`. Shift+Tab reached both bandwidth sliders; Right changed each to 256 KiB/s, confirmed in the settings file. The upload slider's focus ring and tooltip were visible.
+- **Resume All** changed the completed transfer to **Sharing**, and **Pause All** paused it again. The transfer row was inspected in all three interface styles on Linux; this does not establish native macOS/Windows behavior.
+- **Remove and Delete Files…** listed the fixture's full path and explained permanence. Shift+Tab reached **Delete Listed Files** with a visible ring; Shift+Tab again and Enter activated Cancel and kept the fixture. Reopening and keyboard-confirming deletion removed the downloaded fixture and its row, kept an unrelated sibling with byte-identical contents, and kept the seed's original file.
+- The app was closed through its window control. The supervisor stopped its seed, Openbox, and Xvfb by their recorded PIDs. An earlier launch supervisor exited too soon and its processes were terminated before interaction; the subsequent supervised run supplied the observations above. Generated incremental/check-only artifacts from this worktree were removed to stay within available disk space; no other worktree's files were removed.
+
+Screenshots: [first-run keyboard choice](screenshots/flick-transfer-seeding-choice.png), [settings and keyboard slider](screenshots/flick-transfer-settings.png), [file-list confirmation](screenshots/flick-transfer-delete-confirmation.png), and [macOS-style transfer row on Linux](screenshots/flick-transfer-mac-row.png).
+
+Native export save picking, visible hashing progress on a large fixture, interactive torrent-media resume, and actual playback were not exercised. Export and identity resume have automated coverage; this non-video GUI download does not establish the complete share → download → Play acceptance pass. No separate `cargo build` command was run. The existing native libmpv/thumbnail and installed-yt-dlp opt-in tests were not run. The upstream `proc-macro-error2` 2.0.1 future-compatibility notice remains. Final `cargo fmt --all -- --check` and `git diff --check` also passed after the documentation update.
+
 
 ### Review backlog: playback, keyboard, and accessibility on 2026-10-24
 

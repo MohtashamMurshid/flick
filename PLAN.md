@@ -40,8 +40,8 @@ Acceptance met on macOS on 2026-10-25: backend tests and desktop compilation pas
 - [x] Share a chosen file or folder in place and copy its magnet.
 - [x] Show seeding state, provide pause/resume, and explain that transfers stop when Flick closes.
 - [x] Connect one transfer session to GPUI with typed commands/events on a background runtime.
-- [ ] Add delete-files confirmation, torrent export, hashing feedback, upload-rate display, and a first-run seeding preference to the desktop UI.
-- [ ] Key viewing history/resume by infohash and file index for torrent media, alongside local paths. Backend transfer identities are already persisted.
+- [x] Add delete-files confirmation, torrent export, hashing feedback, upload-rate display, and a first-run seeding preference to the desktop UI. Initial share hashing has a status message; verification uses the engine’s checked-byte progress.
+- [x] Key viewing history/resume by infohash and file index for verified torrent media, alongside local paths. Re-downloaded identities retain resume across destinations without deleting existing history.
 - [ ] Complete the native share → download → Play acceptance pass through the GUI controls on each supported OS.
 
 Acceptance: one native app can share a generated video, another instance can download it, and the completed file opens in Flick. Local playback remains usable if transfers fail. The local backend round trip and background completion events pass; the entire GUI round trip remains unverified because native click automation failed during this session.
@@ -108,7 +108,7 @@ Features:
 - [x] 21. Picture-in-picture, or an always-on-top mini window. P or the player button opens a small pop-up window that keeps playing while the library is used. It floats on macOS; on X11 staying above depends on the window manager (Openbox let the main window cover it), and Wayland has no always-on-top request.
 - [x] 22. OpenSubtitles search from the Audio & subtitles menu. Find Online searches by title and OpenSubtitles file hash, lists exact matches first, and downloads and loads a choice beside the video. It needs a personal API key, entered in Appearance or set with `FLICK_OPENSUBTITLES_KEY`. Only the rejected-key path has been checked against the live API.
 - [x] 23. Watch while downloading (stage 4): stream verified pieces from librqbit and prioritize pieces near the playhead. Watch Now plays a downloading video through a `flicktorrent://` libmpv stream; library cards for partly downloaded files use it too, and posters wait for completion.
-- [ ] 24. Transfer gaps from stage 2: delete-files confirmation, upload rate, torrent export, seeding preference, resume keyed by infohash, bandwidth limits, and global pause.
+- [x] 24. Transfer gaps from stage 2: delete-files confirmation, upload rate, torrent export, seeding preference, resume keyed by infohash, live bandwidth limits, global pause, and hashing feedback. The complete GUI acceptance pass on each OS remains the separate unchecked stage-2 item.
 - [x] 26. Download from YouTube, X, and other sites supported by [yt-dlp](https://github.com/yt-dlp/yt-dlp) using a pasted page URL. Run an installed yt-dlp as a separate process, separate from playback and the torrent session, with progress, cancellation, and completed videos joining the library. Tests use a generated local stand-in for yt-dlp and no network access. Done in `src/fetch.rs` and `src/fetch_ui.rs`; direct HTTPS video links skip yt-dlp. X was not tried with a real post; see [validation](docs/VALIDATION.md#link-downloads-on-2026-10-24).
 
 Transfer reliability, which should close most of the gap with other clients:

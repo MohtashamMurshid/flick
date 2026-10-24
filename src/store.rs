@@ -30,6 +30,32 @@ pub struct Settings {
     pub opensubtitles_key: String,
     /// Comma-separated ISO 639-1 codes for subtitle searches.
     pub subtitle_languages: String,
+    pub transfers: TransferPreferences,
+    pub torrent_history: Vec<TorrentResume>,
+}
+
+/// None keeps the first-run choice visible; it behaves as off until chosen.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct TransferPreferences {
+    pub seed_completed: Option<bool>,
+    /// Zero means unlimited. Values are bytes per second.
+    pub download_bps: u32,
+    pub upload_bps: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+pub struct TorrentIdentity {
+    pub infohash: String,
+    pub file_index: usize,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct TorrentResume {
+    pub identity: TorrentIdentity,
+    pub path: PathBuf,
+    pub position: f64,
+    pub duration: f64,
 }
 
 /// How All Videos is sorted and laid out.
@@ -64,6 +90,8 @@ impl Default for Settings {
             library_view: LibraryView::default(),
             opensubtitles_key: String::new(),
             subtitle_languages: "en".into(),
+            transfers: TransferPreferences::default(),
+            torrent_history: Vec::new(),
         }
     }
 }
@@ -83,6 +111,8 @@ pub struct RecentFile {
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(default)]
 pub struct LibraryVideo {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub torrent: Option<TorrentIdentity>,
     pub path: PathBuf,
     pub title: String,
     /// A cached poster frame, made by the thumbnail worker.
@@ -172,7 +202,49 @@ impl Settings {
             dismissed: false,
         };
         file.sanitize();
+        if let Some(identity) = self
+            .library
+            .iter()
+            .find(|v| v.path == path)
+            .and_then(|v| v.torrent.clone())
+        {
+            self.torrent_history.retain(|h| h.identity != identity);
+            self.torrent_history.insert(
+                0,
+                TorrentResume {
+                    identity,
+                    path: path.to_owned(),
+                    position: file.position,
+                    duration: file.duration,
+                },
+            );
+        }
         self.recent.insert(0, file);
+    }
+
+    /// Bind verified media without discarding path-based history or old paths.
+    pub fn bind_torrent(&mut self, path: &Path, infohash: &str, file_index: usize) {
+        if infohash.len() != 40 || !infohash.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return;
+        }
+        self.add_video(path);
+        let identity = TorrentIdentity {
+            infohash: infohash.to_ascii_lowercase(),
+            file_index,
+        };
+        if let Some(video) = self.library.iter_mut().find(|v| v.path == path) {
+            video.torrent = Some(identity.clone());
+        }
+        if !self.torrent_history.iter().any(|h| h.identity == identity)
+            && let Some(file) = self.recent.iter().find(|f| f.path == path)
+        {
+            self.torrent_history.push(TorrentResume {
+                identity,
+                path: path.to_owned(),
+                position: file.position,
+                duration: file.duration,
+            });
+        }
     }
 
     /// Videos with a saved position that are not dismissed, newest first.
@@ -209,11 +281,47 @@ impl Settings {
             None => self.recent.insert(0, file),
         }
         self.add_video(path);
+        if let Some(identity) = self
+            .library
+            .iter()
+            .find(|v| v.path == path)
+            .and_then(|v| v.torrent.clone())
+        {
+            self.torrent_history.retain(|h| h.identity != identity);
+            self.torrent_history.insert(
+                0,
+                TorrentResume {
+                    identity,
+                    path: path.to_owned(),
+                    position: duration,
+                    duration,
+                },
+            );
+        }
     }
 
     /// Forgets the video's history and saved position. It stays in the library.
     pub fn mark_unwatched(&mut self, path: &Path) {
         self.recent.retain(|file| file.path != path);
+        if let Some(identity) = self
+            .library
+            .iter()
+            .find(|v| v.path == path)
+            .and_then(|v| v.torrent.clone())
+        {
+            self.torrent_history.retain(|h| h.identity != identity);
+            // Keep a zero-position identity record so older path history cannot
+            // resurrect resume for a different copy of the same torrent file.
+            self.torrent_history.insert(
+                0,
+                TorrentResume {
+                    identity,
+                    path: path.to_owned(),
+                    position: 0.0,
+                    duration: 0.0,
+                },
+            );
+        }
     }
 
     pub fn watched(&self, path: &Path) -> bool {
@@ -237,6 +345,18 @@ impl Settings {
     }
 
     pub fn resume_position(&self, path: &Path) -> f64 {
+        if let Some(identity) = self
+            .library
+            .iter()
+            .find(|v| v.path == path)
+            .and_then(|v| v.torrent.as_ref())
+            && let Some(saved) = self
+                .torrent_history
+                .iter()
+                .find(|h| &h.identity == identity)
+        {
+            return eligible_resume(saved.position, saved.duration);
+        }
         self.recent
             .iter()
             .find(|file| file.path == path)
@@ -250,6 +370,19 @@ impl Settings {
     }
 
     fn sanitize(&mut self) {
+        let mut identities = std::collections::HashSet::new();
+        self.torrent_history.retain_mut(|saved| {
+            saved.identity.infohash = saved.identity.infohash.to_ascii_lowercase();
+            saved.duration = non_negative_finite(saved.duration);
+            saved.position = non_negative_finite(saved.position).min(saved.duration);
+            saved.identity.infohash.len() == 40
+                && saved
+                    .identity
+                    .infohash
+                    .bytes()
+                    .all(|b| b.is_ascii_hexdigit())
+                && identities.insert((saved.identity.infohash.clone(), saved.identity.file_index))
+        });
         self.shortcuts.sanitize();
         self.appearance.sanitize();
         self.volume = finite_or(self.volume, 80.0).clamp(0.0, 100.0);
@@ -273,6 +406,14 @@ impl Settings {
         }
         for video in &mut self.library {
             video.duration = non_negative_finite(video.duration);
+            if let Some(identity) = &mut video.torrent {
+                identity.infohash = identity.infohash.to_ascii_lowercase();
+                if identity.infohash.len() != 40
+                    || !identity.infohash.bytes().all(|b| b.is_ascii_hexdigit())
+                {
+                    video.torrent = None;
+                }
+            }
         }
     }
 }
@@ -287,6 +428,15 @@ impl RecentFile {
         if self.title.trim().is_empty() {
             self.title = file_title(&self.path);
         }
+    }
+}
+
+fn eligible_resume(position: f64, duration: f64) -> f64 {
+    if position.is_finite() && duration.is_finite() && position > 5.0 && duration - position >= 10.0
+    {
+        position
+    } else {
+        0.0
     }
 }
 
@@ -418,6 +568,80 @@ impl Drop for TemporaryFile {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn torrent_resume_follows_identity_across_paths_without_losing_local_history() {
+        let directory = tempfile::tempdir().unwrap();
+        let settings_path = directory.path().join("settings.json");
+        let mut store = Store::load_from(&settings_path);
+        let hash = "0123456789abcdef0123456789abcdef01234567";
+        let original = Path::new("old/download/movie.mkv");
+        let moved = Path::new("new/download/movie.mkv");
+        // Bind an already-watched local path without destructive migration.
+        store.remember(original, 32.0, 200.0);
+        store.data.bind_torrent(original, hash, 2);
+        store.remember(Path::new("local.mp4"), 24.0, 100.0);
+        store
+            .data
+            .bind_torrent(moved, &hash.to_ascii_uppercase(), 2);
+        assert_eq!(store.resume_position(moved), 32.0);
+        store.remember(moved, 75.0, 200.0);
+        store.save().unwrap();
+        let mut loaded = Store::load_from(&settings_path);
+        assert_eq!(loaded.resume_position(moved), 75.0);
+        assert_eq!(loaded.resume_position(original), 75.0);
+        assert_eq!(loaded.resume_position(Path::new("local.mp4")), 24.0);
+        assert!(
+            loaded
+                .data
+                .recent
+                .iter()
+                .any(|f| f.path == original && f.position == 32.0)
+        );
+        loaded.data.bind_torrent(Path::new("another.mkv"), hash, 3);
+        loaded.data.bind_torrent(
+            Path::new("other-hash.mkv"),
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            2,
+        );
+        assert_eq!(loaded.resume_position(Path::new("another.mkv")), 0.0);
+        assert_eq!(loaded.resume_position(Path::new("other-hash.mkv")), 0.0);
+        loaded.data.mark_watched(moved);
+        assert_eq!(loaded.resume_position(original), 0.0);
+        loaded.data.remember(moved, 60.0, 200.0);
+        loaded.data.mark_unwatched(moved);
+        assert_eq!(loaded.resume_position(original), 0.0);
+        loaded.save().unwrap();
+        assert_eq!(
+            Store::load_from(settings_path).resume_position(original),
+            0.0
+        );
+    }
+
+    #[test]
+    fn transfer_preferences_default_and_roundtrip_with_legacy_settings() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.json");
+        fs::write(
+            &path,
+            br#"{"volume":42,"recent":[{"path":"old.mp4","position":30,"duration":100}]}"#,
+        )
+        .unwrap();
+        let mut store = Store::load_from(&path);
+        assert_eq!(store.data.transfers.seed_completed, None);
+        assert_eq!(store.data.transfers.download_bps, 0);
+        assert_eq!(store.data.transfers.upload_bps, 0);
+        store.data.transfers.seed_completed = Some(false);
+        store.data.transfers.download_bps = 1_048_576;
+        store.data.transfers.upload_bps = 262_144;
+        store.save().unwrap();
+        let loaded = Store::load_from(path);
+        assert_eq!(loaded.data.transfers.seed_completed, Some(false));
+        assert_eq!(loaded.data.transfers.download_bps, 1_048_576);
+        assert_eq!(loaded.data.transfers.upload_bps, 262_144);
+        assert_eq!(loaded.resume_position(Path::new("old.mp4")), 30.0);
+        assert_eq!(loaded.data.volume, 42.0);
+    }
 
     #[test]
     fn missing_settings_use_defaults_and_roundtrip_replaces_existing_file() {

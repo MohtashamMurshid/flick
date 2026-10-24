@@ -112,6 +112,8 @@ async fn main() -> Result<()> {
         },
         public_discovery: args.public,
         download_limit_bytes_per_second: None,
+        upload_limit_bytes_per_second: None,
+        seed_completed_downloads: true,
     })
     .await?;
     let command_timeout = match &args.command {

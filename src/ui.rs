@@ -185,6 +185,8 @@ pub struct Flick {
     search_results: Option<flick::catalog::SearchResults>,
     services: Services,
     downloads: Vec<flick::torrent::TransferSnapshot>,
+    delete_transfer: Option<String>,
+    checking_share: Option<PathBuf>,
     resolving: bool,
     pending_torrent: Option<flick::torrent::ResolvedTorrent>,
     selected_files: HashSet<usize>,
@@ -270,7 +272,7 @@ impl Flick {
         let store = Store::load();
         crate::theme::apply(cx, &store.data.appearance);
         let search_input = cx.new(TextInput::new);
-        let services = Services::start();
+        let services = Services::start(&store.data.transfers);
         let download_folder = services.download_dir.clone();
         let magnet_field = cx.new(TextInput::read_only);
         let subtitle_query = cx.new(|cx| TextInput::with_placeholder(cx, "Title to search for"));
@@ -413,6 +415,8 @@ impl Flick {
             search_results: None,
             services,
             downloads: Vec::new(),
+            delete_transfer: None,
+            checking_share: None,
             resolving: false,
             pending_torrent: None,
             selected_files: HashSet::new(),

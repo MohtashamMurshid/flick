@@ -19,7 +19,10 @@ use std::{
     net::{SocketAddr, TcpListener, UdpSocket},
     num::NonZeroU32,
     path::{Component, Path, PathBuf},
-    sync::Arc,
+    sync::{
+        Arc, RwLock,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 use tokio::io::AsyncReadExt;
@@ -58,6 +61,9 @@ pub struct TransferConfig {
     /// Listener and outgoing transports. Local sessions default to TCP.
     pub listener_mode: ListenerMode,
     pub download_limit_bytes_per_second: Option<NonZeroU32>,
+    pub upload_limit_bytes_per_second: Option<NonZeroU32>,
+    /// Explicit shares keep sharing regardless of the completed-download policy.
+    pub seed_completed_downloads: bool,
 }
 
 impl TransferConfig {
@@ -69,6 +75,8 @@ impl TransferConfig {
             public_discovery: false,
             listener_mode: ListenerMode::TcpOnly,
             download_limit_bytes_per_second: None,
+            upload_limit_bytes_per_second: None,
+            seed_completed_downloads: true,
         }
     }
 }
@@ -204,6 +212,9 @@ pub struct TransferSnapshot {
     pub state: TransferState,
     pub verified_bytes: u64,
     pub total_bytes: u64,
+    /// Bytes examined during verification, distinct from verified download bytes.
+    pub checked_bytes: u64,
+    pub checking_total_bytes: u64,
     pub uploaded_bytes: u64,
     pub peers: u32,
     pub download_bytes_per_second: u64,
@@ -230,6 +241,9 @@ pub struct TransferSession {
     session: Arc<Session>,
     download_dir: PathBuf,
     cancel: CancellationToken,
+    seed_completed: Arc<AtomicBool>,
+    explicit_shares: Arc<RwLock<HashSet<String>>>,
+    state_dir: PathBuf,
     _state_lock: File,
 }
 
@@ -254,6 +268,14 @@ impl TransferSession {
             .context("Open transfer state lock")?;
         lock.try_lock_exclusive()
             .context("Another Flick transfer session owns this state directory")?;
+        let explicit_shares = Arc::new(RwLock::new(
+            match std::fs::read(state_dir.join("explicit-shares.json")) {
+                Ok(bytes) => serde_json::from_slice::<HashSet<String>>(&bytes)
+                    .context("Read explicit share identities")?,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => HashSet::new(),
+                Err(e) => return Err(e).context("Read explicit share identities"),
+            },
+        ));
         let mut listen_addr = select_listen_addr(&config, &state_dir)?;
         // A second process can bind between our probe and librqbit's bind.
         // Retry only address conflicts, without masking unrelated startup errors.
@@ -272,10 +294,30 @@ impl TransferSession {
                         session.stop().await;
                         return Err(error);
                     }
+                    let seed_completed = Arc::new(AtomicBool::new(config.seed_completed_downloads));
+                    let policy_session = session.clone();
+                    let policy = seed_completed.clone();
+                    let policy_cancel = cancel.clone();
+                    let policy_shares = explicit_shares.clone();
+                    tokio::spawn(async move {
+                        loop {
+                            tokio::select! {
+                                _ = policy_cancel.cancelled() => break,
+                                _ = tokio::time::sleep(Duration::from_millis(250)) => {
+                                    if !policy.load(Ordering::Relaxed) {
+                                        pause_completed_downloads(&policy_session, &policy_shares).await;
+                                    }
+                                }
+                            }
+                        }
+                    });
                     return Ok(Self {
                         session,
                         download_dir,
                         cancel,
+                        seed_completed,
+                        explicit_shares,
+                        state_dir,
                         _state_lock: lock,
                     });
                 }
@@ -504,6 +546,7 @@ impl TransferSession {
                 .await?;
             bail!("Shared files did not verify; sharing was not started");
         }
+        self.set_explicit_share(&infohash, true)?;
         self.session.unpause(&handle).await?;
         Ok(SharedTorrent {
             infohash,
@@ -564,6 +607,12 @@ impl TransferSession {
                 .map(|f| f.verified_bytes)
                 .sum(),
             total_bytes: files.iter().filter(|f| f.selected).map(|f| f.length).sum(),
+            checked_bytes: if state == TransferState::Checking {
+                stats.progress_bytes
+            } else {
+                0
+            },
+            checking_total_bytes: stats.total_bytes,
             uploaded_bytes: stats.uploaded_bytes,
             peers: stats
                 .live
@@ -623,18 +672,139 @@ impl TransferSession {
             .await?;
         Ok(())
     }
+    /// Only regular metainfo-listed files inside the torrent's output folder
+    /// are eligible. Never recursively remove a directory or follow a symlink.
     pub async fn remove(&self, infohash: &str, delete_files: bool) -> Result<()> {
+        let handle = self.handle(infohash)?;
+        if matches!(handle.stats().state, TorrentStatsState::Initializing { .. }) {
+            timeout(Duration::from_secs(120), handle.wait_until_initialized())
+                .await
+                .context("File verification timed out")??;
+        }
+        let root = handle.output_folder().to_owned();
+        let paths = handle.with_metadata(|m| {
+            m.file_infos
+                .iter()
+                .map(|f| f.relative_filename.clone())
+                .collect::<Vec<_>>()
+        })?;
+        if delete_files {
+            for path in &paths {
+                validate_delete_path(&root, path)?;
+            }
+        }
         self.session
-            .delete(
-                TorrentIdOrHash::Hash(infohash.parse().context("Invalid infohash")?),
-                delete_files,
-            )
+            .delete(TorrentIdOrHash::Hash(handle.info_hash()), false)
+            .await?;
+        self.set_explicit_share(infohash, false)?;
+        if delete_files {
+            for path in paths {
+                validate_delete_path(&root, &path)?;
+                match delete_owned_file(&root, &path) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => {
+                        return Err(e).context("Transfer removed, but a file could not be deleted");
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub fn torrent_bytes(&self, infohash: &str) -> Result<Vec<u8>> {
+        self.handle(infohash)?
+            .with_metadata(|m| m.torrent_bytes.to_vec())
+    }
+
+    /// The native save picker handles overwrite confirmation. No re-encoding.
+    pub async fn export_torrent(&self, infohash: &str, path: &Path) -> Result<()> {
+        let target = if path.exists() {
+            std::fs::canonicalize(path)?
+        } else {
+            path.to_owned()
+        };
+        ensure!(
+            !self
+                .snapshots()?
+                .iter()
+                .flat_map(|s| &s.files)
+                .any(|f| f.path == target),
+            "Cannot export metadata over torrent content"
+        );
+        tokio::fs::write(path, self.torrent_bytes(infohash)?)
             .await
+            .context("Export torrent")
+    }
+
+    pub fn set_limits(&self, download: Option<NonZeroU32>, upload: Option<NonZeroU32>) {
+        self.session.ratelimits.set_download_bps(download);
+        self.session.ratelimits.set_upload_bps(upload);
+    }
+
+    pub fn limits(&self) -> librqbit::limits::LimitsConfig {
+        self.session.ratelimits.get_config()
+    }
+
+    pub async fn set_seed_completed_downloads(&self, enabled: bool) {
+        self.seed_completed.store(enabled, Ordering::Relaxed);
+        if !enabled {
+            pause_completed_downloads(&self.session, &self.explicit_shares).await;
+        }
+    }
+
+    pub async fn pause_all(&self) -> Result<()> {
+        for item in self
+            .snapshots()?
+            .into_iter()
+            .filter(|item| item.state != TransferState::Error)
+        {
+            let handle = self.handle(&item.infohash)?;
+            timeout(Duration::from_secs(120), handle.wait_until_initialized())
+                .await
+                .context("File verification timed out")??;
+            self.pause(&item.infohash).await?;
+        }
+        Ok(())
+    }
+
+    pub async fn resume_all(&self, peers: Vec<SocketAddr>) -> Result<()> {
+        for item in self
+            .snapshots()?
+            .into_iter()
+            .filter(|item| item.state != TransferState::Error)
+        {
+            let handle = self.handle(&item.infohash)?;
+            if !self.seed_completed.load(Ordering::Relaxed)
+                && is_completed_download(&handle, &self.explicit_shares)
+            {
+                continue;
+            }
+            self.resume(&item.infohash, peers.clone()).await?;
+        }
+        Ok(())
     }
     pub async fn wait_for_completion(&self, infohash: &str, deadline: Duration) -> Result<()> {
-        timeout(deadline, self.handle(infohash)?.wait_until_completed())
-            .await
-            .context("Download timed out")?
+        let handle = self.handle(infohash)?;
+        // The engine's wait helper requires Live state. A completion policy may
+        // already have paused a verified download before this waiter begins.
+        timeout(deadline, async {
+            loop {
+                let stats = handle.stats();
+                ensure!(
+                    !matches!(stats.state, TorrentStatsState::Error),
+                    "Transfer failed: {}",
+                    stats.error.unwrap_or_default()
+                );
+                if stats.finished && !matches!(stats.state, TorrentStatsState::Initializing { .. })
+                {
+                    return Ok(());
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .context("Download timed out")?
     }
 
     /// Existence/preallocation is never sufficient to expose a playback path.
@@ -660,10 +830,12 @@ impl TransferSession {
     }
 
     pub async fn stop(self) {
+        self.cancel.cancel();
         self.session.stop().await;
     }
 
     pub async fn shutdown(&self) {
+        self.cancel.cancel();
         self.session.stop().await;
     }
 
@@ -694,6 +866,23 @@ impl TransferSession {
             inner: Box::new(inner),
             len,
         })
+    }
+
+    fn set_explicit_share(&self, infohash: &str, explicit: bool) -> Result<()> {
+        let mut shares = self
+            .explicit_shares
+            .write()
+            .expect("share registry poisoned");
+        if explicit {
+            shares.insert(infohash.to_owned());
+        } else {
+            shares.remove(infohash);
+        }
+        let bytes = serde_json::to_vec(&*shares)?;
+        let temporary = self.state_dir.join("explicit-shares.tmp");
+        std::fs::write(&temporary, bytes).context("Write share identities")?;
+        std::fs::rename(temporary, self.state_dir.join("explicit-shares.json"))
+            .context("Save share identities")
     }
 
     fn handle(&self, infohash: &str) -> Result<Arc<ManagedTorrent>> {
@@ -848,6 +1037,124 @@ impl Drop for TransferSession {
     }
 }
 
+// Adapter downloads reserve an exclusive infohash-named destination; explicit
+// shares use their original output folder. This also recognizes persisted
+// downloads created before the completion preference existed.
+fn is_completed_download(handle: &ManagedTorrent, shares: &RwLock<HashSet<String>>) -> bool {
+    if shares
+        .read()
+        .expect("share registry poisoned")
+        .contains(&handle.info_hash().as_string())
+    {
+        return false;
+    }
+    handle
+        .output_folder()
+        .file_name()
+        .is_some_and(|name| name == handle.info_hash().as_string().as_str())
+        && handle.stats().finished
+}
+
+async fn pause_completed_downloads(session: &Session, shares: &RwLock<HashSet<String>>) {
+    let handles = session.with_torrents(|items| items.map(|(_, h)| h.clone()).collect::<Vec<_>>());
+    for handle in handles {
+        if handle.live().is_some()
+            && is_completed_download(&handle, shares)
+            && let Err(error) = session.pause(&handle).await
+        {
+            tracing::warn!(%error, "Could not stop completed download sharing");
+        }
+    }
+}
+
+#[cfg(unix)]
+fn delete_owned_file(root: &Path, relative: &Path) -> std::io::Result<()> {
+    use std::{
+        ffi::CString,
+        os::{
+            fd::{AsRawFd, FromRawFd, OwnedFd},
+            unix::ffi::OsStrExt,
+        },
+    };
+    // Open each directory without following symlinks. unlinkat stays relative
+    // to these descriptors even if another process renames a parent directory.
+    let mut directory: OwnedFd = File::open("/")?.into();
+    let parent = root.join(relative.parent().unwrap_or(Path::new("")));
+    for component in parent.components() {
+        let Component::Normal(name) = component else {
+            continue;
+        };
+        let name = CString::new(name.as_bytes())?;
+        let fd = unsafe {
+            libc::openat(
+                directory.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        directory = unsafe { OwnedFd::from_raw_fd(fd) };
+    }
+    let name = CString::new(
+        relative
+            .file_name()
+            .expect("validated relative path")
+            .as_bytes(),
+    )?;
+    // unlinkat never follows a final symlink and cannot delete a directory.
+    let result = unsafe { libc::unlinkat(directory.as_raw_fd(), name.as_ptr(), 0) };
+    if result < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn delete_owned_file(root: &Path, relative: &Path) -> std::io::Result<()> {
+    std::fs::remove_file(root.join(relative))
+}
+
+fn validate_delete_path(root: &Path, relative: &Path) -> Result<()> {
+    validate_relative_path(relative)?;
+    ensure!(
+        std::fs::canonicalize(root)? == root,
+        "Destination changed or contains a symbolic link"
+    );
+    let mut path = root.to_owned();
+    for component in relative.components() {
+        path.push(component);
+        match std::fs::symlink_metadata(&path) {
+            Ok(meta) => {
+                #[cfg(windows)]
+                {
+                    use std::os::windows::fs::MetadataExt;
+                    ensure!(
+                        meta.file_attributes() & 0x400 == 0,
+                        "Refusing deletion through a reparse point"
+                    );
+                }
+                ensure!(
+                    !meta.is_symlink(),
+                    "Refusing deletion through a symbolic link"
+                );
+                ensure!(
+                    if path == root.join(relative) {
+                        meta.is_file()
+                    } else {
+                        meta.is_dir()
+                    },
+                    "Torrent path was replaced"
+                );
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => break,
+            Err(e) => return Err(e).context("Inspect torrent deletion path"),
+        }
+    }
+    Ok(())
+}
+
 fn utf8_path(path: &Path) -> Result<&str> {
     path.to_str().context("Transfer path is not valid UTF-8")
 }
@@ -934,7 +1241,7 @@ fn session_options(
         client_name_and_version: Some(concat!("Flick/", env!("CARGO_PKG_VERSION")).into()),
         ratelimits: librqbit::limits::LimitsConfig {
             download_bps: config.download_limit_bytes_per_second,
-            upload_bps: None,
+            upload_bps: config.upload_limit_bytes_per_second,
         },
         ..Default::default()
     })

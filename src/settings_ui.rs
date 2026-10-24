@@ -338,6 +338,8 @@ impl Flick {
                 ],
             ))
             .child(div().h(px(24.)))
+            .child(self.transfer_settings(cx))
+            .child(div().h(px(24.)))
             .child(section_title(&t, "Subtitles"))
             .child(group(
                 &t,
@@ -380,6 +382,68 @@ impl Flick {
                     .into_any_element(),
                 ],
             ))
+    }
+
+    fn transfer_settings(&self, cx: &Context<Self>) -> Div {
+        let t = cx.theme().clone();
+        let preferences = &self.store.data.transfers;
+        let mut rows = vec![row(&t, Some("share-2"), "Keep sharing completed downloads",
+            Some("When off, completed downloads pause. Explicit shares keep sharing. Transfers stop when Flick closes.".into()),
+            self.switch("seed-completed", preferences.seed_completed.unwrap_or(false), cx, |this, _, cx| {
+                let enabled = !this.store.data.transfers.seed_completed.unwrap_or(false);
+                this.store.data.transfers.seed_completed = Some(enabled);
+                this.update_transfer_preferences(cx);
+            })).into_any_element()];
+        for (upload, key, label, bps) in [
+            (
+                false,
+                "download-limit",
+                "Download limit",
+                preferences.download_bps,
+            ),
+            (true, "upload-limit", "Upload limit", preferences.upload_bps),
+        ] {
+            // 0 is unlimited; each step adds 256 KiB/s, up to 32 MiB/s.
+            let value = bps as f32 / (256. * 1024.);
+            let control = h_flex()
+                .gap_3()
+                .child(div().text_color(t.muted).child(if bps == 0 {
+                    "Unlimited".to_owned()
+                } else {
+                    format!("{}/s", flick::library::format_bytes(u64::from(bps)))
+                }))
+                .child(self.slider(
+                    key,
+                    label,
+                    value,
+                    (0., 128.),
+                    1.,
+                    160.,
+                    cx,
+                    move |this, value, _, cx| {
+                        let bps = (value * 256. * 1024.) as u32;
+                        if upload {
+                            this.store.data.transfers.upload_bps = bps;
+                        } else {
+                            this.store.data.transfers.download_bps = bps;
+                        }
+                        this.update_transfer_preferences(cx);
+                    },
+                ));
+            rows.push(
+                row(
+                    &t,
+                    None,
+                    label,
+                    Some("Applies immediately to torrent transfers · 0 = unlimited".into()),
+                    control,
+                )
+                .into_any_element(),
+            );
+        }
+        v_flex()
+            .child(section_title(&t, "Transfers"))
+            .child(group(&t, rows))
     }
 
     /// Player shortcuts with rebinding, plus the fixed keys.
