@@ -50,7 +50,7 @@ Acceptance: one native app can share a generated video, another instance can dow
 
 - [ ] Implement and measure efficient native GPU presentation, starting with macOS, then Windows and Linux.
 - [ ] Verify native-resolution video, sound/synchronization, resize, subtitles, paused seeking, fullscreen, and sustained resource use on each OS.
-- [ ] Package native dependencies and ship the applicable notices/licenses.
+- [ ] Package native dependencies and ship the applicable notices/licenses. macOS packaging is drafted but unverified (item 25); Windows and Linux are not started.
 - [ ] Run the configured transfer regression jobs on native Windows, macOS, and Linux CI and record their results.
 
 Acceptance: publish actual native results and release measurements. No performance advantage over VLC or mpv is claimed without comparative measurements.
@@ -124,7 +124,7 @@ Automated transfer tests stay local, with generated fixtures and explicit peers.
 
 Distribution:
 
-- [ ] 25. Bundle libmpv, sign and notarize, and ship a DMG. The app currently requires `brew install mpv`, so it can't be handed to anyone.
+- [ ] 25. Bundle libmpv, sign and notarize, and ship a DMG. The app currently requires `brew install mpv`, so it can't be handed to anyone. `scripts/package-macos.sh` and the `macos-package` CI job now do this; see [Packaging for macOS](docs/PACKAGING.md). They were written on Linux, where only syntax checks, ShellCheck, a dry run, and a run with stand-in macOS tools passed. The bundle, signatures, notarization, DMG, and playback from the bundle are unverified until the job or a Mac runs them. Distribution also waits on a Developer ID, notarization credentials, and the license questions in that document: Homebrew's libmpv and FFmpeg are GPL, Flick has no license, and corresponding source is not yet provided. Finder's Open With launches Flick without opening the file until `src/main.rs` handles `on_open_urls`.
 
 Watch folders, remote control, accounts, cloud storage, casting, and a general NDJSON agent interface are outside the first release. Search belongs in the library workflow.
 

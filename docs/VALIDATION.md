@@ -12,6 +12,25 @@ Flick targets Windows, macOS, and Linux. A CI configuration is not evidence of a
 
 The presentation adapter transfers decoded BGRA frames through CPU memory into GPUI images. It sizes frames to physical video bounds without a fixed resolution, axis, or pixel-budget cap. Checked native dimensions and allocation failures produce explicit errors. GPU rendering of those images does not establish hardware video decoding or zero-copy presentation. Treat this as a functional prototype. Hardware decoding, efficient GPU surface sharing, HDR correctness, battery use, and claims of being faster than VLC remain unverified.
 
+### macOS packaging script on 2026-10-24
+
+Backlog item 25 adds `scripts/package-macos.sh`, hardened-runtime entitlements and an app icon in `packaging/macos/`, the `macos-package` CI job, and [Packaging for macOS](PACKAGING.md). All of it was written and checked on Linux, so **no macOS packaging result exists yet**. A real `Flick.app`, its relinked libraries, signatures, notarization, the DMG, Gatekeeper, and playback from the bundle are unverified. They need the CI job or a Mac. No Rust source changed, so no cargo checks were rerun, and no desktop build or interactive playback was attempted.
+
+Environment: Ubuntu 24.04.5 x86_64, GNU bash 5.2.21, ShellCheck 0.9.0, Python 3.12.3 with PyYAML 6.0.1, and librsvg 2.58.0.
+
+- `bash -n scripts/package-macos.sh` passed, and ShellCheck reported nothing for it or for `packaging/macos/test-package-script.sh`. The test script disables SC2016 and SC2012 for its `bash -c` assertions. Neither check ran under macOS's `/bin/bash` 3.2. The script avoids bash 4 features, and the CI job runs it with `/bin/bash`.
+- `scripts/package-macos.sh --dry-run` printed the settings and plan, listed the macOS tools as missing, and created no output directory. Python's `plistlib` parsed the Info.plist it prints: bundle id `app.Flick.Flick`, version 0.1.0, `NSHighResolutionCapable`, and three document types. Both entitlements files parse. The minimum macOS shown is a placeholder; real packaging computes it from the binaries.
+- These inputs were each refused with a specific message: an unknown option, a missing option value, a partial Apple ID credential set, two credential sets, notarization with an ad-hoc identity, an invalid build number, bundle id, or `--min-macos`, and a missing entitlements file. An existing `Flick.app` was refused without `--force` and only reported in a dry run. Packaging and `--verify` on Linux were refused.
+- `bash packaging/macos/test-package-script.sh` passed 35 checks. It runs the real script against a fake Homebrew prefix of text "Mach-O" files, with stand-ins for `otool`, `install_name_tool`, `codesign`, `lipo`, `plutil`, `sips`, `iconutil`, `xattr`, `hdiutil`, `ditto`, and `brew`. It covered:
+  - the closure walk through absolute, `@rpath`, `@loader_path`, weak, and framework dependencies, with Swift's OS rpath kept;
+  - relinking to `@loader_path`, removal of duplicate build-prefix rpaths, and untouched originals;
+  - the minimum macOS, license and SBOM collection with warnings, and GPL reporting;
+  - signing order, DMG contents, `--verify` acceptance and rejection, `--force`, and a missing dependency that leaves no output.
+
+  The stand-ins follow the documented `otool` output format; real Apple tools were not involved. The harness found one real defect, which was fixed: an `awk … exit` or `head -n 1` reader closed its pipe early, and under `pipefail` the writer's SIGPIPE stopped the script without a message.
+- PyYAML parsed `.github/workflows/ci.yml`. The existing `transfers` and `validate` jobs are identical to the previous revision. actionlint was unavailable and not run, and **the new job has not run**.
+- The documented formula versions, licenses, and build flags for mpv, FFmpeg, LuaJIT, and VapourSynth came from Homebrew's formula API and `homebrew-core` sources on this date. They were not observed in an installed keg.
+
 ### Link downloads on 2026-10-24
 
 Backlog items 26 and 31 add downloads from pasted web links. `src/fetch.rs` has no GPUI dependency and is separate from the torrent session. It runs yt-dlp as a separate process for video pages, downloads direct HTTPS files, and lists Internet Archive items from archive.org's metadata API. `src/services.rs` runs these jobs on the existing background runtime without starting the torrent session, and `src/fetch_ui.rs` shows them on the Downloads page. Internet Archive search results now download over HTTPS instead of through the Archive's torrent. librqbit 9.0.1 is still the newest crates.io release, and its metainfo parser has no web seed (`url-list`) support.
@@ -516,7 +535,7 @@ xcrun --find metal
 xcrun --find metallib
 ```
 
-GPUI 0.2.2 builds Metal shaders and uses libclang to generate platform bindings. GitHub's macOS runners supply Xcode; the workflow checks the selected installation. Install a libmpv build matching the machine's architecture for playback. FFmpeg is needed only to generate fixtures. A real desktop session is needed to exercise the player.
+GPUI 0.2.2 builds Metal shaders and uses libclang to generate platform bindings. GitHub's macOS runners supply Xcode; the workflow checks the selected installation. Install a libmpv build matching the machine's architecture for playback. FFmpeg is needed only to generate fixtures. A real desktop session is needed to exercise the player. To build a self-contained `Flick.app` and DMG, see [Packaging for macOS](PACKAGING.md); the earlier development `Flick.app` and `Flick Preview.app` bundles in this record were local wrappers around a debug binary, and nothing here shows that they carried libmpv.
 
 ### Windows
 

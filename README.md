@@ -123,7 +123,19 @@ GPUI 0.2.2 is pinned. Its transitive `xattr` dependency still uses the `ENOATTR`
 
 ## Platform status
 
-Windows, macOS, and Linux have native CI jobs configured. Only results actually executed are recorded in [validation](docs/VALIDATION.md); configuration alone does not establish support. Native installers and bundled media libraries remain release work.
+Windows, macOS, and Linux have native CI jobs configured. Only results actually executed are recorded in [validation](docs/VALIDATION.md); configuration alone does not establish support. Windows and Linux installers remain release work.
+
+## Packaging for macOS
+
+`scripts/package-macos.sh` builds a `Flick.app` that carries libmpv and its libraries, so it runs without Homebrew. It signs the app with the hardened runtime, can notarize it, and builds a DMG:
+
+```sh
+brew install mpv
+scripts/package-macos.sh            # ad-hoc signed, in target/macos/
+scripts/package-macos.sh --dry-run  # print the plan; works on any OS
+```
+
+Set `FLICK_CODESIGN_IDENTITY` and notarization credentials for a distributable build. The bundled Homebrew libmpv and FFmpeg are GPL-licensed, which affects how Flick itself can be distributed. See [Packaging for macOS](docs/PACKAGING.md) for options, entitlements, licenses, and the CI job. The script has not yet run on a Mac.
 
 ## Code organization
 

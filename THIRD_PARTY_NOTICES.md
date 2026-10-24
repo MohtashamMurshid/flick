@@ -28,6 +28,18 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 
+## Libraries bundled in the macOS app
+
+The source repository contains no libmpv or FFmpeg code. A `Flick.app` built by `scripts/package-macos.sh` redistributes libmpv and every non-system library it loads, copied from the build machine's installation (by default Homebrew). Their license texts, Homebrew's SBOM, and a manifest listing each library's formula, version, declared license, and source URL are placed in `Flick.app/Contents/Resources/Licenses/`. That folder also holds this file, the Inter font license (`assets/fonts/OFL.txt`), and the Hugeicons license (`assets/icons/LICENSE`).
+
+The exact set changes with each Homebrew update; the manifest in each bundle records what it ships. On 2026-10-24 Homebrew's formulae declared, among others:
+
+- mpv 0.41.0: GPL-2.0-or-later AND LGPL-2.1-or-later, built with mpv's GPL configuration and LuaJIT.
+- FFmpeg 9.0.2: GPL-3.0-or-later (`--enable-gpl --enable-version3`, with x264 and x265).
+- LuaJIT: MIT.
+
+Distributing such a bundle distributes GPL binaries. Flick's own license, the corresponding-source offer, Rust crate notices, and codec patents are unresolved. See [Packaging for macOS](docs/PACKAGING.md#licenses-and-what-the-bundle-ships) before publishing a build.
+
 ## GPUI text input example
 
 `src/input.rs` is adapted from GPUI 0.2.2 `examples/input.rs`.
