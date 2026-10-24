@@ -40,6 +40,7 @@ Player keys can be changed on the **Keyboard Shortcuts** page, which also lists 
 | Up / Down | Raise or lower volume |
 | M | Mute or unmute |
 | F | Toggle fullscreen |
+| P | Picture in picture |
 | , / . | Previous or next frame |
 | J / K / L | Slower or back 10 seconds / pause at normal speed / play, then faster |
 | 0–9 | Jump to 0–90% of the video |

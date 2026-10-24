@@ -18,6 +18,7 @@ pub enum Shortcut {
     VolumeDown,
     Mute,
     Fullscreen,
+    PictureInPicture,
     FrameBack,
     FrameForward,
     ShuttleBack,
@@ -35,7 +36,7 @@ pub enum Shortcut {
 
 impl Shortcut {
     /// Every shortcut, in the order the shortcuts page lists them.
-    pub const ALL: [Self; 20] = [
+    pub const ALL: [Self; 21] = [
         Self::PlayPause,
         Self::SeekBack,
         Self::SeekForward,
@@ -43,6 +44,7 @@ impl Shortcut {
         Self::VolumeDown,
         Self::Mute,
         Self::Fullscreen,
+        Self::PictureInPicture,
         Self::FrameBack,
         Self::FrameForward,
         Self::ShuttleBack,
@@ -67,6 +69,7 @@ impl Shortcut {
             Self::VolumeDown => "Volume down",
             Self::Mute => "Mute",
             Self::Fullscreen => "Fullscreen",
+            Self::PictureInPicture => "Picture in picture",
             Self::FrameBack => "Previous frame",
             Self::FrameForward => "Next frame",
             Self::ShuttleBack => "Slower, or back 10 seconds",
@@ -92,6 +95,7 @@ impl Shortcut {
             Self::VolumeDown => "down",
             Self::Mute => "m",
             Self::Fullscreen => "f",
+            Self::PictureInPicture => "p",
             Self::FrameBack => ",",
             Self::FrameForward => ".",
             Self::ShuttleBack => "j",

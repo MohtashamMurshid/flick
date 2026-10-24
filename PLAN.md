@@ -105,7 +105,7 @@ Features:
 - [x] 18. Library: sort options, a grid/list toggle, Mark as watched, and Remove from Continue watching.
 - [x] 19. Player controls: chapter markers, frame step (`.` and `,`), J/K/L shuttle, number keys for 10–90%, an A–B loop, and audio delay. The software renderer cannot play in reverse, so J slows a shuttle and otherwise goes back 10 seconds.
 - [x] 20. Timeline hover previews, after item 16. A second silent player seeks to the nearest keyframe and shows the frame, time, and chapter above the pointer.
-- [ ] 21. Picture-in-picture, or an always-on-top mini window.
+- [x] 21. Picture-in-picture, or an always-on-top mini window. P or the player button opens a small pop-up window that keeps playing while the library is used. It floats on macOS; on X11 staying above depends on the window manager (Openbox let the main window cover it), and Wayland has no always-on-top request.
 - [ ] 22. OpenSubtitles search from the Audio & subtitles menu.
 - [ ] 23. Watch while downloading (stage 4): stream verified pieces from librqbit and prioritize pieces near the playhead.
 - [ ] 24. Transfer gaps from stage 2: delete-files confirmation, upload rate, torrent export, seeding preference, resume keyed by infohash, bandwidth limits, and global pause.

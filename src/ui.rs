@@ -2,6 +2,8 @@
 mod chrome_ui;
 #[path = "library_ui.rs"]
 mod library_ui;
+#[path = "pip_ui.rs"]
+mod pip_ui;
 #[path = "player_ui.rs"]
 mod player_ui;
 #[path = "settings_ui.rs"]
@@ -19,9 +21,10 @@ use crate::{
 };
 use chrome_ui::{h_flex, v_flex};
 use gpui::{
-    Bounds, ClickEvent, ClipboardItem, Context, Div, ElementId, Entity, ExternalPaths, FocusHandle,
-    Focusable, KeyDownEvent, MouseButton, ObjectFit, PathPromptOptions, Pixels, RenderImage,
-    SharedString, Stateful, Window, canvas, div, img, prelude::*, px, relative, rgb, rgba,
+    AnyWindowHandle, Bounds, ClickEvent, ClipboardItem, Context, Div, ElementId, Entity,
+    ExternalPaths, FocusHandle, Focusable, KeyDownEvent, MouseButton, ObjectFit, PathPromptOptions,
+    Pixels, RenderImage, SharedString, Stateful, Window, canvas, div, img, prelude::*, px,
+    relative, rgb, rgba,
 };
 use std::{
     cell::{Cell, RefCell},
@@ -115,6 +118,7 @@ enum Control {
     Louder,
     Speed,
     Fullscreen,
+    Pip,
     Tracks,
     Subtitle,
     Keys,
@@ -217,6 +221,9 @@ pub struct Flick {
     preview_image: Option<Arc<RenderImage>>,
     /// Bounds of the keyboard-focused card, where its menu opens.
     focused_card: Rc<Cell<Bounds<Pixels>>>,
+    /// The picture-in-picture window while it is open.
+    pip: Option<pip_ui::PipHandle>,
+    main_window: Option<AnyWindowHandle>,
 }
 
 impl Flick {
@@ -339,6 +346,8 @@ impl Flick {
             hover: None,
             preview_requested: f64::NAN,
             preview_image: None,
+            pip: None,
+            main_window: Some(window.window_handle()),
         };
         this.apply_preferences();
         // Posters deleted from the cache are made again.
@@ -351,7 +360,13 @@ impl Flick {
                 video.poster = None;
             }
         }
-        cx.on_release(|this, _| this.persist()).detach();
+        cx.on_release(|this, cx| {
+            this.persist();
+            if let Some(pip) = this.pip.take() {
+                let _ = pip.update(cx, |_, window, _| window.remove_window());
+            }
+        })
+        .detach();
         cx.spawn_in(window, async move |this, cx| {
             let mut delay = Duration::from_millis(100);
             loop {
@@ -686,11 +701,19 @@ impl Flick {
             self.snapshot = next;
             self.last_snapshot = Instant::now();
         }
-        if self.file_loaded && self.view == View::Player {
+        let pip_target = self.pip_target(cx);
+        if self.pip.is_some() && pip_target.is_none() {
+            // The window was closed some other way.
+            self.pip = None;
+            changed = true;
+        }
+        if self.file_loaded && (self.view == View::Player || pip_target.is_some()) {
             let bounds = self.video_bounds.get();
             let width = f32::from(bounds.size.width).max(1.);
             let height = f32::from(bounds.size.height).max(1.);
-            let (w, h) = flick::presentation::target_size(width, height, window.scale_factor());
+            let (w, h) = pip_target.unwrap_or_else(|| {
+                flick::presentation::target_size(width, height, window.scale_factor())
+            });
             match player.render(w.max(1), h.max(1)) {
                 Ok(Some(frame)) => {
                     if let Some(buffer) =
@@ -698,6 +721,7 @@ impl Flick {
                     {
                         let next = Arc::new(RenderImage::new(vec![image::Frame::new(buffer)]));
                         if let Some(old) = self.frame.replace(next) {
+                            self.drop_pip_image(&old, cx);
                             let _ = window.drop_image(old);
                         }
                         if let Some(started) = self.opened_at.take() {
@@ -842,7 +866,10 @@ impl Flick {
         match control {
             Control::Library => {
                 self.persist();
-                self.property("pause", "yes", cx);
+                // Picture in picture keeps playing while the library is used.
+                if self.pip.is_none() {
+                    self.property("pause", "yes", cx);
+                }
                 self.view = View::Library;
                 self.menu = None;
                 window.set_window_title("Flick");
@@ -910,6 +937,7 @@ impl Flick {
                 self.property("speed", &next.to_string(), cx);
             }
             Control::Fullscreen => window.toggle_fullscreen(),
+            Control::Pip => self.toggle_pip(window, cx),
             Control::DismissError => {
                 self.error = None;
                 cx.notify();
@@ -965,6 +993,7 @@ impl Flick {
             Shortcut::VolumeDown => self.handle(Control::Quieter, window, cx),
             Shortcut::Mute => self.handle(Control::Mute, window, cx),
             Shortcut::Fullscreen => self.handle(Control::Fullscreen, window, cx),
+            Shortcut::PictureInPicture => self.handle(Control::Pip, window, cx),
             Shortcut::ShowShortcuts => self.handle(Control::Keys, window, cx),
             _ if !loaded => {}
             Shortcut::FrameBack => self.command(&["frame-back-step"], cx),

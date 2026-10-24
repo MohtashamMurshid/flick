@@ -136,10 +136,34 @@ impl Flick {
                     cx.notify();
                 }
             }))
-            .when_some(self.frame.clone(), |d, frame| {
-                d.child(img(frame).size_full().object_fit(ObjectFit::Contain))
+            .when(self.pip.is_some(), |d| {
+                d.child(
+                    v_flex()
+                        .items_center()
+                        .gap_3()
+                        .text_color(rgb(ON_VIDEO))
+                        .child(icon("picture-in-picture", 40., rgba(0xffffffb3)))
+                        .child(
+                            div()
+                                .text_size(t.font(20.))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .child("Playing in picture in picture"),
+                        )
+                        .child(self.button(
+                            "pip-return",
+                            Some("maximize"),
+                            "Show Here",
+                            true,
+                            cx,
+                            |this, _, cx| this.close_pip(true, cx),
+                        )),
+                )
             })
-            .when(self.frame.is_none(), |d| {
+            .when_some(
+                self.frame.clone().filter(|_| self.pip.is_none()),
+                |d, frame| d.child(img(frame).size_full().object_fit(ObjectFit::Contain)),
+            )
+            .when(self.frame.is_none() && self.pip.is_none(), |d| {
                 let failed = self.error.is_some();
                 d.child(
                     v_flex()
@@ -708,6 +732,13 @@ impl Flick {
             Control::Tracks,
             cx,
         );
+        let pip = self.overlay_button(
+            "pip",
+            "picture-in-picture",
+            "Picture in picture (P)",
+            Control::Pip,
+            cx,
+        );
         let full = self.overlay_button(
             "fullscreen",
             if fullscreen { "minimize" } else { "maximize" },
@@ -732,7 +763,7 @@ impl Flick {
                     v_flex()
                         .id("player-hud")
                         .w(relative(0.72))
-                        .max_w(px(580.))
+                        .max_w(px(640.))
                         .px_4()
                         .pt_2()
                         .pb_3()
@@ -748,7 +779,7 @@ impl Flick {
                             h_flex()
                                 .child(
                                     h_flex()
-                                        .w(px(130.))
+                                        .w(px(164.))
                                         .gap_1()
                                         .child(mute)
                                         .child(self.volume_slider(72., cx)),
@@ -764,11 +795,12 @@ impl Flick {
                                 )
                                 .child(
                                     h_flex()
-                                        .w(px(130.))
+                                        .w(px(164.))
                                         .justify_end()
                                         .gap_1()
                                         .child(self.speed_button(cx))
                                         .child(tracks)
+                                        .child(pip)
                                         .child(full),
                                 ),
                         )
@@ -848,6 +880,7 @@ impl Flick {
                                     .gap_1()
                                     .child(self.speed_button(cx))
                                     .child(tracks)
+                                    .child(pip)
                                     .child(mute)
                                     .child(self.volume_slider(88., cx))
                                     .child(full),
@@ -878,6 +911,7 @@ impl Flick {
                 .child(mute)
                 .child(self.volume_slider(72., cx))
                 .child(tracks)
+                .child(pip)
                 .child(full)
                 .into_any_element(),
         }
