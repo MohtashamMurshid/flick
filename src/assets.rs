@@ -1,4 +1,4 @@
-use gpui::{AssetSource, SharedString, Styled, Svg, px, rgb, svg};
+use gpui::{AssetSource, Hsla, SharedString, Styled, Svg, px, svg};
 use std::borrow::Cow;
 
 macro_rules! embedded_icons {
@@ -26,11 +26,9 @@ embedded_icons!(
     "pause",
     "check",
     "x",
-    "chevron-down",
     "captions",
     "audio-lines",
     "circle-alert",
-    "file-video",
     "upload",
     "search",
     "library",
@@ -38,6 +36,15 @@ embedded_icons!(
     "download",
     "share-2",
     "folder-plus",
+    "house",
+    "palette",
+    "square",
+    "copy",
+    "monitor",
+    "info",
+    "sun",
+    "eye-off",
+    "magnet",
 );
 
 pub struct Assets;
@@ -59,9 +66,9 @@ impl AssetSource for Assets {
     }
 }
 
-pub fn icon(name: &'static str, size: f32, color: u32) -> Svg {
+pub fn icon(name: &'static str, size: f32, color: impl Into<Hsla>) -> Svg {
     svg()
         .path(format!("icons/{name}.svg"))
         .size(px(size))
-        .text_color(rgb(color))
+        .text_color(color)
 }

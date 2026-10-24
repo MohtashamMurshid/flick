@@ -6,11 +6,33 @@ Flick targets Windows, macOS, and Linux. A CI configuration is not evidence of a
 
 | Platform | Native compilation and tests | Desktop playback | Native GPU video path |
 | --- | --- | --- | --- |
-| Linux | Native debug build, formatting, strict Clippy, 9 unit tests and 3 real-libmpv tests pass | Xvfb/Openbox session exercised; null audio | Deferred |
+| Linux | Native debug build, formatting, strict Clippy, and 26 ordinary tests pass on 2026-10-24; 3 real-libmpv tests passed earlier | Xvfb/Openbox session exercised in all three interface styles; null audio | Deferred |
 | Windows | Workflow configured; not run here | Pending native machine | Deferred |
 | macOS | Debug compilation, formatting, strict Clippy, 23 tests, and an opt-in native resolution test pass on 2026-10-25 | Library/search/resume and public Sintel playback observed; CoreAudio output active | Deferred |
 
 The presentation adapter transfers decoded BGRA frames through CPU memory into GPUI images. It sizes frames to physical video bounds without a fixed resolution, axis, or pixel-budget cap. Checked native dimensions and allocation failures produce explicit errors. GPU rendering of those images does not establish hardware video decoding or zero-copy presentation. Treat this as a functional prototype. Hardware decoding, efficient GPU surface sharing, HDR correctness, battery use, and claims of being faster than VLC remain unverified.
+
+### Native interface styles on 2026-10-24
+
+Flick now draws macOS, Windows 11, and GNOME styles (`src/theme.rs`, `src/chrome_ui.rs`), with an Appearance page, Hugeicons assets, a first-run welcome page, card-based Home and All Videos pages, and style-specific auto-hiding player controls.
+
+On Linux, these checks pass: formatting, strict desktop Clippy, all 26 ordinary desktop tests (including three new appearance tests), strict transfer-only Clippy, and all ten tests with `--no-default-features`. The four opt-in libmpv tests were not rerun.
+
+The debug build was run under Xvfb with Openbox and Mesa Lavapipe, using null audio and a generated 12-second fixture with subtitles. Settings lived in a temporary `HOME`. Each style was captured in dark mode on the first-run, Home, Appearance, and player screens, plus Home in light mode. These interactions were observed:
+
+- A style tile on the Appearance page restyled the window immediately and was saved to `settings.json`.
+- The Downloads sidebar item opened the empty Downloads page.
+- `?` opened the shortcuts panel.
+- Playback controls hid after 2.5 seconds without pointer movement.
+- Subtitles moved above visible controls and returned to the bottom when the controls hid.
+
+[Home in the macOS style](screenshots/flick-mac-dark-home.png), [Windows 11](screenshots/flick-windows-dark-home.png), and [GNOME](screenshots/flick-gnome-dark-home.png). Also: [playback in the Windows style](screenshots/flick-windows-dark-player.png), [Appearance in the GNOME style](screenshots/flick-gnome-dark-appearance.png), and [the macOS-style welcome page](screenshots/flick-mac-dark-first.png). These captures crop the Openbox frame. Openbox provided server-side decorations, so Flick did not draw its own window controls.
+
+Not verified:
+
+- **Linux client-side decorations.** A test-only helper advertised a compositor and `_GTK_FRAME_EXTENTS`, but GPUI presented only black frames without a real compositor. Flick's drawn window controls, shadow, rounded frame, and resize edges remain unchecked on GNOME/Wayland.
+- **macOS and Windows.** Traffic-light alignment, Windows caption buttons and Snap Layouts, and native platform fonts were not checked on those systems.
+- **Transfers.** The share → download → Play GUI flow was not re-exercised for this change.
 
 ### Pull request review follow-up on 2026-10-25
 

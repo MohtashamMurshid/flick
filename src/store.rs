@@ -22,6 +22,7 @@ pub struct Settings {
     pub speed: f64,
     pub recent: Vec<RecentFile>,
     pub library: Vec<LibraryVideo>,
+    pub appearance: crate::theme::Appearance,
 }
 
 impl Default for Settings {
@@ -32,6 +33,7 @@ impl Default for Settings {
             speed: 1.0,
             recent: Vec::new(),
             library: Vec::new(),
+            appearance: crate::theme::Appearance::default(),
         }
     }
 }
