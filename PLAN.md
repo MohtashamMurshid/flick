@@ -100,11 +100,11 @@ Performance:
 
 Features:
 
-- [ ] 16. Real thumbnails: capture and cache a poster frame using the software renderer, recording duration and resolution at the same time. Cards currently use a hashed gradient.
+- [x] 16. Real thumbnails: capture and cache a poster frame using the software renderer, recording duration and resolution at the same time. Cards currently use a hashed gradient. A background thread with its own silent player saves PNG posters to the cache, retrying later in the video if the frame is nearly black; cards show resolution badges and durations.
 - [x] 17. Group series by `S01E02`-style names and folders, and advance to the next episode automatically. A Shows page lists each show's episodes by season; Shift+N and Shift+P change episodes, and an 8-second Up next countdown can be turned off in Appearance.
 - [x] 18. Library: sort options, a grid/list toggle, Mark as watched, and Remove from Continue watching.
 - [x] 19. Player controls: chapter markers, frame step (`.` and `,`), J/K/L shuttle, number keys for 10–90%, an A–B loop, and audio delay. The software renderer cannot play in reverse, so J slows a shuttle and otherwise goes back 10 seconds.
-- [ ] 20. Timeline hover previews, after item 16.
+- [x] 20. Timeline hover previews, after item 16. A second silent player seeks to the nearest keyframe and shows the frame, time, and chapter above the pointer.
 - [ ] 21. Picture-in-picture, or an always-on-top mini window.
 - [ ] 22. OpenSubtitles search from the Audio & subtitles menu.
 - [ ] 23. Watch while downloading (stage 4): stream verified pieces from librqbit and prioritize pieces near the playhead.

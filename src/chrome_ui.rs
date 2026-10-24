@@ -89,6 +89,66 @@ pub(super) fn thumbnail(title: &str, width: f32, height: f32, radius: f32) -> Di
 }
 
 impl Flick {
+    /// A video's cached poster, or the placeholder until it exists. A badge
+    /// shows the resolution once known.
+    pub(super) fn poster(
+        &self,
+        path: &std::path::Path,
+        title: &str,
+        width: f32,
+        height: f32,
+        radius: f32,
+        cx: &Context<Self>,
+    ) -> Div {
+        let video = self
+            .store
+            .data
+            .library
+            .iter()
+            .find(|video| video.path == path);
+        let Some(poster) = video.and_then(|video| video.poster.clone()) else {
+            return thumbnail(title, width, height, radius);
+        };
+        let fallback = title.to_owned();
+        let badge = video
+            .and_then(|video| video.resolution())
+            .filter(|_| width >= 120.);
+        let t = cx.theme();
+        div()
+            .flex_none()
+            .relative()
+            .w(px(width))
+            .h(px(height))
+            .rounded(px(radius))
+            .overflow_hidden()
+            .bg(rgb(0x000000))
+            .child(
+                img(poster)
+                    .absolute()
+                    .inset_0()
+                    .size_full()
+                    .object_fit(ObjectFit::Cover)
+                    .with_fallback(move || {
+                        thumbnail(&fallback, width, height, radius).into_any_element()
+                    }),
+            )
+            .when_some(badge, |d, badge| {
+                d.child(
+                    div()
+                        .absolute()
+                        .top(px(6.))
+                        .right(px(6.))
+                        .px_1p5()
+                        .rounded(px(4.))
+                        .bg(rgba(0x000000b3))
+                        .text_color(rgb(0xffffff))
+                        .text_size(t.font(10.5))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .child(badge),
+                )
+            })
+    }
+
     /// The focus handle that puts the control with this ID in the Tab order.
     pub(super) fn control_handle(&self, id: &ElementId, cx: &App) -> FocusHandle {
         self.control_focus

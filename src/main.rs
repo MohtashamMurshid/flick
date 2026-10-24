@@ -7,6 +7,7 @@ mod shortcuts;
 mod smoke;
 mod store;
 mod theme;
+mod thumbnails;
 mod ui;
 
 use gpui::{

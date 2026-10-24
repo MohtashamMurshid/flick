@@ -78,15 +78,55 @@ pub struct RecentFile {
 pub struct LibraryVideo {
     pub path: PathBuf,
     pub title: String,
+    /// A cached poster frame, made by the thumbnail worker.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub poster: Option<PathBuf>,
+    /// Seconds, or 0 until the video has been read.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub duration: f64,
+    /// Display size after aspect correction, or 0 until known.
+    #[serde(skip_serializing_if = "is_zero_u32")]
+    pub width: u32,
+    #[serde(skip_serializing_if = "is_zero_u32")]
+    pub height: u32,
+}
+
+fn is_zero(value: &f64) -> bool {
+    *value == 0.0
+}
+
+fn is_zero_u32(value: &u32) -> bool {
+    *value == 0
+}
+
+impl LibraryVideo {
+    fn new(path: PathBuf) -> Self {
+        Self {
+            title: file_title(&path),
+            path,
+            ..Default::default()
+        }
+    }
+
+    /// A short resolution label such as `4K` or `1080p`.
+    pub fn resolution(&self) -> Option<&'static str> {
+        let (w, h) = (self.width.max(self.height), self.width.min(self.height));
+        Some(match (w, h) {
+            (0, _) | (_, 0) => return None,
+            (w, h) if w >= 7680 || h >= 4320 => "8K",
+            (w, h) if w >= 3840 || h >= 2160 => "4K",
+            (w, h) if w >= 2560 || h >= 1440 => "1440p",
+            (w, h) if w >= 1920 || h >= 1080 => "1080p",
+            (w, h) if w >= 1280 || h >= 720 => "720p",
+            _ => "SD",
+        })
+    }
 }
 
 impl Settings {
     pub fn add_video(&mut self, path: &Path) {
         if !path.as_os_str().is_empty() && !self.library.iter().any(|v| v.path == path) {
-            self.library.push(LibraryVideo {
-                path: path.to_owned(),
-                title: file_title(path),
-            });
+            self.library.push(LibraryVideo::new(path.to_owned()));
         }
     }
 
@@ -98,10 +138,7 @@ impl Settings {
             .collect::<std::collections::HashSet<_>>();
         for path in paths {
             if !path.as_os_str().is_empty() && known.insert(path.clone()) {
-                self.library.push(LibraryVideo {
-                    title: file_title(&path),
-                    path,
-                });
+                self.library.push(LibraryVideo::new(path));
             }
         }
     }
@@ -216,11 +253,11 @@ impl Settings {
         });
         for file in &self.recent {
             if seen_library.insert(file.path.clone()) {
-                self.library.push(LibraryVideo {
-                    path: file.path.clone(),
-                    title: file_title(&file.path),
-                });
+                self.library.push(LibraryVideo::new(file.path.clone()));
             }
+        }
+        for video in &mut self.library {
+            video.duration = non_negative_finite(video.duration);
         }
     }
 }
@@ -435,6 +472,7 @@ mod tests {
         settings.library.push(LibraryVideo {
             path: "existing.mp4".into(),
             title: "Existing title".into(),
+            ..Default::default()
         });
         settings.add_videos([
             "existing.mp4".into(),
@@ -508,6 +546,23 @@ mod tests {
                 .iter()
                 .any(|v| v.path == Path::new("c.mkv"))
         );
+    }
+
+    #[test]
+    fn resolution_labels_cover_landscape_and_portrait() {
+        let video = |width, height| LibraryVideo {
+            width,
+            height,
+            ..Default::default()
+        };
+        assert_eq!(video(3840, 2160).resolution(), Some("4K"));
+        assert_eq!(video(1920, 800).resolution(), Some("1080p"));
+        assert_eq!(video(1080, 1920).resolution(), Some("1080p"));
+        assert_eq!(video(1024, 436).resolution(), Some("SD"));
+        assert_eq!(video(0, 0).resolution(), None);
+        // Unknown details are not written to settings.
+        let json = serde_json::to_string(&video(0, 0)).unwrap();
+        assert!(!json.contains("poster") && !json.contains("duration"));
     }
 
     #[test]

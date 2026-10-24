@@ -494,11 +494,78 @@ impl Flick {
                 if this.scrubbing {
                     this.seek_at(e.position.x, cx);
                 }
+                this.hover_timeline(e.position.x, cx);
+            }))
+            .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
+                if !hovered {
+                    this.hover = None;
+                    cx.notify();
+                }
             }))
             .on_mouse_up(
                 MouseButton::Left,
                 cx.listener(|this, _, _, _| this.scrubbing = false),
             )
+            .when_some(self.timeline_preview(cx), |d, preview| d.child(preview))
+    }
+
+    /// The frame and time under the pointer, above the timeline.
+    fn timeline_preview(&self, cx: &Context<Self>) -> Option<Div> {
+        let (fraction, time) = self.hover?;
+        let t = cx.theme();
+        let width = 192.;
+        let chapter = self
+            .snapshot
+            .chapters
+            .iter()
+            .rev()
+            .find(|chapter| chapter.time <= time && !chapter.title.is_empty())
+            .map(|chapter| chapter.title.clone());
+        Some(
+            div()
+                .absolute()
+                .bottom(px(22.))
+                .left(relative(fraction))
+                .ml(px(-width / 2. - 4.))
+                .child(
+                    v_flex()
+                        .w(px(width + 8.))
+                        .p_1()
+                        .gap_1()
+                        .items_center()
+                        .rounded(px(t.radius + 2.))
+                        .bg(rgba(0x000000d9))
+                        .border_1()
+                        .border_color(rgba(0xffffff26))
+                        .shadow_lg()
+                        .text_color(rgb(ON_VIDEO))
+                        .when_some(self.preview_image.clone(), |d, image| {
+                            d.child(
+                                img(image)
+                                    .w(px(width))
+                                    .h(px(width * 9. / 16.))
+                                    .rounded(px(t.radius))
+                                    .object_fit(ObjectFit::Contain),
+                            )
+                        })
+                        .when_some(chapter, |d, chapter| {
+                            d.child(
+                                div()
+                                    .max_w(px(width))
+                                    .overflow_hidden()
+                                    .whitespace_nowrap()
+                                    .text_size(t.font(11.))
+                                    .child(chapter),
+                            )
+                        })
+                        .child(
+                            div()
+                                .text_size(t.font(11.5))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .child(format_time(time)),
+                        ),
+                ),
+        )
     }
 
     fn volume_slider(&self, width: f32, cx: &Context<Self>) -> Stateful<Div> {
@@ -745,7 +812,10 @@ impl Flick {
                                     .flex_1()
                                     .min_w(px(0.))
                                     .gap_3()
-                                    .child(thumbnail(&title, 44., 44., 4.))
+                                    .child(match self.path.as_deref() {
+                                        Some(path) => self.poster(path, &title, 44., 44., 4., cx),
+                                        None => thumbnail(&title, 44., 44., 4.),
+                                    })
                                     .child(
                                         v_flex()
                                             .min_w(px(0.))

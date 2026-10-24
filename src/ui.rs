@@ -200,6 +200,21 @@ pub struct Flick {
     up_next: Option<(PathBuf, Instant)>,
     /// Whether the last snapshot was at the end, to notice new endings.
     was_eof: bool,
+    thumbnails: crate::thumbnails::Thumbnails,
+    /// Videos already sent to the thumbnail worker this session.
+    poster_requests: HashSet<PathBuf>,
+    /// Poster results not yet saved to settings.
+    posters_unsaved: bool,
+    /// Started on the first timeline hover.
+    previews: Option<crate::thumbnails::Previews>,
+    preview_generation: u64,
+    /// Results up to this generation are stale.
+    preview_shown: u64,
+    /// The hovered timeline position as a fraction, and its time.
+    hover: Option<(f32, f64)>,
+    /// The time of the last preview requested.
+    preview_requested: f64,
+    preview_image: Option<Arc<RenderImage>>,
     /// Bounds of the keyboard-focused card, where its menu opens.
     focused_card: Rc<Cell<Bounds<Pixels>>>,
 }
@@ -315,8 +330,27 @@ impl Flick {
             selected_show: None,
             up_next: None,
             was_eof: false,
+            thumbnails: crate::thumbnails::Thumbnails::start(thumbnail_cache()),
+            poster_requests: HashSet::new(),
+            posters_unsaved: false,
+            previews: None,
+            preview_generation: 0,
+            preview_shown: 0,
+            hover: None,
+            preview_requested: f64::NAN,
+            preview_image: None,
         };
         this.apply_preferences();
+        // Posters deleted from the cache are made again.
+        for video in &mut this.store.data.library {
+            if video
+                .poster
+                .as_ref()
+                .is_some_and(|poster| !poster.is_file())
+            {
+                video.poster = None;
+            }
+        }
         cx.on_release(|this, _| this.persist()).detach();
         cx.spawn_in(window, async move |this, cx| {
             let mut delay = Duration::from_millis(100);
@@ -448,6 +482,12 @@ impl Flick {
                 self.opened_at = Some(Instant::now());
                 self.up_next = None;
                 self.was_eof = false;
+                self.hover = None;
+                self.preview_requested = f64::NAN;
+                self.preview_shown = self.preview_generation;
+                if let Some(old) = self.preview_image.take() {
+                    let _ = window.drop_image(old);
+                }
                 self.pointer_moved_at = Instant::now();
                 self.controls_shown = true;
                 if let Some(old) = self.frame.take() {
@@ -490,8 +530,98 @@ impl Flick {
             || self.pointer_moved_at.elapsed() < CONTROLS_TIMEOUT
     }
 
+    /// Queues posters for library videos without one, and stores results.
+    fn update_posters(&mut self, cx: &mut Context<Self>) {
+        for video in &self.store.data.library {
+            if video.poster.is_none() && !self.poster_requests.contains(&video.path) {
+                self.poster_requests.insert(video.path.clone());
+                self.thumbnails.request(video.path.clone());
+            }
+        }
+        let mut changed = false;
+        for poster in self.thumbnails.drain().collect::<Vec<_>>() {
+            let Some(video) = self
+                .store
+                .data
+                .library
+                .iter_mut()
+                .find(|video| video.path == poster.video)
+            else {
+                continue;
+            };
+            match poster.result {
+                Ok((image, details)) => {
+                    video.poster = Some(image);
+                    video.duration = details.duration;
+                    video.width = details.width;
+                    video.height = details.height;
+                    changed = true;
+                }
+                // Missing or unreadable files keep the placeholder; they are
+                // tried again next launch.
+                Err(error) => tracing::debug!(path = %poster.video.display(), %error, "No poster"),
+            }
+        }
+        if changed {
+            self.posters_unsaved = true;
+            cx.notify();
+        }
+        // Save in batches rather than once per poster.
+        if self.posters_unsaved && self.last_saved.elapsed() > Duration::from_secs(2) {
+            self.posters_unsaved = false;
+            self.persist();
+        }
+    }
+
+    /// Shows the frame under the pointer while hovering the timeline.
+    fn hover_timeline(&mut self, x: Pixels, cx: &mut Context<Self>) {
+        let bounds = self.timeline.get();
+        let duration = self.snapshot.duration;
+        let Some(path) = self.path.clone() else {
+            return;
+        };
+        if duration <= 0. || bounds.size.width <= px(0.) {
+            return;
+        }
+        let fraction =
+            (f32::from(x - bounds.origin.x) / f32::from(bounds.size.width)).clamp(0., 1.);
+        let time = f64::from(fraction) * duration;
+        self.hover = Some((fraction, time));
+        // Ask again once the pointer moves by about a pixel's worth of time.
+        let step = (duration / f64::from(f32::from(bounds.size.width))).max(0.25);
+        if (time - self.preview_requested).abs() >= step || self.preview_requested.is_nan() {
+            self.preview_requested = time;
+            self.preview_generation += 1;
+            self.previews
+                .get_or_insert_with(crate::thumbnails::Previews::start)
+                .request(crate::thumbnails::PreviewRequest {
+                    video: path,
+                    time,
+                    generation: self.preview_generation,
+                });
+        }
+        cx.notify();
+    }
+
     fn tick(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Duration {
         self.poll_services(cx);
+        self.update_posters(cx);
+        // A preview for another video, from before it opened, is dropped.
+        if let Some(preview) = self.previews.as_ref().and_then(|p| p.latest())
+            && preview.generation > self.preview_shown
+            && let Some(buffer) = image::RgbaImage::from_raw(
+                preview.frame.width,
+                preview.frame.height,
+                preview.frame.pixels,
+            )
+        {
+            self.preview_shown = preview.generation;
+            let next = Arc::new(RenderImage::new(vec![image::Frame::new(buffer)]));
+            if let Some(old) = self.preview_image.replace(next) {
+                let _ = window.drop_image(old);
+            }
+            cx.notify();
+        }
         if self
             .status
             .as_ref()
@@ -1069,6 +1199,18 @@ impl Flick {
             self.property("volume", &(value * 100.).round().to_string(), cx);
         }
     }
+}
+
+/// Where posters are cached: beside other data with `FLICK_DATA_DIR`, else
+/// in the platform cache directory.
+fn thumbnail_cache() -> Option<PathBuf> {
+    std::env::var_os("FLICK_DATA_DIR")
+        .map(PathBuf::from)
+        .or_else(|| {
+            directories::ProjectDirs::from("app", "Flick", "Flick")
+                .map(|dirs| dirs.cache_dir().to_owned())
+        })
+        .map(|base| base.join("thumbnails"))
 }
 
 /// What the A–B loop key does next.

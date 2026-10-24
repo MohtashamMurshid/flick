@@ -378,6 +378,21 @@ pub struct Player {
 
 impl Player {
     pub fn new() -> Result<Self> {
+        Self::create(&[])
+    }
+
+    /// A silent player for poster frames and previews: no audio output,
+    /// audio decoding, or subtitles.
+    pub fn silent() -> Result<Self> {
+        Self::create(&[
+            ("ao", "null"),
+            ("aid", "no"),
+            ("sid", "no"),
+            ("mute", "yes"),
+        ])
+    }
+
+    fn create(extra: &[(&str, &str)]) -> Result<Self> {
         let api = Api::load()?;
         // SAFETY: the checked function pointer belongs to the loaded library.
         let handle = NonNull::new(unsafe { (api.create)() })
@@ -416,6 +431,9 @@ impl Player {
         // timed null audio device without changing production defaults.
         if std::env::var("FLICK_AUDIO").as_deref() == Ok("null") {
             player.option("ao", "null")?;
+        }
+        for (name, value) in extra {
+            player.option(name, value)?;
         }
         // SAFETY: the handle is live, and all initialization options are set.
         player.api.check(
@@ -571,6 +589,23 @@ impl Player {
             loop_end: point("ab-loop-b"),
             audio_delay: number("audio-delay", 0.0),
         }
+    }
+
+    /// The video's display size after aspect correction, once known.
+    pub fn video_size(&self) -> Option<(u32, u32)> {
+        let dimension = |name| {
+            self.property(name)
+                .and_then(|value| value.parse::<u32>().ok())
+                .filter(|value| *value > 0)
+        };
+        Some((dimension("video-params/dw")?, dimension("video-params/dh")?))
+    }
+
+    /// The video codec's short name, such as `h264`.
+    pub fn video_codec(&self) -> Option<String> {
+        self.property("video-codec-name")
+            .or_else(|| self.property("current-tracks/video/codec"))
+            .filter(|value| !value.is_empty())
     }
 
     /// The active hardware decoder, or `None` while decoding in software.

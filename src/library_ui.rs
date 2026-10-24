@@ -898,7 +898,21 @@ impl Flick {
 
     fn video_detail(&self, path: &std::path::Path) -> (Option<f32>, String) {
         let Some(history) = self.store.data.recent.iter().find(|v| v.path == path) else {
-            return (None, "Not started".into());
+            let duration = self
+                .store
+                .data
+                .library
+                .iter()
+                .find(|video| video.path == path)
+                .map_or(0., |video| video.duration);
+            return (
+                None,
+                if duration > 0. {
+                    format!("Not started · {}", format_time(duration))
+                } else {
+                    "Not started".into()
+                },
+            );
         };
         let resume = self.store.resume_position(path);
         if resume > 0. && history.duration > 0. {
@@ -1106,7 +1120,7 @@ impl Flick {
                 this.open(path.clone(), window, cx)
             }))
             .child(
-                thumbnail(title, width, height, t.card_radius)
+                self.poster(&menu_path, title, width, height, t.card_radius, cx)
                     .relative()
                     .border_1()
                     .border_color(t.border)
@@ -1232,7 +1246,7 @@ impl Flick {
             .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
                 this.open(open_path.clone(), window, cx)
             }))
-            .child(thumbnail(title, 80., 45., t.radius))
+            .child(self.poster(path, title, 80., 45., t.radius, cx))
             .child(
                 v_flex()
                     .flex_1()
@@ -1617,12 +1631,22 @@ impl Flick {
                 cx.notify();
             }))
             .child(
-                thumbnail(
-                    &show.title,
-                    width,
-                    (width * 9. / 16.).round(),
-                    t.card_radius,
-                )
+                match show.episodes.first() {
+                    Some((_, path)) => self.poster(
+                        path,
+                        &show.title,
+                        width,
+                        (width * 9. / 16.).round(),
+                        t.card_radius,
+                        cx,
+                    ),
+                    None => thumbnail(
+                        &show.title,
+                        width,
+                        (width * 9. / 16.).round(),
+                        t.card_radius,
+                    ),
+                }
                 .border_1()
                 .border_color(t.border),
             )

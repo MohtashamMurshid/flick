@@ -24,7 +24,7 @@ path = "src/bin/flick-transfer.rs"
 anyhow = "1"
 directories = "6"
 gpui = { version = "=0.2.2", optional = true }
-image = { version = "0.25", default-features = false, optional = true }
+image = { version = "0.25", default-features = false, features = ["png"], optional = true }
 clap = { version = "4", features = ["derive"] }
 fs2 = "0.4"
 librqbit = { version = "=9.0.1", default-features = false, features = ["rust-tls"] }

@@ -56,7 +56,7 @@ Player keys can be changed on the **Keyboard Shortcuts** page, which also lists 
 
 Tab and Shift+Tab move between controls, with a focus ring and the control's tooltip. Enter or Space activates the focused control. Arrow keys move between video cards and list rows, and Shift+F10 or the Menu key opens a video's menu: Play, Show in Folder, Mark as Watched or Unwatched, and Remove from Continue Watching. Right-click opens the same menu.
 
-Click or drag the timeline to seek or the volume slider to adjust sound. Double-click the video to toggle fullscreen. Chapters and an A–B loop are marked on the timeline.
+Click or drag the timeline to seek or the volume slider to adjust sound. Hover the timeline to preview that moment. Double-click the video to toggle fullscreen. Chapters and an A–B loop are marked on the timeline.
 
 **Appearance** also sets text size, contrast, button labels, and subtitle size, color, background, and position. Auto contrast follows the system's increased-contrast setting on macOS, Windows, and GNOME. Colors meet WCAG AA contrast in every style, scheme, and accent.
 
@@ -101,6 +101,7 @@ Windows, macOS, and Linux have native CI jobs configured. Only results actually 
 - `src/services.rs`: desktop background worker and transfer events.
 - `src/input.rs`: text fields with Unicode/IME and clipboard support, including selectable read-only values.
 - `src/shortcuts.rs`: rebindable player shortcuts.
+- `src/thumbnails.rs`: poster frames, media details, and timeline previews from background players.
 - `src/theme.rs`: interface styles, WCAG contrast adjustment, and appearance settings.
 
 Preferences are saved to `settings.json` in the operating system's per-user application configuration directory. Media files are read in place.
