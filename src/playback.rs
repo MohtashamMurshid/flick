@@ -573,6 +573,12 @@ impl Player {
         }
     }
 
+    /// Read a libmpv diagnostic property without changing playback state.
+    /// Unavailable properties stay `None`, rather than being reported as zero.
+    pub fn diagnostic_property(&self, name: &str) -> Option<String> {
+        self.property(name)
+    }
+
     /// The active hardware decoder, or `None` while decoding in software.
     pub fn hardware_decoder(&self) -> Option<String> {
         self.property("hwdec-current")
