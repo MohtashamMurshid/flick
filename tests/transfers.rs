@@ -338,3 +338,110 @@ async fn metadata_timeout_explains_recovery_without_starting_a_download() -> Res
     .await
     .context("Metadata timeout regression timed out")?
 }
+
+/// A file can be played while it downloads: reads return only verified
+/// bytes in order, a seek near the end fetches those pieces early, and
+/// cancelling ends a read that is waiting for pieces.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn streams_read_verified_bytes_while_downloading() -> Result<()> {
+    timeout(Duration::from_secs(120), async {
+        let root = TempDir::new()?;
+        let source = root.path().join("movie.mp4");
+        let bytes = std::sync::Arc::new(content(12 * 1024 * 1024 + 4099));
+        tokio::fs::write(&source, bytes.as_slice()).await?;
+        let seed = TransferSession::start(config(root.path(), "seed")).await?;
+        let shared = seed.share(&source, vec![]).await?;
+        let peer = seed.listen_addr().context("Missing loopback listener")?;
+        let mut receiver_config = config(root.path(), "receiver");
+        // Slow enough that every check below happens before completion.
+        receiver_config.download_limit_bytes_per_second = NonZeroU32::new(512 * 1024);
+        let receiver = TransferSession::start(receiver_config).await?;
+        let resolved = receiver
+            .resolve(
+                TorrentInput::Magnet(shared.magnet),
+                vec![peer],
+                Duration::from_secs(10),
+            )
+            .await?;
+        let id = receiver.download(&resolved, Some(vec![0])).await?;
+        receiver.resume(&id, vec![peer]).await?;
+        let stream = receiver.open_stream(&id, 0).await?;
+        assert_eq!(stream.len(), bytes.len() as u64);
+        let mut stream = stream.into_blocking(&tokio::runtime::Handle::current());
+        let total = bytes.len() as u64;
+        let incomplete = |stage: &str| -> Result<()> {
+            let verified = receiver.snapshot(&id)?.verified_bytes;
+            ensure!(verified < total, "The download finished before {stage}");
+            Ok(())
+        };
+
+        let expected = bytes.clone();
+        stream = tokio::task::spawn_blocking(move || {
+            let mut start = vec![0; 200_000];
+            let mut filled = 0;
+            while filled < start.len() {
+                let read = stream.read(&mut start[filled..])?;
+                ensure!(read > 0, "Early end of stream");
+                filled += read;
+            }
+            ensure!(
+                start == expected[..start.len()],
+                "Stream start differs from source"
+            );
+            Ok::<_, anyhow::Error>(stream)
+        })
+        .await??;
+        incomplete("the start was read")?;
+
+        let expected = bytes.clone();
+        let tail = total - 50_000;
+        stream = tokio::task::spawn_blocking(move || {
+            ensure!(stream.seek(tail)? == tail, "Seek landed elsewhere");
+            let mut end = Vec::new();
+            let mut buffer = vec![0; 16 * 1024];
+            loop {
+                let read = stream.read(&mut buffer)?;
+                if read == 0 {
+                    break;
+                }
+                end.extend_from_slice(&buffer[..read]);
+            }
+            ensure!(
+                end == expected[tail as usize..],
+                "Stream end differs from source"
+            );
+            Ok::<_, anyhow::Error>(stream)
+        })
+        .await??;
+        // The end arrived ahead of the middle, so the seek was prioritized.
+        incomplete("the end was read")?;
+
+        // A read waiting on a paused download ends when cancelled.
+        receiver.pause(&id).await?;
+        let cancel = stream.canceller();
+        let middle = total / 2 + 777;
+        let waiting = tokio::task::spawn_blocking(move || {
+            stream.seek(middle)?;
+            let mut buffer = vec![0; 64 * 1024];
+            // Read through verified data until a missing piece blocks.
+            loop {
+                match stream.read(&mut buffer) {
+                    Ok(0) => return Ok::<_, anyhow::Error>(false),
+                    Ok(_) => continue,
+                    Err(_) => return Ok(stream.read(&mut buffer).is_err()),
+                }
+            }
+        });
+        sleep(Duration::from_millis(500)).await;
+        cancel.cancel();
+        let failed_after_cancel = timeout(Duration::from_secs(5), waiting)
+            .await
+            .context("Cancelling did not end the waiting read")???;
+        ensure!(failed_after_cancel, "Reads continued after cancelling");
+        receiver.stop().await;
+        seed.stop().await;
+        Ok(())
+    })
+    .await
+    .context("Streaming test timed out")?
+}

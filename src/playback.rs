@@ -42,6 +42,8 @@ pub struct PlaybackSnapshot {
     pub loop_end: Option<f64>,
     /// Seconds; positive delays audio relative to video.
     pub audio_delay: f64,
+    /// Waiting for stream data, such as torrent pieces.
+    pub buffering: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -65,6 +67,7 @@ impl Default for PlaybackSnapshot {
             loop_start: None,
             loop_end: None,
             audio_delay: 0.0,
+            buffering: false,
         }
     }
 }
@@ -114,6 +117,150 @@ type Render = unsafe extern "C" fn(*mut c_void, *mut RenderParam) -> c_int;
 type RenderUpdate = unsafe extern "C" fn(*mut c_void) -> u64;
 type RenderCallback = unsafe extern "C" fn(*mut c_void);
 type SetRenderCallback = unsafe extern "C" fn(*mut c_void, Option<RenderCallback>, *mut c_void);
+type StreamOpen = unsafe extern "C" fn(*mut c_void, *mut c_char, *mut StreamCallbacks) -> c_int;
+type StreamAdd = unsafe extern "C" fn(*mut c_void, *const c_char, *mut c_void, StreamOpen) -> c_int;
+
+/// `mpv_stream_cb_info` from libmpv/stream_cb.h.
+#[repr(C)]
+struct StreamCallbacks {
+    cookie: *mut c_void,
+    read: Option<unsafe extern "C" fn(*mut c_void, *mut c_char, u64) -> i64>,
+    seek: Option<unsafe extern "C" fn(*mut c_void, i64) -> i64>,
+    size: Option<unsafe extern "C" fn(*mut c_void) -> i64>,
+    close: Option<unsafe extern "C" fn(*mut c_void)>,
+    cancel: Option<unsafe extern "C" fn(*mut c_void)>,
+}
+
+/// libmpv's MPV_ERROR_LOADING_FAILED and MPV_ERROR_UNSUPPORTED.
+const MPV_ERROR_LOADING_FAILED: c_int = -13;
+const MPV_ERROR_UNSUPPORTED: i64 = -18;
+
+/// A readable, seekable source behind a custom URL scheme, such as a
+/// torrent file that is still downloading. Reads may block until verified
+/// data is available; libmpv calls them on its demuxer thread.
+pub trait MediaStream: Send {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize>;
+    fn seek(&mut self, offset: u64) -> std::io::Result<u64>;
+    fn size(&self) -> Option<u64>;
+    /// Makes a blocked read fail promptly; called from another thread.
+    fn canceller(&self) -> Arc<dyn Fn() + Send + Sync>;
+}
+
+/// Opens a stream for a URI of a registered protocol.
+pub type StreamOpener = dyn Fn(&str) -> std::io::Result<Box<dyn MediaStream>> + Send + Sync;
+
+struct StreamCookie {
+    stream: Mutex<Box<dyn MediaStream>>,
+    cancel: Arc<dyn Fn() + Send + Sync>,
+}
+
+/// Runs a callback body without letting a panic cross into C.
+fn guarded<T>(fallback: T, body: impl FnOnce() -> T) -> T {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(body)).unwrap_or(fallback)
+}
+
+unsafe extern "C" fn stream_open(
+    opener: *mut c_void,
+    uri: *mut c_char,
+    info: *mut StreamCallbacks,
+) -> c_int {
+    guarded(MPV_ERROR_LOADING_FAILED, || {
+        // SAFETY: the opener is the Arc boxed by register_protocol, alive
+        // until the core is destroyed; uri and info are valid for this call.
+        let opener = unsafe { &*opener.cast::<Arc<StreamOpener>>() };
+        let Ok(uri) = unsafe { CStr::from_ptr(uri) }.to_str() else {
+            return MPV_ERROR_LOADING_FAILED;
+        };
+        let stream = match opener(uri) {
+            Ok(stream) => stream,
+            Err(error) => {
+                tracing::warn!(%error, uri, "Could not open stream");
+                return MPV_ERROR_LOADING_FAILED;
+            }
+        };
+        let cookie = Box::new(StreamCookie {
+            cancel: stream.canceller(),
+            stream: Mutex::new(stream),
+        });
+        // SAFETY: libmpv passes a writable info struct.
+        let info = unsafe { &mut *info };
+        info.cookie = Box::into_raw(cookie).cast();
+        info.read = Some(stream_read);
+        info.seek = Some(stream_seek);
+        info.size = Some(stream_size);
+        info.close = Some(stream_close);
+        info.cancel = Some(stream_cancel);
+        0
+    })
+}
+
+/// # Safety
+///
+/// `cookie` must come from `stream_open` and not yet be closed.
+unsafe fn cookie<'a>(cookie: *mut c_void) -> &'a StreamCookie {
+    // SAFETY: guaranteed by the caller.
+    unsafe { &*cookie.cast::<StreamCookie>() }
+}
+
+unsafe extern "C" fn stream_read(cookie_ptr: *mut c_void, buffer: *mut c_char, bytes: u64) -> i64 {
+    guarded(-1, || {
+        // SAFETY: libmpv passes its cookie and a buffer of `bytes` bytes.
+        let cookie = unsafe { cookie(cookie_ptr) };
+        let len = usize::try_from(bytes).unwrap_or(usize::MAX).min(1 << 20);
+        let buffer = unsafe { std::slice::from_raw_parts_mut(buffer.cast::<u8>(), len) };
+        let mut stream = cookie.stream.lock().unwrap_or_else(|e| e.into_inner());
+        match stream.read(buffer) {
+            Ok(read) => read as i64,
+            Err(error) => {
+                tracing::debug!(%error, "Stream read failed");
+                -1
+            }
+        }
+    })
+}
+
+unsafe extern "C" fn stream_seek(cookie_ptr: *mut c_void, offset: i64) -> i64 {
+    guarded(MPV_ERROR_UNSUPPORTED, || {
+        // SAFETY: libmpv passes its cookie.
+        let cookie = unsafe { cookie(cookie_ptr) };
+        let Ok(offset) = u64::try_from(offset) else {
+            return MPV_ERROR_UNSUPPORTED;
+        };
+        let mut stream = cookie.stream.lock().unwrap_or_else(|e| e.into_inner());
+        stream
+            .seek(offset)
+            .ok()
+            .and_then(|at| i64::try_from(at).ok())
+            .unwrap_or(-1)
+    })
+}
+
+unsafe extern "C" fn stream_size(cookie_ptr: *mut c_void) -> i64 {
+    guarded(MPV_ERROR_UNSUPPORTED, || {
+        // SAFETY: libmpv passes its cookie.
+        let cookie = unsafe { cookie(cookie_ptr) };
+        let stream = cookie.stream.lock().unwrap_or_else(|e| e.into_inner());
+        stream
+            .size()
+            .and_then(|size| i64::try_from(size).ok())
+            .unwrap_or(MPV_ERROR_UNSUPPORTED)
+    })
+}
+
+unsafe extern "C" fn stream_cancel(cookie_ptr: *mut c_void) {
+    guarded((), || {
+        // SAFETY: libmpv passes its cookie; cancel never takes the stream
+        // lock, which a blocked read holds.
+        (unsafe { cookie(cookie_ptr) }.cancel)()
+    })
+}
+
+unsafe extern "C" fn stream_close(cookie_ptr: *mut c_void) {
+    guarded((), || {
+        // SAFETY: close is libmpv's last call for this cookie.
+        drop(unsafe { Box::from_raw(cookie_ptr.cast::<StreamCookie>()) })
+    })
+}
 
 unsafe extern "C" fn request_redraw(context: *mut c_void) {
     // SAFETY: callback storage is boxed before registration, stays at a stable
@@ -175,6 +322,8 @@ struct Api {
     render_update: RenderUpdate,
     set_render_callback: SetRenderCallback,
     render_free: Free,
+    /// Absent from libmpv builds without the stream callback API.
+    stream_add: Option<StreamAdd>,
     _library: Library,
 }
 
@@ -248,6 +397,7 @@ impl Api {
                 render_update: *library.get(b"mpv_render_context_update\0")?,
                 set_render_callback: *library.get(b"mpv_render_context_set_update_callback\0")?,
                 render_free: *library.get(b"mpv_render_context_free\0")?,
+                stream_add: library.get(b"mpv_stream_cb_add_ro\0").ok().map(|f| *f),
                 _library: library,
             })
         }
@@ -375,6 +525,12 @@ pub struct Player {
     redraw_requested: Box<AtomicBool>,
     /// Set by [`Player::render_in_background`]; owns the render context.
     render_thread: RefCell<Option<RenderThread>>,
+    /// Openers for registered protocols. libmpv keeps protocols until the
+    /// core is destroyed, and fields drop after `Drop::drop` destroys it.
+    /// Each is boxed because libmpv holds a thin pointer to the Arc, which
+    /// must not move when the vector grows.
+    #[allow(clippy::vec_box)]
+    protocols: RefCell<Vec<Box<Arc<StreamOpener>>>>,
     api: &'static Api,
     _main_thread: PhantomData<Rc<()>>,
 }
@@ -409,6 +565,7 @@ impl Player {
             file_loaded: Cell::new(false),
             redraw_requested: Box::new(AtomicBool::new(false)),
             render_thread: RefCell::new(None),
+            protocols: RefCell::new(Vec::new()),
             api,
             _main_thread: PhantomData,
         };
@@ -599,6 +756,7 @@ impl Player {
             loop_start: point("ab-loop-a"),
             loop_end: point("ab-loop-b"),
             audio_delay: number("audio-delay", 0.0),
+            buffering: flag("paused-for-cache"),
         }
     }
 
@@ -769,6 +927,26 @@ impl Player {
                 changed
             });
         }
+    }
+
+    /// Serves `protocol://…` URIs from streams made by `opener`, so they can
+    /// be loaded like files.
+    pub fn register_protocol(&self, protocol: &str, opener: Arc<StreamOpener>) -> Result<()> {
+        let add = self
+            .api
+            .stream_add
+            .context("This libmpv build cannot play from Flick streams")?;
+        let name = CString::new(protocol).context("Protocol name contains a NUL byte")?;
+        let opener = Box::new(opener);
+        let user_data = (&*opener as *const Arc<StreamOpener>).cast_mut().cast();
+        // SAFETY: the handle is live; the boxed opener keeps a stable address
+        // and is kept until after the core is destroyed.
+        self.api.check(
+            unsafe { add(self.handle.as_ptr(), name.as_ptr(), user_data, stream_open) },
+            &format!("Register {protocol} streams"),
+        )?;
+        self.protocols.borrow_mut().push(opener);
+        Ok(())
     }
 
     /// The generation of frames for the file most recently loaded.
@@ -1157,6 +1335,75 @@ mod tests {
                 .context("Missing resized video frame")?;
             assert_eq!((frame.width, frame.height), (width, height));
             assert_eq!(frame.pixels.len(), width as usize * height as usize * 4);
+        }
+        Ok(())
+    }
+
+    /// A registered protocol plays like a file, reading through callbacks.
+    #[test]
+    #[ignore = "requires native libmpv and FLICK_TEST_VIDEO"]
+    fn real_custom_protocol_streams_play() -> Result<()> {
+        struct FileStream {
+            file: std::fs::File,
+            size: u64,
+            reads: Arc<std::sync::atomic::AtomicUsize>,
+        }
+        impl MediaStream for FileStream {
+            fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+                use std::io::Read;
+                self.reads.fetch_add(1, Ordering::Relaxed);
+                self.file.read(buffer)
+            }
+            fn seek(&mut self, offset: u64) -> std::io::Result<u64> {
+                use std::io::Seek;
+                self.file.seek(std::io::SeekFrom::Start(offset))
+            }
+            fn size(&self) -> Option<u64> {
+                Some(self.size)
+            }
+            fn canceller(&self) -> Arc<dyn Fn() + Send + Sync> {
+                Arc::new(|| {})
+            }
+        }
+        let clip = PathBuf::from(std::env::var("FLICK_TEST_VIDEO")?);
+        let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let opened = reads.clone();
+        let player = Player::new()?;
+        player.register_protocol(
+            "flicktest",
+            Arc::new(move |uri: &str| {
+                if uri != "flicktest://clip" {
+                    return Err(std::io::Error::other("unknown stream"));
+                }
+                let file = std::fs::File::open(&clip)?;
+                let size = file.metadata()?.len();
+                Ok(Box::new(FileStream {
+                    file,
+                    size,
+                    reads: opened.clone(),
+                }) as Box<dyn MediaStream>)
+            }),
+        )?;
+        player.load("flicktest://clip")?;
+        wait_for(&player, |p| {
+            p.file_loaded.get() && p.snapshot().position > 0.5
+        })?;
+        assert!(reads.load(Ordering::Relaxed) > 0);
+        player.command(&["seek", "8", "absolute+exact"])?;
+        wait_for(&player, |p| p.snapshot().position >= 8.)?;
+        // An unknown stream fails like a missing file.
+        player.load("flicktest://missing")?;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if player
+                .poll_events()
+                .iter()
+                .any(|event| matches!(event, PlayerEvent::Error(_)))
+            {
+                break;
+            }
+            ensure!(Instant::now() < deadline, "Unknown stream did not fail");
+            thread::sleep(Duration::from_millis(10));
         }
         Ok(())
     }

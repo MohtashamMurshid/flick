@@ -95,3 +95,9 @@ This is the Sintel torrent from `https://webtorrent.io/torrents/sintel.torrent`.
 ## Web seeds
 
 As checked on 2026-10-24, the [upstream release list](https://github.com/ikatson/rqbit/releases) and GitHub latest-release API still identify v9.0.1 as the latest release. No newer upstream release with BEP 19 support was found. The [web-seed request](https://github.com/ikatson/rqbit/issues/500) remains open; it links a separate fork that implements HTTP sources. The pinned 9.0.1 source has no `url-list` download path. Flick keeps that dependency pinned; direct Archive HTTPS downloads belong to the separate URL-download backend.
+
+## Watching while downloading
+
+The desktop registers a `flicktorrent://<infohash>/<file index>` libmpv protocol. Reads go through librqbit's file stream, which returns only downloaded and verified pieces and steers the piece picker toward the read position. A task on the transfer runtime performs each read, and libmpv's cancel callback ends a read waiting for pieces. Partly downloaded files are never opened from disk: library cards for them use the stream, and posters wait until the file is complete.
+
+`FLICK_DOWNLOAD_LIMIT` sets a download cap in bytes per second for the desktop session. It exists to check streaming against a fast local seed, for example with `FLICK_LOCAL_TRANSFERS=1 FLICK_INITIAL_PEERS=127.0.0.1:<port> FLICK_DOWNLOAD_LIMIT=300000`.

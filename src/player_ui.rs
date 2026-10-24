@@ -77,6 +77,20 @@ impl Flick {
                         .child(panel),
                 )
             })
+            .when(self.buffering(), |d| {
+                d.child(
+                    h_flex().absolute().inset_0().justify_center().child(
+                        div()
+                            .px_4()
+                            .py_2()
+                            .rounded_full()
+                            .bg(rgba(0x000000b3))
+                            .text_color(rgb(ON_VIDEO))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child("Buffering…"),
+                    ),
+                )
+            })
             .when_some(self.up_next_card(cx), |d, card| {
                 d.child(
                     div()

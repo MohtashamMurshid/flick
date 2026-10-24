@@ -97,6 +97,77 @@ pub struct Services {
     events: mpsc::Receiver<Event>,
     worker: Option<thread::JoinHandle<()>>,
     pub download_dir: PathBuf,
+    /// Opens torrent files for playback while they download.
+    pub streams: Arc<StreamSource>,
+}
+
+/// Lets the player read torrent files from its own threads while they
+/// download, through the transfer runtime. Only verified pieces are read.
+#[derive(Default)]
+pub struct StreamSource {
+    runtime: std::sync::OnceLock<tokio::runtime::Handle>,
+    session: std::sync::Mutex<Option<Arc<TransferSession>>>,
+}
+
+impl StreamSource {
+    /// Opens a `flicktorrent://<infohash>/<file index>` URI. Blocks while
+    /// the torrent initializes; call it from a player thread.
+    pub fn open(&self, uri: &str) -> anyhow::Result<flick::torrent::BlockingStream> {
+        use anyhow::Context as _;
+        let (infohash, index) = parse_stream_uri(uri).context("Not a Flick torrent stream")?;
+        let runtime = self.runtime.get().context("Downloads are not running")?;
+        let session = self
+            .session
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+            .context("Downloads are not running")?;
+        let stream = runtime.block_on(async {
+            tokio::time::timeout(
+                Duration::from_secs(60),
+                session.open_stream(&infohash, index),
+            )
+            .await
+            .context("The torrent did not start in time")?
+        })?;
+        Ok(stream.into_blocking(runtime))
+    }
+}
+
+/// The URI the player loads for a torrent file that is still downloading.
+pub fn stream_uri(infohash: &str, index: usize) -> String {
+    format!("{STREAM_PROTOCOL}://{infohash}/{index}")
+}
+
+pub const STREAM_PROTOCOL: &str = "flicktorrent";
+
+fn parse_stream_uri(uri: &str) -> Option<(String, usize)> {
+    let rest = uri.strip_prefix(STREAM_PROTOCOL)?.strip_prefix("://")?;
+    let (infohash, index) = rest.split_once('/')?;
+    let valid = infohash.len() == 40 && infohash.bytes().all(|b| b.is_ascii_hexdigit());
+    valid.then(|| Some((infohash.to_ascii_lowercase(), index.parse().ok()?)))?
+}
+
+/// A torrent stream as the player's stream interface.
+pub struct TorrentMediaStream(pub flick::torrent::BlockingStream);
+
+impl crate::playback::MediaStream for TorrentMediaStream {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        self.0.read(buffer)
+    }
+
+    fn seek(&mut self, offset: u64) -> std::io::Result<u64> {
+        self.0.seek(offset)
+    }
+
+    fn size(&self) -> Option<u64> {
+        Some(self.0.len())
+    }
+
+    fn canceller(&self) -> Arc<dyn Fn() + Send + Sync> {
+        let cancel = self.0.canceller();
+        Arc::new(move || cancel.cancel())
+    }
 }
 
 impl Services {
@@ -134,7 +205,11 @@ impl Services {
             } else {
                 librqbit::ListenerMode::TcpAndUtp
             },
-            download_limit_bytes_per_second: None,
+            // A diagnostic cap in bytes per second, for checking playback
+            // while downloading against a fast local seed.
+            download_limit_bytes_per_second: std::env::var("FLICK_DOWNLOAD_LIMIT")
+                .ok()
+                .and_then(|limit| limit.parse().ok()),
         };
         let (sender, receiver) = channel::unbounded_channel();
         let peers = std::env::var("FLICK_INITIAL_PEERS")
@@ -143,6 +218,8 @@ impl Services {
             .filter_map(|v| v.parse().ok())
             .collect::<Vec<std::net::SocketAddr>>();
         let (events_tx, events) = mpsc::channel();
+        let streams = Arc::new(StreamSource::default());
+        let worker_streams = streams.clone();
         let worker = thread::Builder::new()
             .name("flick-transfers".into())
             .spawn(move || {
@@ -158,7 +235,7 @@ impl Services {
                         return;
                     }
                 };
-                runtime.block_on(run(config, peers, receiver, events_tx));
+                runtime.block_on(run(config, peers, receiver, events_tx, worker_streams));
                 runtime.shutdown_timeout(Duration::from_secs(2));
             })
             .expect("create Flick background worker");
@@ -167,6 +244,7 @@ impl Services {
             events,
             worker: Some(worker),
             download_dir,
+            streams,
         }
     }
     pub fn send(&self, command: Command) -> Result<(), String> {
@@ -192,8 +270,30 @@ async fn run(
     initial_peers: Vec<std::net::SocketAddr>,
     mut commands: channel::UnboundedReceiver<Command>,
     events: mpsc::Sender<Event>,
+    streams: Arc<StreamSource>,
 ) {
+    let _ = streams.runtime.set(tokio::runtime::Handle::current());
     let mut session: Option<Arc<TransferSession>> = None;
+    // Saved transfers start with Flick, so their files are known before any
+    // of them is opened; partly downloaded files must play as streams.
+    if config.state_dir.join("session.json").is_file() {
+        match TransferSession::start(config.clone()).await {
+            Ok(started) => {
+                let started = Arc::new(started);
+                *streams.session.lock().unwrap_or_else(|e| e.into_inner()) = Some(started.clone());
+                session = Some(started);
+            }
+            Err(error) => {
+                let _ = events.send(Event::Error(format!(
+                    "Downloads are unavailable: {error:#}"
+                )));
+            }
+        }
+    }
+    if session.is_none() {
+        // Nothing saved: tell the interface there are no transfers yet.
+        let _ = events.send(Event::Progress(Vec::new()));
+    }
     let mut tasks = JoinSet::new();
     let mut search_task: Option<tokio::task::AbortHandle> = None;
     let mut resolve_task: Option<tokio::task::JoinHandle<()>> = None;
@@ -225,7 +325,11 @@ async fn run(
                 }
                 if session.is_none() {
                     match TransferSession::start(config.clone()).await {
-                        Ok(started) => session = Some(Arc::new(started)),
+                        Ok(started) => {
+                            let started = Arc::new(started);
+                            *streams.session.lock().unwrap_or_else(|e| e.into_inner()) = Some(started.clone());
+                            session = Some(started);
+                        }
                         Err(error) => { let _ = events.send(Event::Error(format!("Downloads are unavailable: {error:#}"))); continue; }
                     }
                 }
@@ -287,6 +391,11 @@ async fn run(
         let _ = task.await;
     }
     tasks.abort_all();
+    streams
+        .session
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take();
     if let Some(session) = session {
         session.shutdown().await;
     }
@@ -440,6 +549,17 @@ async fn fetch_job(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stream_uris_round_trip_and_reject_other_text() {
+        let hash = "0123456789abcdef0123456789ABCDEF01234567";
+        let uri = stream_uri(hash, 3);
+        assert_eq!(uri, format!("flicktorrent://{hash}/3"));
+        assert_eq!(parse_stream_uri(&uri), Some((hash.to_ascii_lowercase(), 3)));
+        assert_eq!(parse_stream_uri("flicktorrent://short/1"), None);
+        assert_eq!(parse_stream_uri(&format!("flicktorrent://{hash}/x")), None);
+        assert_eq!(parse_stream_uri("file:///tmp/a.mp4"), None);
+    }
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn cancelled_resolution_allows_the_next_request() -> anyhow::Result<()> {
         let root = tempfile::tempdir()?;
@@ -465,7 +585,7 @@ mod tests {
             std::future::pending::<()>().await;
             Ok::<_, std::io::Error>(())
         });
-        let job = tokio::spawn(run(config, vec![peer], receiver, events));
+        let job = tokio::spawn(run(config, vec![peer], receiver, events, Arc::default()));
         // An explicit local peer accepts the connection but supplies no metadata.
         commands.send(Command::Resolve(TorrentInput::Magnet(shared.magnet)))?;
         let outcome = tokio::time::timeout(Duration::from_secs(10), async {
@@ -509,7 +629,7 @@ mod tests {
             TransferConfig::local(root.path().join("downloads"), root.path().join("state"));
         let (commands, receiver) = channel::unbounded_channel();
         let (events, output) = mpsc::channel();
-        let job = tokio::spawn(run(config, vec![], receiver, events));
+        let job = tokio::spawn(run(config, vec![], receiver, events, Arc::default()));
         commands.send(Command::Share(video.clone()))?;
         let outcome = tokio::time::timeout(Duration::from_secs(12), async {
             let mut shared = false;
@@ -544,7 +664,7 @@ mod tests {
         let config = TransferConfig::local(root.path().join("downloads"), blocked);
         let (commands, receiver) = channel::unbounded_channel();
         let (events, output) = mpsc::channel();
-        let job = tokio::spawn(run(config, vec![], receiver, events));
+        let job = tokio::spawn(run(config, vec![], receiver, events, Arc::default()));
         // Accepts connections but never answers, so the download stays open.
         let stalled = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
         let folder = root.path().join("links");

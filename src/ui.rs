@@ -254,6 +254,15 @@ pub struct Flick {
     controls_changed_at: Instant,
     /// Counts status messages, restarting their fade.
     status_count: usize,
+    /// Whether saved transfers have reported their files.
+    transfers_known: bool,
+    /// A video to open once transfers are known.
+    pending_open: Option<PathBuf>,
+    /// Playing a torrent file that is still downloading.
+    streaming: bool,
+    /// When the playback position last moved, to notice a stream waiting
+    /// for pieces.
+    position_moved: (f64, Instant),
 }
 
 impl Flick {
@@ -339,6 +348,21 @@ impl Flick {
             Ok(player) => (Some(player), None),
             Err(error) => (None, Some(format!("Playback is unavailable. {error:#}"))),
         };
+        if let Some(player) = &player {
+            let streams = services.streams.clone();
+            let opener = Arc::new(move |uri: &str| {
+                streams
+                    .open(uri)
+                    .map(|stream| {
+                        Box::new(crate::services::TorrentMediaStream(stream))
+                            as Box<dyn crate::playback::MediaStream>
+                    })
+                    .map_err(|error| std::io::Error::other(format!("{error:#}")))
+            });
+            if let Err(error) = player.register_protocol(crate::services::STREAM_PROTOCOL, opener) {
+                tracing::warn!(%error, "Watching while downloading is unavailable");
+            }
+        }
         let frames = player
             .as_mut()
             .and_then(|player| match player.render_in_background() {
@@ -430,6 +454,10 @@ impl Flick {
             controls_changes: 0,
             controls_changed_at: Instant::now(),
             status_count: 0,
+            transfers_known: false,
+            pending_open: None,
+            streaming: false,
+            position_moved: (0., Instant::now()),
         };
         this.apply_preferences();
         // Posters deleted from the cache are made again.
@@ -614,12 +642,21 @@ impl Flick {
             self.resolve(flick::torrent::TorrentInput::Magnet(value.to_owned()), cx);
             return;
         }
-        if !path.is_file() {
-            self.error = Some(format!("This file could not be opened: {}", path.display()));
+        // A partly downloaded torrent file is on disk at full size, with
+        // unverified gaps, so it must play as a stream. Until saved
+        // transfers are known, wait rather than read it directly.
+        if !self.transfers_known {
+            self.pending_open = Some(path);
             cx.notify();
             return;
         }
         let path = path.canonicalize().unwrap_or(path);
+        let stream = self.incomplete_torrent_file(&path);
+        if stream.is_none() && !path.is_file() {
+            self.error = Some(format!("This file could not be opened: {}", path.display()));
+            cx.notify();
+            return;
+        }
         let Some(path_str) = path.to_str() else {
             self.error = Some(
                 "The file path contains unsupported characters. Try renaming the file.".into(),
@@ -627,15 +664,20 @@ impl Flick {
             cx.notify();
             return;
         };
+        let source = match &stream {
+            Some((infohash, index)) => crate::services::stream_uri(infohash, *index),
+            None => path_str.to_owned(),
+        };
         self.persist();
         let Some(player) = &self.player else {
             cx.notify();
             return;
         };
-        match player.load(path_str) {
+        match player.load(&source) {
             Ok(()) => {
                 self.pending_resume = self.store.resume_position(&path);
                 self.file_loaded = false;
+                self.streaming = stream.is_some();
                 self.path = Some(path.clone());
                 self.store.data.add_video(&path);
                 if self.view != View::Player {
@@ -668,6 +710,33 @@ impl Flick {
         cx.notify();
     }
 
+    /// The torrent and file index of a selected file that is still
+    /// downloading at `path`.
+    fn incomplete_torrent_file(&self, path: &std::path::Path) -> Option<(String, usize)> {
+        self.downloads.iter().find_map(|download| {
+            download
+                .files
+                .iter()
+                .find(|file| {
+                    file.selected
+                        && file.verified_bytes < file.length
+                        && (file.path == path
+                            || file.path.canonicalize().is_ok_and(|real| real == path))
+                })
+                .map(|file| (download.infohash.clone(), file.index))
+        })
+    }
+
+    /// Paths of selected torrent files that are not fully verified.
+    fn incomplete_paths(&self) -> HashSet<PathBuf> {
+        self.downloads
+            .iter()
+            .flat_map(|download| &download.files)
+            .filter(|file| file.selected && file.verified_bytes < file.length)
+            .map(|file| file.path.clone())
+            .collect()
+    }
+
     /// Whether a text field has keyboard focus, so typing must reach it.
     fn text_focused(&self, window: &Window, cx: &Context<Self>) -> bool {
         [
@@ -685,6 +754,16 @@ impl Flick {
     /// Whether a video double-click should toggle fullscreen.
     fn accepts_video_double_click(&self) -> bool {
         self.entered_player.elapsed() >= DOUBLE_CLICK_GRACE
+    }
+
+    /// Waiting for data: mpv's cache says so, or a torrent stream that
+    /// should be playing has not advanced for a second.
+    fn buffering(&self) -> bool {
+        self.snapshot.buffering
+            || (self.streaming
+                && self.file_loaded
+                && self.playing()
+                && self.position_moved.1.elapsed() > Duration::from_secs(1))
     }
 
     fn playing(&self) -> bool {
@@ -706,8 +785,13 @@ impl Flick {
 
     /// Queues posters for library videos without one, and stores results.
     fn update_posters(&mut self, cx: &mut Context<Self>) {
+        // Partly downloaded files have unverified gaps; wait for them.
+        let incomplete = self.incomplete_paths();
         for video in &self.store.data.library {
-            if video.poster.is_none() && !self.poster_requests.contains(&video.path) {
+            if video.poster.is_none()
+                && !self.poster_requests.contains(&video.path)
+                && !incomplete.contains(&video.path)
+            {
                 self.poster_requests.insert(video.path.clone());
                 self.thumbnails.request(video.path.clone());
             }
@@ -779,6 +863,11 @@ impl Flick {
 
     fn tick(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Duration {
         self.poll_services(cx);
+        if self.transfers_known
+            && let Some(path) = self.pending_open.take()
+        {
+            self.open(path, window, cx);
+        }
         self.update_posters(cx);
         // A preview for another video, from before it opened, is dropped.
         if let Some(preview) = self.previews.as_ref().and_then(|p| p.latest())
@@ -864,6 +953,9 @@ impl Flick {
             changed |= (self.snapshot.position - next.position).abs() > 0.01
                 || self.snapshot.paused != next.paused
                 || self.snapshot.duration != next.duration;
+            if (next.position - self.position_moved.0).abs() > 0.01 || next.paused {
+                self.position_moved = (next.position, Instant::now());
+            }
             self.snapshot = next;
             self.last_snapshot = Instant::now();
         }

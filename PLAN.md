@@ -57,10 +57,10 @@ Acceptance: publish actual native results and release measurements. No performan
 
 ### 4. Watch during downloads
 
-- [ ] Read only verified pieces using librqbit's stream API, with bounded buffering and cancellation.
-- [ ] Add buffering/recovery states and seek prioritization, including container metadata at the end of a file.
-- [ ] Preserve resume identity when moving from a torrent stream to a completed local file.
-- [ ] Test throttled peers, absent pieces, rapid seeks, file replacement, and subtitle behavior.
+- [x] Read only verified pieces using librqbit's stream API, with bounded buffering and cancellation.
+- [x] Add buffering/recovery states and seek prioritization, including container metadata at the end of a file.
+- [x] Preserve resume identity when moving from a torrent stream to a completed local file. History uses the file's final local path from the start.
+- [ ] Test throttled peers, absent pieces, rapid seeks, file replacement, and subtitle behavior. Throttled downloads, a seek to missing pieces, and cancelling a read blocked on a paused download are covered; rapid seeks, file replacement, and subtitles are not.
 
 Acceptance: playback never reads sparse/unavailable disk regions as if they contained verified media.
 
@@ -107,7 +107,7 @@ Features:
 - [x] 20. Timeline hover previews, after item 16. A second silent player seeks to the nearest keyframe and shows the frame, time, and chapter above the pointer.
 - [x] 21. Picture-in-picture, or an always-on-top mini window. P or the player button opens a small pop-up window that keeps playing while the library is used. It floats on macOS; on X11 staying above depends on the window manager (Openbox let the main window cover it), and Wayland has no always-on-top request.
 - [x] 22. OpenSubtitles search from the Audio & subtitles menu. Find Online searches by title and OpenSubtitles file hash, lists exact matches first, and downloads and loads a choice beside the video. It needs a personal API key, entered in Appearance or set with `FLICK_OPENSUBTITLES_KEY`. Only the rejected-key path has been checked against the live API.
-- [ ] 23. Watch while downloading (stage 4): stream verified pieces from librqbit and prioritize pieces near the playhead.
+- [x] 23. Watch while downloading (stage 4): stream verified pieces from librqbit and prioritize pieces near the playhead. Watch Now plays a downloading video through a `flicktorrent://` libmpv stream; library cards for partly downloaded files use it too, and posters wait for completion.
 - [ ] 24. Transfer gaps from stage 2: delete-files confirmation, upload rate, torrent export, seeding preference, resume keyed by infohash, bandwidth limits, and global pause.
 - [x] 26. Download from YouTube, X, and other sites supported by [yt-dlp](https://github.com/yt-dlp/yt-dlp) using a pasted page URL. Run an installed yt-dlp as a separate process, separate from playback and the torrent session, with progress, cancellation, and completed videos joining the library. Tests use a generated local stand-in for yt-dlp and no network access. Done in `src/fetch.rs` and `src/fetch_ui.rs`; direct HTTPS video links skip yt-dlp. X was not tried with a real post; see [validation](docs/VALIDATION.md#link-downloads-on-2026-10-24).
 

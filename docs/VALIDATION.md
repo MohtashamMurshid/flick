@@ -68,6 +68,18 @@ Not verified:
 - **Edge cases.** A full disk and resuming an HTTPS download after a real crash, beyond the one external interruption above, are untested.
 
 All downloaded media, generated clips, and the downloaded yt-dlp release were deleted after these checks.
+### Watching while downloading on 2026-10-24
+
+This covers backlog item 23 and stage 4 in [PLAN.md](../PLAN.md), on the same Ubuntu VM and Xvfb session.
+
+Automated checks: `cargo test --locked --all-targets` and `--no-default-features` pass, including the new local-peer test `streams_read_verified_bytes_while_downloading`. A 12 MiB generated file is shared over loopback and downloaded at 512 KiB/s. While it downloads, the stream returns exactly the source's first 200,000 bytes. A seek 50,000 bytes before the end then returns the source's final bytes before the download completes, which shows the tail was fetched ahead of the middle. With the download paused, a read blocked in the middle of the file ends when cancelled, and later reads fail. The opt-in `real_custom_protocol_streams_play` test plays the 720p fixture through a registered libmpv protocol, seeks to 8 s, and reports an unknown stream as a load error.
+
+Interactive check: `flick-transfer share` seeded a generated 60-second 1280×720 H.264/AAC file (20.6 MB) on 127.0.0.1:47123. Its MP4 index (`moov`) is at the end of the file, at byte 21,535,740 of 21,601,163. A fresh Flick session used `FLICK_LOCAL_TRANSFERS=1`, `FLICK_INITIAL_PEERS=127.0.0.1:47123`, and `FLICK_DOWNLOAD_LIMIT=300000`. Pasting the magnet in search resolved the file. Download Selected started it, and at 0 KB of 20.6 MB at 285 KB/s the row offered Watch Now. Watch Now showed the first frame after 549 ms. Pressing 9 to seek to 0:54 showed "Buffering…" over the previous frame, and 14 seconds later playback had reached the end at 0:59.97. An earlier run at 400 KB/s seeked to 0:48 and resumed there.
+
+Tried and reverted: enabling mpv's demuxer cache for streams, so mpv would report buffering itself, delayed the first frame from about 0.5 s to 10 s at 300 KB/s. Flick instead shows Buffering when a stream that should be playing has not advanced for a second.
+
+Not verified: public swarms, rapid repeated seeks, subtitles inside streamed files, replacing a file during playback, and macOS or Windows.
+
 ### Library, player, and rendering features on 2026-10-24
 
 This covers backlog items 7, 14, 16, 17, 20, 21, and 22 in [PLAN.md](../PLAN.md), on the same Ubuntu VM, Xvfb/Openbox/Lavapipe session, isolated settings, and generated fixtures as the backlog pass above. Two copies of the 12-second clip were arranged as `Harbor Show/Season 1/01 - Arrival.mp4` and `02 - Departure.mp4`, and the 6-second 4K clip was added to the library. Other agents' builds and benchmarks were running, with load averages of 10–14 on four vCPUs, so no timing below is a performance result.

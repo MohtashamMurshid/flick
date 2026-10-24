@@ -151,7 +151,10 @@ impl Flick {
                     }
                     Err(error) => self.error = Some(error),
                 },
-                ServiceEvent::Progress(downloads) => self.downloads = downloads,
+                ServiceEvent::Progress(downloads) => {
+                    self.downloads = downloads;
+                    self.transfers_known = true;
+                }
                 ServiceEvent::Completed(path) => {
                     self.store.data.add_video(&path);
                     if let Err(error) = self.store.save() {
@@ -1823,6 +1826,19 @@ impl Flick {
                     && flick::library::is_video(&file.path)
             })
             .map(|file| file.path.clone());
+        // A video still downloading plays from verified pieces, fetching
+        // those near the playhead first.
+        let streamable = download
+            .files
+            .iter()
+            .find(|file| {
+                playable.is_none()
+                    && file.selected
+                    && file.verified_bytes < file.length
+                    && download.state == TransferState::Downloading
+                    && flick::library::is_video(&file.path)
+            })
+            .map(|file| file.path.clone());
         let toggle_id = id.clone();
         let remove_id = id.clone();
         h_flex()
@@ -1902,6 +1918,16 @@ impl Flick {
                     SharedString::from(format!("play-{id}")),
                     Some("play"),
                     "Play",
+                    false,
+                    cx,
+                    move |this, w, cx| this.open(path.clone(), w, cx),
+                ))
+            })
+            .when_some(streamable, |d, path| {
+                d.child(self.button(
+                    SharedString::from(format!("watch-{id}")),
+                    Some("play"),
+                    "Watch Now",
                     false,
                     cx,
                     move |this, w, cx| this.open(path.clone(), w, cx),

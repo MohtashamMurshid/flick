@@ -667,12 +667,178 @@ impl TransferSession {
         self.session.stop().await;
     }
 
+    /// Reads one selected file while it downloads. Reads wait for pieces
+    /// that are downloaded and verified, so sparse or unverified regions on
+    /// disk are never returned, and the engine fetches pieces near the read
+    /// position first.
+    pub async fn open_stream(&self, infohash: &str, index: usize) -> Result<VerifiedStream> {
+        let handle = self.handle(infohash)?;
+        timeout(Duration::from_secs(60), handle.wait_until_initialized())
+            .await
+            .context("File verification timed out")??;
+        let snapshot = self.snapshot(infohash)?;
+        let file = snapshot
+            .files
+            .get(index)
+            .context("Unknown torrent file index")?;
+        ensure!(
+            file.selected,
+            "Only files chosen for download can be played"
+        );
+        let inner = handle
+            .stream(index)
+            .await
+            .context("Open the torrent stream")?;
+        let len = inner.len();
+        Ok(VerifiedStream {
+            inner: Box::new(inner),
+            len,
+        })
+    }
+
     fn handle(&self, infohash: &str) -> Result<Arc<ManagedTorrent>> {
         self.session
             .get(TorrentIdOrHash::Hash(
                 infohash.parse().context("Invalid infohash")?,
             ))
             .context("Unknown torrent")
+    }
+}
+
+/// librqbit's file stream, which the pinned release returns without
+/// exporting its type.
+trait ReadSeek: tokio::io::AsyncRead + tokio::io::AsyncSeek + Send + Unpin {}
+impl<T: tokio::io::AsyncRead + tokio::io::AsyncSeek + Send + Unpin> ReadSeek for T {}
+
+/// One torrent file read as it downloads; see [`TransferSession::open_stream`].
+pub struct VerifiedStream {
+    inner: Box<dyn ReadSeek>,
+    len: u64,
+}
+
+impl VerifiedStream {
+    pub fn len(&self) -> u64 {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// A blocking reader for players that read on their own threads. A task
+    /// on `runtime` performs each read, so callers never block the runtime.
+    pub fn into_blocking(self, runtime: &tokio::runtime::Handle) -> BlockingStream {
+        let (requests, receiver) = tokio::sync::mpsc::unbounded_channel();
+        let cancel = CancellationToken::new();
+        runtime.spawn(serve_stream(self.inner, receiver, cancel.clone()));
+        BlockingStream {
+            requests,
+            len: self.len,
+            cancel,
+        }
+    }
+}
+
+enum StreamRequest {
+    Read(usize, std::sync::mpsc::Sender<std::io::Result<Vec<u8>>>),
+    Seek(u64, std::sync::mpsc::Sender<std::io::Result<u64>>),
+}
+
+async fn serve_stream(
+    mut stream: Box<dyn ReadSeek>,
+    mut requests: tokio::sync::mpsc::UnboundedReceiver<StreamRequest>,
+    cancel: CancellationToken,
+) {
+    use tokio::io::{AsyncReadExt, AsyncSeekExt};
+    let cancelled = || std::io::Error::new(std::io::ErrorKind::Interrupted, "Stream cancelled");
+    loop {
+        let request = tokio::select! {
+            request = requests.recv() => request,
+            () = cancel.cancelled() => None,
+        };
+        match request {
+            None => break,
+            Some(StreamRequest::Read(len, reply)) => {
+                let mut buffer = vec![0; len];
+                let result: std::io::Result<Vec<u8>> = tokio::select! {
+                    read = stream.read(&mut buffer) => read.map(|read: usize| {
+                        buffer.truncate(read);
+                        buffer
+                    }),
+                    () = cancel.cancelled() => Err(cancelled()),
+                };
+                let _ = reply.send(result);
+            }
+            Some(StreamRequest::Seek(offset, reply)) => {
+                let result: std::io::Result<u64> = tokio::select! {
+                    at = stream.seek(std::io::SeekFrom::Start(offset)) => at,
+                    () = cancel.cancelled() => Err(cancelled()),
+                };
+                let _ = reply.send(result);
+            }
+        }
+    }
+}
+
+/// A blocking view of a [`VerifiedStream`]. Dropping it, or cancelling
+/// through [`BlockingStream::canceller`], ends pending and later reads.
+pub struct BlockingStream {
+    requests: tokio::sync::mpsc::UnboundedSender<StreamRequest>,
+    len: u64,
+    cancel: CancellationToken,
+}
+
+impl BlockingStream {
+    pub fn len(&self) -> u64 {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Reads up to `buffer.len()` bytes, waiting for verified pieces.
+    /// Returns 0 at the end of the file.
+    pub fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        let (reply, response) = std::sync::mpsc::channel();
+        self.request(StreamRequest::Read(buffer.len(), reply))?;
+        let bytes = Self::wait(response)??;
+        buffer[..bytes.len()].copy_from_slice(&bytes);
+        Ok(bytes.len())
+    }
+
+    pub fn seek(&mut self, offset: u64) -> std::io::Result<u64> {
+        let (reply, response) = std::sync::mpsc::channel();
+        self.request(StreamRequest::Seek(offset, reply))?;
+        Self::wait(response)?
+    }
+
+    pub fn canceller(&self) -> CancellationToken {
+        self.cancel.clone()
+    }
+
+    fn request(&self, request: StreamRequest) -> std::io::Result<()> {
+        if self.cancel.is_cancelled() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "Stream cancelled",
+            ));
+        }
+        self.requests
+            .send(request)
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "Stream closed"))
+    }
+
+    fn wait<T>(response: std::sync::mpsc::Receiver<T>) -> std::io::Result<T> {
+        response
+            .recv()
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "Stream closed"))
+    }
+}
+
+impl Drop for BlockingStream {
+    fn drop(&mut self) {
+        self.cancel.cancel();
     }
 }
 
