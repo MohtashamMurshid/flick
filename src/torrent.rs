@@ -68,6 +68,7 @@ impl TorrentInput {
                 ensure!(url.scheme() == "https", "Torrent downloads require HTTPS");
                 let client = reqwest::Client::builder()
                     .timeout(Duration::from_secs(15))
+                    .https_only(true)
                     .build()?;
                 let mut response = client.get(url).send().await?.error_for_status()?;
                 let mut bytes = Vec::new();

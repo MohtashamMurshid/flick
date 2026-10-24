@@ -57,7 +57,7 @@ Inspect and download also accept an HTTPS torrent URL, a magnet, or a 40-charact
 
 The diagnostic defaults to local explicit peers, with DHT, trackers, multicast discovery, and automatic port mapping disabled. `--public` explicitly enables DHT/trackers. For sharing with another machine, choose a reachable listener address with `--listen`; loopback is accessible only from this machine. Peer discovery and network reachability are separate requirements. Ordinary BitTorrent sharing is not private cloud storage.
 
-Press Ctrl+C to stop sharing. A successful download command stops its session after printing the verified result; it does not continue seeding in the background. Inspect/download deadlines accept 1–86400 seconds and cover command work after session startup; session shutdown adds about a second. Logs/errors go to stderr, and command results go to stdout as JSON. Transfer state stays separate from viewing settings/history.
+Press Ctrl+C to stop sharing successfully. Interrupting inspect or download before completion exits with an error instead of reporting success without a result. A successful download command stops its session after printing the verified result; it does not continue seeding in the background. Inspect/download deadlines accept 1–86400 seconds and cover command work after session startup; session shutdown adds about a second. Logs/errors go to stderr, and command results go to stdout as JSON. Transfer state stays separate from viewing settings/history.
 
 ## Compatibility notes
 

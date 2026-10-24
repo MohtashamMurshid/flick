@@ -2,6 +2,19 @@ use super::*;
 use flick::library::format_bytes;
 
 impl Flick {
+    pub(super) fn add_library_files(&mut self, paths: impl IntoIterator<Item = PathBuf>) {
+        let mut videos = Vec::new();
+        for path in paths {
+            match flick::library::canonical_video(&path) {
+                Ok(path) => videos.push(path),
+                Err(error) => {
+                    self.error = Some(format!("Could not add {}: {error:#}", path.display()))
+                }
+            }
+        }
+        self.store.data.add_videos(videos);
+    }
+
     pub(super) fn send(&mut self, command: ServiceCommand, cx: &mut Context<Self>) {
         if let Err(error) = self.services.send(command) {
             self.error = Some(error);
@@ -143,10 +156,12 @@ impl Flick {
                     } else if folder {
                         if let Some(path) = paths.into_iter().next() { this.import_folder(path, window, cx); }
                     } else {
+                        let mut videos = Vec::new();
                         for path in paths {
                             if path.extension().is_some_and(|v| v.eq_ignore_ascii_case("torrent")) { this.resolve(flick::torrent::TorrentInput::File(path), cx); }
-                            else { this.store.data.add_video(&path); }
+                            else { videos.push(path); }
                         }
+                        this.add_library_files(videos);
                         this.persist(); cx.notify();
                     }
                 }
@@ -168,9 +183,7 @@ impl Flick {
                 this.importing = false;
                 match result {
                     Ok(paths) => {
-                        for path in paths {
-                            this.store.data.add_video(&path);
-                        }
+                        this.store.data.add_videos(paths);
                         this.persist();
                     }
                     Err(error) => {

@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, ensure};
 use std::path::{Path, PathBuf};
 
 pub fn is_video(path: &Path) -> bool {
@@ -23,6 +23,14 @@ pub fn is_video(path: &Path) -> bool {
                 | "vob"
         )
     })
+}
+
+/// Use one existing, canonical file identity for picker and drop imports.
+pub fn canonical_video(path: &Path) -> Result<PathBuf> {
+    ensure!(is_video(path), "Not a supported video: {}", path.display());
+    let path = path.canonicalize().context("Resolve video path")?;
+    ensure!(path.is_file(), "Choose a video file");
+    Ok(path)
 }
 
 /// Explicitly chosen folders only. Skip symlinks to avoid recursion cycles.
@@ -60,6 +68,24 @@ pub fn format_bytes(bytes: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn file_import_resolves_aliases_and_rejects_non_videos_or_missing_files() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("sub")).unwrap();
+        std::fs::create_dir(root.path().join("folder.mp4")).unwrap();
+        let file = root.path().join("film.MKV");
+        std::fs::write(&file, []).unwrap();
+        std::fs::write(root.path().join("notes.txt"), []).unwrap();
+        assert_eq!(
+            canonical_video(&file).unwrap(),
+            canonical_video(&root.path().join("sub/../film.MKV")).unwrap()
+        );
+        for invalid in ["notes.txt", "missing.mp4", "folder.mp4"] {
+            assert!(canonical_video(&root.path().join(invalid)).is_err());
+        }
+    }
+
     #[test]
     fn explicit_folder_scan_finds_nested_videos_but_not_other_files() {
         let root = tempfile::tempdir().unwrap();

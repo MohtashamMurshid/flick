@@ -8,9 +8,15 @@ Flick targets Windows, macOS, and Linux. A CI configuration is not evidence of a
 | --- | --- | --- | --- |
 | Linux | Native debug build, formatting, strict Clippy, 9 unit tests and 3 real-libmpv tests pass | Xvfb/Openbox session exercised; null audio | Deferred |
 | Windows | Workflow configured; not run here | Pending native machine | Deferred |
-| macOS | Debug compilation, formatting, strict Clippy, 20 tests, and an opt-in native resolution test pass on 2026-10-25 | Library/search/resume and public Sintel playback observed; CoreAudio output active | Deferred |
+| macOS | Debug compilation, formatting, strict Clippy, 23 tests, and an opt-in native resolution test pass on 2026-10-25 | Library/search/resume and public Sintel playback observed; CoreAudio output active | Deferred |
 
 The presentation adapter transfers decoded BGRA frames through CPU memory into GPUI images. It sizes frames to physical video bounds without a fixed resolution, axis, or pixel-budget cap. Checked native dimensions and allocation failures produce explicit errors. GPU rendering of those images does not establish hardware video decoding or zero-copy presentation. Treat this as a functional prototype. Hardware decoding, efficient GPU surface sharing, HDR correctness, battery use, and claims of being faster than VLC remain unverified.
+
+### Pull request review follow-up on 2026-10-25
+
+The review fixes make interrupted inspect/download commands fail, give each movie-search host a four-second attempt budget, enforce HTTPS through redirects using reqwest's `https_only` mode, and share canonical video-file validation between picker/drop imports. Imports now use batch deduplication; history migration reuses its existing set instead of scanning the whole library for each entry.
+
+After these changes, formatting, all-target checking, strict desktop/backend Clippy, all 23 ordinary tests, and all ten transfer-only tests pass. New regressions use a stalled loopback HTTP connection followed by a working fallback, aliased/missing/unsupported import paths, and batch import/history ordering with retained titles. Separate real CLI processes were interrupted against a stalled loopback TLS endpoint: inspect and download each exited with code 1 and no success JSON. A generated local share emitted its magnet and stopped with code 0 on Ctrl+C. No public discovery or public peers were used for these regressions.
 
 ### Pull request verification on 2026-10-25
 

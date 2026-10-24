@@ -61,6 +61,22 @@ impl Settings {
             });
         }
     }
+
+    pub fn add_videos(&mut self, paths: impl IntoIterator<Item = PathBuf>) {
+        let mut known = self
+            .library
+            .iter()
+            .map(|video| video.path.clone())
+            .collect::<std::collections::HashSet<_>>();
+        for path in paths {
+            if !path.as_os_str().is_empty() && known.insert(path.clone()) {
+                self.library.push(LibraryVideo {
+                    title: file_title(&path),
+                    path,
+                });
+            }
+        }
+    }
     /// Exact paths are deduplicated without accessing or canonicalizing media files.
     pub fn remember(&mut self, path: &Path, position: f64, duration: f64) {
         if path.as_os_str().is_empty() {
@@ -106,13 +122,13 @@ impl Settings {
             }
             !video.path.as_os_str().is_empty() && seen_library.insert(video.path.clone())
         });
-        for path in self
-            .recent
-            .iter()
-            .map(|v| v.path.clone())
-            .collect::<Vec<_>>()
-        {
-            self.add_video(&path);
+        for file in &self.recent {
+            if seen_library.insert(file.path.clone()) {
+                self.library.push(LibraryVideo {
+                    path: file.path.clone(),
+                    title: file_title(&file.path),
+                });
+            }
         }
     }
 }
@@ -319,6 +335,31 @@ mod tests {
                 .iter()
                 .any(|file| file.path == Path::new("0.mkv"))
         );
+    }
+
+    #[test]
+    fn batch_import_and_history_migration_preserve_order_and_existing_titles() {
+        let mut settings = Settings::default();
+        settings.library.push(LibraryVideo {
+            path: "existing.mp4".into(),
+            title: "Existing title".into(),
+        });
+        settings.add_videos([
+            "existing.mp4".into(),
+            "new.mp4".into(),
+            "new.mp4".into(),
+            PathBuf::new(),
+        ]);
+        settings.recent.push(RecentFile {
+            path: "older.mp4".into(),
+            ..Default::default()
+        });
+        settings.sanitize();
+        settings.sanitize();
+        assert_eq!(settings.library.len(), 3);
+        assert_eq!(settings.library[0].title, "Existing title");
+        assert_eq!(settings.library[1].path, Path::new("new.mp4"));
+        assert_eq!(settings.library[2].path, Path::new("older.mp4"));
     }
 
     #[test]

@@ -128,12 +128,29 @@ fn parse_general(value: serde_json::Value) -> Result<Vec<SearchResult>> {
         .collect())
 }
 async fn search_movies(client: &reqwest::Client, query: &str) -> Result<Vec<SearchResult>> {
-    let mut last = None;
+    let mut urls = Vec::new();
     for host in ["yts.mx", "yts.am", "yts.rs"] {
         let mut url = reqwest::Url::parse(&format!("https://{host}/api/v2/list_movies.json"))?;
         url.query_pairs_mut()
             .extend_pairs([("query_term", query), ("limit", "50")]);
-        match json(client, url).await.and_then(parse_movies) {
+        urls.push(url);
+    }
+    search_movie_urls(client, urls, Duration::from_secs(4)).await
+}
+
+async fn search_movie_urls(
+    client: &reqwest::Client,
+    urls: Vec<reqwest::Url>,
+    attempt_timeout: Duration,
+) -> Result<Vec<SearchResult>> {
+    let mut last = None;
+    for url in urls {
+        let attempt = tokio::time::timeout(attempt_timeout, json(client, url))
+            .await
+            .context("Movie search host timed out")
+            .and_then(|response| response)
+            .and_then(parse_movies);
+        match attempt {
             Ok(items) => return Ok(items),
             Err(error) => last = Some(error),
         }
@@ -240,6 +257,50 @@ fn item(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn movie_search_reaches_fallback_after_a_host_stalls() -> Result<()> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let origin = format!("http://{}", listener.local_addr()?);
+        let server = tokio::spawn(async move {
+            // Keep the first connection open without sending a response.
+            let (_stalled, _) = listener.accept().await?;
+            let (mut working, _) = listener.accept().await?;
+            let mut request = [0; 4096];
+            let read = working.read(&mut request).await?;
+            ensure!(read > 0, "Expected a fallback HTTP request");
+            let body = serde_json::json!({"data":{"movies":[{
+                "title":"Fallback result", "torrents":[{"hash":"a".repeat(40)}]
+            }]}})
+            .to_string();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            working.write_all(response.as_bytes()).await?;
+            Ok::<_, anyhow::Error>(())
+        });
+        let client = reqwest::Client::builder().no_proxy().build()?;
+        let result = tokio::time::timeout(
+            Duration::from_secs(3),
+            search_movie_urls(
+                &client,
+                vec![
+                    reqwest::Url::parse(&format!("{origin}/stalled"))?,
+                    reqwest::Url::parse(&format!("{origin}/working"))?,
+                ],
+                Duration::from_millis(200),
+            ),
+        )
+        .await;
+        server.abort();
+        let items = result??;
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].name, "Fallback result");
+        Ok(())
+    }
+
     #[test]
     fn search_mapping_rejects_invalid_hashes_sentinels_and_non_video_categories() {
         let rows=parse_general(serde_json::json!([

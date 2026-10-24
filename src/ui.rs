@@ -1335,6 +1335,7 @@ impl Render for Flick {
             )
             .on_drop(cx.listener(|this, paths: &ExternalPaths, window, cx| {
                 if this.view == View::Library {
+                    let mut videos = Vec::new();
                     for path in paths.paths() {
                         if path.is_dir() {
                             this.import_folder(path.clone(), window, cx);
@@ -1344,9 +1345,10 @@ impl Render for Flick {
                         {
                             this.resolve(flick::torrent::TorrentInput::File(path.clone()), cx);
                         } else {
-                            this.store.data.add_video(path);
+                            videos.push(path.clone());
                         }
                     }
+                    this.add_library_files(videos);
                     this.persist();
                     cx.notify();
                 } else if let Some(path) = paths.paths().first() {

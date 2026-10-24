@@ -97,7 +97,10 @@ async fn main() -> Result<()> {
                 None => run(&session, args.command).await,
             }
         } => result,
-        signal = tokio::signal::ctrl_c() => signal.context("Listen for Ctrl+C"),
+        signal = tokio::signal::ctrl_c() => signal.context("Listen for Ctrl+C").and_then(|()| {
+            anyhow::ensure!(command_timeout.is_none(), "Interrupted before the command finished");
+            Ok(())
+        }),
     };
     session.stop().await;
     result
