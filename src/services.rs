@@ -41,7 +41,21 @@ pub enum Command {
     },
     Pause(String),
     Resume(String),
-    Remove(String),
+    Remove {
+        id: String,
+        delete_files: bool,
+    },
+    Export {
+        id: String,
+        path: PathBuf,
+    },
+    PauseAll,
+    ResumeAll,
+    ConfigureTransfers {
+        seed_completed: bool,
+        download_bps: u32,
+        upload_bps: u32,
+    },
     Share(PathBuf),
     Load,
     CancelSearch,
@@ -63,7 +77,13 @@ pub enum Event {
     },
     Resolved(Result<ResolvedTorrent, String>),
     ResolveCancelled,
+    ShareChecking(PathBuf),
     Shared(Result<SharedTorrent, String>),
+    TorrentCompleted {
+        infohash: String,
+        file_index: usize,
+        path: PathBuf,
+    },
     Progress(Vec<TransferSnapshot>),
     Completed(PathBuf),
     Error(String),
@@ -77,7 +97,7 @@ pub struct Services {
 }
 
 impl Services {
-    pub fn start() -> Self {
+    pub fn start(preferences: &crate::store::TransferPreferences) -> Self {
         let base = std::env::var_os("FLICK_DATA_DIR")
             .map(PathBuf::from)
             .or_else(|| {
@@ -111,7 +131,9 @@ impl Services {
             } else {
                 librqbit::ListenerMode::TcpAndUtp
             },
-            download_limit_bytes_per_second: None,
+            download_limit_bytes_per_second: std::num::NonZeroU32::new(preferences.download_bps),
+            upload_limit_bytes_per_second: std::num::NonZeroU32::new(preferences.upload_bps),
+            seed_completed_downloads: preferences.seed_completed.unwrap_or(false),
         };
         let (sender, receiver) = channel::unbounded_channel();
         let peers = std::env::var("FLICK_INITIAL_PEERS")
@@ -165,7 +187,7 @@ impl Drop for Services {
 }
 
 async fn run(
-    config: TransferConfig,
+    mut config: TransferConfig,
     initial_peers: Vec<std::net::SocketAddr>,
     mut commands: channel::UnboundedReceiver<Command>,
     events: mpsc::Sender<Event>,
@@ -199,6 +221,16 @@ async fn run(
                     let _ = events.send(Event::ResolveCancelled);
                     continue;
                 }
+                if let Command::ConfigureTransfers { seed_completed, download_bps, upload_bps } = command {
+                    config.seed_completed_downloads = seed_completed;
+                    config.download_limit_bytes_per_second = std::num::NonZeroU32::new(download_bps);
+                    config.upload_limit_bytes_per_second = std::num::NonZeroU32::new(upload_bps);
+                    if let Some(session) = &session {
+                        session.set_limits(config.download_limit_bytes_per_second, config.upload_limit_bytes_per_second);
+                        session.set_seed_completed_downloads(seed_completed).await;
+                    }
+                    continue;
+                }
                 if session.is_none() {
                     match TransferSession::start(config.clone()).await {
                         Ok(started) => session = Some(Arc::new(started)),
@@ -226,8 +258,12 @@ async fn run(
                         }
                         Command::Pause(id) => session.pause(&id).await,
                         Command::Resume(id) => session.resume(&id, peers).await,
-                        Command::Remove(id) => session.remove(&id, false).await,
+                        Command::Remove { id, delete_files } => session.remove(&id, delete_files).await,
+                        Command::Export { id, path } => session.export_torrent(&id, &path).await,
+                        Command::PauseAll => session.pause_all().await,
+                        Command::ResumeAll => session.resume_all(peers).await,
                         Command::Share(path) => {
+                            let _ = events.send(Event::ShareChecking(path.clone()));
                             let result = session.share(&path, vec![]).await.map_err(|e| format!("Could not share these files: {e:#}"));
                             let _ = events.send(Event::Shared(result)); Ok(())
                         }
@@ -240,11 +276,14 @@ async fn run(
                 if let Some(session) = &session {
                     match session.snapshots() {
                         Ok(snapshots) => {
+                            // Include the destination: removing and re-downloading an
+                            // identity to another folder must bind that new path too.
+                            completed.retain(|(id, index, path)| snapshots.iter().any(|s| &s.infohash == id && s.files.iter().any(|f| &f.index == index && &f.path == path)));
                             for snapshot in &snapshots {
                                 for file in &snapshot.files {
-                                    let key = (snapshot.infohash.clone(), file.index);
+                                    let key = (snapshot.infohash.clone(), file.index, file.path.clone());
                                     if !completed.contains(&key) && flick::library::is_video(&file.path) && let Ok(path) = session.completed_file(&snapshot.infohash, file.index) {
-                                        completed.insert(key); let _ = events.send(Event::Completed(path));
+                                        completed.insert(key); let _ = events.send(Event::TorrentCompleted { infohash: snapshot.infohash.clone(), file_index: file.index, path });
                                     }
                                 }
                             }
@@ -427,7 +466,7 @@ mod tests {
             while !shared || !completed {
                 match output.try_recv() {
                     Ok(Event::Shared(Ok(_))) => shared = true,
-                    Ok(Event::Completed(path)) => {
+                    Ok(Event::TorrentCompleted { path, .. }) => {
                         assert_eq!(path, video.canonicalize()?);
                         completed = true;
                     }

@@ -122,16 +122,33 @@ impl Flick {
                         Err(error) => self.error = Some(error),
                     }
                 }
-                ServiceEvent::Shared(result) => match result {
-                    Ok(shared) => {
-                        self.magnet_field
-                            .update(cx, |field, cx| field.set_value(shared.magnet.clone(), cx));
-                        self.shared_magnet = Some(shared.magnet);
-                        self.page = Page::Downloads;
+                ServiceEvent::ShareChecking(path) => {
+                    self.checking_share = Some(path);
+                    self.page = Page::Downloads;
+                }
+                ServiceEvent::Shared(result) => {
+                    self.checking_share = None;
+                    match result {
+                        Ok(shared) => {
+                            self.magnet_field
+                                .update(cx, |field, cx| field.set_value(shared.magnet.clone(), cx));
+                            self.shared_magnet = Some(shared.magnet);
+                            self.page = Page::Downloads;
+                        }
+                        Err(error) => self.error = Some(error),
                     }
-                    Err(error) => self.error = Some(error),
-                },
+                }
                 ServiceEvent::Progress(downloads) => self.downloads = downloads,
+                ServiceEvent::TorrentCompleted {
+                    infohash,
+                    file_index,
+                    path,
+                } => {
+                    self.store.data.bind_torrent(&path, &infohash, file_index);
+                    if let Err(error) = self.store.save() {
+                        self.error = Some(format!("Could not save the library: {error}"));
+                    }
+                }
                 ServiceEvent::Completed(path) => {
                     self.store.data.add_video(&path);
                     if let Err(error) = self.store.save() {
@@ -176,7 +193,7 @@ impl Flick {
             let _ = this.update_in(cx, |this, window, cx| match result {
                 Ok(Ok(Some(paths))) => {
                     if share {
-                        if let Some(path) = paths.into_iter().next() { this.send(ServiceCommand::Share(path), cx); }
+                        if let Some(path) = paths.into_iter().next() { this.show_page(Page::Downloads, window, cx); this.send(ServiceCommand::Share(path), cx); }
                     } else if folder {
                         if let Some(path) = paths.into_iter().next() { this.import_folder(path, window, cx); }
                     } else {
@@ -218,6 +235,54 @@ impl Flick {
             });
         })
         .detach();
+    }
+
+    fn export_torrent(&mut self, id: String, window: &Window, cx: &mut Context<Self>) {
+        let receiver =
+            cx.prompt_for_new_path(&self.download_folder, Some(&format!("{id}.torrent")));
+        cx.spawn_in(window, async move |this, cx| {
+            let result = receiver.await;
+            let _ = this.update_in(cx, |this, _, cx| match result {
+                Ok(Ok(Some(path))) => this.send(ServiceCommand::Export { id, path }, cx),
+                Ok(Ok(None)) => {}
+                _ => {
+                    this.error = Some("The save picker could not open.".into());
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    pub(super) fn update_transfer_preferences(&mut self, cx: &mut Context<Self>) {
+        let preferences = &self.store.data.transfers;
+        let command = ServiceCommand::ConfigureTransfers {
+            seed_completed: preferences.seed_completed.unwrap_or(false),
+            download_bps: preferences.download_bps,
+            upload_bps: preferences.upload_bps,
+        };
+        if let Err(error) = self.store.save() {
+            self.error = Some(format!("Could not save transfer preferences: {error}"));
+        }
+        self.send(command, cx);
+    }
+
+    pub(super) fn seeding_choice(&self, cx: &Context<Self>) -> Div {
+        let t = cx.theme();
+        if self.store.data.transfers.seed_completed.is_some() {
+            return div();
+        }
+        v_flex().gap_2().my_3()
+            .child(div().child("Keep sharing completed downloads?"))
+            .child(div().text_size(t.font(12.)).text_color(t.muted)
+                .child("Sharing uploads to other peers while Flick is open. Until you choose, completed downloads pause. Files you explicitly share keep sharing."))
+            .child(h_flex().gap_2()
+                .child(self.button("seed-choice-on", None, "Keep Sharing", false, cx, |this, _, cx| {
+                    this.store.data.transfers.seed_completed = Some(true); this.update_transfer_preferences(cx);
+                }))
+                .child(self.button("seed-choice-off", None, "Pause When Complete", false, cx, |this, _, cx| {
+                    this.store.data.transfers.seed_completed = Some(false); this.update_transfer_preferences(cx);
+                })))
     }
 
     pub(super) fn choose_download_folder(&mut self, window: &Window, cx: &mut Context<Self>) {
@@ -815,6 +880,7 @@ impl Flick {
                         |this, w, cx| this.handle(Control::PasteMagnet, w, cx),
                     ))),
             )
+            .child(self.seeding_choice(cx))
             .child(
                 div()
                     .mt_2()
@@ -1708,7 +1774,17 @@ impl Flick {
 
     fn downloads_page(&self, cx: &Context<Self>) -> Div {
         let t = cx.theme().clone();
-        let mut page = v_flex().w_full();
+        let mut page = v_flex().w_full().child(self.seeding_choice(cx));
+        if let Some(path) = &self.checking_share {
+            page = page.child(
+                notice(
+                    &t,
+                    false,
+                    format!("Checking files… {} · creating piece hashes", path.display()),
+                )
+                .mb_3(),
+            );
+        }
         if let Some(torrent) = &self.pending_torrent {
             page = page
                 .child(self.torrent_sheet(torrent, cx))
@@ -1755,7 +1831,43 @@ impl Flick {
                 .map(|download| self.transfer_row(download, cx))
                 .collect();
             page = page
-                .child(section_title(&t, "Transfers"))
+                .child(
+                    h_flex()
+                        .justify_between()
+                        .mb_2()
+                        .child(section_title(&t, "Transfers"))
+                        .child(
+                            self.button(
+                                "pause-all-transfers",
+                                None,
+                                if self
+                                    .downloads
+                                    .iter()
+                                    .all(|d| d.state == flick::torrent::TransferState::Paused)
+                                {
+                                    "Resume All"
+                                } else {
+                                    "Pause All"
+                                },
+                                false,
+                                cx,
+                                |this, _, cx| {
+                                    let paused = this
+                                        .downloads
+                                        .iter()
+                                        .all(|d| d.state == flick::torrent::TransferState::Paused);
+                                    this.send(
+                                        if paused {
+                                            ServiceCommand::ResumeAll
+                                        } else {
+                                            ServiceCommand::PauseAll
+                                        },
+                                        cx,
+                                    );
+                                },
+                            ),
+                        ),
+                )
                 .child(group(&t, rows));
         }
         page.child(
@@ -1778,119 +1890,61 @@ impl Flick {
         let t = cx.theme().clone();
         let id = download.infohash.clone();
         let paused = download.state == TransferState::Paused;
+        let complete = download.verified_bytes == download.total_bytes && download.total_bytes > 0;
         let (state, color) = match download.state {
-            TransferState::Checking => ("Checking files", t.accent),
+            TransferState::Checking => ("Checking files…", t.accent),
             TransferState::Downloading => ("Downloading", t.accent),
+            TransferState::Paused if complete => ("Complete · sharing paused", t.muted),
             TransferState::Paused => ("Paused", t.muted),
             TransferState::Seeding => ("Sharing", rgb(0x30b158)),
             TransferState::Error => ("Transfer failed", t.danger),
         };
-        let progress = if download.total_bytes > 0 {
-            (download.verified_bytes as f64 / download.total_bytes as f64).clamp(0., 1.) as f32
+        let (done, total) = if download.state == TransferState::Checking {
+            (download.checked_bytes, download.checking_total_bytes)
+        } else {
+            (download.verified_bytes, download.total_bytes)
+        };
+        let progress = if total > 0 {
+            (done as f64 / total as f64).clamp(0., 1.) as f32
         } else {
             0.
         };
-        let playable = download
-            .files
-            .iter()
-            .find(|file| {
-                file.selected
-                    && file.verified_bytes == file.length
-                    && !matches!(
-                        download.state,
-                        TransferState::Checking | TransferState::Error
-                    )
-                    && flick::library::is_video(&file.path)
-            })
-            .map(|file| file.path.clone());
+        let playable = download.files.iter().find(|file| {
+            file.selected
+                && file.verified_bytes == file.length
+                && !matches!(
+                    download.state,
+                    TransferState::Checking | TransferState::Error
+                )
+                && flick::library::is_video(&file.path)
+        });
+        let mut actions = h_flex().flex_wrap().gap_2();
+        if let Some(file) = playable {
+            let path = file.path.clone();
+            let infohash = id.clone();
+            let index = file.index;
+            actions = actions.child(self.button(
+                SharedString::from(format!("play-{id}")),
+                Some("play"),
+                "Play",
+                false,
+                cx,
+                move |this, w, cx| {
+                    this.store.data.bind_torrent(&path, &infohash, index);
+                    this.open(path.clone(), w, cx);
+                },
+            ));
+        }
         let toggle_id = id.clone();
+        let export_id = id.clone();
         let remove_id = id.clone();
-        h_flex()
-            .gap_3()
-            .px_3()
-            .py_2p5()
-            .child(
-                div()
-                    .flex_none()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .size(px(40.))
-                    .rounded(px(t.radius + 2.))
-                    .bg(t.control)
-                    .child(icon(
-                        if download.state == TransferState::Seeding {
-                            "share-2"
-                        } else {
-                            "download"
-                        },
-                        18.,
-                        color,
-                    )),
-            )
-            .child(
-                v_flex()
-                    .flex_1()
-                    .min_w(px(0.))
-                    .gap_1()
-                    .child(
-                        div()
-                            .font_weight(FontWeight::MEDIUM)
-                            .overflow_hidden()
-                            .whitespace_nowrap()
-                            .child(download.name.clone()),
-                    )
-                    .child(
-                        div()
-                            .h(px(4.))
-                            .w_full()
-                            .rounded_full()
-                            .bg(t.control_hover)
-                            .child(
-                                div()
-                                    .h_full()
-                                    .w(relative(progress))
-                                    .rounded_full()
-                                    .bg(color),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .text_size(t.font(12.))
-                            .text_color(t.muted)
-                            .overflow_hidden()
-                            .whitespace_nowrap()
-                            .child(format!(
-                                "{state} · {} of {} · {}/s · {} peers",
-                                format_bytes(download.verified_bytes),
-                                format_bytes(download.total_bytes),
-                                format_bytes(download.download_bytes_per_second),
-                                download.peers
-                            )),
-                    )
-                    .when_some(download.error.clone(), |d, error| {
-                        d.child(
-                            div()
-                                .text_size(t.font(12.))
-                                .text_color(t.danger)
-                                .child(error),
-                        )
-                    }),
-            )
-            .when_some(playable, |d, path| {
-                d.child(self.button(
-                    SharedString::from(format!("play-{id}")),
-                    Some("play"),
-                    "Play",
-                    false,
-                    cx,
-                    move |this, w, cx| this.open(path.clone(), w, cx),
-                ))
-            })
-            .child(self.icon_button(
+        let delete_id = id.clone();
+        actions = actions
+            .child(self.button(
                 SharedString::from(format!("pause-{id}")),
-                if paused { "play" } else { "pause" },
+                Some(if paused { "play" } else { "pause" }),
                 if paused { "Resume" } else { "Pause" },
+                false,
                 cx,
                 move |this, _, cx| {
                     this.send(
@@ -1903,14 +1957,167 @@ impl Flick {
                     )
                 },
             ))
-            .child(self.icon_button(
-                SharedString::from(format!("remove-{id}")),
-                "x",
-                "Remove · keep files",
+            .child(self.button(
+                SharedString::from(format!("export-{id}")),
+                None,
+                "Export .torrent…",
+                false,
                 cx,
-                move |this, _, cx| this.send(ServiceCommand::Remove(remove_id.clone()), cx),
+                move |this, w, cx| this.export_torrent(export_id.clone(), w, cx),
             ))
-            .into_any_element()
+            .child(self.button(
+                SharedString::from(format!("remove-{id}")),
+                None,
+                "Remove · Keep Files",
+                false,
+                cx,
+                move |this, _, cx| {
+                    this.send(
+                        ServiceCommand::Remove {
+                            id: remove_id.clone(),
+                            delete_files: false,
+                        },
+                        cx,
+                    )
+                },
+            ))
+            .child(self.button(
+                SharedString::from(format!("delete-{id}")),
+                None,
+                "Remove and Delete Files…",
+                false,
+                cx,
+                move |this, _, cx| {
+                    this.delete_transfer = Some(delete_id.clone());
+                    cx.notify();
+                },
+            ));
+        let mut entry = v_flex()
+            .gap_2()
+            .px_3()
+            .py_2p5()
+            .child(
+                h_flex()
+                    .gap_2()
+                    .child(icon(
+                        if complete { "share-2" } else { "download" },
+                        18.,
+                        color,
+                    ))
+                    .child(
+                        div()
+                            .font_weight(FontWeight::MEDIUM)
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .child(download.name.clone()),
+                    ),
+            )
+            .child(
+                div()
+                    .h(px(4.))
+                    .w_full()
+                    .rounded_full()
+                    .bg(t.control_hover)
+                    .child(
+                        div()
+                            .h_full()
+                            .w(relative(progress))
+                            .rounded_full()
+                            .bg(color),
+                    ),
+            )
+            .child(
+                div()
+                    .text_size(t.font(12.))
+                    .text_color(t.muted)
+                    .child(format!(
+                        "{state} · {} of {} · {:.0}%",
+                        format_bytes(done),
+                        format_bytes(total),
+                        progress * 100.
+                    )),
+            )
+            .child(
+                div()
+                    .text_size(t.font(12.))
+                    .text_color(t.muted)
+                    .child(format!(
+                        "Download {}/s · Upload {}/s · {} uploaded · {} peers",
+                        format_bytes(download.download_bytes_per_second),
+                        format_bytes(download.upload_bytes_per_second),
+                        format_bytes(download.uploaded_bytes),
+                        download.peers
+                    )),
+            )
+            .when_some(download.error.clone(), |d, error| {
+                d.child(
+                    div()
+                        .text_size(t.font(12.))
+                        .text_color(t.danger)
+                        .child(error),
+                )
+            })
+            .child(actions);
+        if self.delete_transfer.as_ref() == Some(&id) {
+            let mut confirmation = v_flex()
+                .gap_2()
+                .p_3()
+                .rounded(px(t.radius))
+                .bg(t.control)
+                .child(
+                    div()
+                        .text_color(t.danger)
+                        .child("Permanently delete these torrent files? This cannot be undone."),
+                );
+            for file in &download.files {
+                confirmation = confirmation.child(
+                    div()
+                        .text_size(t.font(12.))
+                        .child(file.path.display().to_string()),
+                );
+            }
+            confirmation = confirmation
+                .child(
+                    div()
+                        .text_size(t.font(12.))
+                        .text_color(t.muted)
+                        .child("Only listed files are deleted. Other files and folders are kept."),
+                )
+                .child(
+                    h_flex()
+                        .gap_2()
+                        .child(self.button(
+                            SharedString::from(format!("cancel-delete-{id}")),
+                            None,
+                            "Cancel",
+                            false,
+                            cx,
+                            |this, _, cx| {
+                                this.delete_transfer = None;
+                                cx.notify();
+                            },
+                        ))
+                        .child(self.button(
+                            SharedString::from(format!("confirm-delete-{id}")),
+                            None,
+                            "Delete Listed Files",
+                            false,
+                            cx,
+                            move |this, _, cx| {
+                                this.delete_transfer = None;
+                                this.send(
+                                    ServiceCommand::Remove {
+                                        id: id.clone(),
+                                        delete_files: true,
+                                    },
+                                    cx,
+                                );
+                            },
+                        )),
+                );
+            entry = entry.child(confirmation);
+        }
+        entry.into_any_element()
     }
 
     fn torrent_sheet(&self, torrent: &flick::torrent::ResolvedTorrent, cx: &Context<Self>) -> Div {

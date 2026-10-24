@@ -4,6 +4,22 @@ The native transfer adapter and `flick-transfer` diagnostic are implemented. Des
 
 The adapter pins librqbit 9.0.1, uses separate transfer state with an exclusive lock, resolves file metadata before download, supports selected files and pause/resume, and exposes completed files only after piece verification. New downloads get a directory named by infohash under the chosen destination. Existing unrelated destinations are refused. Removing a transfer and deleting its files are separate backend operations.
 
+## Desktop transfer controls
+
+Downloads shows verified download progress, download/upload rates, uploaded bytes reported by the engine, peers, and a separate **Checking files…** percentage during file verification. Uploaded totals are the native live-state counter, not a lifetime accounting ledger. Initial share creation shows **Checking files…** while creating piece hashes; librqbit exposes no percentage for that initial operation. Restarted transfers recheck their files before Play becomes available.
+
+Each torrent, whether shared or downloaded, has **Export .torrent…**, which uses the native save picker and writes the stored metainfo bytes without re-encoding. Export refuses to overwrite managed torrent content. **Remove · Keep Files** unregisters a transfer. **Remove and Delete Files…** first lists every metainfo file by its destination path and requires **Delete Listed Files**. The adapter deletes only those files, retains unrelated files and directories, and rejects symlinks/reparse points or replaced paths. Shared torrents delete their original shared files if this action is confirmed. On Unix, deletion uses directory descriptors and `unlinkat` without following parent symlinks. Removal is not recursive; empty folders remain.
+
+**Pause All / Resume All** controls torrent transfers, including explicit shares. Link Downloads have their own Cancel controls and remain independent. Resume All honors the completed-download seeding preference.
+
+The welcome page and Downloads ask whether completed downloads should keep sharing. Until a choice is saved, completed downloads pause after verification. Change the choice in **Appearance → Transfers**. Turning sharing off pauses completed downloads in the background (checked every 250 ms); explicit **Share Files…** torrents keep sharing until paused or removed. Turning it on allows sharing; use Resume on transfers that are already paused. This policy applies to persisted downloads after reopening Flick. Explicit-share identities are stored separately with transfer state. All transfers and shares stop when Flick closes.
+
+The same Transfers group provides download and upload sliders, in 256 KiB/s steps up to 32 MiB/s; zero means unlimited. Both limits are saved in settings, used at session startup, and applied live through librqbit's session limits. They apply to torrents, not yt-dlp or HTTPS downloads. Buttons, switches, and sliders use the existing focusable controls for all three interface styles; sliders support arrow keys, Home, and End.
+
+Verified torrent videos are bound to `(infohash, file index)` in viewing settings as well as their local path. Re-downloading that identity into a different destination restores the saved position. Bindings and saved torrent positions are additive: existing path history remains intact, and local-only videos continue to resume by path. Flick cannot identify an arbitrary manually moved file until it is associated with the torrent again.
+
+## Backend diagnostic
+
 The diagnostic requires no GPUI, Metal, display, audio device, or libmpv:
 
 ```sh
