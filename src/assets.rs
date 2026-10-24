@@ -32,6 +32,12 @@ embedded_icons!(
     "circle-alert",
     "file-video",
     "upload",
+    "search",
+    "library",
+    "arrow-left",
+    "download",
+    "share-2",
+    "folder-plus",
 );
 
 pub struct Assets;

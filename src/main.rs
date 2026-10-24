@@ -1,6 +1,8 @@
 mod assets;
+mod input;
 mod model;
 mod playback;
+mod services;
 mod smoke;
 mod store;
 mod ui;
@@ -32,6 +34,7 @@ fn main() -> anyhow::Result<()> {
     Application::new()
         .with_assets(assets::Assets)
         .run(move |cx: &mut App| {
+            input::init(cx);
             if let Err(error) =
                 cx.text_system()
                     .add_fonts(vec![std::borrow::Cow::Borrowed(include_bytes!(

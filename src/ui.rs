@@ -1,16 +1,22 @@
+#[path = "library_ui.rs"]
+mod library_ui;
+
 use crate::{
     assets::icon,
+    input::{InputEvent, TextInput},
     model::{file_title, format_time, seek_target},
     playback::{PlaybackSnapshot, Player, PlayerEvent},
+    services::{Command as ServiceCommand, Event as ServiceEvent, Services},
     store::Store,
 };
 use gpui::{
-    Bounds, ClickEvent, Context, Div, ExternalPaths, FocusHandle, KeyDownEvent, MouseButton,
-    ObjectFit, PathPromptOptions, Pixels, RenderImage, SharedString, Stateful, Window, canvas, div,
-    img, prelude::*, px, relative, rgb,
+    Bounds, ClickEvent, ClipboardItem, Context, Div, Entity, ExternalPaths, FocusHandle, Focusable,
+    KeyDownEvent, MouseButton, ObjectFit, PathPromptOptions, Pixels, RenderImage, SharedString,
+    Stateful, Window, canvas, div, img, prelude::*, px, relative, rgb,
 };
 use std::{
     cell::Cell,
+    collections::HashSet,
     path::PathBuf,
     rc::Rc,
     sync::Arc,
@@ -25,6 +31,18 @@ const MUTED: u32 = 0x858585;
 const HOVER: u32 = 0x202020;
 const HEADER_HEIGHT: f32 = 56.;
 const FOOTER_HEIGHT: f32 = 108.;
+
+#[derive(Clone, Copy, PartialEq)]
+enum View {
+    Library,
+    Player,
+}
+#[derive(Clone, Copy, PartialEq)]
+enum LibraryTab {
+    Videos,
+    History,
+    Downloads,
+}
 
 #[derive(Clone, Copy, PartialEq)]
 enum Menu {
@@ -48,6 +66,11 @@ enum Control {
     Subtitle,
     Keys,
     DismissError,
+    Library,
+    Search,
+    AddVideos,
+    AddFolder,
+    Share,
 }
 
 pub struct Flick {
@@ -69,11 +92,43 @@ pub struct Flick {
     opened_at: Option<Instant>,
     pending_resume: f64,
     file_loaded: bool,
+    view: View,
+    library_tab: LibraryTab,
+    search_input: Entity<TextInput>,
+    query: String,
+    search_generation: u64,
+    searching: bool,
+    search_results: Option<flick::catalog::SearchResults>,
+    services: Services,
+    downloads: Vec<flick::torrent::TransferSnapshot>,
+    resolving: bool,
+    pending_torrent: Option<flick::torrent::ResolvedTorrent>,
+    selected_files: HashSet<usize>,
+    download_folder: PathBuf,
+    shared_magnet: Option<String>,
+    importing: bool,
 }
 
 impl Flick {
     pub fn new(path: Option<PathBuf>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let store = Store::load();
+        let search_input = cx.new(TextInput::new);
+        let services = Services::start();
+        let download_folder = services.download_dir.clone();
+        cx.subscribe(&search_input, |this, input, event, cx| {
+            match event {
+                InputEvent::Changed => {
+                    let _ = this.services.send(ServiceCommand::CancelSearch);
+                    this.query = input.read(cx).value().to_owned();
+                    this.search_generation += 1;
+                    this.searching = false;
+                    this.search_results = None;
+                }
+                InputEvent::Submit => this.search(cx),
+            }
+            cx.notify();
+        })
+        .detach();
         let (player, error) = match Player::new() {
             Ok(player) => (Some(player), None),
             Err(error) => (None, Some(format!("Playback is unavailable. {error:#}"))),
@@ -99,6 +154,21 @@ impl Flick {
             opened_at: None,
             pending_resume: 0.,
             file_loaded: false,
+            view: View::Library,
+            library_tab: LibraryTab::Videos,
+            search_input,
+            query: String::new(),
+            search_generation: 0,
+            searching: false,
+            search_results: None,
+            services,
+            downloads: Vec::new(),
+            resolving: false,
+            pending_torrent: None,
+            selected_files: HashSet::new(),
+            download_folder,
+            shared_magnet: None,
+            importing: false,
         };
         this.apply_preferences();
         cx.on_release(|this, _| this.persist()).detach();
@@ -149,11 +219,25 @@ impl Flick {
     }
 
     fn open(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        if path
+            .extension()
+            .is_some_and(|v| v.eq_ignore_ascii_case("torrent"))
+        {
+            self.resolve(flick::torrent::TorrentInput::File(path), cx);
+            return;
+        }
+        if let Some(value) = path.to_str()
+            && value.starts_with("magnet:")
+        {
+            self.resolve(flick::torrent::TorrentInput::Magnet(value.to_owned()), cx);
+            return;
+        }
         if !path.is_file() {
             self.error = Some(format!("This file could not be opened: {}", path.display()));
             cx.notify();
             return;
         }
+        let path = path.canonicalize().unwrap_or(path);
         let Some(path_str) = path.to_str() else {
             self.error = Some(
                 "The file path contains unsupported characters. Try renaming the file.".into(),
@@ -171,6 +255,9 @@ impl Flick {
                 self.pending_resume = self.store.resume_position(&path);
                 self.file_loaded = false;
                 self.path = Some(path.clone());
+                self.store.data.add_video(&path);
+                self.view = View::Player;
+                self.focus.focus(window);
                 self.snapshot = PlaybackSnapshot::default();
                 self.error = None;
                 self.menu = None;
@@ -187,6 +274,7 @@ impl Flick {
     }
 
     fn tick(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Duration {
+        self.poll_services(cx);
         let Some(player) = &self.player else {
             return Duration::from_millis(500);
         };
@@ -222,12 +310,11 @@ impl Flick {
             self.snapshot = next;
             self.last_snapshot = Instant::now();
         }
-        if self.file_loaded {
+        if self.file_loaded && self.view == View::Player {
             let bounds = self.video_bounds.get();
             let width = f32::from(bounds.size.width).max(1.);
             let height = f32::from(bounds.size.height).max(1.);
-            let scale = (1280. / width).min(720. / height).min(1.);
-            let (w, h) = ((width * scale) as u32, (height * scale) as u32);
+            let (w, h) = flick::presentation::target_size(width, height, window.scale_factor());
             match player.render(w.max(1), h.max(1)) {
                 Ok(Some(frame)) => {
                     if let Some(buffer) =
@@ -320,6 +407,19 @@ impl Flick {
 
     fn handle(&mut self, control: Control, window: &mut Window, cx: &mut Context<Self>) {
         match control {
+            Control::Library => {
+                self.persist();
+                self.property("pause", "yes", cx);
+                self.view = View::Library;
+                self.menu = None;
+                window.set_window_title("Flick");
+                self.focus.focus(window);
+                cx.notify();
+            }
+            Control::Search => self.search(cx),
+            Control::AddVideos => self.pick_library(false, false, window, cx),
+            Control::AddFolder => self.pick_library(true, false, window, cx),
+            Control::Share => self.pick_library(true, true, window, cx),
             Control::Open => self.pick(false, window, cx),
             Control::Subtitle => self.pick(true, window, cx),
             Control::Play if self.path.is_some() => {
@@ -386,6 +486,39 @@ impl Flick {
     fn key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let key = event.keystroke.key.as_str();
         let modifiers = event.keystroke.modifiers;
+        if (modifiers.control || modifiers.platform) && key == "o" {
+            self.handle(
+                if self.view == View::Library {
+                    Control::AddVideos
+                } else {
+                    Control::Open
+                },
+                window,
+                cx,
+            );
+            cx.stop_propagation();
+            return;
+        }
+        if (modifiers.control || modifiers.platform) && key == "k" {
+            self.handle(Control::Library, window, cx);
+            self.search_input.focus_handle(cx).focus(window);
+            cx.stop_propagation();
+            return;
+        }
+        if key == "escape" {
+            if window.is_fullscreen() {
+                window.toggle_fullscreen();
+            }
+            self.menu = None;
+            cx.notify();
+            return;
+        }
+        if self.search_input.read(cx).focused(window) {
+            return;
+        }
+        if self.view == View::Library && !(modifiers.control || modifiers.platform) {
+            return;
+        }
         let control = if modifiers.control || modifiers.platform {
             match key {
                 "o" => Some(Control::Open),
@@ -402,14 +535,6 @@ impl Flick {
                 "m" => Some(Control::Mute),
                 "f" => Some(Control::Fullscreen),
                 "?" => Some(Control::Keys),
-                "escape" => {
-                    if window.is_fullscreen() {
-                        window.toggle_fullscreen();
-                    }
-                    self.menu = None;
-                    cx.notify();
-                    None
-                }
                 _ => None,
             }
         };
@@ -450,10 +575,13 @@ impl Flick {
                 this.handle(action, window, cx);
             }))
             .child(icon(
-                if matches!(action, Control::Subtitle) {
-                    "captions"
-                } else {
-                    "folder-open"
+                match action {
+                    Control::Subtitle => "captions",
+                    Control::Library => "arrow-left",
+                    Control::Search => "search",
+                    Control::AddFolder => "folder-plus",
+                    Control::Share => "share-2",
+                    _ => "folder-open",
                 },
                 15.,
                 color,
@@ -590,7 +718,12 @@ impl Flick {
                                     .flex()
                                     .flex_col()
                                     .gap_1()
-                                    .child(div().text_ellipsis().child(recent.title.clone()))
+                                    .child(
+                                        div()
+                                            .overflow_hidden()
+                                            .whitespace_nowrap()
+                                            .child(recent.title.clone()),
+                                    )
                                     .child(div().text_size(px(11.)).text_color(rgb(MUTED)).child(
                                         format!(
                                             "{} / {}",
@@ -781,7 +914,10 @@ impl Render for Flick {
                             .text_size(px(15.))
                             .font_weight(gpui::FontWeight::SEMIBOLD)
                             .child("Flick"),
-                    ),
+                    )
+                    .when(self.view == View::Player, |d| {
+                        d.child(self.control("library-home", "Library", Control::Library, cx))
+                    }),
             )
             .child(
                 div()
@@ -790,10 +926,14 @@ impl Render for Flick {
                     .text_center()
                     .text_size(px(12.))
                     .text_color(rgb(MUTED))
-                    .text_ellipsis()
+                    // GPUI 0.2.2 mutates truncation runs between layout passes,
+                    // which can split UTF-8 and abort on macOS. Clip instead.
+                    .overflow_hidden()
+                    .whitespace_nowrap()
                     .child(
                         self.path
                             .as_ref()
+                            .filter(|_| self.view == View::Player)
                             .map(|p| file_title(p))
                             .unwrap_or_default(),
                     ),
@@ -820,7 +960,20 @@ impl Render for Flick {
                         Control::Recent,
                         cx,
                     ))
-                    .child(self.control("open", "Open", Control::Open, cx)),
+                    .child(self.control(
+                        "open",
+                        if self.view == View::Library {
+                            "Add videos"
+                        } else {
+                            "Open"
+                        },
+                        if self.view == View::Library {
+                            Control::AddVideos
+                        } else {
+                            Control::Open
+                        },
+                        cx,
+                    )),
             );
         let video = div()
             .id("video")
@@ -1153,6 +1306,7 @@ impl Render for Flick {
             )
             .child(controls);
         let menu = self.menu_panel(cx);
+        let library = (self.view == View::Library).then(|| self.library_view(cx));
         div()
             .id("flick")
             .relative()
@@ -1180,12 +1334,30 @@ impl Render for Flick {
                 }),
             )
             .on_drop(cx.listener(|this, paths: &ExternalPaths, window, cx| {
-                if let Some(path) = paths.paths().first() {
+                if this.view == View::Library {
+                    let mut videos = Vec::new();
+                    for path in paths.paths() {
+                        if path.is_dir() {
+                            this.import_folder(path.clone(), window, cx);
+                        } else if path
+                            .extension()
+                            .is_some_and(|v| v.eq_ignore_ascii_case("torrent"))
+                        {
+                            this.resolve(flick::torrent::TorrentInput::File(path.clone()), cx);
+                        } else {
+                            videos.push(path.clone());
+                        }
+                    }
+                    this.add_library_files(videos);
+                    this.persist();
+                    cx.notify();
+                } else if let Some(path) = paths.paths().first() {
                     this.open(path.clone(), window, cx);
                 }
             }))
             .child(header)
-            .child(video)
+            .when_some(library, |d, library| d.child(library))
+            .when(self.view == View::Player, |d| d.child(video))
             .when_some(self.error.clone(), |d, error| {
                 d.child(
                     div()
@@ -1214,7 +1386,9 @@ impl Render for Flick {
                         )),
                 )
             })
-            .child(footer)
+            .when(self.file_loaded && self.view == View::Player, |d| {
+                d.child(footer)
+            })
             .when_some(menu, |d, panel| {
                 d.child(
                     div()

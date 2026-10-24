@@ -1,18 +1,18 @@
 # Flick
 
-A local-file desktop video player built in Rust with GPUI and libmpv. Start with the [implementation plan](PLAN.md) and [validation record](docs/VALIDATION.md).
+A desktop video player built in Rust with GPUI and libmpv, now adding native torrent downloads and file sharing. Start with the [implementation plan](PLAN.md), [playback and sharing design](docs/SHARING_PLAN.md), and [validation record](docs/VALIDATION.md).
 
 [View the empty window](docs/screenshots/flick-empty.png) or [playback with subtitles](docs/screenshots/flick-player.png).
 
 The interface uses bundled Inter typography, Lucide icons, centered playback controls, and a black/white/gray theme. See [asset sources and licenses](assets/README.md).
 
-The next milestone is [fully headless agent control](docs/HEADLESS_PLAN.md): an independent CLI and NDJSON session interface sharing the playback core, with no GPUI, display server, GPU, or audio-device requirement. It is planned work; the existing smoke-test command is a diagnostic.
+Flick opens to your library, with Continue watching, All videos, History, and Downloads. Add videos or a folder, filter local titles, or search online for videos to download. Choose torrent files and a destination; completed verified videos join the library. Share a file or folder and copy its magnet link. The [development diagnostic](docs/TRANSFERS.md) uses the same native transfer backend. Watching during downloads follows later. The broad [headless agent proposal](docs/HEADLESS_PLAN.md) is deferred. See [PLAN.md](PLAN.md) for implemented versus planned work.
 
-This first prototype provides video inside the application window, play and pause, seeking, volume and mute, playback speed, fullscreen, audio/subtitle selection, external subtitle loading, recent files, and resume positions. It uses a portable software frame-transfer path capped at a 1280×720 presentation surface. Efficient native GPU video presentation is a separate milestone; this version makes no claim of being faster than VLC.
+This first prototype provides video inside the application window, play and pause, seeking, volume and mute, playback speed, fullscreen, audio/subtitle selection, external subtitle loading, recent files, and resume positions. Playback controls appear after media loads. The software frame-transfer path follows the display's physical video bounds with no fixed resolution or pixel-budget cap. Native dimension/allocator failures are reported instead of silently lowering resolution. Efficient native GPU video presentation is a separate milestone; this version makes no claim of being faster than VLC.
 
 ## Run locally
 
-Install current stable [Rust](https://rust-lang.org/tools/install/) and the platform's desktop build prerequisites described in [validation](docs/VALIDATION.md#native-build-prerequisites). Install a compatible libmpv shared library for playback:
+Install [Rust through rustup](https://rust-lang.org/tools/install/), which selects the repository's pinned 1.99.0 toolchain, and the platform's desktop build prerequisites described in [validation](docs/VALIDATION.md#native-build-prerequisites). Install a compatible libmpv shared library for playback:
 
 - Ubuntu 24.04: `sudo apt-get install libmpv2`.
 - macOS: `brew install mpv`; full Xcode is required to build GPUI's Metal shaders.
@@ -27,7 +27,7 @@ cargo run --locked -- "/path/to/video.mp4"
 
 If Rust was just installed and `cargo` is not on the current shell's path, open a new terminal or run `. "$HOME/.cargo/env"` on macOS/Linux first. On this development machine, `~/.cargo/bin/cargo` also works directly.
 
-Choose **Open**, drop a video into the window, or pass a local path on the command line. The Linux file picker uses the desktop portal; drag and drop and command-line paths remain available when no portal service is running. The captions icon opens **Audio & subtitles** to select tracks or load a subtitle file. The history icon opens **Recent files** to restore prior viewing sessions. Icon controls have descriptive tooltips.
+Use **Add videos** or **Add folder** to build the library, or drop files/folders into it. Click a video to play or continue it. **Library** returns to the library and pauses playback. Passing a local path on the command line opens that video directly. Type to filter local videos; press Enter or **Search online** for download results. Search uses TPB, Internet Archive, and YTS independently and reports unavailable sources. The Linux file picker uses the desktop portal; drag and drop and command-line paths remain available when no portal service is running. The captions icon opens **Audio & subtitles** to select tracks or load a subtitle file. The history icon opens **Recent files** to restore prior viewing sessions. Icon controls have descriptive tooltips.
 
 ## Keyboard controls
 
@@ -39,7 +39,8 @@ Choose **Open**, drop a video into the window, or pass a local path on the comma
 | M | Mute or unmute |
 | F | Toggle fullscreen |
 | Escape | Exit fullscreen or close the menu |
-| Ctrl+O / Cmd+O | Open a video |
+| Ctrl+O / Cmd+O | Add videos in the library or open a video in the player |
+| Ctrl+K / Cmd+K | Go to the library and focus search |
 | Ctrl+L / Cmd+L | Load a subtitle file |
 | ? | Show keyboard shortcuts |
 
@@ -78,5 +79,12 @@ Windows, macOS, and Linux have native CI jobs configured. Only results actually 
 - `src/store.rs`: local preferences, recent files, and resume positions.
 - `src/model.rs`: time and seek helpers.
 - `src/smoke.rs`: real media playback check without a desktop window.
+- `src/torrent.rs`: native transfer adapter, metadata, sharing, selected-file downloads, verification, and session persistence.
+- `src/bin/flick-transfer.rs`: development transfer diagnostic without GPUI or libmpv.
+- `src/presentation.rs`: physical display sizing without fixed resolution limits.
+- `src/library_ui.rs`: library, history, search results, torrent selection, and Downloads views.
+- `src/catalog.rs`: independent native discovery providers with progressive results.
+- `src/services.rs`: desktop background worker and transfer events.
+- `src/input.rs`: editable search field with Unicode/IME and clipboard support.
 
 Preferences are saved to `settings.json` in the operating system's per-user application configuration directory. Media files are read in place.

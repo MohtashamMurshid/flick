@@ -12,7 +12,6 @@ use serde::{Deserialize, Serialize};
 
 use crate::model::{file_title, non_negative_finite};
 
-const RECENT_LIMIT: usize = 20;
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -22,6 +21,7 @@ pub struct Settings {
     pub muted: bool,
     pub speed: f64,
     pub recent: Vec<RecentFile>,
+    pub library: Vec<LibraryVideo>,
 }
 
 impl Default for Settings {
@@ -31,6 +31,7 @@ impl Default for Settings {
             muted: false,
             speed: 1.0,
             recent: Vec::new(),
+            library: Vec::new(),
         }
     }
 }
@@ -44,12 +45,44 @@ pub struct RecentFile {
     pub duration: f64,
 }
 
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct LibraryVideo {
+    pub path: PathBuf,
+    pub title: String,
+}
+
 impl Settings {
+    pub fn add_video(&mut self, path: &Path) {
+        if !path.as_os_str().is_empty() && !self.library.iter().any(|v| v.path == path) {
+            self.library.push(LibraryVideo {
+                path: path.to_owned(),
+                title: file_title(path),
+            });
+        }
+    }
+
+    pub fn add_videos(&mut self, paths: impl IntoIterator<Item = PathBuf>) {
+        let mut known = self
+            .library
+            .iter()
+            .map(|video| video.path.clone())
+            .collect::<std::collections::HashSet<_>>();
+        for path in paths {
+            if !path.as_os_str().is_empty() && known.insert(path.clone()) {
+                self.library.push(LibraryVideo {
+                    title: file_title(&path),
+                    path,
+                });
+            }
+        }
+    }
     /// Exact paths are deduplicated without accessing or canonicalizing media files.
     pub fn remember(&mut self, path: &Path, position: f64, duration: f64) {
         if path.as_os_str().is_empty() {
             return;
         }
+        self.add_video(path);
         self.recent.retain(|file| file.path != path);
         let mut file = RecentFile {
             path: path.to_owned(),
@@ -59,7 +92,6 @@ impl Settings {
         };
         file.sanitize();
         self.recent.insert(0, file);
-        self.recent.truncate(RECENT_LIMIT);
     }
 
     pub fn resume_position(&self, path: &Path) -> f64 {
@@ -83,7 +115,21 @@ impl Settings {
             file.sanitize();
             !file.path.as_os_str().is_empty() && seen.insert(file.path.clone())
         });
-        self.recent.truncate(RECENT_LIMIT);
+        let mut seen_library = std::collections::HashSet::new();
+        self.library.retain_mut(|video| {
+            if video.title.trim().is_empty() {
+                video.title = file_title(&video.path);
+            }
+            !video.path.as_os_str().is_empty() && seen_library.insert(video.path.clone())
+        });
+        for file in &self.recent {
+            if seen_library.insert(file.path.clone()) {
+                self.library.push(LibraryVideo {
+                    path: file.path.clone(),
+                    title: file_title(&file.path),
+                });
+            }
+        }
     }
 }
 
@@ -111,6 +157,9 @@ pub struct Store {
 
 impl Store {
     pub fn load() -> Self {
+        if let Some(path) = std::env::var_os("FLICK_SETTINGS_PATH") {
+            return Self::load_from(PathBuf::from(path));
+        }
         match ProjectDirs::from("app", "Flick", "Flick") {
             Some(dirs) => Self::load_from(dirs.config_dir().join("settings.json")),
             None => {
@@ -261,13 +310,14 @@ mod tests {
     }
 
     #[test]
-    fn history_is_bounded_deduplicated_and_most_recent_first() {
+    fn history_and_library_keep_older_videos_and_deduplicate() {
         let mut settings = Settings::default();
         for index in 0..25 {
             settings.remember(Path::new(&format!("{index}.mkv")), 20.0, 120.0);
         }
         settings.remember(Path::new("10.mkv"), 45.0, 120.0);
-        assert_eq!(settings.recent.len(), 20);
+        assert_eq!(settings.recent.len(), 25);
+        assert_eq!(settings.library.len(), 25);
         assert_eq!(settings.recent[0].path, Path::new("10.mkv"));
         assert_eq!(settings.recent[1].path, Path::new("24.mkv"));
         assert_eq!(settings.resume_position(Path::new("10.mkv")), 45.0);
@@ -280,11 +330,55 @@ mod tests {
             1
         );
         assert!(
-            !settings
+            settings
                 .recent
                 .iter()
                 .any(|file| file.path == Path::new("0.mkv"))
         );
+    }
+
+    #[test]
+    fn batch_import_and_history_migration_preserve_order_and_existing_titles() {
+        let mut settings = Settings::default();
+        settings.library.push(LibraryVideo {
+            path: "existing.mp4".into(),
+            title: "Existing title".into(),
+        });
+        settings.add_videos([
+            "existing.mp4".into(),
+            "new.mp4".into(),
+            "new.mp4".into(),
+            PathBuf::new(),
+        ]);
+        settings.recent.push(RecentFile {
+            path: "older.mp4".into(),
+            ..Default::default()
+        });
+        settings.sanitize();
+        settings.sanitize();
+        assert_eq!(settings.library.len(), 3);
+        assert_eq!(settings.library[0].title, "Existing title");
+        assert_eq!(settings.library[1].path, Path::new("new.mp4"));
+        assert_eq!(settings.library[2].path, Path::new("older.mp4"));
+    }
+
+    #[test]
+    fn old_settings_migrate_history_into_library_and_keep_unwatched_videos() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.json");
+        fs::write(
+            &path,
+            br#"{"recent":[{"path":"old.mp4","position":42,"duration":120}]}"#,
+        )
+        .unwrap();
+        let mut store = Store::load_from(&path);
+        assert_eq!(store.data.library[0].path, Path::new("old.mp4"));
+        store.data.add_video(Path::new("unwatched.mkv"));
+        store.save().unwrap();
+        let loaded = Store::load_from(path);
+        assert_eq!(loaded.data.library.len(), 2);
+        assert_eq!(loaded.data.recent.len(), 1);
+        assert_eq!(loaded.resume_position(Path::new("old.mp4")), 42.);
     }
 
     #[test]

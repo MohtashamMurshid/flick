@@ -2,14 +2,37 @@
 name = "flick"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.99"
 description = "A focused desktop video player built with Rust and GPUI"
 publish = false
+default-run = "flick"
+
+[features]
+default = ["desktop"]
+desktop = ["dep:gpui", "dep:image"]
+
+[[bin]]
+name = "flick"
+path = "src/main.rs"
+required-features = ["desktop"]
+
+[[bin]]
+name = "flick-transfer"
+path = "src/bin/flick-transfer.rs"
 
 [dependencies]
 anyhow = "1"
 directories = "6"
-gpui = "=0.2.2"
-image = { version = "0.25", default-features = false }
+gpui = { version = "=0.2.2", optional = true }
+image = { version = "0.25", default-features = false, optional = true }
+clap = { version = "4", features = ["derive"] }
+fs2 = "0.4"
+librqbit = { version = "=9.0.1", default-features = false, features = ["rust-tls"] }
+librqbit-bencode = "=9.0.1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "time", "fs", "io-util"] }
+tokio-util = "0.7"
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
+unicode-segmentation = "1"
 libloading = "0.8"
 # GPUI 0.2.2 pulls xattr 0.2.3, which needs the ENOATTR alias removed in libc 0.2.190.
 libc = "=0.2.189"
@@ -20,6 +43,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [dev-dependencies]
 tempfile = "3"
+sha1 = "0.10"
 
 [profile.dev]
 debug = 0

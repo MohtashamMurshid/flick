@@ -1,0 +1,294 @@
+use anyhow::{Context, Result, ensure};
+use flick::torrent::{TorrentInput, TransferConfig, TransferSession, TransferState};
+use sha1::{Digest, Sha1};
+use std::{num::NonZeroU32, path::Path, time::Duration};
+use tempfile::TempDir;
+use tokio::time::{sleep, timeout};
+
+fn config(root: &Path, name: &str) -> TransferConfig {
+    TransferConfig::local(
+        root.join(format!("{name}-downloads")),
+        root.join(format!("{name}-state")),
+    )
+}
+
+fn content(len: usize) -> Vec<u8> {
+    (0..len)
+        .map(|i| ((i.wrapping_mul(31) ^ (i >> 9)) % 251) as u8)
+        .collect()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sharing_exact_piece_boundary_has_correct_hashes_and_magnet() -> Result<()> {
+    timeout(Duration::from_secs(30), async {
+        let root = TempDir::new()?;
+        let source = root.path().join("boundary file.bin");
+        let bytes = content(2 * 1024 * 1024);
+        tokio::fs::write(&source, &bytes).await?;
+        let session = TransferSession::start(config(root.path(), "seed")).await?;
+        let result: Result<()> = async {
+            let shared = session.share(&source, vec![]).await?;
+            let parsed = librqbit::torrent_from_bytes(shared.torrent_bytes())?;
+            assert_eq!(parsed.info.data.piece_length, 2 * 1024 * 1024);
+            assert_eq!(parsed.info.data.pieces.as_ref().len(), 20);
+            assert_eq!(
+                parsed.info.data.pieces.as_ref(),
+                Sha1::digest(&bytes).as_slice()
+            );
+            let expected_id = Sha1::digest(parsed.info.raw_bytes.as_ref())
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>();
+            assert_eq!(shared.infohash, expected_id);
+            assert_eq!(
+                librqbit::Magnet::parse(&shared.magnet)?
+                    .as_id20()
+                    .unwrap()
+                    .as_string(),
+                expected_id
+            );
+            parsed.info.data.validate()?;
+            assert_eq!(
+                session.snapshot(&shared.infohash)?.state,
+                TransferState::Seeding
+            );
+            assert_eq!(tokio::fs::read(&source).await?, bytes);
+            assert!(!source.with_extension("bin.torrent").exists());
+            Ok(())
+        }
+        .await;
+        session.stop().await;
+        result
+    })
+    .await
+    .context("Boundary test timed out")?
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn local_clients_share_select_pause_restart_resume_and_verify() -> Result<()> {
+    timeout(Duration::from_secs(60), async {
+        let root = TempDir::new()?;
+        let source = root.path().join("Shared videos ü");
+        tokio::fs::create_dir(&source).await?;
+        let bytes = content(8 * 1024 * 1024 + 137);
+        tokio::fs::write(source.join("clip.bin"), &bytes).await?;
+        tokio::fs::write(
+            source.join("notes.txt"),
+            b"Another file that will not be selected.",
+        )
+        .await?;
+        let seed = TransferSession::start(config(root.path(), "seed")).await?;
+        let result: Result<()> = async {
+            let shared = seed.share(&source, vec![]).await?;
+            let peer = seed.listen_addr().context("Missing loopback listener")?;
+            assert!(peer.ip().is_loopback());
+            let mut receiver_config = config(root.path(), "receiver");
+            receiver_config.download_limit_bytes_per_second = NonZeroU32::new(4 * 1024 * 1024);
+            let receiver = TransferSession::start(receiver_config.clone()).await?;
+            let first: Result<(String, usize, u64)> = async {
+                // Resolve the magnet over BitTorrent's real metadata exchange.
+                let resolved = receiver
+                    .resolve(
+                        TorrentInput::Magnet(shared.magnet.clone()),
+                        vec![peer],
+                        Duration::from_secs(10),
+                    )
+                    .await?;
+                assert_eq!(resolved.files.len(), 2);
+                let index = resolved
+                    .files
+                    .iter()
+                    .find(|f| f.relative_path == Path::new("clip.bin"))
+                    .context("Missing clip metadata")?
+                    .index;
+                assert!(receiver.download(&resolved, Some(vec![])).await.is_err());
+                assert!(receiver.download(&resolved, Some(vec![99])).await.is_err());
+                let id = receiver
+                    .download_to(
+                        &resolved,
+                        Some(vec![index]),
+                        &root.path().join("chosen-folder"),
+                    )
+                    .await?;
+                assert!(receiver.completed_file(&id, index).is_err());
+                // Wait for actual verified pieces, not just an allocated file.
+                let progress = timeout(Duration::from_secs(12), async {
+                    loop {
+                        let snapshot = receiver.snapshot(&id)?;
+                        if snapshot.verified_bytes > 0 {
+                            ensure!(
+                                snapshot.verified_bytes < bytes.len() as u64,
+                                "Fixture finished before restart checkpoint"
+                            );
+                            break Ok::<_, anyhow::Error>(snapshot.verified_bytes);
+                        }
+                        if let Some(error) = snapshot.error {
+                            anyhow::bail!(error);
+                        }
+                        sleep(Duration::from_millis(10)).await;
+                    }
+                })
+                .await
+                .context("No partial verified progress")??;
+                receiver.pause(&id).await?;
+                receiver.pause(&id).await?; // Setting paused is idempotent.
+                assert_eq!(receiver.snapshot(&id)?.state, TransferState::Paused);
+                assert!(
+                    receiver
+                        .wait_for_completion(&id, Duration::from_millis(50))
+                        .await
+                        .is_err()
+                );
+                Ok((id, index, progress))
+            }
+            .await;
+            receiver.stop().await;
+            let (id, index, prior_progress) = first?;
+            receiver_config.download_limit_bytes_per_second = None;
+            let receiver = TransferSession::start(receiver_config).await?;
+            let second: Result<()> = async {
+                let checked = timeout(Duration::from_secs(10), async {
+                    loop {
+                        let snapshot = receiver.snapshot(&id)?;
+                        if snapshot.state != TransferState::Checking {
+                            break Ok::<_, anyhow::Error>(snapshot);
+                        }
+                        sleep(Duration::from_millis(10)).await;
+                    }
+                })
+                .await??;
+                assert_eq!(checked.state, TransferState::Paused);
+                assert!(checked.verified_bytes >= prior_progress);
+                assert!(receiver.completed_file(&id, index).is_err());
+                receiver.resume(&id, vec![peer]).await?;
+                receiver
+                    .wait_for_completion(&id, Duration::from_secs(15))
+                    .await?;
+                let completed = receiver.completed_file(&id, index)?;
+                assert!(completed.is_absolute());
+                assert!(completed.starts_with(root.path().join("chosen-folder").canonicalize()?));
+                assert_eq!(tokio::fs::read(&completed).await?, bytes);
+                let snapshot = receiver.snapshot(&id)?;
+                assert_eq!(snapshot.state, TransferState::Seeding);
+                assert_eq!(snapshot.files[index].verified_bytes, bytes.len() as u64);
+                let other = snapshot.files.iter().find(|f| f.index != index).unwrap();
+                assert!(!other.selected);
+                assert!(receiver.completed_file(&id, other.index).is_err());
+                receiver.remove(&id, false).await?;
+                assert!(completed.is_file());
+                assert!(receiver.snapshot(&id).is_err());
+                Ok(())
+            }
+            .await;
+            receiver.stop().await;
+            second?;
+            assert_eq!(tokio::fs::read(source.join("clip.bin")).await?, bytes);
+            Ok(())
+        }
+        .await;
+        seed.stop().await;
+        result
+    })
+    .await
+    .context("Local transfer regression timed out")?
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn state_lock_invalid_inputs_and_existing_destinations_are_safe() -> Result<()> {
+    timeout(Duration::from_secs(30), async {
+        let root = TempDir::new()?;
+        let cfg = config(root.path(), "client");
+        let session = TransferSession::start(cfg.clone()).await?;
+        let result: Result<()> = async {
+            assert!(TransferSession::start(cfg.clone()).await.is_err());
+            assert!(
+                session
+                    .resolve(
+                        TorrentInput::Bytes(b"invalid torrent".to_vec()),
+                        vec![],
+                        Duration::from_secs(1)
+                    )
+                    .await
+                    .is_err()
+            );
+            // The engine and adapter must reject traversal before allocating
+            // download files, including names the OS normalizes to a directory.
+            for name in ["../escape.bin", "/escape.bin", ".", "folder\\escape.bin"] {
+                #[derive(serde::Serialize)]
+                struct Envelope {
+                    info: librqbit::TorrentMetaV1Info<librqbit::ByteBufOwned>,
+                }
+                let info = librqbit::TorrentMetaV1Info {
+                    name: Some(name.as_bytes().into()),
+                    length: Some(1),
+                    piece_length: 16384,
+                    pieces: Sha1::digest([42]).to_vec().into(),
+                    ..Default::default()
+                };
+                let mut bytes = Vec::new();
+                librqbit_bencode::bencode_serialize_to_writer(&Envelope { info }, &mut bytes)?;
+                assert!(
+                    session
+                        .resolve(TorrentInput::Bytes(bytes), vec![], Duration::from_secs(1))
+                        .await
+                        .is_err(),
+                    "Accepted unsafe name: {name}"
+                );
+            }
+            assert!(
+                session
+                    .resolve(
+                        TorrentInput::File(root.path().join("missing.torrent")),
+                        vec![],
+                        Duration::from_secs(1)
+                    )
+                    .await
+                    .is_err()
+            );
+            assert!(
+                session
+                    .resolve(
+                        TorrentInput::Magnet("not a magnet".into()),
+                        vec![],
+                        Duration::from_secs(1)
+                    )
+                    .await
+                    .is_err()
+            );
+            let empty = root.path().join("empty.bin");
+            tokio::fs::write(&empty, []).await?;
+            assert!(session.share(&empty, vec![]).await.is_err());
+            let seed = TransferSession::start(config(root.path(), "seed")).await?;
+            let transfer: Result<()> = async {
+                let source = root.path().join("sample.bin");
+                tokio::fs::write(&source, content(65_537)).await?;
+                let shared = seed.share(&source, vec![]).await?;
+                let resolved = session
+                    .resolve(
+                        TorrentInput::Bytes(shared.torrent_bytes().to_vec()),
+                        vec![],
+                        Duration::from_secs(2),
+                    )
+                    .await?;
+                let destination = cfg.download_dir.join(&resolved.infohash);
+                tokio::fs::create_dir(&destination).await?;
+                let existing = destination.join("sample.bin");
+                tokio::fs::write(&existing, b"Unrelated existing data").await?;
+                assert!(session.download(&resolved, None).await.is_err());
+                assert_eq!(tokio::fs::read(existing).await?, b"Unrelated existing data");
+                Ok(())
+            }
+            .await;
+            seed.stop().await;
+            transfer
+        }
+        .await;
+        session.stop().await;
+        result?;
+        let reopened = TransferSession::start(cfg).await?;
+        reopened.stop().await;
+        Ok(())
+    })
+    .await
+    .context("Invalid-input test timed out")?
+}

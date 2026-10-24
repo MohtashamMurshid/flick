@@ -1,6 +1,6 @@
 # Flick headless agent implementation plan
 
-**Status: proposed; not implemented.** This is the next implementation plan. The existing GPUI desktop player remains a supported frontend. The current `--smoke-test VIDEO` command is a playback diagnostic, not the headless product described here.
+**Status: deferred; not implemented.** The [playback and sharing plan](SHARING_PLAN.md) supersedes this as the next implementation milestone. The existing GPUI desktop player remains the primary frontend. Small inspection/frame diagnostics may be developed independently; the general protocol below is not part of the first transfer release. The current `--smoke-test VIDEO` command is a playback diagnostic, not the headless product described here.
 
 ## Outcome
 
