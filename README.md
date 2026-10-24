@@ -8,7 +8,7 @@ Flick draws its interface in a macOS, Windows 11, or GNOME style and matches the
 
 Flick opens to your library, with Continue watching, All videos, History, and Downloads. Add videos or a folder, filter local titles, or search online for videos to download. Choose torrent files and a destination; completed verified videos join the library. Share a file or folder and copy its magnet link. The [development diagnostic](docs/TRANSFERS.md) uses the same native transfer backend. Watching during downloads follows later. The broad [headless agent proposal](docs/HEADLESS_PLAN.md) is deferred. See [PLAN.md](PLAN.md) for implemented versus planned work.
 
-This first prototype provides video inside the application window, play and pause, seeking, volume and mute, playback speed, fullscreen, audio/subtitle selection, external subtitle loading, recent files, and resume positions. Playback controls appear after media loads. The software frame-transfer path follows the display's physical video bounds with no fixed resolution or pixel-budget cap. Native dimension/allocator failures are reported instead of silently lowering resolution. Efficient native GPU video presentation is a separate milestone; this version makes no claim of being faster than VLC.
+This first prototype provides video inside the application window, play and pause, seeking, volume and mute, playback speed, fullscreen, audio/subtitle selection with audio delay, external subtitle loading, recent files, and resume positions. Playback controls appear after media loads. libmpv uses the platform's hardware decoder when available (`hwdec=auto-copy`; set `FLICK_HWDEC=no` to compare against software decoding) and renders into the frame GPUI uploads. The software frame-transfer path follows the display's physical video bounds with no fixed resolution or pixel-budget cap. Native dimension/allocator failures are reported instead of silently lowering resolution. Efficient native GPU video presentation is a separate milestone; this version makes no claim of being faster than VLC.
 
 ## Run locally
 
@@ -31,6 +31,8 @@ A new library opens to a welcome page with **Open Video…**, **Add Folder…**,
 
 ## Keyboard controls
 
+Player keys can be changed on the **Keyboard Shortcuts** page, which also lists them. Press `?` to show them in the player or open the page from the library.
+
 | Key | Action |
 | --- | --- |
 | Space | Play or pause |
@@ -38,14 +40,24 @@ A new library opens to a welcome page with **Open Video…**, **Add Folder…**,
 | Up / Down | Raise or lower volume |
 | M | Mute or unmute |
 | F | Toggle fullscreen |
-| Escape | Exit fullscreen or close the menu |
+| , / . | Previous or next frame |
+| J / K / L | Slower or back 10 seconds / pause at normal speed / play, then faster |
+| 0–9 | Jump to 0–90% of the video |
+| Page Up / Page Down | Previous or next chapter |
+| B | Set the A–B loop start, then its end, then clear it |
+| [ / ] | Move audio 50 ms earlier or later |
+| Escape | Exit fullscreen or close a menu |
 | Ctrl+O / Cmd+O | Add videos in the library or open a video in the player |
 | Ctrl+K / Cmd+K | Go to the library and focus search |
 | Ctrl+, / Cmd+, | Open Appearance |
 | Ctrl+L / Cmd+L | Load a subtitle file |
 | ? | Show keyboard shortcuts |
 
-Click or drag the timeline to seek or the volume slider to adjust sound. Double-click the video to toggle fullscreen.
+Tab and Shift+Tab move between controls, with a focus ring and the control's tooltip. Enter or Space activates the focused control. Arrow keys move between video cards and list rows, and Shift+F10 or the Menu key opens a video's menu: Play, Show in Folder, Mark as Watched or Unwatched, and Remove from Continue Watching. Right-click opens the same menu.
+
+Click or drag the timeline to seek or the volume slider to adjust sound. Double-click the video to toggle fullscreen. Chapters and an A–B loop are marked on the timeline.
+
+**Appearance** also sets text size, contrast, button labels, and subtitle size, color, background, and position. Auto contrast follows the system's increased-contrast setting on macOS, Windows, and GNOME. Colors meet WCAG AA contrast in every style, scheme, and accent.
 
 ## Development checks
 
@@ -86,6 +98,8 @@ Windows, macOS, and Linux have native CI jobs configured. Only results actually 
 - `src/library_ui.rs`: library, history, search results, torrent selection, and Downloads views.
 - `src/catalog.rs`: independent native discovery providers with progressive results.
 - `src/services.rs`: desktop background worker and transfer events.
-- `src/input.rs`: editable search field with Unicode/IME and clipboard support.
+- `src/input.rs`: text fields with Unicode/IME and clipboard support, including selectable read-only values.
+- `src/shortcuts.rs`: rebindable player shortcuts.
+- `src/theme.rs`: interface styles, WCAG contrast adjustment, and appearance settings.
 
 Preferences are saved to `settings.json` in the operating system's per-user application configuration directory. Media files are read in place.

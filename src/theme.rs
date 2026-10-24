@@ -198,8 +198,7 @@ impl Default for Appearance {
 impl Appearance {
     pub fn sanitize(&mut self) {
         // Sliders step in hundredths; drop accumulated float noise.
-        let hundredths = |v: f32| (v * 100.).round() / 100.;
-        self.text_scale = hundredths(finite_clamp(self.text_scale, TEXT_SCALE, 1.));
+        self.text_scale = (finite_clamp(self.text_scale, TEXT_SCALE, 1.) * 100.).round() / 100.;
         self.accent = self.accent.map(|accent| accent & 0xffffff);
         self.subtitles.sanitize();
     }

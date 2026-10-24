@@ -76,24 +76,24 @@ Reported after using the macOS build. Items are numbered as reported so commits 
 
 Bugs:
 
-- [ ] 1. Back from fullscreen exits fullscreen. `Control::Library` toggles fullscreen unconditionally. The library already renders in fullscreen, and Escape still exits.
-- [ ] 2. Double-click goes to fullscreen. GPUI 0.2.2 has no selectable static text, so double-clicks fall through to the video surface. Opening a library card with a double-click delivers the second click to the new video surface. Ignore video double-clicks for 500 ms after entering the player. Make read-only values, such as magnet links and file paths, selectable read-only fields.
+- [x] 1. Back from fullscreen exits fullscreen. `Control::Library` toggles fullscreen unconditionally. The library already renders in fullscreen, and Escape still exits.
+- [x] 2. Double-click goes to fullscreen. GPUI 0.2.2 has no selectable static text, so double-clicks fall through to the video surface. Opening a library card with a double-click delivers the second click to the new video surface. Ignore video double-clicks for 500 ms after entering the player. Make read-only values, such as magnet links and file paths, selectable read-only fields.
 
 Accessibility:
 
 - [ ] 3. Screen readers see an empty window: GPUI 0.2.2 exposes no accessibility tree, and AccessKit is absent. This is a framework gap. Upgrade GPUI when it adds AccessKit, or contribute support.
-- [ ] 4. Keyboard navigation: make buttons and cards focusable, define a Tab order with a visible focus ring, move between cards with the arrow keys, and open them with Enter. Library keys other than Ctrl/Cmd shortcuts are currently dropped.
-- [ ] 5. Show tooltips on keyboard focus as well as hover. Add text labels, or a setting that always shows them.
-- [ ] 6. Pad the hit areas of small icon buttons, including 28 px macOS icon buttons, toward Apple's 44 pt guideline while keeping their visual size.
-- [ ] 7. Add text scaling, a reduce-motion switch for fades and control slides, and high contrast. Follow OS settings where GPUI exposes them.
-- [ ] 8. Adjustable subtitles: size, color, background, and position, using mpv's `sub-scale`, `sub-color`, `sub-back-color`, and `sub-pos`.
-- [ ] 9. Check grey-on-black text and both color schemes' accents against WCAG AA.
-- [ ] 10. Add a shortcuts page in Settings and make shortcuts rebindable; `?` is the only discovery path today.
+- [x] 4. Keyboard navigation: make buttons and cards focusable, define a Tab order with a visible focus ring, move between cards with the arrow keys, and open them with Enter. Library keys other than Ctrl/Cmd shortcuts are currently dropped.
+- [x] 5. Show tooltips on keyboard focus as well as hover. Add text labels, or a setting that always shows them. The setting covers toolbar and player title-bar buttons; the transport stays icon-only, with focus tooltips.
+- [x] 6. Pad the hit areas of small icon buttons, including 28 px macOS icon buttons, toward Apple's 44 pt guideline while keeping their visual size. Hit areas reach 44 px vertically; widths are unchanged because neighbors are 4 px apart and GPUI 0.2.2 collapses rows with negative horizontal margins.
+- [ ] 7. Add text scaling, a reduce-motion switch for fades and control slides, and high contrast. Follow OS settings where GPUI exposes them. Text size (85–150%) and high contrast are done; contrast follows the OS setting, which Flick reads itself because GPUI exposes none. Reduce motion waits for the first animation: controls currently appear and hide without fades or slides.
+- [x] 8. Adjustable subtitles: size, color, background, and position, using mpv's `sub-scale`, `sub-color`, `sub-back-color`, and `sub-pos`.
+- [x] 9. Check grey-on-black text and both color schemes' accents against WCAG AA. Several failed; themes now adjust lightness to pass, and a test covers every style, scheme, and accent.
+- [x] 10. Add a shortcuts page in Settings and make shortcuts rebindable; `?` is the only discovery path today.
 
 Performance:
 
-- [ ] 11. Hardware decoding: use `hwdec=auto-copy`, which selects VideoToolbox, D3D11, or VAAPI, instead of `hwdec=no`.
-- [ ] 12. Stop copying each frame twice. mpv renders into a 64-byte-aligned buffer, then every row is repacked into a new `Vec`.
+- [x] 11. Hardware decoding: use `hwdec=auto-copy`, which selects VideoToolbox, D3D11, or VAAPI, instead of `hwdec=no`. Only the software fallback was observed so far: the Linux validation VM has no GPU.
+- [x] 12. Stop copying each frame twice. mpv renders into a 64-byte-aligned buffer, then every row is repacked into a new `Vec`. libmpv now renders directly into the frame GPUI receives.
 - [ ] 13. Native GPU presentation (stage 3): render through mpv's GPU API into a texture that GPUI draws directly. This is the real fix for 4K.
 - [ ] 14. Use a separate render thread with callback-driven redraws instead of a fixed 16 ms UI poll, which fits neither 24 fps content nor 120 Hz displays and stalls the UI on a slow decode.
 - [ ] 15. Benchmark harness: CPU, dropped frames, and memory over a 5-minute 4K loop. Speed claims and regression checks depend on it.
@@ -102,8 +102,8 @@ Features:
 
 - [ ] 16. Real thumbnails: capture and cache a poster frame using the software renderer, recording duration and resolution at the same time. Cards currently use a hashed gradient.
 - [ ] 17. Group series by `S01E02`-style names and folders, and advance to the next episode automatically.
-- [ ] 18. Library: sort options, a grid/list toggle, Mark as watched, and Remove from Continue watching.
-- [ ] 19. Player controls: chapter markers, frame step (`.` and `,`), J/K/L shuttle, number keys for 10–90%, an A–B loop, and audio delay.
+- [x] 18. Library: sort options, a grid/list toggle, Mark as watched, and Remove from Continue watching.
+- [x] 19. Player controls: chapter markers, frame step (`.` and `,`), J/K/L shuttle, number keys for 10–90%, an A–B loop, and audio delay. The software renderer cannot play in reverse, so J slows a shuttle and otherwise goes back 10 seconds.
 - [ ] 20. Timeline hover previews, after item 16.
 - [ ] 21. Picture-in-picture, or an always-on-top mini window.
 - [ ] 22. OpenSubtitles search from the Audio & subtitles menu.
@@ -118,7 +118,7 @@ Transfer reliability, which should close most of the gap with other clients:
 - [x] 29. Turn on UPnP port forwarding, with a fixed listen port so the mapping stays stable.
 - [x] 30. Allow five minutes for metadata resolution, show "Finding peers…", offer Cancel, and explain how to recover after a timeout.
 - [ ] 31. Download Internet Archive results over HTTPS from archive.org's `download/` URLs, using the URL-download backend from item 26, instead of the Archive torrent. Check whether a newer librqbit supports web seeds.
-- [x] 32. Measure `TcpAndUtp` against `TcpOnly` with fresh public Sintel sessions; keep TCP+uTP for public sessions after eight recorded trials. Local sessions retain TCP. See [validation](docs/VALIDATION.md#2026-10-24-public-discovery-and-listener-comparison).
+- [x] 32. Measure `TcpAndUtp` against `TcpOnly` with fresh public Sintel sessions; keep TCP+uTP for public sessions after eight recorded trials. Local sessions retain TCP. See [validation](docs/VALIDATION.md#public-discovery-and-listener-comparison-on-2026-10-24).
 
 Automated transfer tests stay local, with generated fixtures and explicit peers. Public trackers, DHT, and UPnP are checked only in recorded manual runs.
 

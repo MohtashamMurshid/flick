@@ -6,11 +6,106 @@ Flick targets Windows, macOS, and Linux. A CI configuration is not evidence of a
 
 | Platform | Native compilation and tests | Desktop playback | Native GPU video path |
 | --- | --- | --- | --- |
-| Linux | Native debug build, formatting, strict Clippy, and 26 ordinary tests pass on 2026-10-24; 3 real-libmpv tests passed earlier | Xvfb/Openbox session exercised in all three interface styles; null audio | Deferred |
+| Linux | Native debug build, formatting, strict Clippy, all ordinary tests, and all five real-libmpv tests pass on 2026-10-24 | Xvfb/Openbox session exercised for the review backlog and in all three interface styles; null audio | Deferred; hardware decoding unverified without a GPU |
 | Windows | Workflow configured; not run here | Pending native machine | Deferred |
 | macOS | Debug compilation, formatting, strict Clippy, 23 tests, and an opt-in native resolution test pass on 2026-10-25 | Library/search/resume and public Sintel playback observed; CoreAudio output active | Deferred |
 
 The presentation adapter transfers decoded BGRA frames through CPU memory into GPUI images. It sizes frames to physical video bounds without a fixed resolution, axis, or pixel-budget cap. Checked native dimensions and allocation failures produce explicit errors. GPU rendering of those images does not establish hardware video decoding or zero-copy presentation. Treat this as a functional prototype. Hardware decoding, efficient GPU surface sharing, HDR correctness, battery use, and claims of being faster than VLC remain unverified.
+
+### Review backlog: playback, keyboard, and accessibility on 2026-10-24
+
+This covers backlog items 1, 2, 4–12, 18, and 19 in [PLAN.md](../PLAN.md). Environment: the same Ubuntu 24.04.5 x86_64 VM (four vCPUs, no GPU), Rust 1.99.0, GPUI 0.2.2, and libmpv 0.37.0. Interactive checks used Xvfb with Openbox and Mesa Lavapipe, null audio, isolated settings, and generated fixtures: the 12-second 1280×720 H.264/AAC clip with SRT captions from `scripts/make-test-video.sh`, and a 6-second 3840×2160 `testsrc2` clip.
+
+Automated checks:
+
+- `cargo fmt --all -- --check`, `cargo clippy --locked --all-targets -- -D warnings`, and `cargo clippy --locked --no-default-features --all-targets -- -D warnings` pass.
+- `cargo test --locked --all-targets` passes. New desktop tests cover shortcut binding, conflicts, persistence, and keystroke normalization; WCAG contrast for every style, scheme, accent, and contrast mode; appearance clamping and subtitle properties; grid arrow navigation; A–B loop steps; chapter parsing; Continue Watching dismissal, watched marks, and sorting; and double-click word selection in read-only fields.
+- All five opt-in libmpv tests pass with `FLICK_AUDIO=null FLICK_TEST_VIDEO=<720p clip>`: real playback, paused-seek image change, lifecycle/subtitles/EOF, the uncapped 10000×2 and 7680×4320 targets, and the new check that direct and aligned render targets produce byte-identical frames.
+- `FLICK_AUDIO=null cargo run --locked -- --smoke-test <720p clip>` passes: six frames, first software presentation submission at 373 ms, and a paused seek to 6.07 s.
+
+Rendering into the frame GPUI receives (item 12) was measured with the identical-pixel test in a release build. libmpv rendered a paused 4K frame 20 times per size; numbers are milliseconds per frame, including scaling, so they bound the copy's share rather than isolating it. Other builds were running on the VM, so treat the runs as rough comparisons:
+
+| Target size | Aligned buffer + copy, run 1 | Direct, run 1 | Aligned, run 2 | Direct, run 2 |
+| --- | --- | --- | --- | --- |
+| 1920×1080 | 32.25 | 24.22 | 37.11 | 32.90 |
+| 1917×1080 (rows not a 64-byte multiple) | — | — | 50.34 | 32.56 |
+| 3840×2160 | 74.61 | 59.34 | 86.27 | 81.78 |
+
+The direct target was faster at every size, although glibc's large allocations are only 16-byte aligned, so it is now the default whenever the frame meets BGR0's four-byte alignment. The format changed from mpv's undocumented `bgra` to the documented `bgr0`, with alpha still forced opaque.
+
+`hwdec=auto-copy` (item 11) was exercised only without a GPU. libmpv probed VDPAU, found no driver, and decoded in software; `hwdec-current` was empty, and Flick now logs and reports it. Hardware decoding on VideoToolbox, D3D11, or VAAPI remains unverified.
+
+Interactive observations under Xvfb:
+
+- Back from fullscreen kept the library fullscreen (1280×860, no title bar), and Escape returned the window to 1100×740 (item 1).
+- Double-clicking a library card opened the video and left the window at 1100×740 (item 2). The magnet and download-folder fields render as read-only fields; selecting and copying their text was not exercised.
+- Tab moved through the sidebar, toolbar, search field, See All, and cards with a visible focus ring. A focused toolbar button showed its tooltip below it. Right arrow moved between cards. Shift+F10 opened the card menu with Play focused, and Tab, Tab, Enter chose Mark as Unwatched, which reset the card to "Not started" and cleared its saved history (items 4, 5, and 18). The GNOME header showed the same ring and focus tooltip.
+- In the macOS style, a 28 px toolbar button now has a 28×44 hit area. An earlier attempt to widen hit areas collapsed the toolbar, because GPUI 0.2.2 gives rows with negative horizontal margins no width; widths are unchanged (item 6).
+- Number keys sought to 10% and 20%. After the loop fix described below, `b`, a pause, then `b` showed "Loop 0:02–0:03" and an accent span on the timeline, and `]` showed "Audio delay +50 ms" (item 19). Frame step, J/K/L, and chapter keys were not exercised interactively; the fixtures have no chapters.
+- On the Keyboard Shortcuts page, Change followed by `n` rebound Mute; settings stored `{"mute": "n"}`, and the row offered Restore (item 10).
+- Text size 130% enlarged text live. High contrast brightened secondary text and borders. Auto contrast followed GNOME's `org.gnome.desktop.a11y.interface high-contrast` setting through an isolated keyfile GSettings backend, on and off (item 7).
+- Yellow subtitles with the Box background and a raised position rendered as a translucent box behind each line. libmpv 0.37 has no `sub-border-style`, which Flick skips; `sub-back-color` with a shadow offset produced the box (item 8).
+- Finding peers… and its Cancel button were exercised with a stalled loopback peer and local-only transfers. Cancel cleared the notice, and no late result appeared 12 seconds later. Without a peer, local-only resolution fails immediately, which is expected.
+
+Fixed during this pass: the A–B key used mpv's three-state `ab-loop` cycle, which kept stale state and could store the end before the start; it now sets an ordered start and end itself. Earlier, a capture taken after the 12-second clip reached its end showed the player paused at the seek target. That is `keep-open` pausing at the end, not a bug.
+
+Not verified: macOS and Windows, including macOS's `increaseContrast` and Windows' HighContrast flags read through `defaults` and `reg`; screen readers (GPUI 0.2.2 exposes no accessibility tree); audible output; and hardware decoding.
+
+### Public discovery and listener comparison on 2026-10-24
+
+Environment: Ubuntu 24.04.5, x86_64, Linux 7.0.0-1011-gcp, four vCPUs (Intel Xeon at 2.20 GHz), 15 GiB RAM. Rust 1.99.0 (`b940084d7`), pinned librqbit 9.0.1, unoptimized development binary with debug symbols disabled. Other Rust compilation was running on this VM during the measurements; these are short public-swarm observations, not a controlled hardware benchmark or a general speed claim.
+
+The tracker list was fetched from Torlink's [`src/sources/magnet.ts`](https://github.com/baairon/torlink/blob/df059311d0898b7245dd842153c1ff7c892275ee/src/sources/magnet.ts), revision `df059311d0898b7245dd842153c1ff7c892275ee`. Its 11 entries are shared by search magnets and public sessions. Public sessions enable DHT persistence at `state/dht.json`, saved listen-port selection, and UPnP; automated tests keep public discovery and port mapping off. The engine dumps DHT state every 60 seconds. These completed swarm trials were shorter than that interval, so they do not establish an observed DHT save/reload. The pinned UPnP implementation requests TCP mappings only. No successful router UPnP mapping was observed or claimed.
+
+#### Manual public transfers (item 32)
+
+Only the authorized legal [Sintel torrent](https://webtorrent.io/torrents/sintel.torrent) was used. Its v1 infohash is `08ada5a7a6183aae1e09d831df6748d566095a10`. Each run had new state and download directories, public discovery enabled, no rate limit, and a 120-second maximum window. The modes alternated TCP, TCP+uTP, TCP, TCP+uTP for each input type. A separate UDP tracker connect probe to `tracker.opentrackr.org:1337` returned a valid transaction-matching 16-byte response in 0.181 seconds.
+
+The exact diagnostic command was the following, with `ROOT`, `MODE`, and `INPUT` taking the values below (no `cargo run` startup time is included):
+
+```sh
+target/debug/flick-transfer --state-dir "$ROOT/$MODE-$RUN/state" \
+  --download-dir "$ROOT/$MODE-$RUN/downloads" --public --transport "$MODE" \
+  benchmark "$INPUT" --window-seconds 120
+```
+
+For the HTTPS input, `ROOT=/tmp/flick-public-comparison-cxp8oizq` and `INPUT=https://webtorrent.io/torrents/sintel.torrent`. For the magnet input, `ROOT=/tmp/flick-magnet-comparison-emm3tk3r` and `INPUT=magnet:?xt=urn:btih:08ada5a7a6183aae1e09d831df6748d566095a10`. `MODE` was `tcp-only` or `tcp-and-utp`, and `RUN` was `1` or `2`. The magnet hash was independently extracted from the fetched torrent's raw info dictionary with Python's SHA-1 implementation.
+
+Raw elapsed seconds below start after session initialization. HTTPS metadata time includes fetching and parsing the `.torrent`; magnet metadata time requires peer metadata exchange. First verified bytes, completion, and live peers are sampled every 250 ms, so timestamps have that observation granularity. Every run exited successfully after verifying all **129,302,391 bytes**. Peak counts refer to live connections, not all discovered addresses. Live peers were zero in every completion snapshot after the engine closed download connections.
+
+| Input | Mode | Run | Started UTC | Metadata (s) | First verified (s) | Complete (s) | Peak live peers |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| HTTPS | tcp-only | 1 | 2026-10-24T19:50:38.327080+00:00 | 1.310116839 | 3.020489838 | 15.830994119 | 40 |
+| HTTPS | tcp-and-utp | 1 | 2026-10-24T19:50:57.729253+00:00 | 1.166109137 | 3.069033728 | 15.925069505 | 40 |
+| HTTPS | tcp-only | 2 | 2026-10-24T19:51:14.870466+00:00 | 1.295604750 | 2.650823181 | 16.308498002 | 39 |
+| HTTPS | tcp-and-utp | 2 | 2026-10-24T19:51:32.395585+00:00 | 1.178779639 | 3.351984547 | 14.645966774 | 40 |
+| Magnet | tcp-only | 1 | 2026-10-24T19:52:08.513763+00:00 | 1.038129572 | 2.285118184 | 18.061256893 | 39 |
+| Magnet | tcp-and-utp | 1 | 2026-10-24T19:52:27.795379+00:00 | 1.303690219 | 2.692355322 | 13.791851801 | 31 |
+| Magnet | tcp-only | 2 | 2026-10-24T19:52:46.275931+00:00 | 0.999187247 | 3.043522763 | 17.812040816 | 39 |
+| Magnet | tcp-and-utp | 2 | 2026-10-24T19:53:05.468146+00:00 | 1.061685472 | 2.338047551 | 14.677042284 | 31 |
+
+Mean completion time was 16.069746061 seconds for TCP versus 15.285518140 for TCP+uTP with HTTPS metadata, and 17.936648855 versus 14.234447043 with magnet metadata. TCP+uTP was faster in the magnet trials and comparable in the HTTPS trials. Public desktop and diagnostic sessions now default to `TcpAndUtp`; local sessions retain TCP. In 9.0.1 the same uTP listener socket enables outgoing uTP while outgoing TCP stays enabled; no separate outgoing-uTP option exists. Mixed-mode logs confirmed TCP and UDP listeners on the same port. These results do not isolate how many bytes traveled over each protocol.
+
+The uTP engine warned that its receive buffer was 8,388,608 bytes rather than the requested 167,772,160 bytes; `net.core.rmem_max` and `net.core.wmem_max` were both 4,194,304. No kernel settings were changed. All eight download directories, including downloaded media, were deleted after the processes stopped. Raw JSON samples and engine logs remained in the two task-owned `/tmp` roots during this session; no downloaded media is committed.
+
+#### Checks and scope
+
+- `cargo build --locked --no-default-features --bin flick-transfer`: passed (4m 52s). This builds the backend diagnostic, not the desktop.
+- `cargo test --locked --no-default-features --all-targets`: passed, 10 unit tests and four local transfer tests. Generated local fixtures and explicit loopback peers covered sharing, selected-file download, pause/restart/resume, byte verification, invalid inputs, actionable metadata timeout, and no public state files in local mode.
+- `cargo fmt --all -- --check`: passed.
+- `cargo clippy --locked --all-targets -- -D warnings`: passed (7m 39s). Cargo also printed a nonfatal future-incompatibility notice for dependency `proc-macro-error2` 2.0.1.
+- Final `cargo clippy --locked --no-default-features --all-targets -- -D warnings`: passed after the correction below.
+- `cargo test --locked --all-targets`: passed, 32 tests (10 shared-library, 18 desktop, four local-transfer tests); four native libmpv playback tests remained ignored. The desktop cancellation test passed against a generated fixture and a stalled explicit loopback peer.
+- Final `cargo test --locked --no-default-features --all-targets`: passed again, 14 tests (10 unit, four local-transfer tests).
+- `cargo build --locked`: passed; the Linux desktop application and diagnostic linked successfully. Cargo elapsed times included waiting on the same worktree's build lock. A linked desktop binary is not evidence of interactive playback.
+- Initial `cargo clippy --locked --no-default-features --all-targets -- -D warnings` found `collapsible_if` in the new startup code. The conditional was corrected before final checks.
+- An exploratory `cargo check --locked --all-targets` was interrupted during dependency compilation (exit 130) to build the diagnostic first. It is not a passing desktop check.
+
+The desktop resolve notice now says “Finding peers…” and offers Cancel; the worker waits up to five minutes and acknowledges cancellation after aborting the old task. Automated cancellation coverage uses a generated fixture and a stalled explicit loopback peer. This session has not exercised that button interactively or run desktop playback.
+
+#### Web-seed research (item 31, research only)
+
+The [upstream release list](https://github.com/ikatson/rqbit/releases) and GitHub latest-release API returned v9.0.1 (published 2026-08-20); no newer upstream release was found. [Issue 500](https://github.com/ikatson/rqbit/issues/500) remains open for BEP 19 web seeds. Its discussion links a separate fork implementing HTTP sources, not a newer upstream release. The pinned source has no `url-list` downloader. The dependency was not changed. The Sintel metadata's web-seed URL was present but these measurements used BitTorrent peers; the separate URL-download backend owns direct Archive HTTPS downloads.
 
 ### Native interface styles on 2026-10-24
 
@@ -258,59 +353,3 @@ Do not report FPS from a screen refresh callback as decoded FPS. Do not compare 
 - [Zed Linux dependency installer at the package's recorded revision](https://github.com/zed-industries/zed/blob/69e2130295c2649963eb639fc70b4f2ee8ea1624/script/linux)
 - [GPUI 0.2.2 BGRA image contract](https://docs.rs/crate/gpui/0.2.2/source/src/assets.rs)
 - [libmpv rendering API](https://github.com/mpv-player/mpv/blob/master/include/mpv/render.h)
-
-## 2026-10-24: public discovery and listener comparison
-
-Environment: Ubuntu 24.04.5, x86_64, Linux 7.0.0-1011-gcp, four vCPUs (Intel Xeon at 2.20 GHz), 15 GiB RAM. Rust 1.99.0 (`b940084d7`), pinned librqbit 9.0.1, unoptimized development binary with debug symbols disabled. Other Rust compilation was running on this VM during the measurements; these are short public-swarm observations, not a controlled hardware benchmark or a general speed claim.
-
-The tracker list was fetched from Torlink's [`src/sources/magnet.ts`](https://github.com/baairon/torlink/blob/df059311d0898b7245dd842153c1ff7c892275ee/src/sources/magnet.ts), revision `df059311d0898b7245dd842153c1ff7c892275ee`. Its 11 entries are shared by search magnets and public sessions. Public sessions enable DHT persistence at `state/dht.json`, saved listen-port selection, and UPnP; automated tests keep public discovery and port mapping off. The engine dumps DHT state every 60 seconds. These completed swarm trials were shorter than that interval, so they do not establish an observed DHT save/reload. The pinned UPnP implementation requests TCP mappings only. No successful router UPnP mapping was observed or claimed.
-
-### Manual public transfers (item 32)
-
-Only the authorized legal [Sintel torrent](https://webtorrent.io/torrents/sintel.torrent) was used. Its v1 infohash is `08ada5a7a6183aae1e09d831df6748d566095a10`. Each run had new state and download directories, public discovery enabled, no rate limit, and a 120-second maximum window. The modes alternated TCP, TCP+uTP, TCP, TCP+uTP for each input type. A separate UDP tracker connect probe to `tracker.opentrackr.org:1337` returned a valid transaction-matching 16-byte response in 0.181 seconds.
-
-The exact diagnostic command was the following, with `ROOT`, `MODE`, and `INPUT` taking the values below (no `cargo run` startup time is included):
-
-```sh
-target/debug/flick-transfer --state-dir "$ROOT/$MODE-$RUN/state" \
-  --download-dir "$ROOT/$MODE-$RUN/downloads" --public --transport "$MODE" \
-  benchmark "$INPUT" --window-seconds 120
-```
-
-For the HTTPS input, `ROOT=/tmp/flick-public-comparison-cxp8oizq` and `INPUT=https://webtorrent.io/torrents/sintel.torrent`. For the magnet input, `ROOT=/tmp/flick-magnet-comparison-emm3tk3r` and `INPUT=magnet:?xt=urn:btih:08ada5a7a6183aae1e09d831df6748d566095a10`. `MODE` was `tcp-only` or `tcp-and-utp`, and `RUN` was `1` or `2`. The magnet hash was independently extracted from the fetched torrent's raw info dictionary with Python's SHA-1 implementation.
-
-Raw elapsed seconds below start after session initialization. HTTPS metadata time includes fetching and parsing the `.torrent`; magnet metadata time requires peer metadata exchange. First verified bytes, completion, and live peers are sampled every 250 ms, so timestamps have that observation granularity. Every run exited successfully after verifying all **129,302,391 bytes**. Peak counts refer to live connections, not all discovered addresses. Live peers were zero in every completion snapshot after the engine closed download connections.
-
-| Input | Mode | Run | Started UTC | Metadata (s) | First verified (s) | Complete (s) | Peak live peers |
-| --- | --- | --- | --- | --- | --- | --- | --- |
-| HTTPS | tcp-only | 1 | 2026-10-24T19:50:38.327080+00:00 | 1.310116839 | 3.020489838 | 15.830994119 | 40 |
-| HTTPS | tcp-and-utp | 1 | 2026-10-24T19:50:57.729253+00:00 | 1.166109137 | 3.069033728 | 15.925069505 | 40 |
-| HTTPS | tcp-only | 2 | 2026-10-24T19:51:14.870466+00:00 | 1.295604750 | 2.650823181 | 16.308498002 | 39 |
-| HTTPS | tcp-and-utp | 2 | 2026-10-24T19:51:32.395585+00:00 | 1.178779639 | 3.351984547 | 14.645966774 | 40 |
-| Magnet | tcp-only | 1 | 2026-10-24T19:52:08.513763+00:00 | 1.038129572 | 2.285118184 | 18.061256893 | 39 |
-| Magnet | tcp-and-utp | 1 | 2026-10-24T19:52:27.795379+00:00 | 1.303690219 | 2.692355322 | 13.791851801 | 31 |
-| Magnet | tcp-only | 2 | 2026-10-24T19:52:46.275931+00:00 | 0.999187247 | 3.043522763 | 17.812040816 | 39 |
-| Magnet | tcp-and-utp | 2 | 2026-10-24T19:53:05.468146+00:00 | 1.061685472 | 2.338047551 | 14.677042284 | 31 |
-
-Mean completion time was 16.069746061 seconds for TCP versus 15.285518140 for TCP+uTP with HTTPS metadata, and 17.936648855 versus 14.234447043 with magnet metadata. TCP+uTP was faster in the magnet trials and comparable in the HTTPS trials. Public desktop and diagnostic sessions now default to `TcpAndUtp`; local sessions retain TCP. In 9.0.1 the same uTP listener socket enables outgoing uTP while outgoing TCP stays enabled; no separate outgoing-uTP option exists. Mixed-mode logs confirmed TCP and UDP listeners on the same port. These results do not isolate how many bytes traveled over each protocol.
-
-The uTP engine warned that its receive buffer was 8,388,608 bytes rather than the requested 167,772,160 bytes; `net.core.rmem_max` and `net.core.wmem_max` were both 4,194,304. No kernel settings were changed. All eight download directories, including downloaded media, were deleted after the processes stopped. Raw JSON samples and engine logs remained in the two task-owned `/tmp` roots during this session; no downloaded media is committed.
-
-### Checks and scope
-
-- `cargo build --locked --no-default-features --bin flick-transfer`: passed (4m 52s). This builds the backend diagnostic, not the desktop.
-- `cargo test --locked --no-default-features --all-targets`: passed, 10 unit tests and four local transfer tests. Generated local fixtures and explicit loopback peers covered sharing, selected-file download, pause/restart/resume, byte verification, invalid inputs, actionable metadata timeout, and no public state files in local mode.
-- `cargo fmt --all -- --check`: passed.
-- `cargo clippy --locked --all-targets -- -D warnings`: passed (7m 39s). Cargo also printed a nonfatal future-incompatibility notice for dependency `proc-macro-error2` 2.0.1.
-- Final `cargo clippy --locked --no-default-features --all-targets -- -D warnings`: passed after the correction below.
-- `cargo test --locked --all-targets`: passed, 32 tests (10 shared-library, 18 desktop, four local-transfer tests); four native libmpv playback tests remained ignored. The desktop cancellation test passed against a generated fixture and a stalled explicit loopback peer.
-- Final `cargo test --locked --no-default-features --all-targets`: passed again, 14 tests (10 unit, four local-transfer tests).
-- `cargo build --locked`: passed; the Linux desktop application and diagnostic linked successfully. Cargo elapsed times included waiting on the same worktree's build lock. A linked desktop binary is not evidence of interactive playback.
-- Initial `cargo clippy --locked --no-default-features --all-targets -- -D warnings` found `collapsible_if` in the new startup code. The conditional was corrected before final checks.
-- An exploratory `cargo check --locked --all-targets` was interrupted during dependency compilation (exit 130) to build the diagnostic first. It is not a passing desktop check.
-
-The desktop resolve notice now says “Finding peers…” and offers Cancel; the worker waits up to five minutes and acknowledges cancellation after aborting the old task. Automated cancellation coverage uses a generated fixture and a stalled explicit loopback peer. This session has not exercised that button interactively or run desktop playback.
-
-### Web-seed research (item 31, research only)
-
-The [upstream release list](https://github.com/ikatson/rqbit/releases) and GitHub latest-release API returned v9.0.1 (published 2026-08-20); no newer upstream release was found. [Issue 500](https://github.com/ikatson/rqbit/issues/500) remains open for BEP 19 web seeds. Its discussion links a separate fork implementing HTTP sources, not a newer upstream release. The pinned source has no `url-list` downloader. The dependency was not changed. The Sintel metadata's web-seed URL was present but these measurements used BitTorrent peers; the separate URL-download backend owns direct Archive HTTPS downloads.
