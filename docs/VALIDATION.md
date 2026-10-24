@@ -68,6 +68,31 @@ Not verified:
 - **Edge cases.** A full disk and resuming an HTTPS download after a real crash, beyond the one external interruption above, are untested.
 
 All downloaded media, generated clips, and the downloaded yt-dlp release were deleted after these checks.
+### Library, player, and rendering features on 2026-10-24
+
+This covers backlog items 7, 14, 16, 17, 20, 21, and 22 in [PLAN.md](../PLAN.md), on the same Ubuntu VM, Xvfb/Openbox/Lavapipe session, isolated settings, and generated fixtures as the backlog pass above. Two copies of the 12-second clip were arranged as `Harbor Show/Season 1/01 - Arrival.mp4` and `02 - Departure.mp4`, and the 6-second 4K clip was added to the library. Other agents' builds and benchmarks were running, with load averages of 10–14 on four vCPUs, so no timing below is a performance result.
+
+Automated checks on the merged tree: formatting; strict Clippy with and without desktop features; and `cargo test --locked --all-targets` (43 shared-library, 44 desktop, and four local-transfer tests; nine opt-in tests ignored). These opt-in native tests pass with `FLICK_AUDIO=null FLICK_TEST_VIDEO=<720p clip>`:
+
+- `playback::tests::real_render_thread_delivers_tagged_frames`: frames arrive at the target size, a zero target stops rendering, each load advances the generation, a resize re-renders while paused, and dropping the player while it plays joins the render thread.
+- `thumbnails::tests::real_posters_are_written_with_details`: a 400-pixel PNG poster that is not black, with duration 12.02 s, 1280×720, and `h264`; a missing file reports an error.
+- `thumbnails::tests::real_previews_follow_the_newest_request`: previews at 2 s and 8 s differ.
+- The six earlier playback tests also pass after the render-thread refactor, and the smoke test passes.
+
+Interactive observations under Xvfb:
+
+- **Shows (item 17):** the episodes appeared as one show, Harbor Show, listed under Season 1. At the end of episode 1, an "Up next in 7 s" card offered Cancel and Play Now; without input, episode 2 opened. Cancel kept episode 1 open past the countdown. Shift+P returned to episode 1. The first Cancel attempt clicked before the frame after the pointer move rendered; the retry worked.
+- **Posters (item 16):** posters for all six videos were generated in the background, at roughly 2–3 seconds each under this load. Cards showed the posters with 4K and 720p badges and durations such as "Not started · 0:06".
+- **Timeline previews (item 20):** hovering the timeline showed the frame at 0:07 above the pointer.
+- **Picture in picture (item 21):** P opened the video in a separate window while the main window showed "Playing in picture in picture". Back to the library kept it playing: the timecode advanced from 0:05.7 to 0:11.9. Dragging moved it, hovering showed its controls, and its return button closed it and restored the player. Openbox placed it at the bottom left and let the main window cover it, so staying above other windows is unverified on X11.
+- **Render thread (item 14):** the 4K clip, paused seeks (the picture updated at 6.03 s and 9.63 s while paused), and picture in picture all worked through the render thread. During the load above, 20 frames were presented in 5.3 s with 72 frames dropped; this is not a measure of the change.
+- **Fades (item 7):** player controls hid on schedule and were removed. Burst captures went from shown to hidden without an intermediate frame, so the 180 ms fade itself was not observed at this capture rate.
+- **OpenSubtitles (item 22):** Find Online opened with "Harbor lights" filled in. Without a key, Search explained where to add one and offered Open Appearance. With `FLICK_OPENSUBTITLES_KEY` set to a deliberately invalid value, one live search to api.opensubtitles.com showed "OpenSubtitles rejected the API key." A successful live search and download were not attempted, because no key was available.
+
+Fixed during this pass: picture in picture first crashed with "cannot read Flick while it is already being updated", because the new window's first render read the main view during its update. Opening is now deferred to the next turn of the event loop.
+
+Not verified: macOS floating panels and Windows tool windows for picture in picture; Wayland, where no always-on-top request exists; and macOS Reduce motion and Windows animation settings.
+
 ### Review backlog: playback, keyboard, and accessibility on 2026-10-24
 
 This covers backlog items 1, 2, 4–12, 18, and 19 in [PLAN.md](../PLAN.md). Environment: the same Ubuntu 24.04.5 x86_64 VM (four vCPUs, no GPU), Rust 1.99.0, GPUI 0.2.2, and libmpv 0.37.0. Interactive checks used Xvfb with Openbox and Mesa Lavapipe, null audio, isolated settings, and generated fixtures: the 12-second 1280×720 H.264/AAC clip with SRT captions from `scripts/make-test-video.sh`, and a 6-second 3840×2160 `testsrc2` clip.
