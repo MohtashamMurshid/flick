@@ -109,7 +109,7 @@ Features:
 - [ ] 22. OpenSubtitles search from the Audio & subtitles menu.
 - [ ] 23. Watch while downloading (stage 4): stream verified pieces from librqbit and prioritize pieces near the playhead.
 - [ ] 24. Transfer gaps from stage 2: delete-files confirmation, upload rate, torrent export, seeding preference, resume keyed by infohash, bandwidth limits, and global pause.
-- [ ] 26. Download from YouTube, X, and other sites supported by [yt-dlp](https://github.com/yt-dlp/yt-dlp) using a pasted page URL. Run an installed yt-dlp as a separate process, separate from playback and the torrent session, with progress, cancellation, and completed videos joining the library. Tests use a generated local stand-in for yt-dlp and no network access.
+- [x] 26. Download from YouTube, X, and other sites supported by [yt-dlp](https://github.com/yt-dlp/yt-dlp) using a pasted page URL. Run an installed yt-dlp as a separate process, separate from playback and the torrent session, with progress, cancellation, and completed videos joining the library. Tests use a generated local stand-in for yt-dlp and no network access. Done in `src/fetch.rs` and `src/fetch_ui.rs`; direct HTTPS video links skip yt-dlp. X was not tried with a real post; see [validation](docs/VALIDATION.md#link-downloads-on-2026-10-24).
 
 Transfer reliability, which should close most of the gap with other clients:
 
@@ -117,7 +117,7 @@ Transfer reliability, which should close most of the gap with other clients:
 - [ ] 28. Keep the DHT routing table across launches, in the transfer state directory, instead of `persistence: None`.
 - [ ] 29. Turn on UPnP port forwarding, with a fixed listen port so the mapping stays stable.
 - [ ] 30. Raise the 30-second metadata resolve deadline, and show "Finding peers…" while waiting instead of failing.
-- [ ] 31. Download Internet Archive results over HTTPS from archive.org's `download/` URLs, using the URL-download backend from item 26, instead of the Archive torrent. Check whether a newer librqbit supports web seeds.
+- [x] 31. Download Internet Archive results over HTTPS from archive.org's `download/` URLs, using the URL-download backend from item 26, instead of the Archive torrent. Check whether a newer librqbit supports web seeds. Results now list the item's files from the metadata API and download over HTTPS with SHA-1 checks. librqbit 9.0.1 is still the newest release and has no web seed (`url-list`) support.
 - [ ] 32. Try `TcpAndUtp` connections and measure them against `TcpOnly`.
 
 Automated transfer tests stay local, with generated fixtures and explicit peers. Public trackers, DHT, and UPnP are checked only in recorded manual runs.

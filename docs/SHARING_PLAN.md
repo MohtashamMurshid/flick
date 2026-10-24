@@ -18,6 +18,7 @@ Share lets the user choose a file or folder, hashes its contents, seeds those ex
 
 - `playback`: libmpv lifecycle, video rendering, tracks, timing, seeking, and sound.
 - `torrent`: one librqbit session with explicit storage, stable torrent/file identifiers, validated file selection, progress, seeding, and lifecycle management. It must not depend on GPUI, application history, or libmpv.
+- `fetch`: link downloads, separate from the torrent session and GPUI: yt-dlp as an external process for video pages, and HTTPS files for direct links and Internet Archive items.
 - `ui`: GPUI views and input. The transfer service runs on a background Tokio runtime; the UI consumes typed state/events and never blocks on hashing, metadata, filesystem scanning, or a network wait.
 - `store`: desktop viewing settings and resume history. Transfer persistence uses a separate directory and is locked against multiple owners.
 

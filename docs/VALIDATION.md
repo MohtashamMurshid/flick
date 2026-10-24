@@ -12,6 +12,52 @@ Flick targets Windows, macOS, and Linux. A CI configuration is not evidence of a
 
 The presentation adapter transfers decoded BGRA frames through CPU memory into GPUI images. It sizes frames to physical video bounds without a fixed resolution, axis, or pixel-budget cap. Checked native dimensions and allocation failures produce explicit errors. GPU rendering of those images does not establish hardware video decoding or zero-copy presentation. Treat this as a functional prototype. Hardware decoding, efficient GPU surface sharing, HDR correctness, battery use, and claims of being faster than VLC remain unverified.
 
+### Link downloads on 2026-10-24
+
+Backlog items 26 and 31 add downloads from pasted web links. `src/fetch.rs` has no GPUI dependency and is separate from the torrent session. It runs yt-dlp as a separate process for video pages, downloads direct HTTPS files, and lists Internet Archive items from archive.org's metadata API. `src/services.rs` runs these jobs on the existing background runtime without starting the torrent session, and `src/fetch_ui.rs` shows them on the Downloads page. Internet Archive search results now download over HTTPS instead of through the Archive's torrent. librqbit 9.0.1 is still the newest crates.io release, and its metainfo parser has no web seed (`url-list`) support.
+
+Environment: Ubuntu 24.04.5 x86_64, Rust 1.99.0, system yt-dlp 2024.04.09 at `/usr/bin/yt-dlp`, FFmpeg 6.1.1, libmpv 0.37.0, and Xvfb with Openbox and Mesa Lavapipe, using null audio.
+
+Automated checks, all passing:
+
+- `cargo fmt --all -- --check`, `cargo clippy --locked --all-targets -- -D warnings`, and `cargo clippy --locked --no-default-features --all-targets -- -D warnings`. The upstream `proc-macro-error2` future-compatibility notice remains.
+- `cargo test --locked --all-targets` passes 55 tests: 34 library, 18 desktop, and 3 transfer integration tests. Five tests are ignored by default: the four libmpv tests and one opt-in yt-dlp test. `cargo test --locked --no-default-features --all-targets` passes 37, with the same yt-dlp test ignored.
+- The `--no-default-features` normal dependency tree still contains no GPUI, Blade graphics, Cocoa, Metal, or winit.
+- The 28 new tests use no Internet access. A generated `/bin/sh` stand-in for yt-dlp reports progress, a title, and a saved file; fails with exit code 1; exits without saving; reports a file outside the destination; or sleeps after starting a background child. The tests check the argument list, with `--` immediately before the URL, and the removal of partial files after failure. Cancellation must stop the stand-in's whole process group: a mutation that disabled the process group made the test fail. Further tests cover a missing program, discovery through `FLICK_YTDLP`, `PATH`, and extra folders, progress and print parsing, rejected schemes and credentials, and safe file names. Plain-HTTP loopback servers cover resuming after a dropped connection with `Range` and `If-Range`, resuming or restarting an existing part file, checksum failures, never overwriting an unrelated file, reusing an identical copy, cancellation, HTTP refusals, refusing a concurrent download of the same file, and HTML answers. A page at a video-like address falls back to yt-dlp. Archive tests parse a metadata fixture and select files from it. The services test checks that link downloads run and cancel while the torrent session cannot start. The stand-in tests are Unix-only.
+- `cargo test --locked --no-default-features --lib installed_ytdlp -- --ignored` passes with the system yt-dlp and FFmpeg, using only a loopback server. A throttled download was cancelled, which left no files or temporary folder, and a second download saved byte-identical content.
+
+The HTTPS client itself, with TLS and `https_only`, is covered only by the manual checks below. No automated test uses a TLS server.
+
+Manual Internet checks, run with the `flick-fetch` diagnostic into temporary folders:
+
+- **Internet Archive over HTTPS.** [`Nabisco_2`](https://archive.org/details/Nabisco_2) is a public-domain Prelinger item. Its listing preselected the two originals: an MPEG-2 file and a HiRes MPEG-4. The three archive.org derivatives were listed but not selected. The first `get` was killed externally after saving and verifying the first file, leaving an empty part file for the second. The cause was not confirmed; another session's process cleanup is the likely explanation. Running `get` again reused the verified first file without downloading it, completed the second, and removed the part file. Both SHA-1s matched archive.org's metadata (`d723d45d…` and `58a234df…`), and FFmpeg decoded both as about 10.5 seconds of video with audio.
+- **YouTube.** With the system yt-dlp 2024.04.09, YouTube's API answered `HTTP Error 400: Bad Request` ("Precondition check failed"). yt-dlp then reported `[youtube] aqz-KE-bpKQ: Requested format is not available`. Flick showed that error unchanged, and the folder stayed empty. The official yt-dlp 2026.10.21 standalone release was then downloaded into a new temporary folder and selected with `FLICK_YTDLP`. With it, the Blender Foundation's CC BY [Big Buck Bunny 60fps 4K](https://www.youtube.com/watch?v=aqz-KE-bpKQ) downloaded and merged into one 722,512,905-byte WebM: AV1 3840×2160 with Opus audio, 634.6 seconds. A second run was interrupted with SIGINT at 184 MB of 712 MB. It reported `Cancelled`, left the folder empty, and left no yt-dlp or FFmpeg process. YouTube did not block this host.
+- **Wikimedia Commons.** The public-domain NASA clip [`NASA Probe Sparrow Motion.webm`](https://commons.wikimedia.org/wiki/File:NASA_Probe_Sparrow_Motion.webm) exposed a bug. Its page address ends in `.webm`, so the first build saved the 97 KB HTML page as a video. Direct downloads now refuse HTML answers, and a pasted link then falls back to yt-dlp. After the fix, the system yt-dlp received `HTTP Error 403: Forbidden` from Wikimedia, and Flick showed that error. yt-dlp 2026.10.21 downloaded the clip: VP9 1280×720, 4.2 seconds.
+- **X** was not tried, because no suitable public-domain post was at hand.
+
+Interactive desktop checks, using the debug build under a separate Xvfb display with temporary settings and download folders. Video-page downloads came from a loopback HTTP server that served generated 12-second clips, with one path throttled. The Archive check used the public Internet, and the search also queried TPB and YTS. No torrent content was downloaded. The following were observed:
+
+- The welcome page shows **Paste Link**. The GNOME Downloads header shows the same action as an icon; its label was not inspected.
+- Typing a loopback page URL in search and pressing Enter cleared the field and opened Downloads. The **Link Downloads** row showed yt-dlp's title, a progress bar, the size, speed, and time remaining, and the sidebar badge counted the download.
+- The cancel button's tooltip read "Cancel download". Cancelling removed the row and the badge. It left nothing in the download folder, including the hidden temporary folder, and no yt-dlp process remained.
+- With the address copied to the clipboard from Flick's own search field, **Paste Link** downloaded the clip. Play opened it in the player. About three seconds later, the test pattern's timestamp read 2.33 seconds. The video then appeared under Recently Added.
+- A 404 page showed yt-dlp's error in the row. After the file was added to the loopback server, **Try Again** downloaded it. With `FLICK_YTDLP` set to a missing path, the row showed "FLICK_YTDLP is set to …, which is not a file."
+- Searching "Nabisco Bumper" returned the Internet Archive item, labelled "Downloads over HTTPS · choose files first". Download opened a file chooser with formats, sizes, the original-file defaults, and the destination. Changing the selection updated the total. Download Selected showed "File 1 of 2", saved both files into a `Nabisco Bumper` folder with matching SHA-1s, and added them to the library. Play showed the film.
+- Entering `https://archive.org/details/Nabisco_2` in search and choosing Download Selected downloaded the default originals. The MPEG-2 file was fetched. The identical HiRes MPEG-4 already on disk was reused instead of being copied under a numbered name. The row named the `Nabisco Bumper` folder.
+- Closing the window during a throttled yt-dlp download exited Flick within half a second. The hidden temporary folder was removed, and no yt-dlp process remained.
+
+Two problems found during this pass were fixed and rechecked in the GUI. The retry icon showed a "10" seek glyph and is now a **Try Again** button. A multi-file row named the parent folder instead of the item folder.
+
+[Link download in progress](screenshots/flick-gnome-light-link-download.png) and [the Internet Archive file chooser](screenshots/flick-gnome-light-archive-files.png).
+
+Not verified:
+
+- **macOS and Windows.** In particular, on Windows the yt-dlp console window is suppressed with `CREATE_NO_WINDOW`, and cancellation ends the process tree with `taskkill /T`. Neither was compiled or run in this session; Windows CI has not run them.
+- **Downloads on other sites.** X downloads, playlist addresses, and sites that require signing in were not tried.
+- **Edge cases.** A full disk and resuming an HTTPS download after a real crash, beyond the one external interruption above, are untested.
+
+All downloaded media, generated clips, and the downloaded yt-dlp release were deleted after these checks.
+
 ### Native interface styles on 2026-10-24
 
 Flick now draws macOS, Windows 11, and GNOME styles (`src/theme.rs`, `src/chrome_ui.rs`), with an Appearance page, Hugeicons assets, a first-run welcome page, card-based Home and All Videos pages, and style-specific auto-hiding player controls.
