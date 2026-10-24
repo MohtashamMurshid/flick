@@ -7,9 +7,11 @@ use gpui::{
     EntityInputHandler, FocusHandle, Focusable, GlobalElementId, KeyBinding, LayoutId, MouseButton,
     MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point, ShapedLine,
     SharedString, Style, TextRun, UTF16Selection, UnderlineStyle, Window, actions, div, fill,
-    point, prelude::*, px, relative, rgb, rgba, size,
+    point, prelude::*, px, relative, size,
 };
 use unicode_segmentation::*;
+
+use crate::theme::ActiveTheme;
 
 actions!(
     text_input,
@@ -446,9 +448,11 @@ impl Element for TextElement {
         let selected_range = input.selected_range.clone();
         let cursor = input.cursor_offset();
         let style = window.text_style();
+        let theme = cx.theme();
+        let (caret, highlight) = (theme.accent, theme.accent_tint(0.3));
 
         let (display_text, text_color) = if content.is_empty() {
-            (input.placeholder.clone(), rgb(0x858585).into())
+            (input.placeholder.clone(), theme.muted.into())
         } else {
             (content, style.color)
         };
@@ -508,7 +512,7 @@ impl Element for TextElement {
                         point(bounds.left() + cursor_pos - scroll_x, bounds.top()),
                         size(px(2.), bounds.bottom() - bounds.top()),
                     ),
-                    rgb(0xfafafa),
+                    caret,
                 )),
             )
         } else {
@@ -524,7 +528,7 @@ impl Element for TextElement {
                             bounds.bottom(),
                         ),
                     ),
-                    rgba(0xffffff30),
+                    highlight,
                 )),
                 None,
             )
@@ -603,13 +607,13 @@ impl Render for TextInput {
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_move(cx.listener(Self::on_mouse_move))
-            .h(px(36.))
+            .h_full()
             .w_full()
             .overflow_hidden()
             .items_center()
-            .text_color(rgb(0xfafafa))
-            .text_size(px(14.))
-            .line_height(px(22.))
+            .text_color(cx.theme().text)
+            .text_size(px(cx.theme().text_size))
+            .line_height(px(20.))
             .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
                 if event.keystroke.key == "enter" && this.marked_range.is_none() {
                     cx.emit(InputEvent::Submit);
@@ -641,7 +645,7 @@ impl TextInput {
         Self {
             focus_handle: cx.focus_handle(),
             content: "".into(),
-            placeholder: "Search your library or find a video to download".into(),
+            placeholder: "Search library or find videos online".into(),
             selected_range: 0..0,
             selection_reversed: false,
             marked_range: None,

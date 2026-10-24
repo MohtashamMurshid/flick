@@ -4,7 +4,7 @@ A desktop video player built in Rust with GPUI and libmpv, now adding native tor
 
 [View the empty window](docs/screenshots/flick-empty.png) or [playback with subtitles](docs/screenshots/flick-player.png).
 
-The interface uses bundled Inter typography, Lucide icons, centered playback controls, and a black/white/gray theme. See [asset sources and licenses](assets/README.md).
+Flick draws its interface in a macOS, Windows 11, or GNOME style and matches the running system by default. Each style has its own window chrome, sidebar, controls, typography, and player: a floating HUD on macOS, a transport bar on Windows, and a rounded OSD on GNOME. Choose the style, a light or dark scheme, and an accent color in **Appearance**. Icons come from the free Hugeicons set. The native style uses the platform UI font; other styles use the closest installed font or the bundled Inter. See [asset sources and licenses](assets/README.md).
 
 Flick opens to your library, with Continue watching, All videos, History, and Downloads. Add videos or a folder, filter local titles, or search online for videos to download. Choose torrent files and a destination; completed verified videos join the library. Share a file or folder and copy its magnet link. The [development diagnostic](docs/TRANSFERS.md) uses the same native transfer backend. Watching during downloads follows later. The broad [headless agent proposal](docs/HEADLESS_PLAN.md) is deferred. See [PLAN.md](PLAN.md) for implemented versus planned work.
 
@@ -27,7 +27,7 @@ cargo run --locked -- "/path/to/video.mp4"
 
 If Rust was just installed and `cargo` is not on the current shell's path, open a new terminal or run `. "$HOME/.cargo/env"` on macOS/Linux first. On this development machine, `~/.cargo/bin/cargo` also works directly.
 
-Use **Add videos** or **Add folder** to build the library, or drop files/folders into it. Click a video to play or continue it. **Library** returns to the library and pauses playback. Passing a local path on the command line opens that video directly. Type to filter local videos; press Enter or **Search online** for download results. Search uses TPB, Internet Archive, and YTS independently and reports unavailable sources. The Linux file picker uses the desktop portal; drag and drop and command-line paths remain available when no portal service is running. The captions icon opens **Audio & subtitles** to select tracks or load a subtitle file. The history icon opens **Recent files** to restore prior viewing sessions. Icon controls have descriptive tooltips.
+A new library opens to a welcome page with **Open Video…**, **Add Folder…**, and **Paste Magnet Link**. Afterward, Flick opens to **Home**, with Continue Watching and Recently Added; the sidebar also has All Videos, History, Downloads, and Appearance. Use **Add Videos…** or **Add Folder…** to build the library, or drop files/folders into it. Click a video to play or continue it. The back arrow returns to the library and pauses playback. Passing a local path on the command line opens that video directly. Type in the search field to filter local videos; press Enter for download results, or paste a magnet link. Search uses TPB, Internet Archive, and YTS independently and reports unavailable sources. The Linux file picker uses the desktop portal; drag and drop and command-line paths remain available when no portal service is running. The captions icon opens **Audio & subtitles** to select tracks or load a subtitle file. While a video plays, its controls hide after 2.5 seconds without pointer movement, and subtitles move above the controls whenever they show. Turn hiding off in **Appearance**. Icon controls have descriptive tooltips.
 
 ## Keyboard controls
 
@@ -41,6 +41,7 @@ Use **Add videos** or **Add folder** to build the library, or drop files/folders
 | Escape | Exit fullscreen or close the menu |
 | Ctrl+O / Cmd+O | Add videos in the library or open a video in the player |
 | Ctrl+K / Cmd+K | Go to the library and focus search |
+| Ctrl+, / Cmd+, | Open Appearance |
 | Ctrl+L / Cmd+L | Load a subtitle file |
 | ? | Show keyboard shortcuts |
 

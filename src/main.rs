@@ -5,9 +5,13 @@ mod playback;
 mod services;
 mod smoke;
 mod store;
+mod theme;
 mod ui;
 
-use gpui::{App, AppContext, Application, Bounds, WindowBounds, WindowOptions, px, size};
+use gpui::{
+    App, AppContext, Application, Bounds, WindowBackgroundAppearance, WindowBounds,
+    WindowDecorations, WindowOptions, point, px, size,
+};
 use std::path::PathBuf;
 
 fn main() -> anyhow::Result<()> {
@@ -68,10 +72,21 @@ fn main() -> anyhow::Result<()> {
                     cx,
                 ))),
                 window_min_size: Some(size(px(760.), px(500.))),
+                // Flick draws its own title bar in the selected platform style.
+                // macOS keeps its native traffic lights; Linux uses client-side
+                // decorations when the compositor supports them.
                 titlebar: Some(gpui::TitlebarOptions {
                     title: Some("Flick".into()),
-                    ..Default::default()
+                    appears_transparent: true,
+                    traffic_light_position: Some(point(px(20.), px(20.))),
                 }),
+                window_decorations: Some(WindowDecorations::Client),
+                window_background: if cfg!(target_os = "linux") {
+                    WindowBackgroundAppearance::Transparent
+                } else {
+                    WindowBackgroundAppearance::Opaque
+                },
+                app_id: Some("flick".into()),
                 ..Default::default()
             };
             if let Err(error) = cx.open_window(options, |window, cx| {

@@ -1,5 +1,11 @@
+#[path = "chrome_ui.rs"]
+mod chrome_ui;
 #[path = "library_ui.rs"]
 mod library_ui;
+#[path = "player_ui.rs"]
+mod player_ui;
+#[path = "settings_ui.rs"]
+mod settings_ui;
 
 use crate::{
     assets::icon,
@@ -8,11 +14,13 @@ use crate::{
     playback::{PlaybackSnapshot, Player, PlayerEvent},
     services::{Command as ServiceCommand, Event as ServiceEvent, Services},
     store::Store,
+    theme::{ActiveTheme, Appearance, Style, Theme},
 };
+use chrome_ui::{h_flex, v_flex};
 use gpui::{
     Bounds, ClickEvent, ClipboardItem, Context, Div, Entity, ExternalPaths, FocusHandle, Focusable,
     KeyDownEvent, MouseButton, ObjectFit, PathPromptOptions, Pixels, RenderImage, SharedString,
-    Stateful, Window, canvas, div, img, prelude::*, px, relative, rgb,
+    Stateful, Window, canvas, div, img, prelude::*, px, relative, rgb, rgba,
 };
 use std::{
     cell::Cell,
@@ -23,33 +31,49 @@ use std::{
     time::{Duration, Instant},
 };
 
-const BG: u32 = 0x0a0a0a;
-const PANEL: u32 = 0x141414;
-const LINE: u32 = 0x262626;
-const TEXT: u32 = 0xfafafa;
-const MUTED: u32 = 0x858585;
-const HOVER: u32 = 0x202020;
-const HEADER_HEIGHT: f32 = 56.;
-const FOOTER_HEIGHT: f32 = 108.;
+/// How long playback controls stay visible without pointer movement.
+const CONTROLS_TIMEOUT: Duration = Duration::from_millis(2500);
 
 #[derive(Clone, Copy, PartialEq)]
 enum View {
     Library,
     Player,
 }
+
 #[derive(Clone, Copy, PartialEq)]
-enum LibraryTab {
+enum Page {
+    Home,
     Videos,
     History,
     Downloads,
+    Appearance,
+}
+
+impl Page {
+    fn title(self) -> &'static str {
+        match self {
+            Self::Home => "Home",
+            Self::Videos => "All Videos",
+            Self::History => "History",
+            Self::Downloads => "Downloads",
+            Self::Appearance => "Appearance",
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum VideoFilter {
+    All,
+    Unwatched,
+    InProgress,
 }
 
 #[derive(Clone, Copy, PartialEq)]
 enum Menu {
-    Recent,
     Tracks,
     Keys,
 }
+
 #[derive(Clone, Copy)]
 enum Control {
     Open,
@@ -61,16 +85,15 @@ enum Control {
     Louder,
     Speed,
     Fullscreen,
-    Recent,
     Tracks,
     Subtitle,
     Keys,
     DismissError,
     Library,
-    Search,
     AddVideos,
     AddFolder,
     Share,
+    PasteMagnet,
 }
 
 pub struct Flick {
@@ -93,7 +116,10 @@ pub struct Flick {
     pending_resume: f64,
     file_loaded: bool,
     view: View,
-    library_tab: LibraryTab,
+    page: Page,
+    video_filter: VideoFilter,
+    /// GNOME shows search in a bar below the header bar while open.
+    search_open: bool,
     search_input: Entity<TextInput>,
     query: String,
     search_generation: u64,
@@ -107,11 +133,20 @@ pub struct Flick {
     download_folder: PathBuf,
     shared_magnet: Option<String>,
     importing: bool,
+    /// Set when a control inside a title bar is pressed, so the title bar
+    /// does not start a window move.
+    control_pressed: bool,
+    should_move: bool,
+    pointer_moved_at: Instant,
+    controls_shown: bool,
+    /// mpv `sub-pos`, raised so subtitles stay above visible controls.
+    subtitle_position: u32,
 }
 
 impl Flick {
     pub fn new(path: Option<PathBuf>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let store = Store::load();
+        crate::theme::apply(cx, &store.data.appearance);
         let search_input = cx.new(TextInput::new);
         let services = Services::start();
         let download_folder = services.download_dir.clone();
@@ -123,10 +158,18 @@ impl Flick {
                     this.search_generation += 1;
                     this.searching = false;
                     this.search_results = None;
+                    if !this.query.is_empty() && !matches!(this.page, Page::Home | Page::Videos) {
+                        this.page = Page::Videos;
+                    }
                 }
                 InputEvent::Submit => this.search(cx),
             }
             cx.notify();
+        })
+        .detach();
+        cx.observe_window_appearance(window, |this, window, cx| {
+            crate::theme::apply(cx, &this.store.data.appearance);
+            window.refresh();
         })
         .detach();
         let (player, error) = match Player::new() {
@@ -155,7 +198,9 @@ impl Flick {
             pending_resume: 0.,
             file_loaded: false,
             view: View::Library,
-            library_tab: LibraryTab::Videos,
+            page: Page::Home,
+            video_filter: VideoFilter::All,
+            search_open: false,
             search_input,
             query: String::new(),
             search_generation: 0,
@@ -169,6 +214,11 @@ impl Flick {
             download_folder,
             shared_magnet: None,
             importing: false,
+            control_pressed: false,
+            should_move: false,
+            pointer_moved_at: Instant::now(),
+            controls_shown: true,
+            subtitle_position: 100,
         };
         this.apply_preferences();
         cx.on_release(|this, _| this.persist()).detach();
@@ -196,6 +246,20 @@ impl Flick {
             let _ = player.set_property("speed", &self.store.data.speed.to_string());
             self.snapshot = player.snapshot();
         }
+    }
+
+    /// Changes appearance preferences, applies them immediately, and saves.
+    fn set_appearance(
+        &mut self,
+        change: impl FnOnce(&mut Appearance),
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        change(&mut self.store.data.appearance);
+        crate::theme::apply(cx, &self.store.data.appearance);
+        self.persist();
+        window.refresh();
+        cx.notify();
     }
 
     fn persist(&mut self) {
@@ -262,6 +326,8 @@ impl Flick {
                 self.error = None;
                 self.menu = None;
                 self.opened_at = Some(Instant::now());
+                self.pointer_moved_at = Instant::now();
+                self.controls_shown = true;
                 if let Some(old) = self.frame.take() {
                     let _ = window.drop_image(old);
                 }
@@ -273,8 +339,44 @@ impl Flick {
         cx.notify();
     }
 
+    fn playing(&self) -> bool {
+        self.path.is_some() && !self.snapshot.paused && !self.snapshot.eof
+    }
+
+    /// Player controls hide while video plays and the pointer is still.
+    fn controls_wanted(&self) -> bool {
+        self.view != View::Player
+            || !self.file_loaded
+            || !self.playing()
+            || !self.store.data.appearance.autohide_controls
+            || self.menu.is_some()
+            || self.scrubbing
+            || self.changing_volume
+            || self.pointer_moved_at.elapsed() < CONTROLS_TIMEOUT
+    }
+
     fn tick(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Duration {
         self.poll_services(cx);
+        let shown = self.controls_wanted();
+        if shown != self.controls_shown {
+            self.controls_shown = shown;
+            cx.notify();
+        }
+        let height = f32::from(self.video_bounds.get().size.height);
+        let subtitle_position = if self.view == View::Player && self.controls_shown && height > 0. {
+            let covered = player_ui::controls_height(cx.theme().style) + 8.;
+            ((1. - covered / height) * 100.).clamp(50., 100.).round() as u32
+        } else {
+            100
+        };
+        if subtitle_position != self.subtitle_position
+            && let Some(player) = &self.player
+            && player
+                .set_property("sub-pos", &subtitle_position.to_string())
+                .is_ok()
+        {
+            self.subtitle_position = subtitle_position;
+        }
         let Some(player) = &self.player else {
             return Duration::from_millis(500);
         };
@@ -348,7 +450,7 @@ impl Flick {
         if changed {
             cx.notify();
         }
-        if self.path.is_some() && !self.snapshot.paused && !self.snapshot.eof {
+        if self.playing() {
             Duration::from_millis(16)
         } else {
             Duration::from_millis(150)
@@ -405,6 +507,29 @@ impl Flick {
         }).detach();
     }
 
+    fn show_page(&mut self, page: Page, window: &mut Window, cx: &mut Context<Self>) {
+        if self.view == View::Player {
+            self.handle(Control::Library, window, cx);
+        }
+        self.page = page;
+        if page == Page::Downloads {
+            self.send(ServiceCommand::Load, cx);
+        }
+        cx.notify();
+    }
+
+    fn focus_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.view == View::Player {
+            self.handle(Control::Library, window, cx);
+        }
+        if !matches!(self.page, Page::Home | Page::Videos) {
+            self.page = Page::Home;
+        }
+        self.search_open = true;
+        self.search_input.focus_handle(cx).focus(window);
+        cx.notify();
+    }
+
     fn handle(&mut self, control: Control, window: &mut Window, cx: &mut Context<Self>) {
         match control {
             Control::Library => {
@@ -412,14 +537,31 @@ impl Flick {
                 self.property("pause", "yes", cx);
                 self.view = View::Library;
                 self.menu = None;
+                if window.is_fullscreen() {
+                    window.toggle_fullscreen();
+                }
                 window.set_window_title("Flick");
                 self.focus.focus(window);
                 cx.notify();
             }
-            Control::Search => self.search(cx),
             Control::AddVideos => self.pick_library(false, false, window, cx),
             Control::AddFolder => self.pick_library(true, false, window, cx),
             Control::Share => self.pick_library(true, true, window, cx),
+            Control::PasteMagnet => {
+                let text = cx
+                    .read_from_clipboard()
+                    .and_then(|item| item.text())
+                    .unwrap_or_default();
+                let text = text.trim();
+                if text.starts_with("magnet:") {
+                    self.resolve(flick::torrent::TorrentInput::Magnet(text.to_owned()), cx);
+                } else {
+                    self.error = Some(
+                        "Copy a magnet link first, then choose Paste Magnet Link again.".into(),
+                    );
+                    cx.notify();
+                }
+            }
             Control::Open => self.pick(false, window, cx),
             Control::Subtitle => self.pick(true, window, cx),
             Control::Play if self.path.is_some() => {
@@ -429,6 +571,7 @@ impl Flick {
                 } else {
                     self.command(&["cycle", "pause"], cx);
                 }
+                self.pointer_moved_at = Instant::now();
             }
             Control::Back | Control::Forward if self.path.is_some() => {
                 let delta = if matches!(control, Control::Back) {
@@ -466,11 +609,11 @@ impl Flick {
                 self.error = None;
                 cx.notify();
             }
-            Control::Recent | Control::Tracks | Control::Keys => {
-                let menu = match control {
-                    Control::Recent => Menu::Recent,
-                    Control::Tracks => Menu::Tracks,
-                    _ => Menu::Keys,
+            Control::Tracks | Control::Keys => {
+                let menu = if matches!(control, Control::Tracks) {
+                    Menu::Tracks
+                } else {
+                    Menu::Keys
                 };
                 self.menu = if self.menu == Some(menu) {
                     None
@@ -486,7 +629,11 @@ impl Flick {
     fn key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let key = event.keystroke.key.as_str();
         let modifiers = event.keystroke.modifiers;
-        if (modifiers.control || modifiers.platform) && key == "o" {
+        let command = modifiers.control || modifiers.platform;
+        if self.view == View::Player {
+            self.pointer_moved_at = Instant::now();
+        }
+        if command && key == "o" {
             self.handle(
                 if self.view == View::Library {
                     Control::AddVideos
@@ -499,15 +646,22 @@ impl Flick {
             cx.stop_propagation();
             return;
         }
-        if (modifiers.control || modifiers.platform) && key == "k" {
-            self.handle(Control::Library, window, cx);
-            self.search_input.focus_handle(cx).focus(window);
+        if command && (key == "k" || (key == "f" && self.view == View::Library)) {
+            self.focus_search(window, cx);
+            cx.stop_propagation();
+            return;
+        }
+        if command && key == "," {
+            self.show_page(Page::Appearance, window, cx);
             cx.stop_propagation();
             return;
         }
         if key == "escape" {
             if window.is_fullscreen() {
                 window.toggle_fullscreen();
+            } else if self.menu.is_none() && self.view == View::Library && self.search_open {
+                self.search_open = false;
+                self.focus.focus(window);
             }
             self.menu = None;
             cx.notify();
@@ -516,10 +670,10 @@ impl Flick {
         if self.search_input.read(cx).focused(window) {
             return;
         }
-        if self.view == View::Library && !(modifiers.control || modifiers.platform) {
+        if self.view == View::Library && !command {
             return;
         }
-        let control = if modifiers.control || modifiers.platform {
+        let control = if command {
             match key {
                 "o" => Some(Control::Open),
                 "l" => Some(Control::Subtitle),
@@ -544,101 +698,6 @@ impl Flick {
         }
     }
 
-    fn control(
-        &self,
-        id: &'static str,
-        label: impl Into<SharedString>,
-        action: Control,
-        cx: &Context<Self>,
-    ) -> Stateful<Div> {
-        let primary = id == "open-primary";
-        let color = if primary { BG } else { TEXT };
-        div()
-            .id(id)
-            .flex()
-            .items_center()
-            .justify_center()
-            .gap_2()
-            .h(px(36.))
-            .px_3()
-            .rounded(px(6.))
-            .cursor_pointer()
-            .text_size(px(13.))
-            .font_weight(gpui::FontWeight::MEDIUM)
-            .bg(rgb(if primary { TEXT } else { BG }))
-            .border_1()
-            .border_color(rgb(if primary { TEXT } else { LINE }))
-            .text_color(rgb(color))
-            .hover(move |s| s.bg(rgb(if primary { 0xdedede } else { HOVER })))
-            .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
-                cx.stop_propagation();
-                this.handle(action, window, cx);
-            }))
-            .child(icon(
-                match action {
-                    Control::Subtitle => "captions",
-                    Control::Library => "arrow-left",
-                    Control::Search => "search",
-                    Control::AddFolder => "folder-plus",
-                    Control::Share => "share-2",
-                    _ => "folder-open",
-                },
-                15.,
-                color,
-            ))
-            .child(label.into())
-    }
-
-    fn icon_control(
-        &self,
-        id: &'static str,
-        name: &'static str,
-        label: impl Into<SharedString>,
-        action: Control,
-        cx: &Context<Self>,
-    ) -> Stateful<Div> {
-        let play = id == "play";
-        let disabled = self.path.is_none()
-            && matches!(
-                action,
-                Control::Play | Control::Back | Control::Forward | Control::Tracks
-            );
-        let label = label.into();
-        let color = if disabled {
-            0x404040
-        } else if play {
-            BG
-        } else {
-            TEXT
-        };
-        div()
-            .id(id)
-            .flex()
-            .items_center()
-            .justify_center()
-            .size(px(if play { 44. } else { 34. }))
-            .rounded(px(if play { 22. } else { 6. }))
-            .bg(rgb(if play && !disabled { TEXT } else { BG }))
-            .border_1()
-            .border_color(rgb(if play {
-                if disabled { LINE } else { TEXT }
-            } else {
-                BG
-            }))
-            .when(!disabled, |d| {
-                d.cursor_pointer()
-                    .hover(move |s| s.bg(rgb(if play { 0xdedede } else { HOVER })))
-            })
-            .tooltip(move |_, cx| cx.new(|_| Hint(label.clone())).into())
-            .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
-                cx.stop_propagation();
-                if !disabled {
-                    this.handle(action, window, cx);
-                }
-            }))
-            .child(icon(name, if play { 19. } else { 18. }, color))
-    }
-
     fn seek_at(&mut self, x: Pixels, cx: &mut Context<Self>) {
         let bounds = self.timeline.get();
         if self.snapshot.duration > 0. && bounds.size.width > px(0.) {
@@ -656,674 +715,67 @@ impl Flick {
             self.property("volume", &(value * 100.).round().to_string(), cx);
         }
     }
-
-    fn menu_panel(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
-        let menu = self.menu?;
-        let title = match menu {
-            Menu::Recent => "Recent files",
-            Menu::Tracks => "Audio & subtitles",
-            Menu::Keys => "Keyboard shortcuts",
-        };
-        let mut panel = div()
-            .id("panel")
-            .occlude()
-            .flex()
-            .flex_col()
-            .p_2()
-            .w(px(300.))
-            .max_h(px(380.))
-            .overflow_y_scroll()
-            .bg(rgb(PANEL))
-            .border_1()
-            .border_color(rgb(LINE))
-            .rounded(px(8.))
-            .shadow_lg()
-            .text_size(px(13.))
-            .child(
-                div()
-                    .px_2()
-                    .py_2()
-                    .mb_1()
-                    .font_weight(gpui::FontWeight::MEDIUM)
-                    .child(title),
-            );
-        match menu {
-            Menu::Recent => {
-                if self.store.data.recent.is_empty() {
-                    panel = panel.child(
-                        div()
-                            .px_2()
-                            .py_3()
-                            .text_color(rgb(MUTED))
-                            .child("No recent files yet."),
-                    );
-                }
-                for (index, recent) in self.store.data.recent.iter().enumerate() {
-                    let path = recent.path.clone();
-                    panel = panel.child(
-                        div()
-                            .id(("recent", index))
-                            .flex()
-                            .items_center()
-                            .gap_3()
-                            .p_2()
-                            .rounded(px(5.))
-                            .cursor_pointer()
-                            .hover(|s| s.bg(rgb(HOVER)))
-                            .child(icon("file-video", 16., MUTED))
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_w(px(0.))
-                                    .flex()
-                                    .flex_col()
-                                    .gap_1()
-                                    .child(
-                                        div()
-                                            .overflow_hidden()
-                                            .whitespace_nowrap()
-                                            .child(recent.title.clone()),
-                                    )
-                                    .child(div().text_size(px(11.)).text_color(rgb(MUTED)).child(
-                                        format!(
-                                            "{} / {}",
-                                            format_time(recent.position),
-                                            format_time(recent.duration)
-                                        ),
-                                    )),
-                            )
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                this.open(path.clone(), window, cx)
-                            })),
-                    );
-                }
-            }
-            Menu::Tracks => {
-                for (kind, title) in [("audio", "Audio"), ("sub", "Subtitles")] {
-                    panel = panel.child(
-                        div()
-                            .px_2()
-                            .pt_3()
-                            .pb_1()
-                            .text_size(px(11.))
-                            .text_color(rgb(MUTED))
-                            .child(title),
-                    );
-                    for track in self
-                        .snapshot
-                        .tracks
-                        .iter()
-                        .filter(|track| track.kind == kind)
-                    {
-                        let id = track.id.to_string();
-                        let property = if kind == "audio" { "aid" } else { "sid" };
-                        let label = if !track.title.is_empty() {
-                            track.title.clone()
-                        } else if !track.language.is_empty() {
-                            track.language.clone()
-                        } else {
-                            format!("Track {}", track.id)
-                        };
-                        panel =
-                            panel.child(
-                                div()
-                                    .id(SharedString::from(format!("{property}-{id}")))
-                                    .flex()
-                                    .items_center()
-                                    .gap_2()
-                                    .p_2()
-                                    .rounded(px(5.))
-                                    .cursor_pointer()
-                                    .hover(|s| s.bg(rgb(HOVER)))
-                                    .child(div().size(px(16.)).when(track.selected, |d| {
-                                        d.child(icon("check", 15., TEXT))
-                                    }))
-                                    .child(label)
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.property(property, &id, cx)
-                                    })),
-                            );
-                    }
-                    if kind == "sub" {
-                        let off = !self
-                            .snapshot
-                            .tracks
-                            .iter()
-                            .any(|t| t.kind == "sub" && t.selected);
-                        panel = panel.child(
-                            div()
-                                .id("subs-off")
-                                .flex()
-                                .items_center()
-                                .gap_2()
-                                .p_2()
-                                .rounded(px(5.))
-                                .cursor_pointer()
-                                .hover(|s| s.bg(rgb(HOVER)))
-                                .child(
-                                    div()
-                                        .size(px(16.))
-                                        .when(off, |d| d.child(icon("check", 15., TEXT))),
-                                )
-                                .child("Off")
-                                .on_click(
-                                    cx.listener(|this, _, _, cx| this.property("sid", "no", cx)),
-                                ),
-                        );
-                    }
-                }
-                panel = panel.child(
-                    div()
-                        .mt_2()
-                        .pt_2()
-                        .border_t_1()
-                        .border_color(rgb(LINE))
-                        .child(self.control(
-                            "load-subtitle",
-                            "Load subtitle file",
-                            Control::Subtitle,
-                            cx,
-                        )),
-                );
-            }
-            Menu::Keys => {
-                for (key, action) in [
-                    ("Space", "Play / pause"),
-                    ("←  →", "Seek 10 seconds"),
-                    ("↑  ↓", "Change volume"),
-                    ("F / Esc", "Fullscreen / exit"),
-                    ("M", "Mute"),
-                    ("Ctrl / ⌘ O", "Open video"),
-                    ("Ctrl / ⌘ L", "Load subtitles"),
-                ] {
-                    panel = panel.child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .justify_between()
-                            .gap_4()
-                            .px_2()
-                            .py_2()
-                            .child(action)
-                            .child(div().text_size(px(11.)).text_color(rgb(MUTED)).child(key)),
-                    );
-                }
-            }
-        }
-        Some(panel.into_any_element())
-    }
 }
 
 struct Hint(SharedString);
 impl Render for Hint {
-    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let t = cx.theme();
         div()
             .px_2()
             .py_1()
-            .rounded(px(5.))
+            .rounded(px(t.radius))
             .border_1()
-            .border_color(rgb(LINE))
-            .bg(rgb(PANEL))
-            .text_color(rgb(TEXT))
-            .font_family("Inter")
+            .border_color(t.border)
+            .bg(t.popover)
+            .text_color(t.text)
+            .font_family(t.font.clone())
             .text_size(px(12.))
+            .shadow_md()
             .child(self.0.clone())
     }
 }
 
 impl Render for Flick {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let progress = if self.snapshot.duration > 0. {
-            (self.snapshot.position / self.snapshot.duration).clamp(0., 1.) as f32
-        } else {
-            0.
+        let t = cx.theme().clone();
+        let content = match self.view {
+            View::Library => self.library_frame(window, cx),
+            View::Player => self.player_frame(window, cx),
         };
-        let volume = (self.snapshot.volume / 100.).clamp(0., 1.) as f32;
-        let playing = self.path.is_some() && !self.snapshot.paused && !self.snapshot.eof;
-        let timeline = self.timeline.clone();
-        let volume_bounds = self.volume_bounds.clone();
-        let video_bounds = self.video_bounds.clone();
-        let header = div()
-            .relative()
-            .flex()
-            .items_center()
-            .h(px(HEADER_HEIGHT))
-            .flex_shrink_0()
-            .px_6()
-            .border_b_1()
-            .border_color(rgb(LINE))
-            .child(
-                div()
-                    .flex_1()
-                    .min_w(px(0.))
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .child(
-                        div()
-                            .size(px(24.))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .rounded(px(6.))
-                            .bg(rgb(TEXT))
-                            .child(icon("play", 13., BG)),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(15.))
-                            .font_weight(gpui::FontWeight::SEMIBOLD)
-                            .child("Flick"),
-                    )
-                    .when(self.view == View::Player, |d| {
-                        d.child(self.control("library-home", "Library", Control::Library, cx))
-                    }),
-            )
-            .child(
-                div()
-                    .flex_1()
-                    .min_w(px(0.))
-                    .text_center()
-                    .text_size(px(12.))
-                    .text_color(rgb(MUTED))
-                    // GPUI 0.2.2 mutates truncation runs between layout passes,
-                    // which can split UTF-8 and abort on macOS. Clip instead.
-                    .overflow_hidden()
-                    .whitespace_nowrap()
-                    .child(
-                        self.path
-                            .as_ref()
-                            .filter(|_| self.view == View::Player)
-                            .map(|p| file_title(p))
-                            .unwrap_or_default(),
-                    ),
-            )
-            .child(
-                div()
-                    .flex_1()
-                    .min_w(px(0.))
-                    .flex()
-                    .items_center()
-                    .justify_end()
-                    .gap_2()
-                    .child(self.icon_control(
-                        "keys",
-                        "keyboard",
-                        "Keyboard shortcuts (?)",
-                        Control::Keys,
-                        cx,
-                    ))
-                    .child(self.icon_control(
-                        "recent",
-                        "history",
-                        "Recent files",
-                        Control::Recent,
-                        cx,
-                    ))
-                    .child(self.control(
-                        "open",
-                        if self.view == View::Library {
-                            "Add videos"
-                        } else {
-                            "Open"
-                        },
-                        if self.view == View::Library {
-                            Control::AddVideos
-                        } else {
-                            Control::Open
-                        },
-                        cx,
-                    )),
-            );
-        let video = div()
-            .id("video")
-            .relative()
-            .flex_1()
-            .min_h(px(0.))
-            .w_full()
-            .flex()
-            .items_center()
-            .justify_center()
-            .bg(rgb(0x000000))
-            .overflow_hidden()
-            .child(
-                canvas(
-                    move |bounds, _, _| video_bounds.set(bounds),
-                    |_, _, _, _| {},
-                )
-                .absolute()
-                .size_full(),
-            )
-            .on_click(cx.listener(|this, event: &ClickEvent, window, _cx| {
-                this.focus.focus(window);
-                if event.click_count() == 2 {
-                    window.toggle_fullscreen();
-                }
-            }))
-            .when_some(self.frame.clone(), |d, frame| {
-                d.child(img(frame).size_full().object_fit(ObjectFit::Contain))
-            })
-            .when(self.frame.is_none(), |d| {
-                d.child(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .items_center()
-                        .text_center()
-                        .child(
-                            div()
-                                .size(px(56.))
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .rounded(px(12.))
-                                .border_1()
-                                .border_color(rgb(LINE))
-                                .bg(rgb(BG))
-                                .child(icon("film", 24., TEXT)),
-                        )
-                        .child(
-                            div()
-                                .mt_5()
-                                .text_size(px(23.))
-                                .font_weight(gpui::FontWeight::MEDIUM)
-                                .child(if self.path.is_some() {
-                                    if self.error.is_some() {
-                                        "Unable to open video"
-                                    } else {
-                                        "Opening video…"
-                                    }
-                                } else {
-                                    "Open a video"
-                                }),
-                        )
-                        .child(
-                            div()
-                                .mt_2()
-                                .text_size(px(13.))
-                                .text_color(rgb(MUTED))
-                                .child("Choose a local file or drag it into this window."),
-                        )
-                        .child(div().mt_6().child(self.control(
-                            "open-primary",
-                            "Open video",
-                            Control::Open,
-                            cx,
-                        ))),
-                )
-            });
-        let timeline_bar = div()
-            .id("timeline")
-            .relative()
-            .h(px(20.))
-            .flex_1()
-            .cursor_pointer()
-            .flex()
-            .items_center()
-            .child(
-                canvas(move |bounds, _, _| timeline.set(bounds), |_, _, _, _| {})
-                    .absolute()
-                    .size_full(),
-            )
-            .child(
-                div()
-                    .relative()
-                    .w_full()
-                    .h(px(3.))
-                    .rounded_full()
-                    .bg(rgb(LINE))
-                    .child(
-                        div()
-                            .w(relative(progress))
-                            .h_full()
-                            .rounded_full()
-                            .bg(rgb(TEXT)),
-                    )
-                    .when(self.path.is_some(), |d| {
-                        d.child(
-                            div()
-                                .absolute()
-                                .top(px(-2.5))
-                                .left(relative(progress))
-                                .ml(px(-4.))
-                                .size(px(8.))
-                                .rounded_full()
-                                .bg(rgb(TEXT)),
-                        )
-                    }),
-            )
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, e: &gpui::MouseDownEvent, _, cx| {
-                    this.scrubbing = true;
-                    this.seek_at(e.position.x, cx);
-                }),
-            )
-            .on_mouse_move(cx.listener(|this, e: &gpui::MouseMoveEvent, _, cx| {
-                if this.scrubbing {
-                    this.seek_at(e.position.x, cx);
-                }
-            }))
-            .on_mouse_up(
-                MouseButton::Left,
-                cx.listener(|this, _, _, _| this.scrubbing = false),
-            );
-        let volume_slider = div()
-            .id("volume-slider")
-            .relative()
-            .w(px(72.))
-            .h(px(20.))
-            .cursor_pointer()
-            .flex()
-            .items_center()
-            .tooltip(|_, cx| cx.new(|_| Hint("Volume".into())).into())
-            .child(
-                canvas(
-                    move |bounds, _, _| volume_bounds.set(bounds),
-                    |_, _, _, _| {},
-                )
-                .absolute()
-                .size_full(),
-            )
-            .child(
-                div().w_full().h(px(3.)).rounded_full().bg(rgb(LINE)).child(
-                    div()
-                        .w(relative(volume))
-                        .h_full()
-                        .rounded_full()
-                        .bg(rgb(if self.snapshot.muted { MUTED } else { TEXT })),
-                ),
-            )
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, e: &gpui::MouseDownEvent, _, cx| {
-                    this.changing_volume = true;
-                    this.volume_at(e.position.x, cx);
-                }),
-            )
-            .on_mouse_move(cx.listener(|this, e: &gpui::MouseMoveEvent, _, cx| {
-                if this.changing_volume {
-                    this.volume_at(e.position.x, cx);
-                }
-            }))
-            .on_mouse_up(
-                MouseButton::Left,
-                cx.listener(|this, _, _, _| this.changing_volume = false),
-            );
-        let controls = div()
-            .flex()
-            .items_center()
-            .w_full()
-            .h(px(44.))
-            .child(
-                div()
-                    .flex_1()
-                    .min_w(px(0.))
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .child(self.icon_control(
-                        "mute",
-                        if self.snapshot.muted {
-                            "volume-x"
-                        } else {
-                            "volume-2"
-                        },
-                        if self.snapshot.muted {
-                            "Unmute (M)"
-                        } else {
-                            "Mute (M)"
-                        },
-                        Control::Mute,
-                        cx,
-                    ))
-                    .child(volume_slider)
-                    .child(
-                        div()
-                            .w(px(32.))
-                            .ml_1()
-                            .text_size(px(11.))
-                            .text_color(rgb(MUTED))
-                            .child(format!("{:.0}%", self.snapshot.volume)),
-                    ),
-            )
-            .child(
-                div()
-                    .flex_1()
-                    .min_w(px(0.))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .gap_3()
-                    .child(self.icon_control(
-                        "back",
-                        "rotate-ccw",
-                        "Back 10 seconds (←)",
-                        Control::Back,
-                        cx,
-                    ))
-                    .child(self.icon_control(
-                        "play",
-                        if playing { "pause" } else { "play" },
-                        if playing {
-                            "Pause (Space)"
-                        } else {
-                            "Play (Space)"
-                        },
-                        Control::Play,
-                        cx,
-                    ))
-                    .child(self.icon_control(
-                        "forward",
-                        "rotate-cw",
-                        "Forward 10 seconds (→)",
-                        Control::Forward,
-                        cx,
-                    )),
-            )
-            .child(
-                div()
-                    .flex_1()
-                    .min_w(px(0.))
-                    .flex()
-                    .items_center()
-                    .justify_end()
-                    .gap_2()
-                    .child(
-                        div()
-                            .id("speed")
-                            .h(px(34.))
-                            .px_2()
-                            .flex()
-                            .items_center()
-                            .gap_1()
-                            .rounded(px(6.))
-                            .cursor_pointer()
-                            .text_size(px(12.))
-                            .text_color(rgb(TEXT))
-                            .hover(|s| s.bg(rgb(HOVER)))
-                            .tooltip(|_, cx| {
-                                cx.new(|_| Hint("Playback speed · click to cycle".into()))
-                                    .into()
-                            })
-                            .child(format!("{}×", self.snapshot.speed))
-                            .child(icon("chevron-down", 12., MUTED))
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.handle(Control::Speed, window, cx)
-                            })),
-                    )
-                    .child(self.icon_control(
-                        "tracks",
-                        "captions",
-                        "Audio & subtitles",
-                        Control::Tracks,
-                        cx,
-                    ))
-                    .child(self.icon_control(
-                        "fullscreen",
-                        if window.is_fullscreen() {
-                            "minimize"
-                        } else {
-                            "maximize"
-                        },
-                        if window.is_fullscreen() {
-                            "Exit fullscreen (F)"
-                        } else {
-                            "Fullscreen (F)"
-                        },
-                        Control::Fullscreen,
-                        cx,
-                    )),
-            );
-        let footer = div()
-            .flex()
-            .flex_col()
-            .flex_shrink_0()
-            .h(px(FOOTER_HEIGHT))
-            .justify_center()
-            .gap_3()
-            .px_6()
-            .py_4()
-            .border_t_1()
-            .border_color(rgb(LINE))
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_3()
-                    .h(px(20.))
-                    .w_full()
-                    .text_size(px(11.))
-                    .text_color(rgb(MUTED))
-                    .child(div().w(px(42.)).child(format_time(self.snapshot.position)))
-                    .child(timeline_bar)
-                    .child(
-                        div()
-                            .w(px(42.))
-                            .text_right()
-                            .child(format_time(self.snapshot.duration)),
-                    ),
-            )
-            .child(controls);
-        let menu = self.menu_panel(cx);
-        let library = (self.view == View::Library).then(|| self.library_view(cx));
-        div()
+        let root = div()
             .id("flick")
             .relative()
             .size_full()
             .flex()
             .flex_col()
-            .bg(rgb(BG))
-            .text_color(rgb(TEXT))
-            .font_family("Inter")
-            .text_size(px(13.))
+            .bg(if self.view == View::Player {
+                rgb(0x000000)
+            } else {
+                t.window
+            })
+            .text_color(t.text)
+            .font_family(t.font.clone())
+            .text_size(px(t.text_size))
             .track_focus(&self.focus)
             .on_key_down(cx.listener(Self::key))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, _| this.control_pressed = false),
+            )
+            .on_mouse_move(cx.listener(|this, _, _, cx| {
+                this.pointer_moved_at = Instant::now();
+                if !this.controls_shown {
+                    this.controls_shown = true;
+                    cx.notify();
+                }
+            }))
             .on_mouse_up(
                 MouseButton::Left,
                 cx.listener(|this, _, _, _| {
                     this.scrubbing = false;
                     this.changing_volume = false;
+                    this.should_move = false;
                 }),
             )
             .on_mouse_up_out(
@@ -1331,6 +783,7 @@ impl Render for Flick {
                 cx.listener(|this, _, _, _| {
                     this.scrubbing = false;
                     this.changing_volume = false;
+                    this.should_move = false;
                 }),
             )
             .on_drop(cx.listener(|this, paths: &ExternalPaths, window, cx| {
@@ -1355,48 +808,7 @@ impl Render for Flick {
                     this.open(path.clone(), window, cx);
                 }
             }))
-            .child(header)
-            .when_some(library, |d, library| d.child(library))
-            .when(self.view == View::Player, |d| d.child(video))
-            .when_some(self.error.clone(), |d, error| {
-                d.child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap_3()
-                        .px_6()
-                        .py_2()
-                        .bg(rgb(PANEL))
-                        .border_t_1()
-                        .border_color(rgb(LINE))
-                        .child(icon("circle-alert", 16., TEXT))
-                        .child(
-                            div()
-                                .flex_1()
-                                .text_size(px(12.))
-                                .text_color(rgb(0xd4d4d4))
-                                .child(error),
-                        )
-                        .child(self.icon_control(
-                            "dismiss-error",
-                            "x",
-                            "Dismiss",
-                            Control::DismissError,
-                            cx,
-                        )),
-                )
-            })
-            .when(self.file_loaded && self.view == View::Player, |d| {
-                d.child(footer)
-            })
-            .when_some(menu, |d, panel| {
-                d.child(
-                    div()
-                        .absolute()
-                        .right(px(24.))
-                        .top(px(HEADER_HEIGHT + 8.))
-                        .child(panel),
-                )
-            })
+            .child(content);
+        self.window_frame(root.into_any_element(), window, cx)
     }
 }
