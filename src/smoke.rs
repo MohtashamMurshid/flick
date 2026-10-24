@@ -74,7 +74,7 @@ pub fn run(path: &Path) -> Result<()> {
         if sought && frames_after_seek >= 3 && state.position > seek_target + 0.03 {
             println!(
                 "{}",
-                serde_json::json!({"result":"passed","frames":frames,"first_frame_ms":first_frame_ms,"duration":state.duration,"position_after_seek":state.position,"presentation":"software-bgra","audio":std::env::var("FLICK_AUDIO").unwrap_or_else(|_| "system".into())})
+                serde_json::json!({"result":"passed","frames":frames,"first_frame_ms":first_frame_ms,"duration":state.duration,"position_after_seek":state.position,"presentation":"software-bgra","hardware_decoder":player.hardware_decoder(),"audio":std::env::var("FLICK_AUDIO").unwrap_or_else(|_| "system".into())})
             );
             return Ok(());
         }

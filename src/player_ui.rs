@@ -6,6 +6,15 @@ use super::{
 };
 use gpui::{AnyElement, FontWeight, Rgba, linear_color_stop, linear_gradient};
 
+/// Fraction of the video's duration at `time`, for timeline markers.
+fn timeline_fraction(time: f64, duration: f64) -> f32 {
+    if duration > 0. {
+        (time / duration).clamp(0., 1.) as f32
+    } else {
+        0.
+    }
+}
+
 const ON_VIDEO: u32 = 0xffffff;
 const ON_VIDEO_HOVER: u32 = 0xffffff26;
 
@@ -66,6 +75,35 @@ impl Flick {
                         .child(panel),
                 )
             })
+            .when_some(self.up_next_card(cx), |d, card| {
+                d.child(
+                    div()
+                        .absolute()
+                        .right(px(16.))
+                        .bottom(px(controls_height + 8.))
+                        .child(card),
+                )
+            })
+            .when_some(self.status.as_ref(), |d, (text, _)| {
+                d.child(
+                    h_flex()
+                        .absolute()
+                        .top(px(t.titlebar_height.max(44.) + 12.))
+                        .left_0()
+                        .right_0()
+                        .justify_center()
+                        .child(
+                            div()
+                                .px_3()
+                                .py_1p5()
+                                .rounded_full()
+                                .bg(rgba(0x000000b3))
+                                .text_color(rgb(ON_VIDEO))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .child(text.clone()),
+                        ),
+                )
+            })
             .into_any_element()
     }
 
@@ -115,7 +153,7 @@ impl Flick {
                         ))
                         .child(
                             div()
-                                .text_size(px(20.))
+                                .text_size(t.font(20.))
                                 .font_weight(FontWeight::SEMIBOLD)
                                 .child(if failed {
                                     "Unable to open video"
@@ -158,28 +196,69 @@ impl Flick {
             size,
             rgb(ON_VIDEO),
             rgba(ON_VIDEO_HOVER),
+            None,
             cx,
             move |this, w, cx| this.handle(control, w, cx),
         )
     }
 
+    /// A labeled overlay button, used when "Show button labels" is on.
+    fn overlay_label_button(
+        &self,
+        id: &'static str,
+        name: &'static str,
+        label: &'static str,
+        control: Control,
+        cx: &Context<Self>,
+    ) -> Stateful<Div> {
+        let t = cx.theme();
+        let el = h_flex()
+            .id(id)
+            .relative()
+            .flex_none()
+            .gap_1p5()
+            .h(px(30.))
+            .px_2p5()
+            .rounded(px(t.radius))
+            .bg(rgba(0x00000066))
+            .text_color(rgb(ON_VIDEO))
+            .cursor_pointer()
+            .hover(|s| s.bg(rgba(ON_VIDEO_HOVER)))
+            .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                cx.stop_propagation();
+                this.handle(control, window, cx);
+            }))
+            .child(icon(name, 16., rgb(ON_VIDEO)))
+            .child(label);
+        self.focusable(el, &id.into(), None, t.radius, (0., 0.), cx)
+    }
+
     fn player_titlebar(&self, window: &Window, cx: &Context<Self>) -> Stateful<Div> {
         let t = cx.theme();
         let title = self.path.as_deref().map(file_title).unwrap_or_default();
-        let back = self.overlay_button(
-            "player-back",
-            "arrow-left",
-            "Back to Library",
-            Control::Library,
-            cx,
-        );
-        let keys = self.overlay_button(
-            "player-keys",
-            "keyboard",
-            "Keyboard shortcuts (?)",
-            Control::Keys,
-            cx,
-        );
+        let labels = self.store.data.appearance.show_labels;
+        let back = if labels {
+            self.overlay_label_button("player-back", "arrow-left", "Library", Control::Library, cx)
+        } else {
+            self.overlay_button(
+                "player-back",
+                "arrow-left",
+                "Back to Library",
+                Control::Library,
+                cx,
+            )
+        };
+        let keys = if labels {
+            self.overlay_label_button("player-keys", "keyboard", "Shortcuts", Control::Keys, cx)
+        } else {
+            self.overlay_button(
+                "player-keys",
+                "keyboard",
+                "Keyboard shortcuts (?)",
+                Control::Keys,
+                cx,
+            )
+        };
         let controls = self.window_controls(window, true, cx);
         let bar = div()
             .id("player-titlebar")
@@ -224,7 +303,7 @@ impl Flick {
                     div()
                         .flex_1()
                         .min_w(px(0.))
-                        .text_size(px(12.))
+                        .text_size(t.font(12.))
                         .overflow_hidden()
                         .whitespace_nowrap()
                         .child(format!("{title} – Flick")),
@@ -256,8 +335,9 @@ impl Flick {
             Style::Windows => (44., t.accent, t.on_accent),
             Style::Gnome => (38., rgba(0xffffff26), rgb(ON_VIDEO)),
         };
-        div()
+        let el = div()
             .id("play")
+            .relative()
             .flex_none()
             .flex()
             .items_center()
@@ -276,7 +356,15 @@ impl Flick {
                 name,
                 if t.style == Style::Mac { 26. } else { 20. },
                 fg,
-            ))
+            ));
+        self.focusable(
+            el,
+            &"play".into(),
+            Some(tip.into()),
+            size / 2.,
+            (0., 0.),
+            cx,
+        )
     }
 
     fn timeline_bar(&self, cx: &Context<Self>) -> Stateful<Div> {
@@ -325,6 +413,41 @@ impl Flick {
             Style::Windows => 18.,
             Style::Gnome => 14.,
         };
+        let duration = self.snapshot.duration;
+        let chapters = self
+            .snapshot
+            .chapters
+            .iter()
+            .filter(|chapter| chapter.time > 0. && chapter.time < duration)
+            .map(|chapter| {
+                div()
+                    .absolute()
+                    .top(px(-2.))
+                    .left(relative(timeline_fraction(chapter.time, duration)))
+                    .w(px(2.))
+                    .h(px(8.))
+                    .rounded_full()
+                    .bg(rgba(0xffffffcc))
+            })
+            .collect::<Vec<_>>();
+        let loop_span = self.snapshot.loop_start.map(|start| {
+            let a = timeline_fraction(start, duration);
+            let b = self
+                .snapshot
+                .loop_end
+                .map_or(a, |end| timeline_fraction(end, duration));
+            div()
+                .absolute()
+                .top(px(-2.))
+                .left(relative(a))
+                .w(relative((b - a).max(0.)))
+                .min_w(px(2.))
+                .h(px(8.))
+                .rounded(px(2.))
+                .border_1()
+                .border_color(t.accent)
+                .bg(t.accent_tint(0.35))
+        });
         div()
             .id("timeline")
             .relative()
@@ -346,6 +469,8 @@ impl Flick {
                     .rounded_full()
                     .bg(rgba(0xffffff40))
                     .child(div().w(relative(progress)).h_full().rounded_full().bg(fill))
+                    .children(chapters)
+                    .children(loop_span)
                     .when_some(knob, |d, knob| {
                         d.child(
                             div()
@@ -433,16 +558,18 @@ impl Flick {
     }
 
     fn speed_button(&self, cx: &Context<Self>) -> Stateful<Div> {
-        div()
+        let t = cx.theme();
+        let el = div()
             .id("speed")
+            .relative()
             .flex_none()
             .h(px(30.))
             .px_2()
             .flex()
             .items_center()
-            .rounded(px(cx.theme().radius))
+            .rounded(px(t.radius))
             .cursor_pointer()
-            .text_size(px(12.))
+            .text_size(t.font(12.))
             .text_color(rgb(ON_VIDEO))
             .hover(|s| s.bg(rgba(ON_VIDEO_HOVER)))
             .tooltip(|_, cx| {
@@ -450,7 +577,15 @@ impl Flick {
                     .into()
             })
             .child(format!("{}×", self.snapshot.speed))
-            .on_click(cx.listener(|this, _, window, cx| this.handle(Control::Speed, window, cx)))
+            .on_click(cx.listener(|this, _, window, cx| this.handle(Control::Speed, window, cx)));
+        self.focusable(
+            el,
+            &"speed".into(),
+            Some("Playback speed".into()),
+            t.radius,
+            (0., 0.),
+            cx,
+        )
     }
 
     fn player_controls(&self, window: &Window, cx: &Context<Self>) -> AnyElement {
@@ -466,7 +601,7 @@ impl Flick {
             div()
                 .flex_none()
                 .min_w(px(44.))
-                .text_size(px(11.5))
+                .text_size(t.font(11.5))
                 .text_color(rgba(0xffffffc0))
                 .child(text)
         };
@@ -623,7 +758,7 @@ impl Flick {
                                             )
                                             .child(
                                                 div()
-                                                    .text_size(px(12.))
+                                                    .text_size(t.font(12.))
                                                     .text_color(rgba(0xffffffb3))
                                                     .child("Now playing"),
                                             ),
@@ -678,6 +813,108 @@ impl Flick {
         }
     }
 
+    /// The next episode's countdown, with Play Now and Cancel.
+    fn up_next_card(&self, cx: &Context<Self>) -> Option<Div> {
+        let (path, started) = self.up_next.as_ref()?;
+        let t = cx.theme();
+        let left = super::UP_NEXT_DELAY
+            .saturating_sub(started.elapsed())
+            .as_secs_f32()
+            .ceil();
+        let next = path.clone();
+        Some(
+            v_flex()
+                .w(px(300.))
+                .gap_2()
+                .p_3()
+                .rounded(px(t.card_radius))
+                .bg(t.popover)
+                .border_1()
+                .border_color(t.border)
+                .shadow_lg()
+                .text_color(t.text)
+                .child(
+                    div()
+                        .text_size(t.font(12.))
+                        .text_color(t.muted)
+                        .child(format!("Up next in {left:.0} s")),
+                )
+                .child(
+                    div()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .overflow_hidden()
+                        .whitespace_nowrap()
+                        .child(file_title(path)),
+                )
+                .child(
+                    h_flex()
+                        .gap_2()
+                        .justify_end()
+                        .child(self.button(
+                            "up-next-cancel",
+                            None,
+                            "Cancel",
+                            false,
+                            cx,
+                            |this, _, cx| {
+                                this.up_next = None;
+                                cx.notify();
+                            },
+                        ))
+                        .child(self.button(
+                            "up-next-play",
+                            Some("play"),
+                            "Play Now",
+                            true,
+                            cx,
+                            move |this, w, cx| {
+                                this.persist();
+                                this.open(next.clone(), w, cx);
+                            },
+                        )),
+                ),
+        )
+    }
+
+    /// Audio delay, adjustable in 50 ms steps, with a reset.
+    fn audio_delay_row(&self, cx: &Context<Self>) -> Div {
+        let t = cx.theme();
+        let delay = self.snapshot.audio_delay;
+        h_flex()
+            .gap_1()
+            .px_2()
+            .py_1()
+            .child(
+                div()
+                    .flex_1()
+                    .child(format!("Audio delay {:+.0} ms", delay * 1000.)),
+            )
+            .child(self.icon_button(
+                "audio-earlier",
+                "minus",
+                "Audio earlier by 50 ms",
+                cx,
+                |this, w, cx| this.shortcut(Shortcut::AudioDelayDown, w, cx),
+            ))
+            .child(self.icon_button(
+                "audio-later",
+                "plus",
+                "Audio later by 50 ms",
+                cx,
+                |this, w, cx| this.shortcut(Shortcut::AudioDelayUp, w, cx),
+            ))
+            .when(delay.abs() > 0.0005, |d| {
+                d.child(self.icon_button(
+                    "audio-delay-reset",
+                    "rotate-ccw",
+                    "Reset audio delay",
+                    cx,
+                    |this, _, cx| this.property("audio-delay", "0", cx),
+                ))
+            })
+            .text_color(t.text)
+    }
+
     fn menu_panel(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let menu = self.menu?;
         let t = cx.theme().clone();
@@ -686,8 +923,10 @@ impl Flick {
             Menu::Keys => "Keyboard shortcuts",
         };
         let option = |id: SharedString, label: String, selected: bool| {
-            h_flex()
-                .id(id)
+            let id = ElementId::from(id);
+            let el = h_flex()
+                .id(id.clone())
+                .relative()
                 .gap_2()
                 .p_2()
                 .rounded(px(t.radius))
@@ -698,7 +937,8 @@ impl Flick {
                         .size(px(16.))
                         .when(selected, |d| d.child(icon("check", 16., t.accent))),
                 )
-                .child(label)
+                .child(label);
+            self.focusable(el, &id, None, t.radius, (-2., -2.), cx)
         };
         let mut panel = v_flex()
             .id("panel")
@@ -713,7 +953,7 @@ impl Flick {
             .rounded(px(t.card_radius))
             .shadow_lg()
             .text_color(t.text)
-            .text_size(px(13.))
+            .text_size(t.font(13.))
             .child(
                 div()
                     .px_2()
@@ -729,7 +969,7 @@ impl Flick {
                             .px_2()
                             .pt_2()
                             .pb_1()
-                            .text_size(px(11.))
+                            .text_size(t.font(11.))
                             .text_color(t.muted)
                             .child(title),
                     );
@@ -754,6 +994,9 @@ impl Flick {
                                     this.property(property, &id, cx)
                                 })),
                         );
+                    }
+                    if kind == "audio" {
+                        panel = panel.child(self.audio_delay_row(cx));
                     }
                     if kind == "sub" {
                         let off = !self
@@ -785,22 +1028,18 @@ impl Flick {
                 );
             }
             Menu::Keys => {
-                let command = if cfg!(target_os = "macos") {
-                    "⌘"
-                } else {
-                    "Ctrl+"
-                };
-                for (key, action) in [
-                    ("Space".to_owned(), "Play / pause"),
-                    ("←  →".to_owned(), "Seek 10 seconds"),
-                    ("↑  ↓".to_owned(), "Change volume"),
-                    ("F / Esc".to_owned(), "Fullscreen / exit"),
-                    ("M".to_owned(), "Mute"),
-                    (format!("{command}O"), "Open video"),
-                    (format!("{command}L"), "Load subtitles"),
-                    (format!("{command}K"), "Search"),
-                    (format!("{command},"), "Appearance"),
-                ] {
+                let bindings = &self.store.data.shortcuts;
+                let rows = Shortcut::ALL
+                    .into_iter()
+                    .filter(|shortcut| !bindings.binding(*shortcut).is_empty())
+                    .map(|shortcut| {
+                        (
+                            crate::shortcuts::display(bindings.binding(shortcut)),
+                            shortcut.label(),
+                        )
+                    })
+                    .chain([("0 – 9".to_owned(), "Jump to 0–90%")]);
+                for (key, action) in rows {
                     panel = panel.child(
                         h_flex()
                             .justify_between()
@@ -808,9 +1047,17 @@ impl Flick {
                             .px_2()
                             .py_1p5()
                             .child(action)
-                            .child(div().text_size(px(12.)).text_color(t.muted).child(key)),
+                            .child(div().text_size(t.font(12.)).text_color(t.muted).child(key)),
                     );
                 }
+                panel = panel.child(
+                    div()
+                        .px_2()
+                        .pt_2()
+                        .text_size(t.font(11.))
+                        .text_color(t.muted)
+                        .child("Change these in Keyboard Shortcuts."),
+                );
             }
         }
         Some(panel.into_any_element())

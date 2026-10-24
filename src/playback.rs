@@ -1,8 +1,9 @@
 //! The libmpv boundary and a portable software presentation baseline.
 //!
 //! libmpv is loaded at runtime, so building Flick does not need native mpv
-//! development headers or a link-time library. The renderer intentionally uses
-//! software decoding, scaling, and subtitle composition. GPUI uploads the final
+//! development headers or a link-time library. Decoding uses the platform's
+//! hardware decoder when one is available and copies frames back to memory;
+//! scaling and subtitle composition stay on the CPU. GPUI uploads the final
 //! BGRA image; this path is functional scaffolding, not a zero-copy GPU path.
 //!
 //! Keep this object on the UI thread. Advanced render control is deliberately
@@ -34,6 +35,18 @@ pub struct PlaybackSnapshot {
     pub speed: f64,
     pub tracks: Vec<Track>,
     pub eof: bool,
+    pub chapters: Vec<Chapter>,
+    /// A–B loop points in seconds, when set.
+    pub loop_start: Option<f64>,
+    pub loop_end: Option<f64>,
+    /// Seconds; positive delays audio relative to video.
+    pub audio_delay: f64,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Chapter {
+    pub title: String,
+    pub time: f64,
 }
 
 impl Default for PlaybackSnapshot {
@@ -47,6 +60,10 @@ impl Default for PlaybackSnapshot {
             speed: 1.0,
             tracks: Vec::new(),
             eof: false,
+            chapters: Vec::new(),
+            loop_start: None,
+            loop_end: None,
+            audio_delay: 0.0,
         }
     }
 }
@@ -254,6 +271,25 @@ impl Api {
     }
 }
 
+/// Chapters from mpv's `chapter-list` JSON, sorted by start time.
+fn parse_chapters(json: &str) -> Vec<Chapter> {
+    let mut chapters = serde_json::from_str::<Vec<Value>>(json)
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|chapter| {
+            let time = chapter["time"]
+                .as_f64()
+                .filter(|t| t.is_finite() && *t >= 0.)?;
+            Some(Chapter {
+                title: chapter["title"].as_str().unwrap_or_default().to_owned(),
+                time,
+            })
+        })
+        .collect::<Vec<_>>();
+    chapters.sort_by(|a, b| a.time.total_cmp(&b.time));
+    chapters
+}
+
 fn library_candidates() -> Vec<OsString> {
     if let Some(path) = std::env::var_os("FLICK_MPV_LIBRARY") {
         return vec![path];
@@ -286,8 +322,8 @@ fn library_candidates() -> Vec<OsString> {
     candidates
 }
 
-// mpv requires at least four-byte alignment for BGRA; 64-byte alignment for
-// both pointer and stride also avoids unnecessary conversion fallback copies.
+// mpv requires at least four-byte alignment for BGR0. The fallback buffer
+// uses 64-byte pointer and stride alignment, mpv's fast path.
 #[derive(Clone)]
 #[repr(C, align(64))]
 struct RenderBlock([u8; 64]);
@@ -297,7 +333,33 @@ struct RenderBuffer {
     width: u32,
     height: u32,
     stride: usize,
+    /// Allocated only for [`Target::Aligned`] frames.
     blocks: Vec<RenderBlock>,
+}
+
+/// Where libmpv writes a frame before GPUI receives it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Target {
+    /// Straight into the tightly packed frame handed to GPUI: no extra copy.
+    Direct,
+    /// Into a persistent 64-byte-aligned buffer, then copied row by row.
+    Aligned,
+}
+
+impl Target {
+    /// GPUI needs tightly packed rows and takes ownership of each frame, so
+    /// libmpv renders straight into the frame whenever the allocation meets
+    /// BGR0's four-byte pixel alignment. On Linux this beat the aligned copy
+    /// at every measured size, even without 64-byte rows or pointers (see
+    /// docs/VALIDATION.md). Rust only guarantees one-byte alignment for a
+    /// byte vector, so the aligned buffer remains the fallback.
+    fn choose(pointer: usize) -> Self {
+        if pointer.is_multiple_of(4) {
+            Self::Direct
+        } else {
+            Self::Aligned
+        }
+    }
 }
 
 /// A single-thread-bound libmpv instance. It is intentionally neither Send nor
@@ -331,6 +393,8 @@ impl Player {
             api,
             _main_thread: PhantomData,
         };
+        // FLICK_HWDEC=no compares against pure software decoding.
+        let hwdec = std::env::var("FLICK_HWDEC").unwrap_or_else(|_| "auto-copy".into());
         // Any failure after creating the handle drops player and releases it.
         for (name, value) in [
             ("config", "no"),
@@ -338,7 +402,8 @@ impl Player {
             ("input-default-bindings", "no"),
             ("input-vo-keyboard", "no"),
             ("vo", "libmpv"),
-            ("hwdec", "no"),
+            // Copy-back decoding keeps the software renderer's frame access.
+            ("hwdec", hwdec.as_str()),
             ("vd-lavc-dr", "no"),
             ("keep-open", "yes"),
             ("idle", "yes"),
@@ -483,6 +548,12 @@ impl Player {
                 selected: track["selected"].as_bool().unwrap_or(false),
             })
             .collect();
+        // ab-loop-a/b read "no" when unset.
+        let point = |name| {
+            self.property(name)
+                .and_then(|value| value.parse::<f64>().ok())
+                .filter(|value| value.is_finite())
+        };
         PlaybackSnapshot {
             paused: flag("pause"),
             position: number("time-pos", 0.0).max(0.0),
@@ -492,7 +563,20 @@ impl Player {
             speed: number("speed", 1.0),
             tracks,
             eof: flag("eof-reached"),
+            chapters: self
+                .property("chapter-list")
+                .map(|json| parse_chapters(&json))
+                .unwrap_or_default(),
+            loop_start: point("ab-loop-a"),
+            loop_end: point("ab-loop-b"),
+            audio_delay: number("audio-delay", 0.0),
         }
+    }
+
+    /// The active hardware decoder, or `None` while decoding in software.
+    pub fn hardware_decoder(&self) -> Option<String> {
+        self.property("hwdec-current")
+            .filter(|value| !value.is_empty() && value != "no")
     }
 
     /// Drain queued events with a zero timeout; never wait for the next event.
@@ -553,6 +637,15 @@ impl Player {
     /// Render only when a new frame or changed target size needs presentation.
     /// libmpv performs aspect-preserving scaling and letterboxing itself.
     pub fn render(&self, width: u32, height: u32) -> Result<Option<VideoFrame>> {
+        self.render_to(width, height, None)
+    }
+
+    fn render_to(
+        &self,
+        width: u32,
+        height: u32,
+        force: Option<Target>,
+    ) -> Result<Option<VideoFrame>> {
         if width == 0 || height == 0 || !self.file_loaded.get() {
             return Ok(None);
         }
@@ -573,77 +666,67 @@ impl Player {
             return Ok(None);
         }
         if resized {
-            let stride = (width as usize)
-                .checked_mul(4)
-                .and_then(|bytes| bytes.checked_add(63))
-                .map(|bytes| bytes / 64 * 64)
-                .context("Video row size exceeds this platform's address space")?;
-            let byte_count = stride
-                .checked_mul(height as usize)
-                .context("Video surface exceeds this platform's address space")?;
-            let blocks = byte_count / 64;
-            let additional = blocks.saturating_sub(buffer.blocks.len());
-            buffer
-                .blocks
-                .try_reserve_exact(additional)
-                .context("Allocate video presentation surface")?;
-            buffer.blocks.resize(blocks, RenderBlock([0; 64]));
-            buffer.width = width;
-            buffer.height = height;
-            buffer.stride = stride;
             tracing::debug!(width, height, "Video presentation resized");
         }
-        let mut dimensions = [width as c_int, height as c_int];
-        let mut stride = buffer.stride; // MPV_RENDER_PARAM_SW_STRIDE is size_t*.
-        let mut block_for_time: c_int = 0;
-        let mut params = [
-            RenderParam {
-                kind: 17, // SW_SIZE: int[2]
-                data: dimensions.as_mut_ptr().cast(),
-            },
-            RenderParam {
-                kind: 18, // SW_FORMAT: char*
-                data: c"bgra".as_ptr().cast_mut().cast(),
-            },
-            RenderParam {
-                kind: 19, // SW_STRIDE: size_t*
-                data: (&mut stride as *mut usize).cast(),
-            },
-            RenderParam {
-                kind: 20, // SW_POINTER: pointer to writable aligned pixels.
-                data: buffer.blocks.as_mut_ptr().cast(),
-            },
-            RenderParam {
-                kind: 12, // BLOCK_FOR_TARGET_TIME: int*, don't sleep on UI.
-                data: (&mut block_for_time as *mut c_int).cast(),
-            },
-            RenderParam::end(),
-        ];
-        // SAFETY: all params outlive this call. The block vector has 64-byte
-        // alignment and stride * height writable bytes, including row padding.
-        self.api.check(
-            unsafe { (self.api.render)(self.renderer, params.as_mut_ptr()) },
-            "Render video frame",
-        )?;
-        let byte_count = buffer.stride * height as usize;
-        // SAFETY: RenderBlock has no padding, contains initialized u8 values,
-        // and the contiguous vector covers exactly byte_count bytes.
-        let bytes =
-            unsafe { std::slice::from_raw_parts(buffer.blocks.as_ptr().cast::<u8>(), byte_count) };
-        let row_bytes = width as usize * 4;
-        let mut pixels = Vec::new();
+        buffer.width = width;
+        buffer.height = height;
+        let row_bytes = (width as usize)
+            .checked_mul(4)
+            .context("Video row size exceeds this platform's address space")?;
+        let byte_count = row_bytes
+            .checked_mul(height as usize)
+            .context("Video frame size overflow")?;
+        let mut pixels = Vec::<u8>::new();
         pixels
-            .try_reserve_exact(
-                row_bytes
-                    .checked_mul(height as usize)
-                    .context("Video frame size overflow")?,
-            )
+            .try_reserve_exact(byte_count)
             .context("Allocate video frame at display resolution")?;
-        for row in bytes.chunks_exact(buffer.stride) {
-            pixels.extend_from_slice(&row[..row_bytes]);
+        match force.unwrap_or_else(|| Target::choose(pixels.as_ptr().addr())) {
+            Target::Direct => {
+                // SAFETY: the reserved capacity holds row_bytes * height bytes
+                // and outlives the call. Pointer and stride are at least
+                // four-byte aligned (BGR0's pixel size).
+                unsafe { self.render_into(pixels.as_mut_ptr(), row_bytes, width, height)? };
+                // SAFETY: on success libmpv overwrites every byte from the
+                // pointer to pointer + stride * height (libmpv render.h).
+                unsafe { pixels.set_len(byte_count) };
+                buffer.blocks = Vec::new();
+            }
+            Target::Aligned => {
+                let stride = row_bytes
+                    .checked_add(63)
+                    .map(|bytes| bytes / 64 * 64)
+                    .context("Video row size exceeds this platform's address space")?;
+                let blocks = stride
+                    .checked_mul(height as usize)
+                    .context("Video surface exceeds this platform's address space")?
+                    / 64;
+                if buffer.stride != stride || buffer.blocks.len() != blocks {
+                    let additional = blocks.saturating_sub(buffer.blocks.len());
+                    buffer
+                        .blocks
+                        .try_reserve_exact(additional)
+                        .context("Allocate video presentation surface")?;
+                    buffer.blocks.resize(blocks, RenderBlock([0; 64]));
+                    buffer.stride = stride;
+                }
+                // SAFETY: the block vector has 64-byte alignment and
+                // stride * height writable bytes, including row padding.
+                unsafe {
+                    self.render_into(buffer.blocks.as_mut_ptr().cast(), stride, width, height)?
+                };
+                // SAFETY: RenderBlock has no padding, contains initialized u8
+                // values, and the vector covers exactly stride * height bytes.
+                let bytes = unsafe {
+                    std::slice::from_raw_parts(buffer.blocks.as_ptr().cast::<u8>(), blocks * 64)
+                };
+                for row in bytes.chunks_exact(stride) {
+                    pixels.extend_from_slice(&row[..row_bytes]);
+                }
+            }
         }
-        // Every video frame is opaque, including black letterbox bars. Force
-        // alpha rather than exposing decoder/format-specific alpha semantics.
+        // BGR0 leaves the fourth byte undefined, and every video frame is
+        // opaque, including black letterbox bars. Set alpha rather than
+        // exposing decoder/format-specific alpha semantics.
         for pixel in pixels.as_chunks_mut::<4>().0 {
             pixel[3] = 255;
         }
@@ -652,6 +735,51 @@ impl Player {
             height,
             pixels,
         }))
+    }
+
+    /// # Safety
+    ///
+    /// `pixels` must be valid for writes of `stride * height` bytes and, like
+    /// `stride`, aligned to at least four bytes.
+    unsafe fn render_into(
+        &self,
+        pixels: *mut u8,
+        stride: usize,
+        width: u32,
+        height: u32,
+    ) -> Result<()> {
+        let mut dimensions = [width as c_int, height as c_int];
+        let mut stride = stride; // MPV_RENDER_PARAM_SW_STRIDE is size_t*.
+        let mut block_for_time: c_int = 0;
+        let mut params = [
+            RenderParam {
+                kind: 17, // SW_SIZE: int[2]
+                data: dimensions.as_mut_ptr().cast(),
+            },
+            RenderParam {
+                kind: 18, // SW_FORMAT: char*
+                data: c"bgr0".as_ptr().cast_mut().cast(),
+            },
+            RenderParam {
+                kind: 19, // SW_STRIDE: size_t*
+                data: (&mut stride as *mut usize).cast(),
+            },
+            RenderParam {
+                kind: 20, // SW_POINTER: pointer to writable pixels.
+                data: pixels.cast(),
+            },
+            RenderParam {
+                kind: 12, // BLOCK_FOR_TARGET_TIME: int*, don't sleep on UI.
+                data: (&mut block_for_time as *mut c_int).cast(),
+            },
+            RenderParam::end(),
+        ];
+        // SAFETY: all params outlive this call; the caller guarantees the
+        // target memory and alignment.
+        self.api.check(
+            unsafe { (self.api.render)(self.renderer, params.as_mut_ptr()) },
+            "Render video frame",
+        )
     }
 }
 
@@ -676,6 +804,27 @@ mod tests {
     use std::io::Write;
     use std::thread;
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn chapter_lists_parse_sort_and_skip_invalid_entries() {
+        let chapters = parse_chapters(
+            r#"[{"title":"Two","time":60.5},{"time":0},{"title":"Bad","time":-1},{"title":"x"}]"#,
+        );
+        assert_eq!(
+            chapters,
+            vec![
+                Chapter {
+                    title: String::new(),
+                    time: 0.
+                },
+                Chapter {
+                    title: "Two".into(),
+                    time: 60.5
+                },
+            ]
+        );
+        assert!(parse_chapters("not json").is_empty());
+    }
 
     fn wait_for(player: &Player, mut condition: impl FnMut(&Player) -> bool) -> Result<()> {
         let deadline = Instant::now() + Duration::from_secs(8);
@@ -737,6 +886,59 @@ mod tests {
             assert_eq!((frame.width, frame.height), (width, height));
             assert_eq!(frame.pixels.len(), width as usize * height as usize * 4);
         }
+        Ok(())
+    }
+
+    /// Both presentation targets must produce identical pixels; timings show
+    /// what the direct target saves. Run with --nocapture and a release build
+    /// for meaningful numbers.
+    #[test]
+    #[ignore = "requires native libmpv and FLICK_TEST_VIDEO"]
+    fn real_presentation_targets_match_and_report_cost() -> Result<()> {
+        let clip = std::env::var("FLICK_TEST_VIDEO")?;
+        let player = Player::new()?;
+        player.load(&clip)?;
+        wait_for(&player, |p| {
+            p.file_loaded.get() && p.snapshot().position > 0.2
+        })?;
+        player.set_property("pause", "yes")?;
+        // Let the pause settle so every render below shows the same frame.
+        for _ in 0..4 {
+            player.poll_events();
+            player.render(323, 183)?;
+            thread::sleep(Duration::from_millis(150));
+        }
+        // 1917 px rows are not a multiple of 64 bytes.
+        for (width, height) in [(1920, 1080), (1917, 1080), (3840, 2160)] {
+            let mut frames = Vec::new();
+            for target in [Target::Aligned, Target::Direct] {
+                let rounds = 20;
+                let mut elapsed = Duration::ZERO;
+                let mut last = None;
+                for _ in 0..rounds {
+                    player.redraw_requested.store(true, Ordering::Release);
+                    let started = Instant::now();
+                    let frame = player
+                        .render_to(width, height, Some(target))?
+                        .context("Requested redraw produced no frame")?;
+                    elapsed += started.elapsed();
+                    last = Some(frame);
+                }
+                let frame = last.context("No frame rendered")?;
+                assert_eq!(frame.pixels.len(), width as usize * height as usize * 4);
+                assert!(frame.pixels.as_chunks::<4>().0.iter().all(|p| p[3] == 255));
+                println!(
+                    "{width}x{height} {target:?}: {:.2} ms/frame",
+                    elapsed.as_secs_f64() * 1000. / rounds as f64
+                );
+                frames.push(frame.pixels);
+            }
+            assert!(
+                frames[0] == frames[1],
+                "Direct and aligned targets rendered different pixels at {width}x{height}"
+            );
+        }
+        println!("hardware decoder: {:?}", player.hardware_decoder());
         Ok(())
     }
 

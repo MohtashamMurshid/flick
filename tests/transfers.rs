@@ -199,6 +199,9 @@ async fn state_lock_invalid_inputs_and_existing_destinations_are_safe() -> Resul
         let root = TempDir::new()?;
         let cfg = config(root.path(), "client");
         let session = TransferSession::start(cfg.clone()).await?;
+        // Local startup must never create public discovery/port mapping state.
+        assert!(!cfg.state_dir.join("dht.json").exists());
+        assert!(!cfg.state_dir.join("listen-port").exists());
         let result: Result<()> = async {
             assert!(TransferSession::start(cfg.clone()).await.is_err());
             assert!(
@@ -291,4 +294,47 @@ async fn state_lock_invalid_inputs_and_existing_destinations_are_safe() -> Resul
     })
     .await
     .context("Invalid-input test timed out")?
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn metadata_timeout_explains_recovery_without_starting_a_download() -> Result<()> {
+    timeout(Duration::from_secs(10), async {
+        let root = TempDir::new()?;
+        let source = root.path().join("fixture.bin");
+        tokio::fs::write(&source, content(65_537)).await?;
+        let seed = TransferSession::start(config(root.path(), "seed")).await?;
+        let shared = seed.share(&source, vec![]).await?;
+        seed.stop().await;
+        let cfg = config(root.path(), "receiver");
+        let session = TransferSession::start(cfg.clone()).await?;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let peer = listener.local_addr()?;
+        let stalled = tokio::spawn(async move {
+            let (_socket, _) = listener.accept().await?;
+            std::future::pending::<()>().await;
+            Ok::<_, std::io::Error>(())
+        });
+        let result: Result<()> = async {
+            let error = session
+                .resolve(
+                    TorrentInput::Magnet(shared.magnet),
+                    vec![peer],
+                    Duration::from_millis(200),
+                )
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("active seeders"), "{error}");
+            assert!(error.contains(".torrent file"), "{error}");
+            assert!(session.snapshots()?.is_empty());
+            assert!(std::fs::read_dir(&cfg.download_dir)?.next().is_none());
+            Ok(())
+        }
+        .await;
+        stalled.abort();
+        session.stop().await;
+        result
+    })
+    .await
+    .context("Metadata timeout regression timed out")?
 }

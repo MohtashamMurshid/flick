@@ -15,18 +15,19 @@ use crate::{
     model::{file_title, format_time, seek_target},
     playback::{PlaybackSnapshot, Player, PlayerEvent},
     services::{Command as ServiceCommand, Event as ServiceEvent, Services},
+    shortcuts::Shortcut,
     store::Store,
     theme::{ActiveTheme, Appearance, Style, Theme},
 };
 use chrome_ui::{h_flex, v_flex};
 use gpui::{
-    Bounds, ClickEvent, ClipboardItem, Context, Div, Entity, ExternalPaths, FocusHandle, Focusable,
-    KeyDownEvent, MouseButton, ObjectFit, PathPromptOptions, Pixels, RenderImage, SharedString,
-    Stateful, Window, canvas, div, img, prelude::*, px, relative, rgb, rgba,
+    Bounds, ClickEvent, ClipboardItem, Context, Div, ElementId, Entity, ExternalPaths, FocusHandle,
+    Focusable, KeyDownEvent, MouseButton, ObjectFit, PathPromptOptions, Pixels, RenderImage,
+    SharedString, Stateful, Window, canvas, div, img, prelude::*, px, relative, rgb, rgba,
 };
 use std::{
-    cell::Cell,
-    collections::HashSet,
+    cell::{Cell, RefCell},
+    collections::{HashMap, HashSet},
     path::PathBuf,
     rc::Rc,
     sync::Arc,
@@ -40,6 +41,15 @@ const CONTROLS_TIMEOUT: Duration = Duration::from_millis(2500);
 /// surface. Ignore video double-clicks this soon after entering the player.
 const DOUBLE_CLICK_GRACE: Duration = Duration::from_millis(500);
 
+/// How long a keyboard action's status message stays on the video.
+const STATUS_TIMEOUT: Duration = Duration::from_millis(1500);
+
+/// How long the next episode waits before starting.
+const UP_NEXT_DELAY: Duration = Duration::from_secs(8);
+
+/// Playback speeds stepped through by the shuttle-forward key.
+const SHUTTLE_SPEEDS: [f64; 4] = [1., 1.5, 2., 4.];
+
 #[derive(Clone, Copy, PartialEq)]
 enum View {
     Library,
@@ -51,8 +61,10 @@ enum Page {
     Home,
     Videos,
     History,
+    Shows,
     Downloads,
     Appearance,
+    Shortcuts,
 }
 
 impl Page {
@@ -61,8 +73,10 @@ impl Page {
             Self::Home => "Home",
             Self::Videos => "All Videos",
             Self::History => "History",
+            Self::Shows => "Shows",
             Self::Downloads => "Downloads",
             Self::Appearance => "Appearance",
+            Self::Shortcuts => "Keyboard Shortcuts",
         }
     }
 }
@@ -74,6 +88,14 @@ enum VideoFilter {
     InProgress,
 }
 
+/// The context menu for a video card or history row.
+struct CardMenu {
+    path: PathBuf,
+    position: gpui::Point<Pixels>,
+    /// Shown in Continue Watching, so it can be removed from there.
+    continuing: bool,
+}
+
 #[derive(Clone, Copy, PartialEq)]
 enum Menu {
     Tracks,
@@ -82,6 +104,10 @@ enum Menu {
 
 #[derive(Clone, Copy)]
 enum Control {
+    /// A rebindable player action.
+    Shortcut(Shortcut),
+    /// Seek to this fraction of the video.
+    SeekFraction(f64),
     Open,
     Play,
     Back,
@@ -154,6 +180,32 @@ pub struct Flick {
     controls_shown: bool,
     /// mpv `sub-pos`, raised so subtitles stay above visible controls.
     subtitle_position: u32,
+    /// Set by Tab and arrow navigation, cleared by the mouse. Focus rings
+    /// and focus tooltips show only while navigating by keyboard.
+    keyboard_nav: bool,
+    /// Stable focus handles that put controls in the Tab order.
+    control_focus: RefCell<HashMap<ElementId, FocusHandle>>,
+    /// The focused element when this frame was rendered.
+    focused: Option<FocusHandle>,
+    /// A shortcut waiting for its new key on the shortcuts page.
+    capturing: Option<Shortcut>,
+    /// A short message about the last keyboard action, shown on the video.
+    status: Option<(SharedString, Instant)>,
+    /// The speed before shuttling faster, restored by shuttle-pause.
+    shuttle_base: Option<f64>,
+    /// Measured slider tracks, keyed by slider ID.
+    slider_bounds: RefCell<HashMap<&'static str, Rc<Cell<Bounds<Pixels>>>>>,
+    /// The slider being dragged.
+    dragging_slider: Option<&'static str>,
+    card_menu: Option<CardMenu>,
+    /// The show whose episodes the Shows page lists, by show key.
+    selected_show: Option<String>,
+    /// The next episode, counting down after the current one ends.
+    up_next: Option<(PathBuf, Instant)>,
+    /// Whether the last snapshot was at the end, to notice new endings.
+    was_eof: bool,
+    /// Bounds of the keyboard-focused card, where its menu opens.
+    focused_card: Rc<Cell<Bounds<Pixels>>>,
 }
 
 impl Flick {
@@ -189,6 +241,19 @@ impl Flick {
         cx.observe_window_appearance(window, |this, window, cx| {
             crate::theme::apply(cx, &this.store.data.appearance);
             window.refresh();
+        })
+        .detach();
+        // Reading OS accessibility settings can start a helper process.
+        cx.spawn_in(window, async move |this, cx| {
+            let preferences = cx
+                .background_executor()
+                .spawn(async { crate::theme::SystemPreferences::detect() })
+                .await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                cx.set_global(preferences);
+                crate::theme::apply(cx, &this.store.data.appearance);
+                window.refresh();
+            });
         })
         .detach();
         let (player, error) = match Player::new() {
@@ -242,6 +307,19 @@ impl Flick {
             entered_player: Instant::now(),
             controls_shown: true,
             subtitle_position: 100,
+            keyboard_nav: false,
+            control_focus: RefCell::default(),
+            focused: None,
+            capturing: None,
+            status: None,
+            shuttle_base: None,
+            slider_bounds: RefCell::default(),
+            dragging_slider: None,
+            card_menu: None,
+            focused_card: Rc::default(),
+            selected_show: None,
+            up_next: None,
+            was_eof: false,
         };
         this.apply_preferences();
         cx.on_release(|this, _| this.persist()).detach();
@@ -269,6 +347,22 @@ impl Flick {
             let _ = player.set_property("speed", &self.store.data.speed.to_string());
             self.snapshot = player.snapshot();
         }
+        self.apply_subtitle_style();
+    }
+
+    /// Applies the subtitle appearance. Properties a libmpv build lacks are
+    /// skipped; `sub-pos` follows the controls in [`Self::tick`].
+    fn apply_subtitle_style(&mut self) {
+        let Some(player) = &self.player else {
+            return;
+        };
+        for (name, value) in self.store.data.appearance.subtitles.properties() {
+            if let Err(error) = player.set_property(name, &value) {
+                tracing::debug!(%error, name, "Subtitle style not supported by this libmpv");
+            }
+        }
+        // Force tick to reapply the base position.
+        self.subtitle_position = 0;
     }
 
     /// Changes appearance preferences, applies them immediately, and saves.
@@ -278,8 +372,13 @@ impl Flick {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let subtitles = self.store.data.appearance.subtitles.clone();
         change(&mut self.store.data.appearance);
+        self.store.data.appearance.sanitize();
         crate::theme::apply(cx, &self.store.data.appearance);
+        if self.store.data.appearance.subtitles != subtitles {
+            self.apply_subtitle_style();
+        }
         self.persist();
         window.refresh();
         cx.notify();
@@ -352,6 +451,8 @@ impl Flick {
                 self.error = None;
                 self.menu = None;
                 self.opened_at = Some(Instant::now());
+                self.up_next = None;
+                self.was_eof = false;
                 self.pointer_moved_at = Instant::now();
                 self.controls_shown = true;
                 if let Some(old) = self.frame.take() {
@@ -390,22 +491,32 @@ impl Flick {
             || self.menu.is_some()
             || self.scrubbing
             || self.changing_volume
+            || (self.keyboard_nav && self.control_has_focus())
             || self.pointer_moved_at.elapsed() < CONTROLS_TIMEOUT
     }
 
     fn tick(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Duration {
         self.poll_services(cx);
+        if self
+            .status
+            .as_ref()
+            .is_some_and(|(_, shown)| shown.elapsed() >= STATUS_TIMEOUT)
+        {
+            self.status = None;
+            cx.notify();
+        }
         let shown = self.controls_wanted();
         if shown != self.controls_shown {
             self.controls_shown = shown;
             cx.notify();
         }
         let height = f32::from(self.video_bounds.get().size.height);
+        let base = self.store.data.appearance.subtitles.position;
         let subtitle_position = if self.view == View::Player && self.controls_shown && height > 0. {
             let covered = player_ui::controls_height(cx.theme().style) + 8.;
-            ((1. - covered / height) * 100.).clamp(50., 100.).round() as u32
+            (((1. - covered / height) * 100.).clamp(50., 100.).round() as u32).min(base)
         } else {
-            100
+            base
         };
         if subtitle_position != self.subtitle_position
             && let Some(player) = &self.player
@@ -467,6 +578,7 @@ impl Flick {
                         if let Some(started) = self.opened_at.take() {
                             tracing::info!(
                                 elapsed_ms = started.elapsed().as_millis(),
+                                hardware_decoder = ?player.hardware_decoder(),
                                 "First video presentation submitted"
                             );
                         }
@@ -481,6 +593,36 @@ impl Flick {
                     }
                 }
             }
+        }
+        let ended = self.snapshot.eof && self.file_loaded;
+        if ended && !self.was_eof {
+            self.up_next = self
+                .store
+                .data
+                .appearance
+                .autoplay_next
+                .then(|| self.adjacent_episode(1))
+                .flatten()
+                .map(|path| (path, Instant::now()));
+            changed |= self.up_next.is_some();
+        } else if !ended && self.up_next.is_some() {
+            // Seeking back or replaying cancels the countdown.
+            self.up_next = None;
+            changed = true;
+        }
+        self.was_eof = ended;
+        if let Some((path, started)) = &self.up_next
+            && started.elapsed() >= UP_NEXT_DELAY
+            && self.view == View::Player
+        {
+            let path = path.clone();
+            self.persist();
+            self.open(path, window, cx);
+            return Duration::from_millis(16);
+        }
+        if self.up_next.is_some() {
+            // Refresh the countdown text.
+            changed = true;
         }
         if self.path.is_some() && self.last_saved.elapsed() > Duration::from_secs(5) {
             self.persist();
@@ -548,6 +690,9 @@ impl Flick {
     fn show_page(&mut self, page: Page, window: &mut Window, cx: &mut Context<Self>) {
         if self.view == View::Player {
             self.handle(Control::Library, window, cx);
+        }
+        if page == Page::Shows {
+            self.selected_show = None;
         }
         self.page = page;
         if page == Page::Downloads {
@@ -643,14 +788,174 @@ impl Flick {
                 };
                 cx.notify();
             }
+            Control::SeekFraction(fraction) if self.snapshot.duration > 0. => {
+                let target = fraction * self.snapshot.duration;
+                self.command(&["seek", &target.to_string(), "absolute+exact"], cx);
+                self.show_status(format!("{}%", (fraction * 100.).round()));
+            }
+            Control::Shortcut(shortcut) => self.shortcut(shortcut, window, cx),
             _ => {}
         }
+    }
+
+    /// The next (`step` 1) or previous (-1) episode of the playing show.
+    fn adjacent_episode(&self, step: isize) -> Option<PathBuf> {
+        let current = self.path.as_deref()?;
+        flick::library::adjacent_episode(
+            self.store
+                .data
+                .library
+                .iter()
+                .map(|video| video.path.as_path()),
+            current,
+            step,
+        )
+    }
+
+    fn show_status(&mut self, text: impl Into<SharedString>) {
+        self.status = Some((text.into(), Instant::now()));
+    }
+
+    fn shortcut(&mut self, shortcut: Shortcut, window: &mut Window, cx: &mut Context<Self>) {
+        let loaded = self.path.is_some() && self.file_loaded;
+        match shortcut {
+            Shortcut::PlayPause => self.handle(Control::Play, window, cx),
+            Shortcut::SeekBack => self.handle(Control::Back, window, cx),
+            Shortcut::SeekForward => self.handle(Control::Forward, window, cx),
+            Shortcut::VolumeUp => self.handle(Control::Louder, window, cx),
+            Shortcut::VolumeDown => self.handle(Control::Quieter, window, cx),
+            Shortcut::Mute => self.handle(Control::Mute, window, cx),
+            Shortcut::Fullscreen => self.handle(Control::Fullscreen, window, cx),
+            Shortcut::ShowShortcuts => self.handle(Control::Keys, window, cx),
+            _ if !loaded => {}
+            Shortcut::FrameBack => self.command(&["frame-back-step"], cx),
+            Shortcut::FrameForward => self.command(&["frame-step"], cx),
+            Shortcut::ShuttleForward => {
+                if self.snapshot.paused || self.snapshot.eof {
+                    self.handle(Control::Play, window, cx);
+                } else {
+                    let base = *self.shuttle_base.get_or_insert(self.snapshot.speed);
+                    let next = SHUTTLE_SPEEDS
+                        .into_iter()
+                        .find(|speed| *speed > self.snapshot.speed.max(base) + 0.01)
+                        .unwrap_or(SHUTTLE_SPEEDS[SHUTTLE_SPEEDS.len() - 1]);
+                    self.property("speed", &next.to_string(), cx);
+                    self.show_status(format!("{next}×"));
+                }
+            }
+            Shortcut::ShuttleBack => match self.shuttle_base {
+                Some(base) if self.snapshot.speed > base + 0.01 => {
+                    let next = SHUTTLE_SPEEDS
+                        .into_iter()
+                        .rev()
+                        .find(|speed| *speed < self.snapshot.speed - 0.01)
+                        .unwrap_or(base)
+                        .max(base);
+                    if (next - base).abs() < 0.01 {
+                        self.shuttle_base = None;
+                    }
+                    self.property("speed", &next.to_string(), cx);
+                    self.show_status(format!("{next}×"));
+                }
+                _ => self.handle(Control::Back, window, cx),
+            },
+            Shortcut::ShuttlePause => {
+                if let Some(base) = self.shuttle_base.take() {
+                    self.property("speed", &base.to_string(), cx);
+                }
+                self.handle(Control::Play, window, cx);
+            }
+            Shortcut::PreviousChapter | Shortcut::NextChapter => {
+                if self.snapshot.chapters.is_empty() {
+                    self.show_status("No chapters");
+                } else {
+                    let step = if shortcut == Shortcut::NextChapter {
+                        "1"
+                    } else {
+                        "-1"
+                    };
+                    self.command(&["add", "chapter", step], cx);
+                }
+            }
+            Shortcut::PreviousEpisode | Shortcut::NextEpisode => {
+                let step = if shortcut == Shortcut::NextEpisode {
+                    1
+                } else {
+                    -1
+                };
+                match self.adjacent_episode(step) {
+                    Some(path) => {
+                        self.persist();
+                        self.open(path, window, cx);
+                    }
+                    None => self.show_status(if step > 0 {
+                        "No next episode"
+                    } else {
+                        "No previous episode"
+                    }),
+                }
+            }
+            Shortcut::LoopAb => {
+                let s = &self.snapshot;
+                let text = match loop_step(s.loop_start, s.loop_end, s.position) {
+                    LoopStep::Start(a) => {
+                        self.property("ab-loop-a", &a.to_string(), cx);
+                        format!("Loop from {}", format_time(a))
+                    }
+                    LoopStep::Span(a, b) => {
+                        self.property("ab-loop-a", &a.to_string(), cx);
+                        self.property("ab-loop-b", &b.to_string(), cx);
+                        format!("Loop {}–{}", format_time(a), format_time(b))
+                    }
+                    LoopStep::Clear => {
+                        self.property("ab-loop-a", "no", cx);
+                        self.property("ab-loop-b", "no", cx);
+                        "Loop off".into()
+                    }
+                };
+                self.show_status(text);
+            }
+            Shortcut::AudioDelayDown | Shortcut::AudioDelayUp => {
+                let step = if shortcut == Shortcut::AudioDelayUp {
+                    "0.05"
+                } else {
+                    "-0.05"
+                };
+                self.command(&["add", "audio-delay", step], cx);
+                self.show_status(format!(
+                    "Audio delay {:+.0} ms",
+                    self.snapshot.audio_delay * 1000.
+                ));
+            }
+        }
+        cx.notify();
     }
 
     fn key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let key = event.keystroke.key.as_str();
         let modifiers = event.keystroke.modifiers;
         let command = modifiers.control || modifiers.platform;
+        let binding = crate::shortcuts::normalize(&event.keystroke);
+        if let Some(shortcut) = self.capturing.take() {
+            cx.stop_propagation();
+            if key != "escape" {
+                match self.store.data.shortcuts.assign(shortcut, &binding) {
+                    Ok(Some(displaced)) => {
+                        self.error = Some(format!(
+                            "{} is now unassigned; {} uses {}.",
+                            displaced.label(),
+                            shortcut.label(),
+                            crate::shortcuts::display(&binding)
+                        ))
+                    }
+                    Ok(None) => self.error = None,
+                    Err(error) => self.error = Some(error),
+                }
+                self.persist();
+            }
+            cx.notify();
+            return;
+        }
         if self.view == View::Player {
             self.pointer_moved_at = Instant::now();
         }
@@ -677,6 +982,32 @@ impl Flick {
             cx.stop_propagation();
             return;
         }
+        if key == "tab" && !command {
+            if modifiers.shift {
+                window.focus_prev();
+            } else {
+                window.focus_next();
+            }
+            self.keyboard_nav = true;
+            cx.stop_propagation();
+            cx.notify();
+            return;
+        }
+        // A focused control activates with Enter or Space on key release.
+        if matches!(key, "space" | "enter")
+            && !command
+            && window
+                .focused(cx)
+                .is_some_and(|focused| self.is_control_handle(&focused))
+        {
+            return;
+        }
+        if key == "escape" && self.card_menu.take().is_some() {
+            self.focus.focus(window);
+            cx.stop_propagation();
+            cx.notify();
+            return;
+        }
         if key == "escape" {
             if window.is_fullscreen() {
                 window.toggle_fullscreen();
@@ -691,27 +1022,20 @@ impl Flick {
         if self.text_focused(window, cx) {
             return;
         }
-        if self.view == View::Library && !command {
+        let shortcut = self.store.data.shortcuts.lookup(&binding);
+        if self.view == View::Library {
+            if shortcut == Some(Shortcut::ShowShortcuts) {
+                cx.stop_propagation();
+                self.show_page(Page::Shortcuts, window, cx);
+            }
             return;
         }
-        let control = if command {
-            match key {
-                "o" => Some(Control::Open),
-                "l" => Some(Control::Subtitle),
-                _ => None,
-            }
+        let control = if command && key == "l" {
+            Some(Control::Subtitle)
+        } else if let Some(fraction) = crate::shortcuts::percent_key(&binding) {
+            Some(Control::SeekFraction(fraction))
         } else {
-            match key {
-                "space" => Some(Control::Play),
-                "left" => Some(Control::Back),
-                "right" => Some(Control::Forward),
-                "up" => Some(Control::Louder),
-                "down" => Some(Control::Quieter),
-                "m" => Some(Control::Mute),
-                "f" => Some(Control::Fullscreen),
-                "?" => Some(Control::Keys),
-                _ => None,
-            }
+            shortcut.map(Control::Shortcut)
         };
         if let Some(control) = control {
             cx.stop_propagation();
@@ -738,28 +1062,54 @@ impl Flick {
     }
 }
 
+/// What the A–B loop key does next.
+#[derive(Debug, PartialEq)]
+enum LoopStep {
+    Start(f64),
+    /// Start and end, in order.
+    Span(f64, f64),
+    Clear,
+}
+
+/// Sets the loop start, then the end (swapping so the loop runs forward),
+/// then clears the loop. An end too close to the start is ignored.
+fn loop_step(start: Option<f64>, end: Option<f64>, position: f64) -> LoopStep {
+    match (start, end) {
+        (None, _) => LoopStep::Start(position),
+        (Some(a), None) if (position - a).abs() < 0.1 => LoopStep::Start(a),
+        (Some(a), None) => LoopStep::Span(a.min(position), a.max(position)),
+        (Some(_), Some(_)) => LoopStep::Clear,
+    }
+}
+
 struct Hint(SharedString);
 impl Render for Hint {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let t = cx.theme();
-        div()
-            .px_2()
-            .py_1()
-            .rounded(px(t.radius))
-            .border_1()
-            .border_color(t.border)
-            .bg(t.popover)
-            .text_color(t.text)
-            .font_family(t.font.clone())
-            .text_size(px(12.))
-            .shadow_md()
-            .child(self.0.clone())
+        hint_box(cx.theme(), self.0.clone())
     }
+}
+
+/// A tooltip's appearance, shared by hover and keyboard-focus tooltips.
+fn hint_box(t: &Theme, text: SharedString) -> Div {
+    div()
+        .px_2()
+        .py_1()
+        .rounded(px(t.radius))
+        .border_1()
+        .border_color(t.border)
+        .bg(t.popover)
+        .text_color(t.text)
+        .font_family(t.font.clone())
+        .text_size(t.font(12.))
+        .whitespace_nowrap()
+        .shadow_md()
+        .child(text)
 }
 
 impl Render for Flick {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let t = cx.theme().clone();
+        self.focused = window.focused(cx);
         let content = match self.view {
             View::Library => self.library_frame(window, cx),
             View::Player => self.player_frame(window, cx),
@@ -777,12 +1127,17 @@ impl Render for Flick {
             })
             .text_color(t.text)
             .font_family(t.font.clone())
-            .text_size(px(t.text_size))
+            .text_size(t.font(t.text_size))
             .track_focus(&self.focus)
             .on_key_down(cx.listener(Self::key))
             .on_mouse_down(
                 MouseButton::Left,
-                cx.listener(|this, _, _, _| this.control_pressed = false),
+                cx.listener(|this, _, _, cx| {
+                    this.control_pressed = false;
+                    if std::mem::take(&mut this.keyboard_nav) {
+                        cx.notify();
+                    }
+                }),
             )
             .on_mouse_move(cx.listener(|this, _, _, cx| {
                 this.pointer_moved_at = Instant::now();
@@ -797,6 +1152,7 @@ impl Render for Flick {
                     this.scrubbing = false;
                     this.changing_volume = false;
                     this.should_move = false;
+                    this.dragging_slider = None;
                 }),
             )
             .on_mouse_up_out(
@@ -805,6 +1161,7 @@ impl Render for Flick {
                     this.scrubbing = false;
                     this.changing_volume = false;
                     this.should_move = false;
+                    this.dragging_slider = None;
                 }),
             )
             .on_drop(cx.listener(|this, paths: &ExternalPaths, window, cx| {
@@ -829,7 +1186,24 @@ impl Render for Flick {
                     this.open(path.clone(), window, cx);
                 }
             }))
-            .child(content);
+            .child(content)
+            .children(self.card_menu_panel(cx));
         self.window_frame(root.into_any_element(), window, cx)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn loop_key_sets_start_then_ordered_end_then_clears() {
+        assert_eq!(loop_step(None, None, 4.), LoopStep::Start(4.));
+        assert_eq!(loop_step(Some(4.), None, 9.), LoopStep::Span(4., 9.));
+        assert_eq!(loop_step(Some(4.), None, 1.), LoopStep::Span(1., 4.));
+        assert_eq!(loop_step(Some(4.), None, 4.05), LoopStep::Start(4.));
+        assert_eq!(loop_step(Some(1.), Some(4.), 2.), LoopStep::Clear);
+        // A stray end without a start starts over.
+        assert_eq!(loop_step(None, Some(4.), 2.), LoopStep::Start(2.));
     }
 }

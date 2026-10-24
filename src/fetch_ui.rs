@@ -3,14 +3,14 @@
 
 use super::{
     chrome_ui::{group, notice, row, section_title},
-    library_ui::checkbox,
+    library_ui::{RING_INSET, checkbox},
     *,
 };
 use flick::{
     fetch::{FetchProgress, FetchSource, FetchStage, FetchUpdate, WebLink, archive::ArchiveItem},
     library::format_bytes,
 };
-use gpui::{AnyElement, FontWeight};
+use gpui::{AnyElement, ElementId, FontWeight};
 
 /// Link downloads, and an Internet Archive item awaiting file selection.
 #[derive(Default)]
@@ -339,7 +339,7 @@ impl Flick {
                     )
                     .child(
                         div()
-                            .text_size(px(12.))
+                            .text_size(t.font(12.))
                             .text_color(t.muted)
                             .overflow_hidden()
                             .whitespace_nowrap()
@@ -351,7 +351,12 @@ impl Flick {
                             _ => None,
                         },
                         |d, error| {
-                            d.child(div().text_size(px(12.)).text_color(t.danger).child(error))
+                            d.child(
+                                div()
+                                    .text_size(t.font(12.))
+                                    .text_color(t.danger)
+                                    .child(error),
+                            )
                         },
                     ),
             )
@@ -435,53 +440,56 @@ impl Flick {
             .into_any_element(),
         ];
         for (index, file) in item.files.iter().enumerate() {
+            let id = ElementId::from(("archive-file", index));
+            let el = h_flex()
+                .id(id.clone())
+                .relative()
+                .gap_3()
+                .px_3()
+                .py_2()
+                .cursor_pointer()
+                .hover(|s| s.bg(t.selection))
+                .child(checkbox(&t, self.fetches.chosen.contains(&index)))
+                .child(
+                    v_flex()
+                        .flex_1()
+                        .min_w(px(0.))
+                        .child(
+                            div()
+                                .overflow_hidden()
+                                .whitespace_nowrap()
+                                .child(file.name.clone()),
+                        )
+                        .child(
+                            div()
+                                .text_size(t.font(12.))
+                                .text_color(t.muted)
+                                .overflow_hidden()
+                                .whitespace_nowrap()
+                                .child(format!(
+                                    "{} · {}",
+                                    if file.original {
+                                        "Original"
+                                    } else {
+                                        "Converted by archive.org"
+                                    },
+                                    file.format
+                                )),
+                        ),
+                )
+                .child(
+                    div()
+                        .text_color(t.muted)
+                        .child(file.size.map(format_bytes).unwrap_or_default()),
+                )
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    if !this.fetches.chosen.remove(&index) {
+                        this.fetches.chosen.insert(index);
+                    }
+                    cx.notify();
+                }));
             rows.push(
-                h_flex()
-                    .id(("archive-file", index))
-                    .gap_3()
-                    .px_3()
-                    .py_2()
-                    .cursor_pointer()
-                    .hover(|s| s.bg(t.selection))
-                    .child(checkbox(&t, self.fetches.chosen.contains(&index)))
-                    .child(
-                        v_flex()
-                            .flex_1()
-                            .min_w(px(0.))
-                            .child(
-                                div()
-                                    .overflow_hidden()
-                                    .whitespace_nowrap()
-                                    .child(file.name.clone()),
-                            )
-                            .child(
-                                div()
-                                    .text_size(px(12.))
-                                    .text_color(t.muted)
-                                    .overflow_hidden()
-                                    .whitespace_nowrap()
-                                    .child(format!(
-                                        "{} · {}",
-                                        if file.original {
-                                            "Original"
-                                        } else {
-                                            "Converted by archive.org"
-                                        },
-                                        file.format
-                                    )),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .text_color(t.muted)
-                            .child(file.size.map(format_bytes).unwrap_or_default()),
-                    )
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        if !this.fetches.chosen.remove(&index) {
-                            this.fetches.chosen.insert(index);
-                        }
-                        cx.notify();
-                    }))
+                self.focusable(el, &id, None, t.radius, (-RING_INSET, -RING_INSET), cx)
                     .into_any_element(),
             );
         }
@@ -490,7 +498,7 @@ impl Flick {
             self.read_only_field(&self.folder_field, cx)
         } else {
             div()
-                .text_size(px(12.))
+                .text_size(t.font(12.))
                 .text_color(t.muted)
                 .child(self.download_folder.display().to_string())
         };

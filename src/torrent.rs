@@ -15,7 +15,8 @@ use serde::Serialize;
 use std::{
     collections::HashSet,
     fs::{File, OpenOptions},
-    net::SocketAddr,
+    hash::{BuildHasher, Hasher},
+    net::{SocketAddr, TcpListener, UdpSocket},
     num::NonZeroU32,
     path::{Component, Path, PathBuf},
     sync::Arc,
@@ -24,6 +25,22 @@ use std::{
 use tokio::io::AsyncReadExt;
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
+
+// Torlink src/sources/magnet.ts, revision df059311d0898b7245dd842153c1ff7c892275ee.
+// MIT; see THIRD_PARTY_NOTICES.md. Shared by search magnets and public sessions.
+pub const PUBLIC_TRACKERS: &[&str] = &[
+    "udp://tracker.opentrackr.org:1337/announce",
+    "udp://open.demonii.com:1337/announce",
+    "udp://tracker.openbittorrent.com:6969/announce",
+    "udp://tracker.torrent.eu.org:451/announce",
+    "udp://exodus.desync.com:6969/announce",
+    "udp://open.stealth.si:80/announce",
+    "udp://tracker.dler.org:6969/announce",
+    "http://tracker.opentrackr.org:1337/announce",
+    "http://tracker.openbittorrent.com:80/announce",
+    "http://tracker.dler.org:6969/announce",
+    "https://tracker.tamersunion.org:443/announce",
+];
 
 const MAX_METADATA_BYTES: u64 = 16 * 1024 * 1024;
 const EMPTY_SHA1: [u8; 20] = [
@@ -36,8 +53,10 @@ pub struct TransferConfig {
     pub download_dir: PathBuf,
     pub state_dir: PathBuf,
     pub listen_addr: SocketAddr,
-    /// Explicit opt-in to DHT and trackers. Multicast/port mapping stay off.
+    /// Explicit opt-in to DHT, fallback trackers, and UPnP port mapping.
     pub public_discovery: bool,
+    /// Listener and outgoing transports. Local sessions default to TCP.
+    pub listener_mode: ListenerMode,
     pub download_limit_bytes_per_second: Option<NonZeroU32>,
 }
 
@@ -48,6 +67,7 @@ impl TransferConfig {
             state_dir,
             listen_addr: ([127, 0, 0, 1], 0).into(),
             public_discovery: false,
+            listener_mode: ListenerMode::TcpOnly,
             download_limit_bytes_per_second: None,
         }
     }
@@ -234,49 +254,46 @@ impl TransferSession {
             .context("Open transfer state lock")?;
         lock.try_lock_exclusive()
             .context("Another Flick transfer session owns this state directory")?;
-        let cancel = CancellationToken::new();
-        let session = Session::new_with_opts(
-            download_dir.clone(),
-            SessionOptions {
-                dht: config.public_discovery.then_some(DhtSessionConfig {
-                    persistence: None,
-                    ..Default::default()
-                }),
-                disable_trackers: !config.public_discovery,
-                disable_local_service_discovery: true,
-                persistence: Some(SessionPersistenceConfig::Json {
-                    folder: Some(state_dir),
-                }),
-                fastresume: false, // Always verify on-disk bytes when reopening.
-                listen: Some(ListenerOptions {
-                    mode: ListenerMode::TcpOnly,
-                    listen_addr: config.listen_addr,
-                    ipv4_only: config.listen_addr.is_ipv4(),
-                    enable_upnp_port_forwarding: false,
-                    ..Default::default()
-                }),
-                cancellation_token: Some(cancel.clone()),
-                client_name_and_version: Some(concat!("Flick/", env!("CARGO_PKG_VERSION")).into()),
-                ratelimits: librqbit::limits::LimitsConfig {
-                    download_bps: config.download_limit_bytes_per_second,
-                    upload_bps: None,
-                },
-                ..Default::default()
-            },
-        )
-        .await;
-        match session {
-            Ok(session) => Ok(Self {
-                session,
-                download_dir,
-                cancel,
-                _state_lock: lock,
-            }),
-            Err(error) => {
-                cancel.cancel();
-                Err(error).context("Start transfer session")
+        let mut listen_addr = select_listen_addr(&config, &state_dir)?;
+        // A second process can bind between our probe and librqbit's bind.
+        // Retry only address conflicts, without masking unrelated startup errors.
+        for attempt in 0..16 {
+            let cancel = CancellationToken::new();
+            let session = Session::new_with_opts(
+                download_dir.clone(),
+                session_options(&config, &state_dir, listen_addr, cancel.clone())?,
+            )
+            .await;
+            match session {
+                Ok(session) => {
+                    if config.public_discovery
+                        && let Err(error) = persist_listen_port(&state_dir, listen_addr.port())
+                    {
+                        session.stop().await;
+                        return Err(error);
+                    }
+                    return Ok(Self {
+                        session,
+                        download_dir,
+                        cancel,
+                        _state_lock: lock,
+                    });
+                }
+                Err(error) => {
+                    cancel.cancel();
+                    let address_in_use = error.chain().any(|cause| {
+                        cause
+                            .downcast_ref::<std::io::Error>()
+                            .is_some_and(|e| e.kind() == std::io::ErrorKind::AddrInUse)
+                    });
+                    if !config.public_discovery || !address_in_use || attempt == 15 {
+                        return Err(error).context("Start transfer session");
+                    }
+                    listen_addr = available_public_addr(config.listen_addr, config.listener_mode)?;
+                }
             }
         }
+        unreachable!("bounded startup loop returns on its last attempt")
     }
 
     pub fn listen_addr(&self) -> Option<SocketAddr> {
@@ -302,7 +319,7 @@ impl TransferSession {
             ),
         )
         .await
-        .context("Torrent metadata resolution timed out")??;
+        .context("No peers supplied torrent details before the deadline. Check your connection, try a torrent with active seeders, or open a .torrent file and retry.")??;
         match result {
             AddTorrentResponse::ListOnly(list) => {
                 let files = list
@@ -708,4 +725,188 @@ fn validate_share_source(path: &Path) -> Result<()> {
         );
     }
     Ok(())
+}
+
+fn session_options(
+    config: &TransferConfig,
+    state_dir: &Path,
+    listen_addr: SocketAddr,
+    cancel: CancellationToken,
+) -> Result<SessionOptions> {
+    Ok(SessionOptions {
+        dht: config.public_discovery.then(|| DhtSessionConfig {
+            persistence: Some(librqbit::dht::DhtPersistenceConfig {
+                config_filename: Some(state_dir.join("dht.json")),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }),
+        trackers: if config.public_discovery {
+            PUBLIC_TRACKERS
+                .iter()
+                .map(|value| reqwest::Url::parse(value))
+                .collect::<Result<_, _>>()?
+        } else {
+            HashSet::new()
+        },
+        disable_trackers: !config.public_discovery,
+        disable_local_service_discovery: true,
+        persistence: Some(SessionPersistenceConfig::Json {
+            folder: Some(state_dir.to_owned()),
+        }),
+        fastresume: false, // Always verify on-disk bytes when reopening.
+        listen: Some(ListenerOptions {
+            mode: config.listener_mode,
+            listen_addr,
+            ipv4_only: listen_addr.is_ipv4(),
+            enable_upnp_port_forwarding: config.public_discovery,
+            announce_port: config.public_discovery.then_some(listen_addr.port()),
+            ..Default::default()
+        }),
+        ipv4_only: listen_addr.is_ipv4(),
+        cancellation_token: Some(cancel),
+        client_name_and_version: Some(concat!("Flick/", env!("CARGO_PKG_VERSION")).into()),
+        ratelimits: librqbit::limits::LimitsConfig {
+            download_bps: config.download_limit_bytes_per_second,
+            upload_bps: None,
+        },
+        ..Default::default()
+    })
+}
+
+fn persist_listen_port(state_dir: &Path, port: u16) -> Result<()> {
+    let temporary = state_dir.join("listen-port.tmp");
+    std::fs::write(&temporary, format!("{port}\n")).context("Write transfer listen port")?;
+    std::fs::rename(temporary, state_dir.join("listen-port")).context("Save transfer listen port")
+}
+
+fn select_listen_addr(config: &TransferConfig, state_dir: &Path) -> Result<SocketAddr> {
+    if !config.public_discovery {
+        return Ok(config.listen_addr);
+    }
+    let mut addr = config.listen_addr;
+    if addr.port() == 0 {
+        match std::fs::read_to_string(state_dir.join("listen-port")) {
+            Ok(value) => addr.set_port(
+                value
+                    .trim()
+                    .parse::<u16>()
+                    .ok()
+                    .filter(|p| *p != 0)
+                    .unwrap_or(0),
+            ),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error).context("Read transfer listen port"),
+        }
+    }
+    if addr.port() != 0 && port_available(addr, config.listener_mode)? {
+        return Ok(addr);
+    }
+    available_public_addr(addr, config.listener_mode)
+}
+
+fn port_available(addr: SocketAddr, mode: ListenerMode) -> Result<bool> {
+    let _tcp = match TcpListener::bind(addr) {
+        Ok(socket) => socket,
+        Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => return Ok(false),
+        Err(error) => return Err(error).context("Probe transfer TCP listen address"),
+    };
+    if mode.utp_enabled() {
+        match UdpSocket::bind(addr) {
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => return Ok(false),
+            Err(error) => return Err(error).context("Probe transfer UDP listen address"),
+        }
+    }
+    Ok(true)
+}
+
+fn available_public_addr(mut addr: SocketAddr, mode: ListenerMode) -> Result<SocketAddr> {
+    // RandomState is seeded from the OS, without adding a random-number dependency.
+    let first = std::collections::hash_map::RandomState::new()
+        .build_hasher()
+        .finish();
+    for offset in 0..16384 {
+        addr.set_port(49152 + (first.wrapping_add(offset) % 16384) as u16);
+        if port_available(addr, mode)? {
+            return Ok(addr);
+        }
+    }
+    bail!("No available transfer listen port in 49152–65535")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn public_trackers_are_valid_unique_supported_urls() {
+        let mut seen = HashSet::new();
+        assert!(!PUBLIC_TRACKERS.is_empty());
+        for value in PUBLIC_TRACKERS {
+            let url = reqwest::Url::parse(value).unwrap();
+            assert!(matches!(url.scheme(), "udp" | "http" | "https"));
+            assert!(url.host_str().is_some());
+            assert!(seen.insert(url));
+        }
+    }
+
+    #[test]
+    fn local_config_disables_all_discovery_and_mapping() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let config =
+            TransferConfig::local(root.path().join("downloads"), root.path().join("state"));
+        let addr = select_listen_addr(&config, root.path())?;
+        assert!(addr.ip().is_loopback());
+        assert_eq!(addr.port(), 0);
+        let opts = session_options(&config, root.path(), addr, CancellationToken::new())?;
+        assert!(opts.dht.is_none());
+        assert!(opts.trackers.is_empty());
+        assert!(opts.disable_trackers);
+        assert!(opts.disable_local_service_discovery);
+        let listen = opts.listen.unwrap();
+        assert!(!listen.enable_upnp_port_forwarding);
+        assert!(listen.announce_port.is_none());
+        assert!(!root.path().join("listen-port").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn public_port_is_persisted_reused_and_replaced_when_busy() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let mut config =
+            TransferConfig::local(root.path().join("downloads"), root.path().to_owned());
+        config.public_discovery = true;
+        let first = select_listen_addr(&config, root.path())?;
+        assert!((49152..=65535).contains(&first.port()));
+        persist_listen_port(root.path(), first.port())?;
+        assert_eq!(select_listen_addr(&config, root.path())?, first);
+        let busy = TcpListener::bind(first)?;
+        let replacement = select_listen_addr(&config, root.path())?;
+        assert_ne!(replacement.port(), first.port());
+        persist_listen_port(root.path(), replacement.port())?;
+        assert_eq!(select_listen_addr(&config, root.path())?, replacement);
+        drop(busy);
+        config.listener_mode = ListenerMode::TcpAndUtp;
+        config.listen_addr.set_port(first.port());
+        let busy_udp = UdpSocket::bind(first)?;
+        assert_ne!(select_listen_addr(&config, root.path())?, first);
+        drop(busy_udp);
+        std::fs::write(root.path().join("listen-port"), "invalid")?;
+        config.listen_addr.set_port(0);
+        assert_ne!(select_listen_addr(&config, root.path())?.port(), 0);
+        config.listen_addr.set_port(first.port());
+        assert_eq!(select_listen_addr(&config, root.path())?, first);
+        let opts = session_options(&config, root.path(), first, CancellationToken::new())?;
+        assert_eq!(opts.trackers.len(), PUBLIC_TRACKERS.len());
+        let persistence = opts.dht.unwrap().persistence.unwrap();
+        assert_eq!(
+            persistence.config_filename,
+            Some(root.path().join("dht.json"))
+        );
+        let listen = opts.listen.unwrap();
+        assert!(listen.enable_upnp_port_forwarding);
+        assert_eq!(listen.announce_port, Some(first.port()));
+        Ok(())
+    }
 }

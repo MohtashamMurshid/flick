@@ -637,8 +637,8 @@ impl Render for TextInput {
             .overflow_hidden()
             .items_center()
             .text_color(cx.theme().text)
-            .text_size(px(cx.theme().text_size))
-            .line_height(px(20.))
+            .text_size(cx.theme().font(cx.theme().text_size))
+            .line_height(cx.theme().font(20.))
             .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
                 if this.read_only {
                     return;
