@@ -91,6 +91,10 @@ impl Flick {
                     }
                 }
                 ServiceEvent::Search { .. } => {}
+                ServiceEvent::ResolveCancelled => {
+                    self.resolving = false;
+                    self.pending_torrent = None;
+                }
                 ServiceEvent::Resolved(result) => {
                     self.resolving = false;
                     match result {
@@ -694,7 +698,18 @@ impl Flick {
             body = body.child(notice(&t, false, "Adding videos from your folder…").mb_4());
         }
         if self.resolving {
-            body = body.child(notice(&t, false, "Reading torrent details…").mb_4());
+            body = body.child(
+                notice(&t, false, "Finding peers…")
+                    .mb_4()
+                    .child(self.button(
+                        "cancel-resolve",
+                        None,
+                        "Cancel",
+                        false,
+                        cx,
+                        |this, _, cx| this.send(ServiceCommand::CancelResolve, cx),
+                    )),
+            );
         }
         body = body.child(match self.page {
             Page::Home => self.home_page(width, cx),

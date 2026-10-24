@@ -1,7 +1,7 @@
 //! Development diagnostic for the shared transfer adapter. No GUI or media runtime.
 
 use anyhow::{Context, Result};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use flick::torrent::{TorrentInput, TransferConfig, TransferSession};
 use serde::Serialize;
 use std::{
@@ -20,14 +20,23 @@ struct Args {
     /// Downloads are stored beneath this directory, grouped by infohash.
     #[arg(long)]
     download_dir: PathBuf,
-    /// Enable public DHT/tracker discovery. Default is explicit peers only.
+    /// Enable public DHT, trackers, and UPnP. Default is explicit peers only.
     #[arg(long)]
     public: bool,
-    /// Incoming BitTorrent listener, not an HTTP API.
-    #[arg(long, default_value = "127.0.0.1:0")]
-    listen: SocketAddr,
+    /// Incoming BitTorrent listener. Defaults to loopback locally, wildcard with --public.
+    #[arg(long)]
+    listen: Option<SocketAddr>,
+    /// Incoming/outgoing transports: TCP locally, TCP plus uTP with --public.
+    #[arg(long, value_enum)]
+    transport: Option<Transport>,
     #[command(subcommand)]
     command: Command,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum Transport {
+    TcpOnly,
+    TcpAndUtp,
 }
 
 #[derive(Subcommand)]
@@ -59,6 +68,12 @@ enum Command {
         #[arg(long)]
         tracker: Vec<String>,
     },
+    /// Measure metadata, first verified bytes, and peers over a fixed download window.
+    Benchmark {
+        input: String,
+        #[arg(long, default_value_t = 120, value_parser = clap::value_parser!(u64).range(1..=86400))]
+        window_seconds: u64,
+    },
     /// Show restored transfer state, then stop. This is not a daemon.
     Status,
 }
@@ -76,7 +91,25 @@ async fn main() -> Result<()> {
     let session = TransferSession::start(TransferConfig {
         download_dir: args.download_dir,
         state_dir: args.state_dir,
-        listen_addr: args.listen,
+        listen_addr: args.listen.unwrap_or_else(|| {
+            (
+                if args.public {
+                    [0, 0, 0, 0]
+                } else {
+                    [127, 0, 0, 1]
+                },
+                0,
+            )
+                .into()
+        }),
+        listener_mode: match args.transport.unwrap_or(if args.public {
+            Transport::TcpAndUtp
+        } else {
+            Transport::TcpOnly
+        }) {
+            Transport::TcpOnly => librqbit::ListenerMode::TcpOnly,
+            Transport::TcpAndUtp => librqbit::ListenerMode::TcpAndUtp,
+        },
         public_discovery: args.public,
         download_limit_bytes_per_second: None,
     })
@@ -88,6 +121,7 @@ async fn main() -> Result<()> {
         | Command::Download {
             timeout_seconds, ..
         } => Some(Duration::from_secs(*timeout_seconds)),
+        Command::Benchmark { window_seconds, .. } => Some(Duration::from_secs(*window_seconds + 2)),
         _ => None,
     };
     let result = tokio::select! {
@@ -178,6 +212,64 @@ async fn run(session: &TransferSession, command: Command) -> Result<()> {
             })?;
             eprintln!("Sharing while this process is running. Press Ctrl+C to stop.");
             tokio::signal::ctrl_c().await?;
+        }
+        Command::Benchmark {
+            input,
+            window_seconds,
+        } => {
+            #[derive(Serialize)]
+            struct Measurement {
+                elapsed_seconds: f64,
+                phase: &'static str,
+                verified_bytes: u64,
+                peers: Option<u32>,
+            }
+            let start = tokio::time::Instant::now();
+            let resolved = session
+                .resolve(
+                    torrent_input(input),
+                    vec![],
+                    Duration::from_secs(window_seconds.min(300)),
+                )
+                .await?;
+            json(&Measurement {
+                elapsed_seconds: start.elapsed().as_secs_f64(),
+                phase: "metadata",
+                verified_bytes: 0,
+                peers: None,
+            })?;
+            let id = session.download(&resolved, None).await?;
+            session.resume(&id, vec![]).await?;
+            let mut first_bytes = false;
+            loop {
+                let snapshot = session.snapshot(&id)?;
+                if let Some(error) = snapshot.error {
+                    anyhow::bail!(error);
+                }
+                let first = !first_bytes && snapshot.verified_bytes > 0;
+                first_bytes |= first;
+                let complete =
+                    snapshot.verified_bytes == snapshot.total_bytes && snapshot.total_bytes > 0;
+                let finished = complete || start.elapsed() >= Duration::from_secs(window_seconds);
+                json(&Measurement {
+                    elapsed_seconds: start.elapsed().as_secs_f64(),
+                    phase: if complete {
+                        "complete"
+                    } else if finished {
+                        "window_end"
+                    } else if first {
+                        "first_verified_bytes"
+                    } else {
+                        "progress"
+                    },
+                    verified_bytes: snapshot.verified_bytes,
+                    peers: Some(snapshot.peers),
+                })?;
+                if finished {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
         }
         Command::Status => json(&session.snapshots()?)?,
     }

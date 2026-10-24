@@ -21,6 +21,7 @@ pub enum Command {
         query: String,
     },
     Resolve(TorrentInput),
+    CancelResolve,
     Download {
         torrent: ResolvedTorrent,
         files: Vec<usize>,
@@ -41,6 +42,7 @@ pub enum Event {
         done: bool,
     },
     Resolved(Result<ResolvedTorrent, String>),
+    ResolveCancelled,
     Shared(Result<SharedTorrent, String>),
     Progress(Vec<TransferSnapshot>),
     Completed(PathBuf),
@@ -84,6 +86,11 @@ impl Services {
             )
                 .into(),
             public_discovery: std::env::var_os("FLICK_LOCAL_TRANSFERS").is_none(),
+            listener_mode: if std::env::var_os("FLICK_LOCAL_TRANSFERS").is_some() {
+                librqbit::ListenerMode::TcpOnly
+            } else {
+                librqbit::ListenerMode::TcpAndUtp
+            },
             download_limit_bytes_per_second: None,
         };
         let (sender, receiver) = channel::unbounded_channel();
@@ -146,6 +153,7 @@ async fn run(
     let mut session: Option<Arc<TransferSession>> = None;
     let mut tasks = JoinSet::new();
     let mut search_task: Option<tokio::task::AbortHandle> = None;
+    let mut resolve_task: Option<tokio::task::JoinHandle<()>> = None;
     let mut completed = HashSet::new();
     let mut timer = tokio::time::interval(Duration::from_millis(700));
     loop {
@@ -163,6 +171,12 @@ async fn run(
                     }));
                     continue;
                 }
+                if matches!(command, Command::CancelResolve) {
+                    if let Some(task) = resolve_task.take() { task.abort(); let _ = task.await; }
+                    // Acknowledge only after it stops publishing results.
+                    let _ = events.send(Event::ResolveCancelled);
+                    continue;
+                }
                 if session.is_none() {
                     match TransferSession::start(config.clone()).await {
                         Ok(started) => session = Some(Arc::new(started)),
@@ -172,12 +186,16 @@ async fn run(
                 let session = session.as_ref().unwrap().clone();
                 let peers = initial_peers.clone();
                 let events = events.clone();
+                if let Command::Resolve(input) = command {
+                    if let Some(task) = resolve_task.take() { task.abort(); let _ = task.await; }
+                    resolve_task = Some(tokio::spawn(async move {
+                        let result = session.resolve(input, peers, Duration::from_secs(300)).await.map_err(|e| format!("Could not read torrent files: {e:#}"));
+                        let _ = events.send(Event::Resolved(result));
+                    }));
+                    continue;
+                }
                 tasks.spawn(async move {
                     let result: anyhow::Result<()> = match command {
-                        Command::Resolve(input) => {
-                            let result = session.resolve(input, peers, Duration::from_secs(30)).await.map_err(|e| format!("Could not read torrent files: {e:#}"));
-                            let _ = events.send(Event::Resolved(result)); Ok(())
-                        }
                         Command::Download { torrent, files, folder } => {
                             match session.download_to(&torrent, Some(files), &folder).await {
                                 Ok(id) => session.resume(&id, peers).await,
@@ -217,6 +235,10 @@ async fn run(
             _ = tasks.join_next(), if !tasks.is_empty() => {}
         }
     }
+    if let Some(task) = resolve_task {
+        task.abort();
+        let _ = task.await;
+    }
     tasks.abort_all();
     if let Some(session) = session {
         session.shutdown().await;
@@ -226,6 +248,65 @@ async fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_resolution_allows_the_next_request() -> anyhow::Result<()> {
+        let root = tempfile::tempdir()?;
+        let config =
+            TransferConfig::local(root.path().join("downloads"), root.path().join("state"));
+        let source = root.path().join("fixture.bin");
+        tokio::fs::write(&source, vec![42u8; 65_537]).await?;
+        let seed = TransferSession::start(TransferConfig::local(
+            root.path().join("seed-downloads"),
+            root.path().join("seed-state"),
+        ))
+        .await?;
+        let shared = seed.share(&source, vec![]).await?;
+        seed.stop().await;
+        let (commands, receiver) = channel::unbounded_channel();
+        let (events, output) = mpsc::channel();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let peer = listener.local_addr()?;
+        let (connected, connection) = tokio::sync::oneshot::channel();
+        let stalled = tokio::spawn(async move {
+            let (_socket, _) = listener.accept().await?;
+            let _ = connected.send(());
+            std::future::pending::<()>().await;
+            Ok::<_, std::io::Error>(())
+        });
+        let job = tokio::spawn(run(config, vec![peer], receiver, events));
+        // An explicit local peer accepts the connection but supplies no metadata.
+        commands.send(Command::Resolve(TorrentInput::Magnet(shared.magnet)))?;
+        let outcome = tokio::time::timeout(Duration::from_secs(10), async {
+            connection.await?;
+            commands.send(Command::CancelResolve)?;
+            loop {
+                match output.try_recv() {
+                    Ok(Event::ResolveCancelled) => break,
+                    Ok(Event::Resolved(_) | Event::Error(_)) => {
+                        anyhow::bail!("Cancelled request published a result")
+                    }
+                    _ => tokio::time::sleep(Duration::from_millis(10)).await,
+                }
+            }
+            commands.send(Command::Resolve(TorrentInput::Bytes(
+                b"bad metadata".to_vec(),
+            )))?;
+            loop {
+                match output.try_recv() {
+                    Ok(Event::Resolved(Err(_))) => return Ok::<_, anyhow::Error>(()),
+                    Ok(Event::Error(error)) => anyhow::bail!(error),
+                    _ => tokio::time::sleep(Duration::from_millis(10)).await,
+                }
+            }
+        })
+        .await;
+        commands.send(Command::Shutdown)?;
+        job.await?;
+        stalled.abort();
+        outcome??;
+        Ok(())
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn background_transfers_publish_completed_videos_and_stop_cleanly() -> anyhow::Result<()>
     {

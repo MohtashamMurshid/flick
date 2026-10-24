@@ -113,12 +113,12 @@ Features:
 
 Transfer reliability, which should close most of the gap with other clients:
 
-- [ ] 27. Add Torlink's tracker list to search magnets in `catalog.rs`, and to `SessionOptions.trackers`, which librqbit adds to every torrent as a fallback.
-- [ ] 28. Keep the DHT routing table across launches, in the transfer state directory, instead of `persistence: None`.
-- [ ] 29. Turn on UPnP port forwarding, with a fixed listen port so the mapping stays stable.
-- [ ] 30. Raise the 30-second metadata resolve deadline, and show "Finding peers…" while waiting instead of failing.
+- [x] 27. Add Torlink's tracker list to search magnets in `catalog.rs`, and to `SessionOptions.trackers`, which librqbit adds to every torrent as a fallback.
+- [x] 28. Keep the DHT routing table across launches, in the transfer state directory, instead of `persistence: None`.
+- [x] 29. Turn on UPnP port forwarding, with a fixed listen port so the mapping stays stable.
+- [x] 30. Allow five minutes for metadata resolution, show "Finding peers…", offer Cancel, and explain how to recover after a timeout.
 - [ ] 31. Download Internet Archive results over HTTPS from archive.org's `download/` URLs, using the URL-download backend from item 26, instead of the Archive torrent. Check whether a newer librqbit supports web seeds.
-- [ ] 32. Try `TcpAndUtp` connections and measure them against `TcpOnly`.
+- [x] 32. Measure `TcpAndUtp` against `TcpOnly` with fresh public Sintel sessions; keep TCP+uTP for public sessions after eight recorded trials. Local sessions retain TCP. See [validation](docs/VALIDATION.md#2026-10-24-public-discovery-and-listener-comparison).
 
 Automated transfer tests stay local, with generated fixtures and explicit peers. Public trackers, DHT, and UPnP are checked only in recorded manual runs.
 

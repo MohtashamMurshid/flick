@@ -243,7 +243,15 @@ fn item(
         return None;
     }
     let infohash = hash.to_ascii_lowercase();
-    let magnet = librqbit::Magnet::from_id20(infohash.parse().ok()?, vec![], None).to_string();
+    let magnet = librqbit::Magnet::from_id20(
+        infohash.parse().ok()?,
+        crate::torrent::PUBLIC_TRACKERS
+            .iter()
+            .map(|s| (*s).to_owned())
+            .collect(),
+        None,
+    )
+    .to_string();
     Some(SearchResult {
         name,
         infohash: Some(infohash),
@@ -310,6 +318,15 @@ mod tests {
             {"id":"3","info_hash":"bad","name":"Invalid","category":"201"}
         ])).unwrap();
         assert_eq!(rows.len(), 1);
+        for result in rows.iter() {
+            let url = reqwest::Url::parse(&result.magnet).unwrap();
+            let trackers: Vec<_> = url
+                .query_pairs()
+                .filter(|(key, _)| key == "tr")
+                .map(|(_, value)| value.into_owned())
+                .collect();
+            assert_eq!(trackers, crate::torrent::PUBLIC_TRACKERS);
+        }
         assert_eq!(rows[0].size_bytes, 1234);
         assert_eq!(rows[0].infohash, Some("a".repeat(40)));
         assert_eq!(

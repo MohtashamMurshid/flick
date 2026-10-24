@@ -2,7 +2,9 @@
 
 ## Torlink
 
-The native search adapters in `src/catalog.rs` are derived from baairon/torlink source adapters.
+The native search adapters in `src/catalog.rs` are derived from baairon/torlink source adapters. The shared public tracker list in `src/torrent.rs` comes from
+[`src/sources/magnet.ts`](https://github.com/baairon/torlink/blob/df059311d0898b7245dd842153c1ff7c892275ee/src/sources/magnet.ts)
+at revision `df059311d0898b7245dd842153c1ff7c892275ee`.
 
 MIT License
 
