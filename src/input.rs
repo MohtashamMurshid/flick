@@ -43,6 +43,9 @@ pub struct TextInput {
     last_bounds: Option<Bounds<Pixels>>,
     is_selecting: bool,
     scroll_x: Pixels,
+    /// Read-only fields keep selection and copying but reject edits, so
+    /// values such as magnet links and paths can be selected and copied.
+    read_only: bool,
 }
 
 impl TextInput {
@@ -104,12 +107,27 @@ impl TextInput {
         cx: &mut Context<Self>,
     ) {
         self.focus_handle.focus(_window);
-        self.is_selecting = true;
-
-        if event.modifiers.shift {
-            self.select_to(self.index_for_mouse_position(event.position), cx);
-        } else {
-            self.move_to(self.index_for_mouse_position(event.position), cx)
+        let index = self.index_for_mouse_position(event.position);
+        match event.click_count {
+            2 => {
+                let word = word_range(&self.content, index);
+                self.selection_reversed = false;
+                self.selected_range = word;
+                cx.notify();
+            }
+            3.. => {
+                self.selection_reversed = false;
+                self.selected_range = 0..self.content.len();
+                cx.notify();
+            }
+            _ => {
+                self.is_selecting = true;
+                if event.modifiers.shift {
+                    self.select_to(index, cx);
+                } else {
+                    self.move_to(index, cx)
+                }
+            }
         }
     }
 
@@ -146,7 +164,7 @@ impl TextInput {
         }
     }
     fn cut(&mut self, _: &Cut, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.selected_range.is_empty() {
+        if !self.selected_range.is_empty() && !self.read_only {
             cx.write_to_clipboard(ClipboardItem::new_string(
                 self.content[self.selected_range.clone()].to_string(),
             ));
@@ -309,6 +327,9 @@ impl EntityInputHandler for TextInput {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.read_only {
+            return;
+        }
         let range = range_utf16
             .as_ref()
             .map(|range_utf16| self.range_from_utf16(range_utf16))
@@ -332,6 +353,9 @@ impl EntityInputHandler for TextInput {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.read_only {
+            return;
+        }
         let range = range_utf16
             .as_ref()
             .map(|range_utf16| self.range_from_utf16(range_utf16))
@@ -570,6 +594,7 @@ impl Element for TextElement {
         .unwrap();
 
         if focus_handle.is_focused(window)
+            && !self.input.read(cx).read_only
             && let Some(cursor) = prepaint.cursor.take()
         {
             window.paint_quad(cursor);
@@ -615,6 +640,9 @@ impl Render for TextInput {
             .text_size(px(cx.theme().text_size))
             .line_height(px(20.))
             .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
+                if this.read_only {
+                    return;
+                }
                 if event.keystroke.key == "enter" && this.marked_range.is_none() {
                     cx.emit(InputEvent::Submit);
                     cx.stop_propagation();
@@ -643,7 +671,7 @@ impl gpui::EventEmitter<InputEvent> for TextInput {}
 impl TextInput {
     pub fn new(cx: &mut Context<Self>) -> Self {
         Self {
-            focus_handle: cx.focus_handle(),
+            focus_handle: cx.focus_handle().tab_stop(true),
             content: "".into(),
             placeholder: "Search library or find videos online".into(),
             selected_range: 0..0,
@@ -653,8 +681,30 @@ impl TextInput {
             last_bounds: None,
             is_selecting: false,
             scroll_x: px(0.),
+            read_only: false,
         }
     }
+
+    /// A selectable, copyable field whose value only the application sets.
+    pub fn read_only(cx: &mut Context<Self>) -> Self {
+        Self {
+            placeholder: "".into(),
+            read_only: true,
+            ..Self::new(cx)
+        }
+    }
+
+    /// Replaces the value, keeping the selection only if it is unchanged.
+    pub fn set_value(&mut self, value: impl Into<SharedString>, cx: &mut Context<Self>) {
+        let value = value.into();
+        if value == self.content {
+            return;
+        }
+        self.reset();
+        self.content = value;
+        cx.notify();
+    }
+
     pub fn value(&self) -> &str {
         &self.content
     }
@@ -682,6 +732,15 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("ctrl-x", Cut, Some("TextInput")),
     ]);
 }
+/// The Unicode word segment containing `index`, or the last segment at the
+/// end of the text. Paths and links select up to a separator.
+fn word_range(text: &str, index: usize) -> Range<usize> {
+    text.split_word_bound_indices()
+        .map(|(offset, word)| offset..offset + word.len())
+        .find(|range| index < range.end || range.end == text.len())
+        .unwrap_or(0..0)
+}
+
 fn utf16_range_in(text: &str, range: &Range<usize>) -> Range<usize> {
     let offset = |target| {
         let mut count = 0;
@@ -702,6 +761,17 @@ fn utf16_range_in(text: &str, range: &Range<usize>) -> Range<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn double_click_selects_the_word_under_the_pointer() {
+        let text = "/home/me/My Videos/Arrival.mkv";
+        assert_eq!(&text[word_range(text, 1)], "home");
+        assert_eq!(&text[word_range(text, 12)], "Videos");
+        assert_eq!(&text[word_range(text, 20)], "Arrival.mkv");
+        assert_eq!(&text[word_range(text, text.len())], "Arrival.mkv");
+        assert_eq!(word_range("", 0), 0..0);
+        assert_eq!(&"a 😀 b"[word_range("a 😀 b", 2)], "😀");
+    }
+
     #[test]
     fn ime_offsets_use_utf16_without_splitting_multibyte_characters() {
         assert_eq!(utf16_range_in("a😀文b", &(1..3)), 1..5);

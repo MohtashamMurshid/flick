@@ -390,6 +390,23 @@ impl Flick {
         }
     }
 
+    /// A selectable, copyable value such as a magnet link or a path.
+    pub(super) fn read_only_field(&self, input: &Entity<TextInput>, cx: &Context<Self>) -> Div {
+        let t = cx.theme();
+        div()
+            .flex()
+            .items_center()
+            .min_w(px(0.))
+            .h(px(28.))
+            .px_2()
+            .rounded(px(t.radius))
+            .bg(t.control)
+            .border_1()
+            .border_color(t.border)
+            .text_size(px(t.text_size - 1.))
+            .child(input.clone())
+    }
+
     /// A segmented control: a macOS segmented control, a Windows selector
     /// bar, or GNOME linked toggle buttons.
     pub(super) fn segmented<T: Copy + PartialEq + 'static>(

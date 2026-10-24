@@ -112,6 +112,8 @@ impl Flick {
                 }
                 ServiceEvent::Shared(result) => match result {
                     Ok(shared) => {
+                        self.magnet_field
+                            .update(cx, |field, cx| field.set_value(shared.magnet.clone(), cx));
                         self.shared_magnet = Some(shared.magnet);
                         self.page = Page::Downloads;
                     }
@@ -218,6 +220,9 @@ impl Flick {
                 && let Some(path) = paths.into_iter().next()
             {
                 let _ = this.update_in(cx, |this, _, cx| {
+                    this.folder_field.update(cx, |field, cx| {
+                        field.set_value(path.to_string_lossy().into_owned(), cx)
+                    });
                     this.download_folder = path;
                     cx.notify();
                 });
@@ -1175,22 +1180,27 @@ impl Flick {
         if let Some(magnet) = &self.shared_magnet {
             let magnet = magnet.clone();
             page = page.child(
-                notice(
-                    &t,
-                    false,
-                    "Share link ready. Keep Flick open while others download.",
-                )
-                .mb_6()
-                .child(self.button(
-                    "copy-magnet",
-                    Some("copy"),
-                    "Copy Magnet Link",
-                    false,
-                    cx,
-                    move |_, _, cx| {
-                        cx.write_to_clipboard(ClipboardItem::new_string(magnet.clone()))
-                    },
-                )),
+                v_flex()
+                    .mb_6()
+                    .gap_2()
+                    .child(
+                        notice(
+                            &t,
+                            false,
+                            "Share link ready. Keep Flick open while others download.",
+                        )
+                        .child(self.button(
+                            "copy-magnet",
+                            Some("copy"),
+                            "Copy Magnet Link",
+                            false,
+                            cx,
+                            move |_, _, cx| {
+                                cx.write_to_clipboard(ClipboardItem::new_string(magnet.clone()))
+                            },
+                        )),
+                    )
+                    .child(self.read_only_field(&self.magnet_field, cx)),
             );
         }
         if self.downloads.is_empty() {
@@ -1410,21 +1420,28 @@ impl Flick {
             );
         }
         rows.push(
-            row(
-                &t,
-                Some("folder-open"),
-                "Save to",
-                Some(self.download_folder.to_string_lossy().into_owned().into()),
-                self.button(
-                    "choose-destination",
+            v_flex()
+                .pb_3()
+                .child(row(
+                    &t,
+                    Some("folder-open"),
+                    "Save to",
                     None,
-                    "Choose…",
-                    false,
-                    cx,
-                    |this, w, cx| this.choose_download_folder(w, cx),
-                ),
-            )
-            .into_any_element(),
+                    self.button(
+                        "choose-destination",
+                        None,
+                        "Choose…",
+                        false,
+                        cx,
+                        |this, w, cx| this.choose_download_folder(w, cx),
+                    ),
+                ))
+                .child(
+                    div()
+                        .px_3()
+                        .child(self.read_only_field(&self.folder_field, cx)),
+                )
+                .into_any_element(),
         );
         v_flex()
             .child(section_title(&t, "New Download"))

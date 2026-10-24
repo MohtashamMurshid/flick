@@ -34,6 +34,10 @@ use std::{
 /// How long playback controls stay visible without pointer movement.
 const CONTROLS_TIMEOUT: Duration = Duration::from_millis(2500);
 
+/// Clicks that open a video can finish as a double-click on the new video
+/// surface. Ignore video double-clicks this soon after entering the player.
+const DOUBLE_CLICK_GRACE: Duration = Duration::from_millis(500);
+
 #[derive(Clone, Copy, PartialEq)]
 enum View {
     Library,
@@ -121,6 +125,9 @@ pub struct Flick {
     /// GNOME shows search in a bar below the header bar while open.
     search_open: bool,
     search_input: Entity<TextInput>,
+    /// Selectable read-only copies of the share magnet and download folder.
+    magnet_field: Entity<TextInput>,
+    folder_field: Entity<TextInput>,
     query: String,
     search_generation: u64,
     searching: bool,
@@ -138,6 +145,8 @@ pub struct Flick {
     control_pressed: bool,
     should_move: bool,
     pointer_moved_at: Instant,
+    /// When the player view last opened, for [`DOUBLE_CLICK_GRACE`].
+    entered_player: Instant,
     controls_shown: bool,
     /// mpv `sub-pos`, raised so subtitles stay above visible controls.
     subtitle_position: u32,
@@ -150,6 +159,12 @@ impl Flick {
         let search_input = cx.new(TextInput::new);
         let services = Services::start();
         let download_folder = services.download_dir.clone();
+        let magnet_field = cx.new(TextInput::read_only);
+        let folder_field = cx.new(|cx| {
+            let mut field = TextInput::read_only(cx);
+            field.set_value(download_folder.to_string_lossy().into_owned(), cx);
+            field
+        });
         cx.subscribe(&search_input, |this, input, event, cx| {
             match event {
                 InputEvent::Changed => {
@@ -202,6 +217,8 @@ impl Flick {
             video_filter: VideoFilter::All,
             search_open: false,
             search_input,
+            magnet_field,
+            folder_field,
             query: String::new(),
             search_generation: 0,
             searching: false,
@@ -217,6 +234,7 @@ impl Flick {
             control_pressed: false,
             should_move: false,
             pointer_moved_at: Instant::now(),
+            entered_player: Instant::now(),
             controls_shown: true,
             subtitle_position: 100,
         };
@@ -320,6 +338,9 @@ impl Flick {
                 self.file_loaded = false;
                 self.path = Some(path.clone());
                 self.store.data.add_video(&path);
+                if self.view != View::Player {
+                    self.entered_player = Instant::now();
+                }
                 self.view = View::Player;
                 self.focus.focus(window);
                 self.snapshot = PlaybackSnapshot::default();
@@ -337,6 +358,18 @@ impl Flick {
             Err(error) => self.error = Some(format!("Could not play this file. {error:#}")),
         }
         cx.notify();
+    }
+
+    /// Whether a text field has keyboard focus, so typing must reach it.
+    fn text_focused(&self, window: &Window, cx: &Context<Self>) -> bool {
+        [&self.search_input, &self.magnet_field, &self.folder_field]
+            .into_iter()
+            .any(|input| input.read(cx).focused(window))
+    }
+
+    /// Whether a video double-click should toggle fullscreen.
+    fn accepts_video_double_click(&self) -> bool {
+        self.entered_player.elapsed() >= DOUBLE_CLICK_GRACE
     }
 
     fn playing(&self) -> bool {
@@ -537,9 +570,6 @@ impl Flick {
                 self.property("pause", "yes", cx);
                 self.view = View::Library;
                 self.menu = None;
-                if window.is_fullscreen() {
-                    window.toggle_fullscreen();
-                }
                 window.set_window_title("Flick");
                 self.focus.focus(window);
                 cx.notify();
@@ -667,7 +697,7 @@ impl Flick {
             cx.notify();
             return;
         }
-        if self.search_input.read(cx).focused(window) {
+        if self.text_focused(window, cx) {
             return;
         }
         if self.view == View::Library && !command {

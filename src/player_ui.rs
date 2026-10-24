@@ -91,7 +91,9 @@ impl Flick {
             .on_click(cx.listener(|this, event: &ClickEvent, window, cx| {
                 this.focus.focus(window);
                 if event.click_count() == 2 {
-                    window.toggle_fullscreen();
+                    if this.accepts_video_double_click() {
+                        window.toggle_fullscreen();
+                    }
                 } else if this.menu.take().is_some() {
                     cx.notify();
                 }
