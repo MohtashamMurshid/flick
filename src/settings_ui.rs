@@ -95,6 +95,14 @@ impl Flick {
                 this.set_appearance(|a| a.autohide_controls = !a.autohide_controls, window, cx)
             },
         );
+        let autoplay = self.switch(
+            "autoplay-next",
+            appearance.autoplay_next,
+            cx,
+            |this, window, cx| {
+                this.set_appearance(|a| a.autoplay_next = !a.autoplay_next, window, cx)
+            },
+        );
         let percent = |value: f32| format!("{}%", (value * 100.).round());
         let text_size = h_flex()
             .gap_3()
@@ -298,6 +306,14 @@ impl Flick {
                         "Hide controls while playing",
                         Some("After 2.5 seconds without pointer movement".into()),
                         autohide,
+                    )
+                    .into_any_element(),
+                    row(
+                        &t,
+                        Some("play"),
+                        "Play next episode automatically",
+                        Some("Shows in your library continue after an 8-second countdown".into()),
+                        autoplay,
                     )
                     .into_any_element(),
                 ],

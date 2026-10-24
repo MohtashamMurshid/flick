@@ -172,6 +172,8 @@ pub struct Appearance {
     /// `0xRRGGBB`, or `None` for the style's own accent.
     pub accent: Option<u32>,
     pub autohide_controls: bool,
+    /// Start the next episode of a show when one ends.
+    pub autoplay_next: bool,
     /// Multiple of each style's text sizes.
     pub text_scale: f32,
     pub contrast: ContrastChoice,
@@ -187,6 +189,7 @@ impl Default for Appearance {
             scheme: SchemeChoice::System,
             accent: None,
             autohide_controls: true,
+            autoplay_next: true,
             text_scale: 1.,
             contrast: ContrastChoice::System,
             show_labels: false,
@@ -748,6 +751,7 @@ mod tests {
             scheme: SchemeChoice::Light,
             accent: Some(0x3fa34d),
             autohide_controls: false,
+            autoplay_next: false,
             text_scale: 1.25,
             contrast: ContrastChoice::High,
             show_labels: true,

@@ -42,6 +42,9 @@ const DOUBLE_CLICK_GRACE: Duration = Duration::from_millis(500);
 /// How long a keyboard action's status message stays on the video.
 const STATUS_TIMEOUT: Duration = Duration::from_millis(1500);
 
+/// How long the next episode waits before starting.
+const UP_NEXT_DELAY: Duration = Duration::from_secs(8);
+
 /// Playback speeds stepped through by the shuttle-forward key.
 const SHUTTLE_SPEEDS: [f64; 4] = [1., 1.5, 2., 4.];
 
@@ -56,6 +59,7 @@ enum Page {
     Home,
     Videos,
     History,
+    Shows,
     Downloads,
     Appearance,
     Shortcuts,
@@ -67,6 +71,7 @@ impl Page {
             Self::Home => "Home",
             Self::Videos => "All Videos",
             Self::History => "History",
+            Self::Shows => "Shows",
             Self::Downloads => "Downloads",
             Self::Appearance => "Appearance",
             Self::Shortcuts => "Keyboard Shortcuts",
@@ -189,6 +194,12 @@ pub struct Flick {
     /// The slider being dragged.
     dragging_slider: Option<&'static str>,
     card_menu: Option<CardMenu>,
+    /// The show whose episodes the Shows page lists, by show key.
+    selected_show: Option<String>,
+    /// The next episode, counting down after the current one ends.
+    up_next: Option<(PathBuf, Instant)>,
+    /// Whether the last snapshot was at the end, to notice new endings.
+    was_eof: bool,
     /// Bounds of the keyboard-focused card, where its menu opens.
     focused_card: Rc<Cell<Bounds<Pixels>>>,
 }
@@ -301,6 +312,9 @@ impl Flick {
             dragging_slider: None,
             card_menu: None,
             focused_card: Rc::default(),
+            selected_show: None,
+            up_next: None,
+            was_eof: false,
         };
         this.apply_preferences();
         cx.on_release(|this, _| this.persist()).detach();
@@ -432,6 +446,8 @@ impl Flick {
                 self.error = None;
                 self.menu = None;
                 self.opened_at = Some(Instant::now());
+                self.up_next = None;
+                self.was_eof = false;
                 self.pointer_moved_at = Instant::now();
                 self.controls_shown = true;
                 if let Some(old) = self.frame.take() {
@@ -573,6 +589,36 @@ impl Flick {
                 }
             }
         }
+        let ended = self.snapshot.eof && self.file_loaded;
+        if ended && !self.was_eof {
+            self.up_next = self
+                .store
+                .data
+                .appearance
+                .autoplay_next
+                .then(|| self.adjacent_episode(1))
+                .flatten()
+                .map(|path| (path, Instant::now()));
+            changed |= self.up_next.is_some();
+        } else if !ended && self.up_next.is_some() {
+            // Seeking back or replaying cancels the countdown.
+            self.up_next = None;
+            changed = true;
+        }
+        self.was_eof = ended;
+        if let Some((path, started)) = &self.up_next
+            && started.elapsed() >= UP_NEXT_DELAY
+            && self.view == View::Player
+        {
+            let path = path.clone();
+            self.persist();
+            self.open(path, window, cx);
+            return Duration::from_millis(16);
+        }
+        if self.up_next.is_some() {
+            // Refresh the countdown text.
+            changed = true;
+        }
         if self.path.is_some() && self.last_saved.elapsed() > Duration::from_secs(5) {
             self.persist();
         }
@@ -639,6 +685,9 @@ impl Flick {
     fn show_page(&mut self, page: Page, window: &mut Window, cx: &mut Context<Self>) {
         if self.view == View::Player {
             self.handle(Control::Library, window, cx);
+        }
+        if page == Page::Shows {
+            self.selected_show = None;
         }
         self.page = page;
         if page == Page::Downloads {
@@ -758,6 +807,20 @@ impl Flick {
         }
     }
 
+    /// The next (`step` 1) or previous (-1) episode of the playing show.
+    fn adjacent_episode(&self, step: isize) -> Option<PathBuf> {
+        let current = self.path.as_deref()?;
+        flick::library::adjacent_episode(
+            self.store
+                .data
+                .library
+                .iter()
+                .map(|video| video.path.as_path()),
+            current,
+            step,
+        )
+    }
+
     fn show_status(&mut self, text: impl Into<SharedString>) {
         self.status = Some((text.into(), Instant::now()));
     }
@@ -821,6 +884,24 @@ impl Flick {
                         "-1"
                     };
                     self.command(&["add", "chapter", step], cx);
+                }
+            }
+            Shortcut::PreviousEpisode | Shortcut::NextEpisode => {
+                let step = if shortcut == Shortcut::NextEpisode {
+                    1
+                } else {
+                    -1
+                };
+                match self.adjacent_episode(step) {
+                    Some(path) => {
+                        self.persist();
+                        self.open(path, window, cx);
+                    }
+                    None => self.show_status(if step > 0 {
+                        "No next episode"
+                    } else {
+                        "No previous episode"
+                    }),
                 }
             }
             Shortcut::LoopAb => {

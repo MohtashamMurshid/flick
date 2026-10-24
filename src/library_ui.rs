@@ -238,7 +238,7 @@ impl Flick {
 
     fn page_actions(&self) -> &'static [(&'static str, &'static str, Control)] {
         match self.page {
-            Page::Home | Page::Videos => &[
+            Page::Home | Page::Videos | Page::Shows => &[
                 ("folder-plus", "Add Folder…", Control::AddFolder),
                 ("plus", "Add Videos…", Control::AddVideos),
             ],
@@ -440,6 +440,7 @@ impl Flick {
         let library = vec![
             item(Page::Home, "house", None),
             item(Page::Videos, "film", None),
+            item(Page::Shows, "library", None),
             item(Page::History, "history", None),
         ];
         let transfers = item(Page::Downloads, "download", badge);
@@ -719,6 +720,7 @@ impl Flick {
         body = body.child(match self.page {
             Page::Home => self.home_page(width, cx),
             Page::Videos => self.videos_page(width, cx),
+            Page::Shows => self.shows_page(width, cx),
             Page::History => self.history_page(cx),
             Page::Downloads => self.downloads_page(cx),
             Page::Appearance => self.appearance_page(cx),
@@ -1473,6 +1475,174 @@ impl Flick {
             .collect();
         page = page.child(card_grid(cards, cols, gap));
         page
+    }
+
+    /// Shows found in the library, or one show's episodes by season.
+    fn shows_page(&self, width: f32, cx: &Context<Self>) -> Div {
+        let t = cx.theme().clone();
+        let query = self.query.to_lowercase();
+        let shows = flick::library::group_shows(
+            self.store
+                .data
+                .library
+                .iter()
+                .map(|video| video.path.as_path()),
+        )
+        .into_iter()
+        .filter(|show| show.title.to_lowercase().contains(&query))
+        .collect::<Vec<_>>();
+        let selected = self.selected_show.as_ref().and_then(|key| {
+            shows.iter().find(|show| {
+                show.episodes
+                    .first()
+                    .is_some_and(|(e, _)| e.show_key() == *key)
+            })
+        });
+        if let Some(show) = selected {
+            let watched = show
+                .episodes
+                .iter()
+                .filter(|(_, path)| self.store.data.watched(path))
+                .count();
+            let mut page = v_flex().w_full().child(
+                h_flex()
+                    .mb_4()
+                    .gap_3()
+                    .child(self.button(
+                        "all-shows",
+                        Some("arrow-left"),
+                        "All Shows",
+                        false,
+                        cx,
+                        |this, _, cx| {
+                            this.selected_show = None;
+                            cx.notify();
+                        },
+                    ))
+                    .child(
+                        div()
+                            .text_size(t.font(t.text_size + 5.))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(show.title.clone()),
+                    )
+                    .child(div().flex_1())
+                    .child(
+                        div()
+                            .text_size(t.font(12.))
+                            .text_color(t.muted)
+                            .child(format!(
+                                "{} episodes · {watched} watched",
+                                show.episodes.len()
+                            )),
+                    ),
+            );
+            let count = show.episodes.len();
+            let mut index = 0;
+            let mut seasons = show
+                .episodes
+                .chunk_by(|(a, _), (b, _)| a.season == b.season);
+            for season in seasons.by_ref() {
+                let rows = season
+                    .iter()
+                    .map(|(episode, path)| {
+                        let title =
+                            format!("{} · {}", episode.label(), crate::model::file_title(path));
+                        let row = self.video_row(("episode", index), count, path, &title, cx);
+                        index += 1;
+                        row
+                    })
+                    .collect();
+                page = page
+                    .child(section_title(&t, format!("Season {}", season[0].0.season)))
+                    .child(group(&t, rows))
+                    .child(div().h(px(20.)));
+            }
+            return page;
+        }
+        if shows.is_empty() {
+            return v_flex().child(empty_state(
+                &t,
+                "library",
+                "No shows yet",
+                "Episodes named like Show S01E02, Show 1x02, or Show/Season 1/02 appear here.",
+            ));
+        }
+        let gap = 16.;
+        let (cols, card) = columns(width, 180., gap);
+        let count = shows.len();
+        let cards = shows
+            .iter()
+            .enumerate()
+            .map(|(index, show)| self.show_card(index, (cols, count), show, card, cx))
+            .collect();
+        v_flex().w_full().child(card_grid(cards, cols, gap))
+    }
+
+    fn show_card(
+        &self,
+        index: usize,
+        (cols, count): (usize, usize),
+        show: &flick::library::Show,
+        width: f32,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let t = cx.theme();
+        let key = show
+            .episodes
+            .first()
+            .map(|(e, _)| e.show_key())
+            .unwrap_or_default();
+        let unwatched = show
+            .episodes
+            .iter()
+            .filter(|(_, path)| !self.store.data.watched(path))
+            .count();
+        let detail = match unwatched {
+            0 => format!("{} episodes · all watched", show.episodes.len()),
+            n => format!("{} episodes · {n} unwatched", show.episodes.len()),
+        };
+        let id = ElementId::from(("show", index));
+        let el = v_flex()
+            .id(id.clone())
+            .relative()
+            .w(px(width))
+            .gap_1()
+            .cursor_pointer()
+            .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                this.selected_show = Some(key.clone());
+                if this.keyboard_nav {
+                    this.control_handle(&ElementId::from(("episode", 0usize)), cx)
+                        .focus(window);
+                }
+                cx.notify();
+            }))
+            .child(
+                thumbnail(
+                    &show.title,
+                    width,
+                    (width * 9. / 16.).round(),
+                    t.card_radius,
+                )
+                .border_1()
+                .border_color(t.border),
+            )
+            .child(
+                div()
+                    .mt_1()
+                    .font_weight(FontWeight::MEDIUM)
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .child(show.title.clone()),
+            )
+            .child(
+                div()
+                    .text_size(t.font(12.))
+                    .text_color(t.muted)
+                    .child(detail),
+            );
+        let el = self.with_grid_keys(el, ("show", index), (cols, count), cx);
+        self.focusable(el, &id, None, t.card_radius, (0., 0.), cx)
+            .into_any_element()
     }
 
     fn history_page(&self, cx: &Context<Self>) -> Div {

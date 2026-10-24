@@ -75,6 +75,15 @@ impl Flick {
                         .child(panel),
                 )
             })
+            .when_some(self.up_next_card(cx), |d, card| {
+                d.child(
+                    div()
+                        .absolute()
+                        .right(px(16.))
+                        .bottom(px(controls_height + 8.))
+                        .child(card),
+                )
+            })
             .when_some(self.status.as_ref(), |d, (text, _)| {
                 d.child(
                     h_flex()
@@ -802,6 +811,69 @@ impl Flick {
                 .child(full)
                 .into_any_element(),
         }
+    }
+
+    /// The next episode's countdown, with Play Now and Cancel.
+    fn up_next_card(&self, cx: &Context<Self>) -> Option<Div> {
+        let (path, started) = self.up_next.as_ref()?;
+        let t = cx.theme();
+        let left = super::UP_NEXT_DELAY
+            .saturating_sub(started.elapsed())
+            .as_secs_f32()
+            .ceil();
+        let next = path.clone();
+        Some(
+            v_flex()
+                .w(px(300.))
+                .gap_2()
+                .p_3()
+                .rounded(px(t.card_radius))
+                .bg(t.popover)
+                .border_1()
+                .border_color(t.border)
+                .shadow_lg()
+                .text_color(t.text)
+                .child(
+                    div()
+                        .text_size(t.font(12.))
+                        .text_color(t.muted)
+                        .child(format!("Up next in {left:.0} s")),
+                )
+                .child(
+                    div()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .overflow_hidden()
+                        .whitespace_nowrap()
+                        .child(file_title(path)),
+                )
+                .child(
+                    h_flex()
+                        .gap_2()
+                        .justify_end()
+                        .child(self.button(
+                            "up-next-cancel",
+                            None,
+                            "Cancel",
+                            false,
+                            cx,
+                            |this, _, cx| {
+                                this.up_next = None;
+                                cx.notify();
+                            },
+                        ))
+                        .child(self.button(
+                            "up-next-play",
+                            Some("play"),
+                            "Play Now",
+                            true,
+                            cx,
+                            move |this, w, cx| {
+                                this.persist();
+                                this.open(next.clone(), w, cx);
+                            },
+                        )),
+                ),
+        )
     }
 
     /// Audio delay, adjustable in 50 ms steps, with a reset.

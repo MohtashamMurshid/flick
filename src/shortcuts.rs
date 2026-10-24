@@ -25,6 +25,8 @@ pub enum Shortcut {
     ShuttleForward,
     PreviousChapter,
     NextChapter,
+    PreviousEpisode,
+    NextEpisode,
     LoopAb,
     AudioDelayDown,
     AudioDelayUp,
@@ -33,7 +35,7 @@ pub enum Shortcut {
 
 impl Shortcut {
     /// Every shortcut, in the order the shortcuts page lists them.
-    pub const ALL: [Self; 18] = [
+    pub const ALL: [Self; 20] = [
         Self::PlayPause,
         Self::SeekBack,
         Self::SeekForward,
@@ -48,6 +50,8 @@ impl Shortcut {
         Self::ShuttleForward,
         Self::PreviousChapter,
         Self::NextChapter,
+        Self::PreviousEpisode,
+        Self::NextEpisode,
         Self::LoopAb,
         Self::AudioDelayDown,
         Self::AudioDelayUp,
@@ -70,6 +74,8 @@ impl Shortcut {
             Self::ShuttleForward => "Play, then faster",
             Self::PreviousChapter => "Previous chapter",
             Self::NextChapter => "Next chapter",
+            Self::PreviousEpisode => "Previous episode",
+            Self::NextEpisode => "Next episode",
             Self::LoopAb => "A–B loop: start, end, clear",
             Self::AudioDelayDown => "Audio earlier by 50 ms",
             Self::AudioDelayUp => "Audio later by 50 ms",
@@ -93,6 +99,8 @@ impl Shortcut {
             Self::ShuttleForward => "l",
             Self::PreviousChapter => "pageup",
             Self::NextChapter => "pagedown",
+            Self::PreviousEpisode => "shift-p",
+            Self::NextEpisode => "shift-n",
             Self::LoopAb => "b",
             Self::AudioDelayDown => "[",
             Self::AudioDelayUp => "]",
