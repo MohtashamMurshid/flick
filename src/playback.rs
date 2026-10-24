@@ -454,16 +454,19 @@ fn library_candidates() -> Vec<OsString> {
     #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
     let names = ["libmpv.so"];
 
-    let mut candidates: Vec<OsString> = names.iter().map(OsString::from).collect();
+    // A copy shipped with Flick wins over one found on the search path, so a
+    // bundled app never picks up a different libmpv by accident.
+    let mut candidates: Vec<OsString> = Vec::new();
     if let Ok(executable) = std::env::current_exe()
         && let Some(directory) = executable.parent()
     {
         for name in names {
-            candidates.push(directory.join(name).into_os_string());
             #[cfg(target_os = "macos")]
             candidates.push(directory.join("../Frameworks").join(name).into_os_string());
+            candidates.push(directory.join(name).into_os_string());
         }
     }
+    candidates.extend(names.iter().map(OsString::from));
     #[cfg(target_os = "macos")]
     for directory in ["/opt/homebrew/lib", "/usr/local/lib"] {
         for name in names {

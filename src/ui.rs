@@ -867,6 +867,14 @@ impl Flick {
 
     fn tick(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Duration {
         self.poll_services(cx);
+        let requested =
+            std::mem::take(&mut *OPEN_REQUESTS.lock().unwrap_or_else(|e| e.into_inner()));
+        let mut requested = requested.into_iter();
+        if let Some(first) = requested.next() {
+            // Open the first; add the rest to the library.
+            self.add_library_files(requested);
+            self.open(first, window, cx);
+        }
         if self.transfers_known
             && let Some(path) = self.pending_open.take()
         {
@@ -1532,6 +1540,39 @@ impl Flick {
     }
 }
 
+/// Files the operating system asked Flick to open, such as from Finder's
+/// Open With, waiting for the window.
+static OPEN_REQUESTS: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+
+/// Queues `file://` URLs (and magnet links) from the platform.
+pub fn queue_open_urls(urls: Vec<String>) {
+    let paths = urls.into_iter().filter_map(|url| url_path(&url));
+    OPEN_REQUESTS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .extend(paths);
+}
+
+fn url_path(url: &str) -> Option<PathBuf> {
+    if url.starts_with("magnet:") {
+        return Some(PathBuf::from(url));
+    }
+    let path = url.strip_prefix("file://")?;
+    // Drop an optional host, keeping the absolute path.
+    let path = &path[path.find('/')?..];
+    let mut bytes = Vec::with_capacity(path.len());
+    let mut chars = path.bytes();
+    while let Some(byte) = chars.next() {
+        if byte == b'%' {
+            let hex = [chars.next()?, chars.next()?];
+            bytes.push(u8::from_str_radix(std::str::from_utf8(&hex).ok()?, 16).ok()?);
+        } else {
+            bytes.push(byte);
+        }
+    }
+    Some(PathBuf::from(String::from_utf8(bytes).ok()?))
+}
+
 /// Where posters are cached: beside other data with `FLICK_DATA_DIR`, else
 /// in the platform cache directory.
 fn thumbnail_cache() -> Option<PathBuf> {
@@ -1677,6 +1718,24 @@ impl Render for Flick {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn opened_urls_become_paths() {
+        assert_eq!(
+            url_path("file:///Users/me/My%20Movies/Caf%C3%A9.mp4"),
+            Some(PathBuf::from("/Users/me/My Movies/Café.mp4"))
+        );
+        assert_eq!(
+            url_path("file://localhost/tmp/a.mkv"),
+            Some(PathBuf::from("/tmp/a.mkv"))
+        );
+        assert_eq!(
+            url_path("magnet:?xt=urn:btih:abc"),
+            Some(PathBuf::from("magnet:?xt=urn:btih:abc"))
+        );
+        assert_eq!(url_path("https://example.com/a.mp4"), None);
+        assert_eq!(url_path("file:///bad%2"), None);
+    }
 
     #[test]
     fn loop_key_sets_start_then_ordered_end_then_clears() {

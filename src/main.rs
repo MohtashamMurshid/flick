@@ -42,67 +42,68 @@ fn main() -> anyhow::Result<()> {
         return benchmark::run(benchmark::Options::parse(args)?);
     }
     let path = first.map(PathBuf::from);
-    Application::new()
-        .with_assets(assets::Assets)
-        .run(move |cx: &mut App| {
-            input::init(cx);
-            if let Err(error) =
-                cx.text_system()
-                    .add_fonts(vec![std::borrow::Cow::Borrowed(include_bytes!(
-                        "../assets/fonts/Inter.ttf"
-                    ))])
-            {
-                tracing::warn!(%error, "Could not load the bundled Inter font");
+    let app = Application::new().with_assets(assets::Assets);
+    // Finder's Open With and dropping files on the Dock icon arrive here.
+    app.on_open_urls(ui::queue_open_urls);
+    app.run(move |cx: &mut App| {
+        input::init(cx);
+        if let Err(error) =
+            cx.text_system()
+                .add_fonts(vec![std::borrow::Cow::Borrowed(include_bytes!(
+                    "../assets/fonts/Inter.ttf"
+                ))])
+        {
+            tracing::warn!(%error, "Could not load the bundled Inter font");
+        }
+        cx.on_window_closed(|cx| {
+            if cx.windows().is_empty() {
+                // GPUI 0.2.2's X11 close callback still holds a platform
+                // RefCell borrow. Quit on the next event-loop turn instead.
+                cx.spawn(async move |cx| {
+                    cx.background_executor()
+                        .timer(std::time::Duration::from_millis(10))
+                        .await;
+                    let _ = cx.update(|cx| {
+                        if cx.windows().is_empty() {
+                            cx.quit();
+                        }
+                    });
+                })
+                .detach();
             }
-            cx.on_window_closed(|cx| {
-                if cx.windows().is_empty() {
-                    // GPUI 0.2.2's X11 close callback still holds a platform
-                    // RefCell borrow. Quit on the next event-loop turn instead.
-                    cx.spawn(async move |cx| {
-                        cx.background_executor()
-                            .timer(std::time::Duration::from_millis(10))
-                            .await;
-                        let _ = cx.update(|cx| {
-                            if cx.windows().is_empty() {
-                                cx.quit();
-                            }
-                        });
-                    })
-                    .detach();
-                }
-            })
-            .detach();
-            let options = WindowOptions {
-                window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
-                    None,
-                    size(px(1100.), px(740.)),
-                    cx,
-                ))),
-                window_min_size: Some(size(px(760.), px(500.))),
-                // Flick draws its own title bar in the selected platform style.
-                // macOS keeps its native traffic lights; Linux uses client-side
-                // decorations when the compositor supports them.
-                titlebar: Some(gpui::TitlebarOptions {
-                    title: Some("Flick".into()),
-                    appears_transparent: true,
-                    traffic_light_position: Some(point(px(20.), px(20.))),
-                }),
-                window_decorations: Some(WindowDecorations::Client),
-                window_background: if cfg!(target_os = "linux") {
-                    WindowBackgroundAppearance::Transparent
-                } else {
-                    WindowBackgroundAppearance::Opaque
-                },
-                app_id: Some("flick".into()),
-                ..Default::default()
-            };
-            if let Err(error) = cx.open_window(options, |window, cx| {
-                cx.new(|cx| ui::Flick::new(path, window, cx))
-            }) {
-                tracing::error!(%error, "Could not open the Flick window");
-                cx.quit();
-            }
-            cx.activate(true);
-        });
+        })
+        .detach();
+        let options = WindowOptions {
+            window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
+                None,
+                size(px(1100.), px(740.)),
+                cx,
+            ))),
+            window_min_size: Some(size(px(760.), px(500.))),
+            // Flick draws its own title bar in the selected platform style.
+            // macOS keeps its native traffic lights; Linux uses client-side
+            // decorations when the compositor supports them.
+            titlebar: Some(gpui::TitlebarOptions {
+                title: Some("Flick".into()),
+                appears_transparent: true,
+                traffic_light_position: Some(point(px(20.), px(20.))),
+            }),
+            window_decorations: Some(WindowDecorations::Client),
+            window_background: if cfg!(target_os = "linux") {
+                WindowBackgroundAppearance::Transparent
+            } else {
+                WindowBackgroundAppearance::Opaque
+            },
+            app_id: Some("flick".into()),
+            ..Default::default()
+        };
+        if let Err(error) = cx.open_window(options, |window, cx| {
+            cx.new(|cx| ui::Flick::new(path, window, cx))
+        }) {
+            tracing::error!(%error, "Could not open the Flick window");
+            cx.quit();
+        }
+        cx.activate(true);
+    });
     Ok(())
 }
