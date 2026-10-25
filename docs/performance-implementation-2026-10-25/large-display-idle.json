@@ -615,13 +615,13 @@
       "utc": "2026-10-25T14:38:50.668853+00:00"
     }
   ],
-  "before_screenshot": "/home/mohtasham_humeo_com/.t3/projects/flick/docs/performance-implementation-2026-10-25/large-display-before.png",
-  "after_screenshot": "/home/mohtasham_humeo_com/.t3/projects/flick/docs/performance-implementation-2026-10-25/large-display-after.png",
+  "before_screenshot": "<repo>/docs/performance-implementation-2026-10-25/large-display-before.png",
+  "after_screenshot": "<repo>/docs/performance-implementation-2026-10-25/large-display-after.png",
   "screenshot_file_sha256_before": "1c67b85ca3f405bfc2f2b4e7e38a0c5897613c2360d4d4c167c7e95f92d0874e",
   "screenshot_file_sha256_after": "1c67b85ca3f405bfc2f2b4e7e38a0c5897613c2360d4d4c167c7e95f92d0874e",
   "screenshots_pixel_identical": true,
   "lavapipe_mapped": true,
-  "binary": "/home/mohtasham_humeo_com/.t3/projects/flick/target/debug/flick",
+  "binary": "<repo>/target/debug/flick",
   "binary_sha256": "f1f4dcc529588c128537635052e104b281605d288e34d6d19fc9818c8921eab9",
   "running_binary_sha256_at_start": "f1f4dcc529588c128537635052e104b281605d288e34d6d19fc9818c8921eab9",
   "running_binary_size": 169137800,

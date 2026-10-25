@@ -2640,13 +2640,13 @@
       "utc": "2026-10-25T14:36:08.244415+00:00"
     }
   ],
-  "before_screenshot": "/home/mohtasham_humeo_com/.t3/projects/flick/docs/performance-implementation-2026-10-25/large-display-second-attempt-before.png",
-  "after_screenshot": "/home/mohtasham_humeo_com/.t3/projects/flick/docs/performance-implementation-2026-10-25/large-display-second-attempt-after.png",
+  "before_screenshot": "<repo>/docs/performance-implementation-2026-10-25/large-display-second-attempt-before.png",
+  "after_screenshot": "<repo>/docs/performance-implementation-2026-10-25/large-display-second-attempt-after.png",
   "screenshot_file_sha256_before": "1c67b85ca3f405bfc2f2b4e7e38a0c5897613c2360d4d4c167c7e95f92d0874e",
   "screenshot_file_sha256_after": "1c67b85ca3f405bfc2f2b4e7e38a0c5897613c2360d4d4c167c7e95f92d0874e",
   "screenshots_pixel_identical": true,
   "lavapipe_mapped": true,
-  "binary": "/home/mohtasham_humeo_com/.t3/projects/flick/target/debug/flick",
+  "binary": "<repo>/target/debug/flick",
   "binary_sha256": "f32ed62ab3333bf151ef491abc15f61b18fe06526e0fa2f97c4f9b826622f8ec",
   "binary_stat": {
     "size": 169137800,

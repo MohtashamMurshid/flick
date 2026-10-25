@@ -370,7 +370,7 @@ impl Flick {
             }
             Action::Page(page) => self.show_page(page, window, cx),
             Action::Control(control) => self.handle(control, window, cx),
-            Action::Quit => cx.quit(),
+            Action::Quit => cx.defer(crate::shutdown::request),
             Action::SearchOnline => {}
         }
         cx.notify();

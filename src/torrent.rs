@@ -102,8 +102,11 @@ fn validate_saved_folder(folder: &Path) -> Result<()> {
 }
 
 async fn read_saved_metadata(state_dir: &Path) -> Result<Option<Vec<u8>>> {
-    let path = state_dir.join("session.json");
-    let metadata = match tokio::fs::symlink_metadata(&path).await {
+    read_saved_metadata_file(&state_dir.join("session.json")).await
+}
+
+async fn read_saved_metadata_file(path: &Path) -> Result<Option<Vec<u8>>> {
+    let metadata = match tokio::fs::symlink_metadata(path).await {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error).context("Inspect saved transfer ownership"),
@@ -133,6 +136,33 @@ async fn read_saved_metadata(state_dir: &Path) -> Result<Option<Vec<u8>>> {
         "Saved transfer metadata exceeds 16 MiB"
     );
     Ok(Some(bytes))
+}
+
+/// Validate sidecar identities before librqbit can replace a saved record by ID.
+/// Missing sidecars keep the engine's existing magnet-restoration behavior.
+async fn validate_saved_metainfo(state_dir: &Path, saved: &SavedOwnership) -> Result<()> {
+    for expected in &saved.infohashes {
+        let path = state_dir.join(format!("{expected}.torrent"));
+        let Some(bytes) = read_saved_metadata_file(&path)
+            .await
+            .with_context(|| format!("Read saved torrent metadata for {expected}"))?
+        else {
+            continue;
+        };
+        let actual = tokio::task::spawn_blocking(move || -> Result<_> {
+            let metainfo =
+                librqbit::torrent_from_bytes(&bytes).context("Parse saved torrent metadata")?;
+            metainfo.info.data.validate()?;
+            Ok(metainfo.info_hash.as_string())
+        })
+        .await
+        .context("Check saved torrent metadata")??;
+        ensure!(
+            actual == *expected,
+            "Saved torrent metadata infohash does not match saved transfer {expected}"
+        );
+    }
+    Ok(())
 }
 
 /// Read before starting librqbit, whose restoration may wait for peers. Missing
@@ -589,6 +619,9 @@ impl TransferSession {
             },
         ));
         let saved = read_saved_ownership(&state_dir).await?;
+        if let Some(saved) = &saved {
+            validate_saved_metainfo(&state_dir, saved).await?;
+        }
         let mut listen_addr = select_listen_addr(&config, &state_dir)?;
         // A second process can bind between our probe and librqbit's bind.
         // Retry only unusable ports, without masking unrelated startup errors.
@@ -1980,7 +2013,7 @@ mod tests {
             "Refusal dropped the state lock"
         );
         timeout(Duration::from_secs(5), handle.wait_until_initialized()).await??;
-        assert_eq!(session.completed_file(&id, 0)?, source);
+        assert_eq!(session.completed_file(&id, 0)?, source.canonicalize()?);
         session.release_for_deletion(&id).await?;
         assert!(session.snapshot(&id).is_err());
         assert_eq!(std::fs::read(&source)?, content);
@@ -1996,6 +2029,12 @@ mod tests {
             let config =
                 TransferConfig::local(root.path().join("downloads"), root.path().join("state"));
             let source = root.path().join("large-sparse.mp4");
+            // Windows may reserve the full length instead of creating a sparse
+            // file. Both sizes leave work after the first 64 KiB cancellation
+            // fence, without reserving 64 GiB on the Windows CI disk.
+            #[cfg(windows)]
+            let length = 64 * 1024 * 1024;
+            #[cfg(not(windows))]
             let length = 64 * 1024 * 1024 * 1024;
             let file = File::create(&source)?;
             file.set_len(length)?;
@@ -2141,6 +2180,141 @@ mod tests {
 
     fn saved_record(folder: &Path) -> serde_json::Value {
         serde_json::json!({"info_hash":"0123456789abcdef0123456789abcdef01234567", "trackers":[], "output_folder":folder, "only_files":null, "is_paused":true})
+    }
+
+    async fn saved_metainfo_fixture(
+        root: &Path,
+    ) -> Result<(TransferConfig, String, Vec<u8>, PathBuf)> {
+        let config = TransferConfig::local(root.join("downloads"), root.join("state"));
+        let source = root.join("source");
+        std::fs::create_dir(&source)?;
+        std::fs::create_dir(&config.state_dir)?;
+        std::fs::write(source.join("chosen.mp4"), vec![1; 32_768])?;
+        std::fs::write(source.join("orphan-a.mp4"), vec![2; 32_768])?;
+        let created = share::create(source, CancellationToken::new()).await?;
+        #[derive(Serialize)]
+        struct Envelope<T> {
+            info: T,
+        }
+        let mut bytes = Vec::new();
+        librqbit_bencode::bencode_serialize_to_writer(
+            &Envelope { info: created.info },
+            &mut bytes,
+        )?;
+        let infohash = librqbit::torrent_from_bytes(&bytes)?.info_hash.as_string();
+        let orphan = created.output_folder.join("orphan-a.mp4");
+        std::fs::write(&orphan, vec![0; 32_768])?;
+        let mut record = saved_record(&created.output_folder);
+        record["info_hash"] = serde_json::json!(infohash);
+        record["only_files"] = serde_json::json!([0]);
+        std::fs::write(
+            config.state_dir.join("session.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({"torrents":{"0":record}}))?,
+        )?;
+        std::fs::write(config.state_dir.join(format!("{infohash}.torrent")), &bytes)?;
+        Ok((config, infohash, bytes, orphan))
+    }
+
+    #[tokio::test]
+    async fn saved_metainfo_mismatch_preserves_ownership_across_retry_and_repair() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let (config, infohash, bytes, orphan) = saved_metainfo_fixture(root.path()).await?;
+        let session_path = config.state_dir.join("session.json");
+        let saved = std::fs::read(&session_path)?;
+        let sidecar = config.state_dir.join(format!("{infohash}.torrent"));
+        let mut mismatched = bytes.clone();
+        let offset = mismatched
+            .windows(b"orphan-a.mp4".len())
+            .position(|window| window == b"orphan-a.mp4")
+            .context("Missing fixture filename")?;
+        mismatched[offset + b"orphan-".len()] = b'b';
+        assert_ne!(
+            librqbit::torrent_from_bytes(&mismatched)?
+                .info_hash
+                .as_string(),
+            infohash
+        );
+        std::fs::write(&sidecar, &mismatched)?;
+        for _ in 0..2 {
+            let error = TransferSession::start(config.clone())
+                .await
+                .err()
+                .context("Mismatched sidecar restored")?;
+            assert!(format!("{error:#}").contains("infohash does not match"));
+            assert_eq!(std::fs::read(&session_path)?, saved);
+            assert_eq!(std::fs::read(&sidecar)?, mismatched);
+            assert_eq!(std::fs::read(&orphan)?, vec![0; 32_768]);
+            assert!(!orphan.with_file_name("orphan-b.mp4").exists());
+            assert!(
+                confirm_saved_owner_absent(&config.state_dir, &infohash)
+                    .await
+                    .is_err()
+            );
+        }
+        std::fs::write(&sidecar, bytes)?;
+        let session = TransferSession::start(config).await?;
+        let snapshot = session.snapshot(&infohash)?;
+        session.stop().await;
+        assert!(
+            snapshot
+                .files
+                .iter()
+                .any(|file| file.path == orphan && !file.selected)
+        );
+        assert_eq!(std::fs::read(orphan)?, vec![0; 32_768]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn invalid_saved_metainfo_preserves_ownership_before_engine_start() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let (config, infohash, bytes, _) = saved_metainfo_fixture(root.path()).await?;
+        let session_path = config.state_dir.join("session.json");
+        let saved = std::fs::read(&session_path)?;
+        let sidecar = config.state_dir.join(format!("{infohash}.torrent"));
+        for invalid in [b"".as_slice(), b"malformed".as_slice()] {
+            std::fs::write(&sidecar, invalid)?;
+            for _ in 0..2 {
+                assert!(TransferSession::start(config.clone()).await.is_err());
+                assert_eq!(std::fs::read(&session_path)?, saved);
+                assert_eq!(std::fs::read(&sidecar)?, invalid);
+                assert!(
+                    confirm_saved_owner_absent(&config.state_dir, &infohash)
+                        .await
+                        .is_err()
+                );
+            }
+        }
+        std::fs::File::create(&sidecar)?.set_len(MAX_METADATA_BYTES + 1)?;
+        let error = TransferSession::start(config.clone()).await.err().unwrap();
+        assert!(format!("{error:#}").contains("16 MiB"));
+        assert_eq!(std::fs::read(&session_path)?, saved);
+        std::fs::remove_file(&sidecar)?;
+        std::fs::create_dir(&sidecar)?;
+        assert!(TransferSession::start(config.clone()).await.is_err());
+        assert_eq!(std::fs::read(&session_path)?, saved);
+        std::fs::remove_dir(&sidecar)?;
+        #[cfg(unix)]
+        {
+            let target = config.state_dir.join("fixture.torrent");
+            std::fs::write(&target, &bytes)?;
+            std::os::unix::fs::symlink(&target, &sidecar)?;
+            assert!(TransferSession::start(config.clone()).await.is_err());
+            assert_eq!(std::fs::read(&session_path)?, saved);
+            std::fs::remove_file(&sidecar)?;
+        }
+        // A genuinely missing sidecar still permits the existing magnet path;
+        // the preflight alone never forgets or proves absence of that owner.
+        let ownership = read_saved_ownership(&config.state_dir).await?.unwrap();
+        validate_saved_metainfo(&config.state_dir, &ownership).await?;
+        assert_eq!(std::fs::read(&session_path)?, saved);
+        assert!(
+            confirm_saved_owner_absent(&config.state_dir, &infohash)
+                .await
+                .is_err()
+        );
+        std::fs::write(sidecar, bytes)?;
+        Ok(())
     }
 
     #[tokio::test]

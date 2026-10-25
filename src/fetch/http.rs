@@ -1992,6 +1992,12 @@ pub(crate) mod tests {
         let folder = tempfile::tempdir()?;
         let path = folder.path().join("large.part");
         let file = std::fs::File::create(&path)?;
+        // set_len can reserve real disk space on Windows. Retain the large
+        // sparse-prefix regression elsewhere and verify metadata-only opening
+        // on Windows without allocating 16 GiB on its temporary volume.
+        #[cfg(windows)]
+        let bytes = 64_u64 * 1024 * 1024;
+        #[cfg(not(windows))]
         let bytes = 16_u64 * 1024 * 1024 * 1024;
         file.set_len(bytes)?;
         drop(file);

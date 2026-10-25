@@ -393,6 +393,14 @@ impl Flick {
         if self.store.data.video(&path).is_none() {
             return;
         }
+        let Some(worker) = self.library_files_state.worker.clone() else {
+            self.error = Some(
+                "File monitoring could not start. Your file was kept; restart Flick and retry."
+                    .into(),
+            );
+            cx.notify();
+            return;
+        };
         if self.library_files_state.revision != Some(self.store.data.revision()) {
             self.library_files_changed(cx);
         }
@@ -401,22 +409,14 @@ impl Flick {
         let Some(generation) = self.library_file_generation(&path) else {
             return;
         };
-        let phase = if let Some(worker) = &self.library_files_state.worker {
-            worker.prepare(path.clone(), generation, request);
-            DeletePhase::Checking
-        } else {
-            DeletePhase::Failed(
-                "File monitoring could not start. Your file was kept; restart Flick and retry."
-                    .into(),
-            )
-        };
+        worker.prepare(path.clone(), generation, request);
         self.control_handle(&ElementId::from("library-delete-close"), cx)
             .focus(window);
         self.library_files_state.dialog = Some(DeleteDialog {
             path,
             request,
             generation,
-            phase,
+            phase: DeletePhase::Checking,
         });
         cx.notify();
     }

@@ -2558,8 +2558,8 @@ mod tests {
             let link = temp.path().join("link.mp4");
             std::os::unix::fs::symlink(&path, &link).unwrap();
             assert!(prepare_trash(&link, 1).is_err());
-            assert!(path.exists());
         }
+        assert!(path.exists());
     }
 
     #[cfg(target_os = "linux")]

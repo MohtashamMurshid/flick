@@ -476,17 +476,48 @@ impl Flick {
                 this.library_files_restored(videos.iter());
                 this.store.data.restore_videos(videos);
                 this.library_changed(cx);
-                for path in torrents {
-                    this.resolve(flick::torrent::TorrentInput::File(path), cx);
-                }
-                if !errors.is_empty() {
-                    this.error = Some(errors.join("\n"));
-                }
+                this.resolve_imported_torrents(torrents, errors, cx);
                 this.persist();
                 cx.notify();
             });
         })
         .detach();
+    }
+
+    /// Keep the single metadata request/chooser flow and report every file not admitted.
+    fn resolve_imported_torrents(
+        &mut self,
+        torrents: Vec<PathBuf>,
+        mut errors: Vec<String>,
+        cx: &mut Context<Self>,
+    ) {
+        let mut not_started = torrents.len();
+        if !self.resolving
+            && !self.quitting
+            && let Some(path) = torrents.into_iter().next()
+        {
+            self.resolve(flick::torrent::TorrentInput::File(path), cx);
+            if self.resolving {
+                not_started -= 1;
+            }
+            // Resolve clears the previous error; preserve any new admission failure.
+            if let Some(error) = self.error.take() {
+                errors.push(error);
+            }
+        }
+        if not_started > 0 {
+            let files = if not_started == 1 {
+                "file was"
+            } else {
+                "files were"
+            };
+            errors.push(format!(
+                "{not_started} torrent {files} not started. Open torrent files one at a time and retry when Flick is ready."
+            ));
+        }
+        if !errors.is_empty() {
+            self.error = Some(errors.join("\n"));
+        }
     }
 
     pub(super) fn send(&mut self, command: ServiceCommand, cx: &mut Context<Self>) {
@@ -856,7 +887,6 @@ impl Flick {
                     });
                     let _ = this.update_in(cx, |this, _, cx| {
                         this.importing = true;
-                        for path in torrents { this.resolve(flick::torrent::TorrentInput::File(path), cx); }
                         cx.notify();
                     });
                     let (videos, errors) = cx.background_executor()
@@ -864,9 +894,9 @@ impl Flick {
                     let _ = this.update_in(cx, |this, _, cx| {
                         this.importing = false;
                         this.library_files_restored(videos.iter());
-                this.store.data.restore_videos(videos);
+                        this.store.data.restore_videos(videos);
                         this.library_changed(cx);
-                        if !errors.is_empty() { this.error = Some(errors.join("\n")); }
+                        this.resolve_imported_torrents(torrents, errors, cx);
                         this.persist();
                         cx.notify();
                     });
