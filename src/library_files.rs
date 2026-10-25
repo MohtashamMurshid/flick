@@ -1879,6 +1879,25 @@ mod tests {
         let old = temp.path().with_extension("old-parent");
         fs::rename(temp.path(), &old).unwrap();
         fs::create_dir(temp.path()).unwrap();
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::{FileTimesExt, OpenOptionsExt};
+            // Directory identity uses creation time on Windows; distinguish
+            // this replacement after recreation despite tunneling/granularity.
+            let created = entry.parent.as_ref().unwrap().created.unwrap() + Duration::from_secs(60);
+            fs::OpenOptions::new()
+                .access_mode(0x100) // FILE_WRITE_ATTRIBUTES
+                .custom_flags(0x02000000) // FILE_FLAG_BACKUP_SEMANTICS: open a directory
+                .open(temp.path())
+                .unwrap()
+                .set_times(fs::FileTimes::new().set_created(created))
+                .unwrap();
+        }
+        assert_ne!(
+            entry.parent.as_ref().unwrap(),
+            &Identity::of(&fs::metadata(temp.path()).unwrap()),
+            "replacement fixture must have a distinct parent identity"
+        );
         assert!(matches!(
             check(&mut entry, now + FALLBACK),
             Some(Change::Unavailable(_))

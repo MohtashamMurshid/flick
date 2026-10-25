@@ -1,0 +1,57 @@
+[
+  {
+    "command": [
+      "cargo",
+      "test",
+      "--offline",
+      "--locked",
+      "--all-targets"
+    ],
+    "exit_code": 0,
+    "seconds": 61.47381882998161,
+    "log": "/tmp/flick-pr5-r8-check-0.log",
+    "passed": 244,
+    "ignored": 13,
+    "platform": "Linux"
+  },
+  {
+    "command": [
+      "cargo",
+      "clippy",
+      "--offline",
+      "--locked",
+      "--all-targets",
+      "--",
+      "-D",
+      "warnings"
+    ],
+    "exit_code": 0,
+    "seconds": 4.765729493927211,
+    "log": "/tmp/flick-pr5-r8-check-1.log"
+  },
+  {
+    "command": [
+      "cargo",
+      "fmt",
+      "--all",
+      "--",
+      "--check"
+    ],
+    "exit_code": 0,
+    "seconds": 1.1358011660631746,
+    "log": "/tmp/flick-pr5-r8-check-2.log"
+  },
+  {
+    "command": [
+      "cargo",
+      "build",
+      "--offline",
+      "--locked",
+      "--bin",
+      "flick"
+    ],
+    "exit_code": 0,
+    "seconds": 0.754806512966752,
+    "log": "/tmp/flick-pr5-r8-check-3.log"
+  }
+]

@@ -790,7 +790,11 @@ async fn run_loop(
                     continue;
                 }
                 if let Some(error) = &startup_error {
-                    reject_transfer(command, error, &events);
+                    // Readiness was already reported as Unavailable. A page
+                    // visit must not replace its actionable Retry message.
+                    if !matches!(command, Command::Load) {
+                        reject_transfer(command, error, &events);
+                    }
                     continue;
                 }
                 if matches!(command, Command::Resolve(_)) {
@@ -1879,6 +1883,41 @@ mod tests {
         assert!(
             failure,
             "No terminal availability state after corrupt startup"
+        );
+        // Visiting Downloads only asks for readiness. Once Unavailable has
+        // been delivered, repeated visits must not replace its Retry guidance.
+        for _ in 0..3 {
+            services.send(Command::Load).map_err(anyhow::Error::msg)?;
+        }
+        services
+            .send(Command::Resolve(TorrentInput::Bytes(vec![])))
+            .map_err(anyhow::Error::msg)?;
+        // FIFO reply fences the preceding commands without a timing sleep.
+        assert!(
+            tokio::time::timeout(
+                Duration::from_secs(3),
+                services.release_for_deletion("0123456789abcdef0123456789abcdef01234567".into()),
+            )
+            .await??
+            .is_err()
+        );
+        let mut rejected_resolve = false;
+        for event in services.drain() {
+            match event {
+                Event::Resolved(Err(error)) => {
+                    assert!(error.contains("Parse saved transfer metadata"), "{error}");
+                    rejected_resolve = true;
+                }
+                Event::Error(_)
+                | Event::TransferAvailability(_)
+                | Event::TransferRoots(_)
+                | Event::Progress(_) => anyhow::bail!("Load repeated the terminal startup state"),
+                _ => {}
+            }
+        }
+        assert!(
+            rejected_resolve,
+            "Explicit metadata request was not rejected"
         );
         services.begin_shutdown();
         assert!(
