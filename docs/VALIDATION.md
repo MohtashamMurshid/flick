@@ -12,6 +12,14 @@ Flick targets Windows, macOS, and Linux. A CI configuration is not evidence of a
 
 The presentation adapter transfers decoded BGRA frames through CPU memory into GPUI images. It sizes frames to physical video bounds without a fixed resolution, axis, or pixel-budget cap. Checked native dimensions and allocation failures produce explicit errors. GPU rendering of those images does not establish hardware video decoding or zero-copy presentation. Treat this as a functional prototype. Hardware decoding, efficient GPU surface sharing, HDR correctness, battery use, and claims of being faster than VLC remain unverified.
 
+### Windows listen-port failure in CI on 2026-10-25
+
+Pull request #3 ran CI twice at `051da49`. In the `pull_request` run, the `Transfers without desktop / windows-latest` job failed `torrent::tests::public_port_is_persisted_reused_and_replaced_when_busy` with "Probe transfer UDP listen address: An attempt was made to access a socket in a way forbidden by its access permissions (os error 10013)". The same job passed in the `push` run. Windows refuses ports in its excluded ranges, which Hyper-V and WinNAT reserve inside 49152–65535, with that access error instead of "address in use". TCP and UDP ranges differ, so a random port could pass the TCP probe and fail the UDP one. The test exposed a real defect: public desktop sessions on Windows could fail to start whenever the saved or random port fell in a reserved range.
+
+The fix treats a refused bind like a busy one, both when probing ports and when librqbit's own bind fails at startup, so Flick moves to another port. The new `torrent::tests::refused_ports_are_replaced_like_busy_ones` uses port 1, which unprivileged Linux processes cannot bind, as the stand-in for a reserved port. The test returns early where that bind succeeds. With the fix reverted, it failed on this VM with "Permission denied (os error 13)"; with the fix, it passed.
+
+On Linux (Ubuntu 24.04.5, Rust 1.99.0): `cargo fmt --check`, strict Clippy with and without default features, and `cargo test` all passed: 44 library tests, 48 desktop tests and 9 local transfer tests, with 11 ignored. No desktop playback was run, and the fix has not yet run on Windows.
+
 ### macOS packaging script on 2026-10-24
 
 Backlog item 25 adds `scripts/package-macos.sh`, hardened-runtime entitlements and an app icon in `packaging/macos/`, the `macos-package` CI job, and [Packaging for macOS](PACKAGING.md). All of it was written and checked on Linux, so **no macOS packaging result exists yet**. A real `Flick.app`, its relinked libraries, signatures, notarization, the DMG, Gatekeeper, and playback from the bundle are unverified. They need the CI job or a Mac. No Rust source changed, so no cargo checks were rerun, and no desktop build or interactive playback was attempted.

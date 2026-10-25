@@ -278,7 +278,7 @@ impl TransferSession {
         ));
         let mut listen_addr = select_listen_addr(&config, &state_dir)?;
         // A second process can bind between our probe and librqbit's bind.
-        // Retry only address conflicts, without masking unrelated startup errors.
+        // Retry only unusable ports, without masking unrelated startup errors.
         for attempt in 0..16 {
             let cancel = CancellationToken::new();
             let session = Session::new_with_opts(
@@ -323,12 +323,12 @@ impl TransferSession {
                 }
                 Err(error) => {
                     cancel.cancel();
-                    let address_in_use = error.chain().any(|cause| {
+                    let address_unusable = error.chain().any(|cause| {
                         cause
                             .downcast_ref::<std::io::Error>()
-                            .is_some_and(|e| e.kind() == std::io::ErrorKind::AddrInUse)
+                            .is_some_and(port_unusable)
                     });
-                    if !config.public_discovery || !address_in_use || attempt == 15 {
+                    if !config.public_discovery || !address_unusable || attempt == 15 {
                         return Err(error).context("Start transfer session");
                     }
                     listen_addr = available_public_addr(config.listen_addr, config.listener_mode)?;
@@ -1278,16 +1278,28 @@ fn select_listen_addr(config: &TransferConfig, state_dir: &Path) -> Result<Socke
     available_public_addr(addr, config.listener_mode)
 }
 
+/// Whether a bind failed because of the port, so another port may work.
+/// Windows refuses ports in its excluded ranges, which Hyper-V and WinNAT
+/// reserve inside 49152–65535, with an access error rather than "in use".
+/// The TCP and UDP ranges differ, so a port can pass one probe and fail the
+/// other.
+fn port_unusable(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::AddrInUse | std::io::ErrorKind::PermissionDenied
+    )
+}
+
 fn port_available(addr: SocketAddr, mode: ListenerMode) -> Result<bool> {
     let _tcp = match TcpListener::bind(addr) {
         Ok(socket) => socket,
-        Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => return Ok(false),
+        Err(error) if port_unusable(&error) => return Ok(false),
         Err(error) => return Err(error).context("Probe transfer TCP listen address"),
     };
     if mode.utp_enabled() {
         match UdpSocket::bind(addr) {
             Ok(_) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => return Ok(false),
+            Err(error) if port_unusable(&error) => return Ok(false),
             Err(error) => return Err(error).context("Probe transfer UDP listen address"),
         }
     }
@@ -1380,6 +1392,28 @@ mod tests {
         let listen = opts.listen.unwrap();
         assert!(listen.enable_upnp_port_forwarding);
         assert_eq!(listen.announce_port, Some(first.port()));
+        Ok(())
+    }
+
+    #[test]
+    fn refused_ports_are_replaced_like_busy_ones() -> Result<()> {
+        // Unprivileged Linux processes cannot bind port 1, which stands in for
+        // a port inside a Windows excluded range. Elsewhere the bind succeeds
+        // and there is nothing to check.
+        let refused: SocketAddr = ([127, 0, 0, 1], 1).into();
+        match TcpListener::bind(refused) {
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {}
+            _ => return Ok(()),
+        }
+        assert!(!port_available(refused, ListenerMode::TcpAndUtp)?);
+        let root = tempfile::tempdir()?;
+        let mut config =
+            TransferConfig::local(root.path().join("downloads"), root.path().to_owned());
+        config.public_discovery = true;
+        config.listener_mode = ListenerMode::TcpAndUtp;
+        config.listen_addr = refused;
+        let replacement = select_listen_addr(&config, root.path())?;
+        assert!((49152..=65535).contains(&replacement.port()));
         Ok(())
     }
 }
