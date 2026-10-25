@@ -393,6 +393,7 @@ impl Flick {
         let selected = palette.selected.min(items.len().saturating_sub(1));
         let viewport = window.viewport_size();
         let width = (f32::from(viewport.width) - 48.).clamp(320., 680.);
+        // A fixed height keeps the centered panel still while results change.
         let list_height = (f32::from(viewport.height) * 0.55).clamp(140., 480.);
 
         let heading = |text: &'static str| {
@@ -421,7 +422,7 @@ impl Flick {
             .id("palette-list")
             .track_scroll(&palette.scroll)
             .overflow_y_scroll()
-            .max_h(px(list_height))
+            .h(px(list_height))
             .px_2()
             .py_1p5();
         let mut child = 0;
@@ -574,9 +575,8 @@ impl Flick {
                     .absolute()
                     .inset_0()
                     .flex()
-                    .items_start()
+                    .items_center()
                     .justify_center()
-                    .pt(px(f32::from(viewport.height) * 0.12))
                     .bg(rgba(0x00000059))
                     .on_mouse_down(
                         MouseButton::Left,
