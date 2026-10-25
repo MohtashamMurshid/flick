@@ -4,6 +4,8 @@ mod chrome_ui;
 mod fetch_ui;
 #[path = "library_ui.rs"]
 mod library_ui;
+#[path = "palette_ui.rs"]
+mod palette_ui;
 #[path = "pip_ui.rs"]
 mod pip_ui;
 #[path = "player_ui.rs"]
@@ -172,6 +174,9 @@ pub struct Flick {
     /// GNOME shows search in a bar below the header bar while open.
     search_open: bool,
     search_input: Entity<TextInput>,
+    /// The command center, while open, and its search field.
+    palette: Option<palette_ui::Palette>,
+    palette_input: Entity<TextInput>,
     /// Selectable read-only copies of the share magnet and download folder.
     magnet_field: Entity<TextInput>,
     folder_field: Entity<TextInput>,
@@ -198,6 +203,8 @@ pub struct Flick {
     /// Set when a control inside a title bar is pressed, so the title bar
     /// does not start a window move.
     control_pressed: bool,
+    /// The last press inside a title bar landed on the bar, not a control.
+    titlebar_pressed: bool,
     should_move: bool,
     pointer_moved_at: Instant,
     /// When the player view last opened, for [`DOUBLE_CLICK_GRACE`].
@@ -272,6 +279,19 @@ impl Flick {
         let store = Store::load();
         crate::theme::apply(cx, &store.data.appearance);
         let search_input = cx.new(TextInput::new);
+        let palette_input = cx.new(|cx| {
+            TextInput::with_placeholder(cx, "Search videos and commands, or paste a link")
+                .with_size(17.)
+        });
+        cx.subscribe_in(
+            &palette_input,
+            window,
+            |this, _, event, window, cx| match event {
+                InputEvent::Changed => this.palette_changed(cx),
+                InputEvent::Submit => this.palette_submit(window, cx),
+            },
+        )
+        .detach();
         let services = Services::start(&store.data.transfers);
         let download_folder = services.download_dir.clone();
         let magnet_field = cx.new(TextInput::read_only);
@@ -403,6 +423,8 @@ impl Flick {
             video_filter: VideoFilter::All,
             search_open: false,
             search_input,
+            palette: None,
+            palette_input,
             magnet_field,
             folder_field,
             subtitle_query,
@@ -425,6 +447,7 @@ impl Flick {
             fetches: Default::default(),
             importing: false,
             control_pressed: false,
+            titlebar_pressed: false,
             should_move: false,
             pointer_moved_at: Instant::now(),
             entered_player: Instant::now(),
@@ -1450,7 +1473,12 @@ impl Flick {
             cx.stop_propagation();
             return;
         }
-        if command && (key == "k" || (key == "f" && self.view == View::Library)) {
+        if command && key == "k" {
+            self.toggle_palette(window, cx);
+            cx.stop_propagation();
+            return;
+        }
+        if command && key == "f" && self.view == View::Library {
             self.focus_search(window, cx);
             cx.stop_propagation();
             return;
@@ -1710,7 +1738,8 @@ impl Render for Flick {
                 }
             }))
             .child(content)
-            .children(self.card_menu_panel(cx));
+            .children(self.card_menu_panel(cx))
+            .children(self.palette_view(window, cx));
         self.window_frame(root.into_any_element(), window, cx)
     }
 }

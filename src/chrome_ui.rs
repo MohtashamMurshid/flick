@@ -410,9 +410,8 @@ impl Flick {
         .on_mouse_down(
             MouseButton::Left,
             cx.listener(|this, _, _, _| {
-                if !std::mem::take(&mut this.control_pressed) {
-                    this.should_move = true;
-                }
+                this.titlebar_pressed = !std::mem::take(&mut this.control_pressed);
+                this.should_move = this.titlebar_pressed;
             }),
         )
         .on_mouse_move(cx.listener(|this, _, window, _| {
@@ -421,15 +420,18 @@ impl Flick {
                 window.start_window_move();
             }
         }))
-        .on_click(|event, window, _| {
-            if event.click_count() == 2 {
+        // Clicks inside the search field or a button reach here too. A
+        // double-click there selects a word or presses twice; it must not
+        // zoom or fill the screen.
+        .on_click(cx.listener(|this, event: &ClickEvent, window, _| {
+            if event.click_count() == 2 && this.titlebar_pressed {
                 if cfg!(target_os = "macos") {
                     window.titlebar_double_click();
                 } else {
                     window.zoom_window();
                 }
             }
-        })
+        }))
     }
 
     /// Minimize, maximize, and close, drawn in the selected style when the
@@ -534,6 +536,23 @@ impl Flick {
         let t = cx.theme();
         let focused = self.search_input.read(cx).focused(window);
         let search_icon = icon("search", 16., t.muted);
+        // The command center's shortcut, shown until the field is used.
+        let hint = (!focused && self.query.is_empty()).then(|| {
+            div()
+                .id("search-shortcut")
+                .cursor_pointer()
+                .on_click(
+                    cx.listener(|this, _: &ClickEvent, window, cx| this.toggle_palette(window, cx)),
+                )
+                .flex_none()
+                .px_1()
+                .rounded(px(4.))
+                .border_1()
+                .border_color(t.border)
+                .text_size(t.font(11.))
+                .text_color(t.muted)
+                .child(crate::shortcuts::command("k"))
+        });
         let field = div()
             .id("search-field")
             .flex()
@@ -559,7 +578,8 @@ impl Flick {
                         .min_w(px(0.))
                         .h_full()
                         .child(self.search_input.clone()),
-                ),
+                )
+                .children(hint),
             Style::Windows => field
                 .h(px(32.))
                 .rounded(px(4.))
@@ -574,6 +594,7 @@ impl Flick {
                         .h_full()
                         .child(self.search_input.clone()),
                 )
+                .children(hint)
                 .child(search_icon),
             Style::Gnome => field
                 .h(px(34.))
@@ -587,7 +608,8 @@ impl Flick {
                         .min_w(px(0.))
                         .h_full()
                         .child(self.search_input.clone()),
-                ),
+                )
+                .children(hint),
         }
     }
 

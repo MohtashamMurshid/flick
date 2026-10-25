@@ -126,6 +126,14 @@ Distribution:
 
 - [ ] 25. Bundle libmpv, sign and notarize, and ship a DMG. The app currently requires `brew install mpv`, so it can't be handed to anyone. `scripts/package-macos.sh` and the `macos-package` CI job now do this; see [Packaging for macOS](docs/PACKAGING.md). They were written on Linux, where only syntax checks, ShellCheck, a dry run, and a run with stand-in macOS tools passed. The bundle, signatures, notarization, DMG, and playback from the bundle are unverified until the job or a Mac runs them. Distribution also waits on a Developer ID, notarization credentials, and the license questions in that document: Homebrew's libmpv and FFmpeg are GPL, Flick has no license, and corresponding source is not yet provided. Finder's Open With launches Flick without opening the file until `src/main.rs` handles `on_open_urls`.
 
+### 7. Follow-ups from 2026-10-25
+
+- [x] 33. Quit with ⌘Q on macOS and Ctrl+Q elsewhere, with Quit Flick in the macOS app menu. Settings and the playback position are saved first.
+- [x] 34. A double-click inside the title bar's search field or on its buttons no longer zooms or fills the screen; only empty title-bar space does.
+- [x] 35. ⌘K or Ctrl+K opens a command center over any view: library videos, online search and results, link downloads, and commands, chosen with the arrow keys. The library search field shows the shortcut.
+- [x] 36. Pasting a YouTube, X, other web, or magnet link into the command center or the search field offers its download straight away, naming the site.
+- [x] 37. Cards say Watched only for finished videos, using the same flag as Mark as Watched; older history that reached the end counts as finished.
+
 Watch folders, remote control, accounts, cloud storage, casting, and a general NDJSON agent interface are outside the first release. Search belongs in the library workflow.
 
 ## Existing prototype

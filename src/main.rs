@@ -12,9 +12,11 @@ mod thumbnails;
 mod ui;
 
 use gpui::{
-    App, AppContext, Application, Bounds, WindowBackgroundAppearance, WindowBounds,
-    WindowDecorations, WindowOptions, point, px, size,
+    App, AppContext, Application, Bounds, KeyBinding, Menu, MenuItem, WindowBackgroundAppearance,
+    WindowBounds, WindowDecorations, WindowOptions, actions, point, px, size,
 };
+
+actions!(flick, [Quit]);
 use std::path::PathBuf;
 
 fn main() -> anyhow::Result<()> {
@@ -47,6 +49,15 @@ fn main() -> anyhow::Result<()> {
     app.on_open_urls(ui::queue_open_urls);
     app.run(move |cx: &mut App| {
         input::init(cx);
+        // ⌘Q on macOS, Ctrl+Q elsewhere. Quitting closes the window first, so
+        // the player saves its position as it does when the window closes.
+        cx.on_action(|_: &Quit, cx| cx.quit());
+        cx.bind_keys([KeyBinding::new("secondary-q", Quit, None)]);
+        // macOS shows Quit in the app menu, where people look for it.
+        cx.set_menus(vec![Menu {
+            name: "Flick".into(),
+            items: vec![MenuItem::action("Quit Flick", Quit)],
+        }]);
         if let Err(error) =
             cx.text_system()
                 .add_fonts(vec![std::borrow::Cow::Borrowed(include_bytes!(

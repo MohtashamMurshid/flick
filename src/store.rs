@@ -209,7 +209,6 @@ impl Settings {
             finished,
         };
         file.sanitize();
-        file.finished |= reached_end(file.position, file.duration);
         if let Some(identity) = self
             .library
             .iter()
@@ -412,6 +411,7 @@ impl Settings {
             saved.identity.infohash = saved.identity.infohash.to_ascii_lowercase();
             saved.duration = non_negative_finite(saved.duration);
             saved.position = non_negative_finite(saved.position).min(saved.duration);
+            saved.finished |= reached_end(saved.position, saved.duration);
             saved.identity.infohash.len() == 40
                 && saved
                     .identity
@@ -465,6 +465,8 @@ impl RecentFile {
         if self.title.trim().is_empty() {
             self.title = file_title(&self.path);
         }
+        // Also covers history saved before the flag existed.
+        self.finished |= reached_end(self.position, self.duration);
     }
 }
 
@@ -821,6 +823,15 @@ mod tests {
 
         // Opening or sampling a video does not count as watching it.
         assert!(!settings.watched(Path::new("b.mkv")));
+        // History saved before the flag existed counts if it reached the end.
+        let mut old: Settings = serde_json::from_str(
+            r#"{"recent":[{"path":"done.mkv","position":118,"duration":120},
+                          {"path":"half.mkv","position":60,"duration":120}]}"#,
+        )
+        .unwrap();
+        old.sanitize();
+        assert!(old.watched(Path::new("done.mkv")));
+        assert!(!old.watched(Path::new("half.mkv")));
         settings.remember(Path::new("short.mkv"), 0.0, 8.0);
         assert!(!settings.watched(Path::new("short.mkv")));
         // Reaching the end does, and watching again keeps it.

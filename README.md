@@ -27,13 +27,15 @@ cargo run --locked -- "/path/to/video.mp4"
 
 If Rust was just installed and `cargo` is not on the current shell's path, open a new terminal or run `. "$HOME/.cargo/env"` on macOS/Linux first. On this development machine, `~/.cargo/bin/cargo` also works directly.
 
-A new library opens to a welcome page with **Open Video…**, **Add Folder…**, and **Paste Link**. Afterward, Flick opens to **Home**, with Continue Watching and Recently Added; the sidebar also has All Videos, History, Downloads, and Appearance. Use **Add Videos…** or **Add Folder…** to build the library, or drop files/folders into it. Click a video to play or continue it. The back arrow returns to the library and pauses playback. Passing a local path on the command line opens that video directly. Type in the search field to filter local videos; press Enter for download results, or paste a magnet link or web address and press Enter to download it. Search uses TPB, Internet Archive, and YTS independently and reports unavailable sources. The Linux file picker uses the desktop portal; drag and drop and command-line paths remain available when no portal service is running. The captions icon opens **Audio & subtitles** to select tracks, adjust audio delay, load a subtitle file, or find subtitles on OpenSubtitles.com. Finding subtitles needs a free personal API key from OpenSubtitles, entered in **Appearance** or set with `FLICK_OPENSUBTITLES_KEY`; it is stored in `settings.json`. While a video plays, its controls hide after 2.5 seconds without pointer movement, and subtitles move above the controls whenever they show. Turn hiding off in **Appearance**. Icon controls have descriptive tooltips.
+A new library opens to a welcome page with **Open Video…**, **Add Folder…**, and **Paste Link**. Afterward, Flick opens to **Home**, with Continue Watching and Recently Added; the sidebar also has All Videos, History, Downloads, and Appearance. Use **Add Videos…** or **Add Folder…** to build the library, or drop files/folders into it. Click a video to play or continue it. The back arrow returns to the library and pauses playback. Passing a local path on the command line opens that video directly. Type in the search field to filter local videos; press Enter for download results, or paste a magnet link or web address to see a download suggestion and press Enter to start it. Search uses TPB, Internet Archive, and YTS independently and reports unavailable sources. The Linux file picker uses the desktop portal; drag and drop and command-line paths remain available when no portal service is running. The captions icon opens **Audio & subtitles** to select tracks, adjust audio delay, load a subtitle file, or find subtitles on OpenSubtitles.com. Finding subtitles needs a free personal API key from OpenSubtitles, entered in **Appearance** or set with `FLICK_OPENSUBTITLES_KEY`; it is stored in `settings.json`. While a video plays, its controls hide after 2.5 seconds without pointer movement, and subtitles move above the controls whenever they show. Turn hiding off in **Appearance**. Icon controls have descriptive tooltips.
 
 Downloads shows torrent download and upload rates, verification progress, and Pause All / Resume All. Export exact metainfo with **Export .torrent…**. Removing a transfer keeps its files unless you choose **Remove and Delete Files…** and confirm the listed paths. First run asks whether completed downloads keep sharing; change this and the live torrent bandwidth limits in **Appearance → Transfers**. Explicit shares keep sharing independently of that download preference, and all transfers stop when Flick closes. Verified torrent videos also save resume by infohash and file index, so re-downloading into another destination retains your position. See [transfer controls](docs/TRANSFERS.md#desktop-transfer-controls).
 
+Press ⌘K on macOS or Ctrl+K elsewhere, from the library or the player, to open the **command center**. One large field finds library videos and plays them, searches online and lists the results there, offers to download a pasted YouTube, X, web, or magnet link, and runs commands such as Open Video, Add Folder, Downloads, Appearance, Fullscreen, Picture in Picture, and Quit. Arrow keys choose a row, Enter runs it, and Escape or a click outside closes it. The library's search field shows the shortcut; clicking it opens the command center too.
+
 ## Downloading from web links
 
-Type or paste an `http`/`https` address into the search field and press Enter, or copy it and choose **Paste Link** on the Downloads page. Downloads appear under **Link Downloads** with progress, speed, Cancel, errors, Try Again, and Play. Completed videos join the library. Files are saved to the current download folder: `FLICK_DOWNLOAD_DIR`, otherwise `Downloads/Flick` in your home folder. Download only videos you have the right to save.
+Paste an `http`/`https` address into the command center or the search field; Flick names the site (YouTube, X, Vimeo, Internet Archive, or the host) and offers the download, which Enter starts. You can also copy it and choose **Paste Link** on the Downloads page. Downloads appear under **Link Downloads** with progress, speed, Cancel, errors, Try Again, and Play. Completed videos join the library. Files are saved to the current download folder: `FLICK_DOWNLOAD_DIR`, otherwise `Downloads/Flick` in your home folder. Download only videos you have the right to save.
 
 - **Video pages** such as YouTube or X posts need [yt-dlp](https://github.com/yt-dlp/yt-dlp#installation), an optional runtime dependency that Flick runs as a separate program. Keep it current; sites change often, and outdated releases fail. Flick uses `FLICK_YTDLP` if set to the program's full path, then `yt-dlp` (`yt-dlp.exe` on Windows) on `PATH`, then common install folders that apps opened from the desktop may not have on `PATH`: `/opt/homebrew/bin`, `/usr/local/bin`, and `/opt/local/bin` on macOS; `/usr/local/bin`, `/usr/bin`, `/snap/bin`, and `~/.local/bin` on Linux; and `%LOCALAPPDATA%\Microsoft\WinGet\Links` on Windows. Install with `brew install yt-dlp`, `winget install yt-dlp.yt-dlp`, `pipx install yt-dlp`, or the official standalone release. Distribution packages are often too old. A whole-playlist address downloads every entry.
 - **FFmpeg** is optional. Flick looks for it on `PATH`, beside yt-dlp, and in the same install folders, and passes its location to yt-dlp. With FFmpeg, yt-dlp merges the best video and audio; without it, Flick asks for the best single file that has both.
@@ -44,7 +46,7 @@ Flick never overwrites an existing file: a different file with the same name get
 
 ## Keyboard controls
 
-Player keys can be changed on the **Keyboard Shortcuts** page, which also lists them. Press `?` to show them in the player or open the page from the library. Tab, Escape, Enter, number keys, and Ctrl or ⌘ with O, K, comma, or L keep their fixed jobs and can't be assigned.
+Player keys can be changed on the **Keyboard Shortcuts** page, which also lists them. Press `?` to show them in the player or open the page from the library. Tab, Escape, Enter, number keys, and Ctrl or ⌘ with O, K, comma, L, or Q keep their fixed jobs and can't be assigned.
 
 | Key | Action |
 | --- | --- |
@@ -63,9 +65,11 @@ Player keys can be changed on the **Keyboard Shortcuts** page, which also lists 
 | Shift+N / Shift+P | Next or previous episode |
 | Escape | Exit fullscreen or close a menu |
 | Ctrl+O / Cmd+O | Add videos in the library or open a video in the player |
-| Ctrl+K / Cmd+K | Go to the library and focus search |
+| Ctrl+K / Cmd+K | Open the command center |
+| Ctrl+F / Cmd+F | Focus the library search field |
 | Ctrl+, / Cmd+, | Open Appearance |
 | Ctrl+L / Cmd+L | Load a subtitle file |
+| Ctrl+Q / Cmd+Q | Quit Flick |
 | ? | Show keyboard shortcuts |
 
 Tab and Shift+Tab move between controls, with a focus ring and the control's tooltip. Enter or Space activates the focused control. Arrow keys move between video cards and list rows, and Shift+F10 or the Menu key opens a video's menu: Play, Show in Folder, Mark as Watched or Unwatched, and Remove from Continue Watching. Right-click opens the same menu.
@@ -151,6 +155,7 @@ Set `FLICK_CODESIGN_IDENTITY` and notarization credentials for a distributable b
 - `src/catalog.rs`: independent native discovery providers with progressive results.
 - `src/fetch.rs`: link downloads without GPUI, separate from the torrent session: yt-dlp processes, HTTPS files, and Internet Archive file lists.
 - `src/fetch_ui.rs`: Link Downloads on the Downloads page and the Internet Archive file chooser.
+- `src/palette_ui.rs`: the ⌘K / Ctrl+K command center.
 - `src/bin/flick-fetch.rs`: development diagnostic for link downloads.
 - `src/services.rs`: desktop background worker and transfer events.
 - `src/input.rs`: text fields with Unicode/IME and clipboard support, including selectable read-only values.

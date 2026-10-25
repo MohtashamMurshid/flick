@@ -49,6 +49,28 @@ pub enum WebLink {
 }
 
 impl WebLink {
+    /// The website, as people know it: YouTube, X, Vimeo, Internet Archive,
+    /// or the host name without `www.`.
+    pub fn site(&self) -> String {
+        let Self::Page(url) = self else {
+            return "Internet Archive".into();
+        };
+        let host = reqwest::Url::parse(url)
+            .ok()
+            .and_then(|url| url.host_str().map(str::to_ascii_lowercase))
+            .unwrap_or_default();
+        let on = |domain: &str| host == domain || host.ends_with(&format!(".{domain}"));
+        if on("youtube.com") || on("youtu.be") || on("youtube-nocookie.com") {
+            "YouTube".into()
+        } else if on("x.com") || on("twitter.com") {
+            "X".into()
+        } else if on("vimeo.com") {
+            "Vimeo".into()
+        } else {
+            host.strip_prefix("www.").unwrap_or(&host).to_owned()
+        }
+    }
+
     /// The download for this link, except Archive items, which need a listing.
     pub fn source(&self) -> Option<FetchSource> {
         match self {
@@ -323,6 +345,26 @@ mod tests {
 
     fn link(text: &str) -> WebLink {
         web_link(text).unwrap().unwrap()
+    }
+
+    #[test]
+    fn links_name_their_site() {
+        for (text, site) in [
+            ("https://www.youtube.com/watch?v=aqz-KE-bpKQ", "YouTube"),
+            ("https://youtu.be/aqz-KE-bpKQ", "YouTube"),
+            ("https://m.youtube.com/shorts/abc", "YouTube"),
+            ("https://x.com/someone/status/1234567890", "X"),
+            ("https://mobile.twitter.com/someone/status/1", "X"),
+            ("https://vimeo.com/1084537", "Vimeo"),
+            ("https://www.example.com/clip.mp4", "example.com"),
+            ("https://notyoutube.com/watch", "notyoutube.com"),
+            (
+                "https://archive.org/details/night_of_the_living_dead",
+                "Internet Archive",
+            ),
+        ] {
+            assert_eq!(link(text).site(), site, "{text}");
+        }
     }
 
     #[test]
