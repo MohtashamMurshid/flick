@@ -1,5 +1,16 @@
+/// Positive parent/volume evidence saved for conservative missing-file reconciliation.
+/// Tokens are platform-specific; a changed or unknown token never proves deletion.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+pub struct FileLocation {
+    pub parent: String,
+    pub volume: String,
+}
+
 use anyhow::{Context, Result, ensure};
-use std::path::{Path, PathBuf};
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+};
 
 pub fn is_video(path: &Path) -> bool {
     path.extension().and_then(|v| v.to_str()).is_some_and(|v| {
@@ -208,28 +219,22 @@ pub struct Show {
 /// Groups recognized episodes by show, keeping each show's first-seen title.
 /// Shows are ordered by title; duplicate episode numbers keep library order.
 pub fn group_shows<'a>(paths: impl IntoIterator<Item = &'a Path>) -> Vec<Show> {
-    let mut shows: Vec<(String, Show)> = Vec::new();
+    let mut shows: Vec<Show> = Vec::new();
+    let mut indices = HashMap::new();
     for path in paths {
         let Some(episode) = parse_episode(path) else {
             continue;
         };
         let key = episode.show_key();
-        let index = match shows.iter().position(|(k, _)| *k == key) {
-            Some(index) => index,
-            None => {
-                shows.push((
-                    key,
-                    Show {
-                        title: episode.show.clone(),
-                        episodes: Vec::new(),
-                    },
-                ));
-                shows.len() - 1
-            }
-        };
-        shows[index].1.episodes.push((episode, path.to_owned()));
+        let index = *indices.entry(key).or_insert_with(|| {
+            shows.push(Show {
+                title: episode.show.clone(),
+                episodes: Vec::new(),
+            });
+            shows.len() - 1
+        });
+        shows[index].episodes.push((episode, path.to_owned()));
     }
-    let mut shows = shows.into_iter().map(|(_, show)| show).collect::<Vec<_>>();
     for show in &mut shows {
         show.episodes.sort_by_key(|(e, _)| (e.season, e.episode));
     }
@@ -384,6 +389,32 @@ mod tests {
         }
         let previous = next("/tv/Show.S01E03.mkv", -1).and_then(|p| parse_episode(&p));
         assert_eq!(previous.map(|e| e.label()).as_deref(), Some("S01E02"));
+    }
+
+    #[test]
+    fn keyed_grouping_preserves_first_spelling_and_exact_duplicate_order_at_scale() {
+        let mut paths = (0..5_000)
+            .rev()
+            .map(|i| PathBuf::from(format!("/tv/Series{i:05}.S01E01.mkv")))
+            .collect::<Vec<_>>();
+        let copies = [
+            "/tv/Élan.Show.S01E02.720p.mkv",
+            "/tv/élan_show S01E01.mkv",
+            "/tv/Élan Show S01E02.1080p.mkv",
+            "/tv/Élan.Show.S01E02.720p.mkv",
+        ]
+        .map(PathBuf::from);
+        paths.extend(copies.iter().cloned());
+        let shows = group_shows(paths.iter().map(PathBuf::as_path));
+        assert_eq!(shows.len(), 5_001);
+        assert_eq!(shows[0].title, "Series00000");
+        assert_eq!(shows[4_999].title, "Series04999");
+        let show = &shows[5_000];
+        assert_eq!(show.title, "Élan Show");
+        assert_eq!(
+            show.episodes.iter().map(|(_, p)| p).collect::<Vec<_>>(),
+            [&copies[1], &copies[0], &copies[2], &copies[3]]
+        );
     }
 
     #[test]

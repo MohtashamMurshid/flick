@@ -1,0 +1,63 @@
+{
+  "method": "Debug application, Xvfb/Openbox/Lavapipe/null audio, 1100x740, 1000 generated local hard-linked videos/history; XTest click to X11 sidebar pixel transition polled ~2ms, not physical display scanout. Uncontrolled CPU contention; old binary preserved before implementation. First baseline returns Home, remaining baseline and three new trials All Videos.",
+  "before": [
+    {
+      "elapsed_ms": 7124.343926087022,
+      "n": 1000,
+      "phase": "back_to_library_x11_pixel",
+      "last_old_sample_ms": 7117.973928106949,
+      "detected_color": "0x2e2e32",
+      "sample_count": 3177
+    },
+    {
+      "elapsed_ms": 15790.806492092088,
+      "n": 1000,
+      "phase": "back_to_library_x11_pixel",
+      "last_old_sample_ms": 15784.934623166919,
+      "detected_color": "0x2e2e32",
+      "sample_count": 6152
+    },
+    {
+      "elapsed_ms": 8726.147334091365,
+      "n": 1000,
+      "phase": "back_to_library_x11_pixel",
+      "last_old_sample_ms": 8722.522922093049,
+      "detected_color": "0x2e2e32",
+      "sample_count": 3656
+    },
+    {
+      "elapsed_ms": 20738.20544593036,
+      "n": 1000,
+      "phase": "back_to_library_x11_pixel",
+      "last_old_sample_ms": 20727.736020926386,
+      "detected_color": "0x2e2e32",
+      "sample_count": 6931
+    }
+  ],
+  "after": [
+    {
+      "elapsed_ms": 341.20152215473354,
+      "n": 1000,
+      "phase": "back_to_library_x11_pixel",
+      "last_old_sample_ms": 333.630315028131,
+      "detected_color": "0x2e2e32",
+      "sample_count": 142
+    },
+    {
+      "elapsed_ms": 258.8347119744867,
+      "n": 1000,
+      "phase": "back_to_library_x11_pixel",
+      "last_old_sample_ms": 255.1796599291265,
+      "detected_color": "0x2e2e32",
+      "sample_count": 115
+    },
+    {
+      "elapsed_ms": 348.7753758672625,
+      "n": 1000,
+      "phase": "back_to_library_x11_pixel",
+      "last_old_sample_ms": 343.07452593930066,
+      "detected_color": "0x2e2e32",
+      "sample_count": 150
+    }
+  ]
+}

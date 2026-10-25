@@ -100,12 +100,8 @@ impl Flick {
         radius: f32,
         cx: &Context<Self>,
     ) -> Div {
-        let video = self
-            .store
-            .data
-            .library
-            .iter()
-            .find(|video| video.path == path);
+        self.library_ui_state.record_visible_poster(path);
+        let video = self.store.data.video(path);
         let Some(poster) = video.and_then(|video| video.poster.clone()) else {
             return thumbnail(title, width, height, radius);
         };
@@ -124,6 +120,9 @@ impl Flick {
             .bg(rgb(0x000000))
             .child(
                 img(poster)
+                    .when_some(self.library_ui_state.posters.as_ref(), |image, cache| {
+                        image.image_cache(cache)
+                    })
                     .absolute()
                     .inset_0()
                     .size_full()

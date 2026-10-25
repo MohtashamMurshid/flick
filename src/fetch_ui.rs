@@ -46,6 +46,7 @@ struct Job {
     progress: FetchProgress,
     saved: Vec<PathBuf>,
     state: JobState,
+    removal_epoch: u64,
 }
 
 #[derive(PartialEq)]
@@ -162,6 +163,7 @@ impl Flick {
                 progress: FetchProgress::default(),
                 saved: Vec::new(),
                 state,
+                removal_epoch: self.library_removal_epoch,
             },
         );
         cx.notify();
@@ -177,14 +179,26 @@ impl Flick {
         }
     }
 
-    pub(super) fn fetch_event(&mut self, id: u64, update: FetchUpdate) {
+    pub(super) fn fetch_event(&mut self, id: u64, update: FetchUpdate, cx: &mut Context<Self>) {
         let Some(job) = self.fetches.jobs.iter_mut().find(|job| job.id == id) else {
             return;
         };
         match update {
             FetchUpdate::Title(title) => job.title = title,
             FetchUpdate::Progress(progress) => job.progress = progress,
-            FetchUpdate::Saved(path) => job.saved.push(path),
+            FetchUpdate::Saved(path) => {
+                let restore =
+                    self.removal_generations.get(&path).copied().unwrap_or(0) <= job.removal_epoch;
+                job.saved.push(path.clone());
+                if restore {
+                    self.library_files_restored([&path]);
+                    self.store.data.restore_video(&path);
+                    self.library_changed(cx);
+                    if let Err(error) = self.store.queue_save() {
+                        self.error = Some(format!("Could not save downloaded video: {error}"));
+                    }
+                }
+            }
             FetchUpdate::Done => job.state = JobState::Done,
             FetchUpdate::Failed(error) => job.state = JobState::Failed(error),
             FetchUpdate::Cancelled => self.fetches.jobs.retain(|job| job.id != id),

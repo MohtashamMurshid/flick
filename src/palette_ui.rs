@@ -162,7 +162,10 @@ impl Flick {
                     .library
                     .iter()
                     .rev()
-                    .filter(|video| matches(&video.title))
+                    .filter(|video| {
+                        let title = self.store.data.normalized_title(&video.path).unwrap_or("");
+                        words.iter().all(|word| title.contains(word))
+                    })
                     .take(LIBRARY_MATCHES)
                     .map(|video| (video.path.clone(), video.title.clone()))
                     .collect(),

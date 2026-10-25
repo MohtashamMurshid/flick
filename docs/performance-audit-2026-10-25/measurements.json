@@ -1,0 +1,408 @@
+{
+  "repo_head": "71587ecac24801d0d1eb3d67fe6dec9451034931",
+  "cpu_cores": 4,
+  "start_loadavg": [
+    9.06689453125,
+    9.05029296875,
+    6.2880859375
+  ],
+  "build": "release opt-level=3, bin LTO off; dependencies release; no desktop window",
+  "fixture": "generated 12s 1280x720 30fps H264/AAC; BGRA target 1920x1080",
+  "runs": [
+    [
+      {
+        "kind": "library_source_microbenchmark",
+        "n": 100,
+        "settings_bytes": 46357,
+        "save_including_fsync": {
+          "p50_ms": 5.735773,
+          "p95_ms": 7.16833,
+          "min_ms": 2.7147819999999996,
+          "max_ms": 7.16833,
+          "rounds": 9
+        },
+        "sort_and_unwatched_filter": {
+          "p50_ms": 7.286007,
+          "p95_ms": 12.980477,
+          "min_ms": 3.8599680000000003,
+          "max_ms": 12.980477,
+          "rounds": 9
+        },
+        "all_card_metadata_lookups_no_gpui": {
+          "p50_ms": 14.840921999999999,
+          "p95_ms": 19.185371,
+          "min_ms": 8.442006000000001,
+          "max_ms": 19.185371,
+          "rounds": 5
+        },
+        "group_shows": {
+          "p50_ms": 0.06022,
+          "p95_ms": 0.074081,
+          "min_ms": 0.054062,
+          "max_ms": 0.074081,
+          "rounds": 9
+        },
+        "continue_watching": {
+          "p50_ms": 2.34538,
+          "p95_ms": 2.829391,
+          "min_ms": 1.9653660000000002,
+          "max_ms": 2.829391,
+          "rounds": 5
+        },
+        "prototype_indexed_metadata_including_index_build": {
+          "p50_ms": 0.08264300000000001,
+          "p95_ms": 0.097396,
+          "min_ms": 0.073348,
+          "max_ms": 0.097396,
+          "rounds": 5
+        }
+      },
+      {
+        "kind": "library_source_microbenchmark",
+        "n": 1000,
+        "settings_bytes": 457357,
+        "save_including_fsync": {
+          "p50_ms": 13.128580000000001,
+          "p95_ms": 18.613596,
+          "min_ms": 9.762483000000001,
+          "max_ms": 18.613596,
+          "rounds": 9
+        },
+        "sort_and_unwatched_filter": {
+          "p50_ms": 355.18116399999997,
+          "p95_ms": 545.6276829999999,
+          "min_ms": 263.678945,
+          "max_ms": 545.6276829999999,
+          "rounds": 9
+        },
+        "all_card_metadata_lookups_no_gpui": {
+          "p50_ms": 552.861711,
+          "p95_ms": 689.076299,
+          "min_ms": 473.286823,
+          "max_ms": 689.076299,
+          "rounds": 5
+        },
+        "group_shows": {
+          "p50_ms": 0.5583940000000001,
+          "p95_ms": 0.620396,
+          "min_ms": 0.533776,
+          "max_ms": 0.620396,
+          "rounds": 9
+        },
+        "continue_watching": {
+          "p50_ms": 241.24915,
+          "p95_ms": 343.029178,
+          "min_ms": 211.59949699999999,
+          "max_ms": 343.029178,
+          "rounds": 5
+        },
+        "prototype_indexed_metadata_including_index_build": {
+          "p50_ms": 0.839284,
+          "p95_ms": 0.971393,
+          "min_ms": 0.74376,
+          "max_ms": 0.971393,
+          "rounds": 5
+        }
+      },
+      {
+        "kind": "external_deletion_reproduction",
+        "file_exists": false,
+        "library_count_after_reload": 1,
+        "library_count_after_clearing_library_only_and_saving": 1,
+        "history_count_after_reload": 1
+      },
+      {
+        "kind": "native_backend",
+        "player_init_ms": 333.724162,
+        "load_to_first_frame_received_ms": 456.211627,
+        "snapshot_playing": {
+          "p50_ms": 0.120561,
+          "p95_ms": 0.24548199999999998,
+          "min_ms": 0.09933,
+          "max_ms": 12.633999,
+          "rounds": 100
+        },
+        "two_pause_sets_and_two_snapshots": {
+          "p50_ms": 0.342342,
+          "p95_ms": 15.086275,
+          "min_ms": 0.25053,
+          "max_ms": 21.575713,
+          "rounds": 40
+        },
+        "snapshot_paused": {
+          "p50_ms": 0.125785,
+          "p95_ms": 1.9922009999999999,
+          "min_ms": 0.09315899999999999,
+          "max_ms": 9.207313,
+          "rounds": 100
+        },
+        "hwdec": null
+      }
+    ],
+    [
+      {
+        "kind": "library_source_microbenchmark",
+        "n": 100,
+        "settings_bytes": 46357,
+        "save_including_fsync": {
+          "p50_ms": 4.907884,
+          "p95_ms": 8.866276,
+          "min_ms": 2.716999,
+          "max_ms": 8.866276,
+          "rounds": 9
+        },
+        "sort_and_unwatched_filter": {
+          "p50_ms": 5.355495,
+          "p95_ms": 8.383985000000001,
+          "min_ms": 2.400134,
+          "max_ms": 8.383985000000001,
+          "rounds": 9
+        },
+        "all_card_metadata_lookups_no_gpui": {
+          "p50_ms": 4.647947,
+          "p95_ms": 9.775974,
+          "min_ms": 4.492343,
+          "max_ms": 9.775974,
+          "rounds": 5
+        },
+        "group_shows": {
+          "p50_ms": 0.05914,
+          "p95_ms": 0.07109499999999999,
+          "min_ms": 0.043891,
+          "max_ms": 0.07109499999999999,
+          "rounds": 9
+        },
+        "continue_watching": {
+          "p50_ms": 2.367566,
+          "p95_ms": 3.531129,
+          "min_ms": 1.962587,
+          "max_ms": 3.531129,
+          "rounds": 5
+        },
+        "prototype_indexed_metadata_including_index_build": {
+          "p50_ms": 0.09528500000000001,
+          "p95_ms": 0.10501999999999999,
+          "min_ms": 0.09114499999999999,
+          "max_ms": 0.10501999999999999,
+          "rounds": 5
+        }
+      },
+      {
+        "kind": "library_source_microbenchmark",
+        "n": 1000,
+        "settings_bytes": 457357,
+        "save_including_fsync": {
+          "p50_ms": 13.070425,
+          "p95_ms": 16.355057,
+          "min_ms": 9.930667000000001,
+          "max_ms": 16.355057,
+          "rounds": 9
+        },
+        "sort_and_unwatched_filter": {
+          "p50_ms": 342.592394,
+          "p95_ms": 528.675048,
+          "min_ms": 273.365435,
+          "max_ms": 528.675048,
+          "rounds": 9
+        },
+        "all_card_metadata_lookups_no_gpui": {
+          "p50_ms": 697.136817,
+          "p95_ms": 730.134414,
+          "min_ms": 585.354873,
+          "max_ms": 730.134414,
+          "rounds": 5
+        },
+        "group_shows": {
+          "p50_ms": 0.596953,
+          "p95_ms": 1.7895429999999999,
+          "min_ms": 0.512331,
+          "max_ms": 1.7895429999999999,
+          "rounds": 9
+        },
+        "continue_watching": {
+          "p50_ms": 236.596946,
+          "p95_ms": 292.501674,
+          "min_ms": 221.613869,
+          "max_ms": 292.501674,
+          "rounds": 5
+        },
+        "prototype_indexed_metadata_including_index_build": {
+          "p50_ms": 0.809624,
+          "p95_ms": 0.829589,
+          "min_ms": 0.779635,
+          "max_ms": 0.829589,
+          "rounds": 5
+        }
+      },
+      {
+        "kind": "external_deletion_reproduction",
+        "file_exists": false,
+        "library_count_after_reload": 1,
+        "library_count_after_clearing_library_only_and_saving": 1,
+        "history_count_after_reload": 1
+      },
+      {
+        "kind": "native_backend",
+        "player_init_ms": 271.017156,
+        "load_to_first_frame_received_ms": 275.204096,
+        "snapshot_playing": {
+          "p50_ms": 0.12394700000000002,
+          "p95_ms": 0.251136,
+          "min_ms": 0.097951,
+          "max_ms": 29.27159,
+          "rounds": 100
+        },
+        "two_pause_sets_and_two_snapshots": {
+          "p50_ms": 0.303058,
+          "p95_ms": 6.848611999999999,
+          "min_ms": 0.253965,
+          "max_ms": 8.705960000000001,
+          "rounds": 40
+        },
+        "snapshot_paused": {
+          "p50_ms": 0.109505,
+          "p95_ms": 0.8778279999999999,
+          "min_ms": 0.090887,
+          "max_ms": 25.70571,
+          "rounds": 100
+        },
+        "hwdec": null
+      }
+    ],
+    [
+      {
+        "kind": "library_source_microbenchmark",
+        "n": 100,
+        "settings_bytes": 46357,
+        "save_including_fsync": {
+          "p50_ms": 2.703017,
+          "p95_ms": 8.372424,
+          "min_ms": 2.119059,
+          "max_ms": 8.372424,
+          "rounds": 9
+        },
+        "sort_and_unwatched_filter": {
+          "p50_ms": 2.650604,
+          "p95_ms": 4.894457,
+          "min_ms": 2.304593,
+          "max_ms": 4.894457,
+          "rounds": 9
+        },
+        "all_card_metadata_lookups_no_gpui": {
+          "p50_ms": 5.873126,
+          "p95_ms": 9.998025,
+          "min_ms": 4.423336,
+          "max_ms": 9.998025,
+          "rounds": 5
+        },
+        "group_shows": {
+          "p50_ms": 0.055561,
+          "p95_ms": 0.067078,
+          "min_ms": 0.054703,
+          "max_ms": 0.067078,
+          "rounds": 9
+        },
+        "continue_watching": {
+          "p50_ms": 1.8755620000000002,
+          "p95_ms": 2.975445,
+          "min_ms": 1.8158720000000002,
+          "max_ms": 2.975445,
+          "rounds": 5
+        },
+        "prototype_indexed_metadata_including_index_build": {
+          "p50_ms": 0.081155,
+          "p95_ms": 0.083335,
+          "min_ms": 0.080651,
+          "max_ms": 0.083335,
+          "rounds": 5
+        }
+      },
+      {
+        "kind": "library_source_microbenchmark",
+        "n": 1000,
+        "settings_bytes": 457357,
+        "save_including_fsync": {
+          "p50_ms": 13.317091,
+          "p95_ms": 15.765397,
+          "min_ms": 9.936734,
+          "max_ms": 15.765397,
+          "rounds": 9
+        },
+        "sort_and_unwatched_filter": {
+          "p50_ms": 280.133003,
+          "p95_ms": 450.708667,
+          "min_ms": 254.67286099999998,
+          "max_ms": 450.708667,
+          "rounds": 9
+        },
+        "all_card_metadata_lookups_no_gpui": {
+          "p50_ms": 562.977462,
+          "p95_ms": 734.241733,
+          "min_ms": 410.02583999999996,
+          "max_ms": 734.241733,
+          "rounds": 5
+        },
+        "group_shows": {
+          "p50_ms": 0.519198,
+          "p95_ms": 0.6669729999999999,
+          "min_ms": 0.499247,
+          "max_ms": 0.6669729999999999,
+          "rounds": 9
+        },
+        "continue_watching": {
+          "p50_ms": 206.14316499999998,
+          "p95_ms": 238.595913,
+          "min_ms": 182.995475,
+          "max_ms": 238.595913,
+          "rounds": 5
+        },
+        "prototype_indexed_metadata_including_index_build": {
+          "p50_ms": 0.98916,
+          "p95_ms": 1.010932,
+          "min_ms": 0.80316,
+          "max_ms": 1.010932,
+          "rounds": 5
+        }
+      },
+      {
+        "kind": "external_deletion_reproduction",
+        "file_exists": false,
+        "library_count_after_reload": 1,
+        "library_count_after_clearing_library_only_and_saving": 1,
+        "history_count_after_reload": 1
+      },
+      {
+        "kind": "native_backend",
+        "player_init_ms": 153.808539,
+        "load_to_first_frame_received_ms": 171.42408700000001,
+        "snapshot_playing": {
+          "p50_ms": 0.118567,
+          "p95_ms": 0.633724,
+          "min_ms": 0.097593,
+          "max_ms": 18.216863,
+          "rounds": 100
+        },
+        "two_pause_sets_and_two_snapshots": {
+          "p50_ms": 0.346785,
+          "p95_ms": 2.365102,
+          "min_ms": 0.268801,
+          "max_ms": 2.421381,
+          "rounds": 40
+        },
+        "snapshot_paused": {
+          "p50_ms": 0.121292,
+          "p95_ms": 2.6013,
+          "min_ms": 0.097814,
+          "max_ms": 67.395343,
+          "rounds": 100
+        },
+        "hwdec": null
+      }
+    ]
+  ],
+  "end_loadavg": [
+    9.16259765625,
+    9.06494140625,
+    6.38037109375
+  ]
+}

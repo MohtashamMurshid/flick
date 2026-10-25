@@ -1,0 +1,85 @@
+[
+  {
+    "check": "fmt",
+    "command": [
+      "cargo",
+      "fmt",
+      "--all",
+      "--",
+      "--check"
+    ],
+    "exit_code": 0
+  },
+  {
+    "check": "actor-fmt",
+    "command": [
+      "cargo",
+      "fmt",
+      "--manifest-path",
+      "tests/playback_actor_backend/Cargo.toml",
+      "--all",
+      "--",
+      "--check"
+    ],
+    "exit_code": 0
+  },
+  {
+    "check": "clippy-desktop",
+    "command": [
+      "cargo",
+      "clippy",
+      "--locked",
+      "--all-targets",
+      "--",
+      "-D",
+      "warnings"
+    ],
+    "exit_code": 0
+  },
+  {
+    "check": "tests-desktop",
+    "command": [
+      "cargo",
+      "test",
+      "--locked",
+      "--all-targets"
+    ],
+    "exit_code": 0
+  },
+  {
+    "check": "clippy-backend",
+    "command": [
+      "cargo",
+      "clippy",
+      "--locked",
+      "--no-default-features",
+      "--all-targets",
+      "--",
+      "-D",
+      "warnings"
+    ],
+    "exit_code": 0
+  },
+  {
+    "check": "tests-backend",
+    "command": [
+      "cargo",
+      "test",
+      "--locked",
+      "--no-default-features",
+      "--all-targets"
+    ],
+    "exit_code": 0
+  },
+  {
+    "check": "build-desktop",
+    "command": [
+      "cargo",
+      "build",
+      "--locked",
+      "--bin",
+      "flick"
+    ],
+    "exit_code": 0
+  }
+]

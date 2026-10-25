@@ -1,7 +1,11 @@
 //! Native discovery adapters. Torlink ports are credited in THIRD_PARTY_NOTICES.md.
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
-use std::{collections::HashSet, time::Duration};
+use std::{
+    collections::{HashSet, VecDeque},
+    sync::{Mutex, OnceLock},
+    time::{Duration, Instant},
+};
 
 #[derive(Clone, Debug, Serialize)]
 pub struct SearchResult {
@@ -29,16 +33,60 @@ pub struct SearchResults {
     pub unavailable: Vec<String>,
 }
 
+const QUERY_CACHE_TTL: Duration = Duration::from_secs(30);
+const QUERY_CACHE_LIMIT: usize = 16;
+#[derive(Default)]
+struct QueryCache(VecDeque<(String, Instant, SearchResults)>);
+impl QueryCache {
+    fn get(&mut self, query: &str, now: Instant) -> Option<SearchResults> {
+        self.0
+            .retain(|(_, at, _)| now.saturating_duration_since(*at) < QUERY_CACHE_TTL);
+        self.0
+            .iter()
+            .find(|(q, _, _)| q == query)
+            .map(|(_, _, result)| result.clone())
+    }
+    fn insert(&mut self, query: &str, result: &SearchResults, now: Instant) {
+        if !result.unavailable.is_empty() {
+            return;
+        }
+        self.0.retain(|(q, _, _)| q != query);
+        while self.0.len() >= QUERY_CACHE_LIMIT {
+            self.0.pop_front();
+        }
+        self.0.push_back((query.to_owned(), now, result.clone()));
+    }
+}
+static QUERY_CACHE: Mutex<QueryCache> = Mutex::new(QueryCache(VecDeque::new()));
+
+fn search_client() -> Result<reqwest::Client> {
+    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    if let Some(client) = CLIENT.get() {
+        return Ok(client.clone());
+    }
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(12))
+        .user_agent(concat!("Flick/", env!("CARGO_PKG_VERSION")))
+        .build()?;
+    let _ = CLIENT.set(client.clone());
+    Ok(CLIENT.get().cloned().unwrap_or(client))
+}
+
 pub async fn search(query: &str, mut publish: impl FnMut(SearchResults)) -> Result<SearchResults> {
     let query = query.trim();
     ensure!(
         query.chars().count() >= 3,
         "Type at least 3 characters to search online"
     );
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(12))
-        .user_agent(concat!("Flick/", env!("CARGO_PKG_VERSION")))
-        .build()?;
+    if let Some(cached) = QUERY_CACHE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(query, Instant::now())
+    {
+        publish(cached.clone());
+        return Ok(cached);
+    }
+    let client = search_client()?;
     let mut jobs = tokio::task::JoinSet::new();
     for provider in ["TPB", "Internet Archive", "YTS"] {
         let client = client.clone();
@@ -75,6 +123,10 @@ pub async fn search(query: &str, mut publish: impl FnMut(SearchResults)) -> Resu
             .sort_by_key(|item| std::cmp::Reverse(item.seeders));
         publish(result.clone());
     }
+    QUERY_CACHE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(query, &result, Instant::now());
     Ok(result)
 }
 async fn bounded<T>(future: impl std::future::Future<Output = Result<T>>) -> Result<T> {
@@ -311,6 +363,26 @@ mod tests {
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].name, "Fallback result");
         Ok(())
+    }
+
+    #[test]
+    fn query_cache_is_bounded_expires_and_never_caches_failed_sources() {
+        let mut cache = QueryCache::default();
+        let now = Instant::now();
+        let result = SearchResults::default();
+        for n in 0..100 {
+            cache.insert(&format!("query-{n}"), &result, now);
+        }
+        assert_eq!(cache.0.len(), QUERY_CACHE_LIMIT);
+        assert!(cache.get("query-0", now).is_none());
+        assert!(cache.get("query-99", now).is_some());
+        let failed = SearchResults {
+            unavailable: vec!["offline".into()],
+            ..Default::default()
+        };
+        cache.insert("failed", &failed, now);
+        assert!(cache.get("failed", now).is_none());
+        assert!(cache.get("query-99", now + QUERY_CACHE_TTL).is_none());
     }
 
     #[test]

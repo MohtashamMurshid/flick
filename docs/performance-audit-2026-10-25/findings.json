@@ -1,0 +1,122 @@
+[
+  {
+    "p": "P0",
+    "area": "Navigation & settings",
+    "title": "Back waits for durable disk writes",
+    "fact": "Before switching views, Back runs persist(), then pause with a second full player snapshot. Each snapshot performs 13 synchronous property reads. save_to clones and sanitizes the entire settings object, serializes it, writes a temporary file, fsyncs and renames it.",
+    "source": "src/ui.rs:638, 1071, 1139 · src/store.rs:548 · src/playback.rs:719",
+    "fix": "Use cached player state for an immediate view transition; queue ordered pause/save work. Add a single coalescing writer with generation ordering, atomic replacement, write-error reporting and a shutdown flush. Never move the existing !Send Player into arbitrary background tasks.",
+    "verify": "Instrument click → first painted library frame, save subspans and p95/p99 frame gaps. Test newest-save-wins, atomic replacement, quit flush, PiP and resume.",
+    "confidence": "Confirmed code; Back end-to-end latency remains unmeasured."
+  },
+  {
+    "p": "P0",
+    "area": "Library & local search",
+    "title": "Quadratic metadata work on every rebuild",
+    "fact": "watched(), resume_position(), video_detail() and poster() repeatedly search library/history vectors. Continue Watching also scans history through resume_position. All Videos, History and Shows build their full item trees; Home scans all entries even though it only displays a few.",
+    "source": "src/store.rs:260, 341, 383 · src/library_ui.rs:1036, 1440, 1574, 1818 · src/chrome_ui.rs:103",
+    "fix": "Maintain path/history/torrent identity indexes and precomputed lowercase titles; cache filtered/sorted data by revision. Stop Home iterators once enough visible matches are found. Virtualize lists and grid rows with stable IDs, keyboard focus and scroll restoration.",
+    "verify": "Release builds with 100/1k/5k/10k entries: typing latency, Back-to-paint, scroll frame time, RSS and cold/warm image loads.",
+    "confidence": "Measured source-helper bottleneck; prototype is fixture-specific, not a shipped app speedup."
+  },
+  {
+    "p": "P0",
+    "area": "Deletion correctness",
+    "title": "Deleted files stay visible and records can reappear",
+    "fact": "The displayed library comes from settings and has no file-deletion watcher/reconciliation. The context menu lacks Delete. sanitize() repopulates library from history, periodic remember() can re-add the open file, and completion events can re-add removed paths.",
+    "source": "src/store.rs:177, 196, 433 · src/library_ui.rs:159, 1123 · src/ui.rs:1046",
+    "fix": "Add visible Delete/Move to Trash and Remove from Library actions, with coherent library/history/torrent updates and entry generations or durable removal markers. Reconcile external deletions off the UI thread on focus/startup and through coalesced file events. Treat offline volumes and permission errors separately from a confirmed deletion.",
+    "verify": "Delete while playing, from each view and externally; restart; late thumbnail/download events; restored file; offline volume; failed deletion. Verify no resurrection and no UI filesystem scan.",
+    "confidence": "Reproduced interactively and with actual Store save/reload."
+  },
+  {
+    "p": "P1",
+    "area": "PiP & render invalidation",
+    "title": "Every video frame invalidates the main library",
+    "fact": "present() calls cx.notify() on the root Flick entity and PiP observes that entity. With PiP active and the library visible, video frame updates rebuild unrelated library content.",
+    "source": "src/ui.rs:543, 591, 1661 · src/pip_ui.rs:128",
+    "fix": "Separate the video frame/surface entity from library, player controls and transfer state. Notify only the affected surface; isolate the timeline too if profiling supports it.",
+    "verify": "Count library renders per second during PiP and compare CPU/RSS at 1k/5k entries. Preserve track, control and pause updates.",
+    "confidence": "Confirmed dependency graph; CPU gain not measured."
+  },
+  {
+    "p": "P1",
+    "area": "Memory & video delivery",
+    "title": "Full-size frames use an unbounded queue",
+    "fact": "The background renderer sends fresh BGRA buffers through an unbounded channel; the UI drops older frames only when it runs again. A 3840×2160 frame is 31.6 MiB, so a blocked UI can accumulate substantial data. The last video and hover images remain after Back.",
+    "source": "src/playback.rs:895, 1036, 1122 · src/ui.rs:519, 565, 1140",
+    "fix": "Use a bounded latest-frame mailbox with generation checks and no blocking dependency on the render thread. Explore a small reclaimable buffer pool after confirming GPUI image ownership. Release/idle hidden resources according to Back/Return and PiP behavior.",
+    "verify": "Stall the UI deliberately; require bounded queued frames, no stale frames, no producer deadlock and stable RSS through repeated open/Back/PiP cycles.",
+    "confidence": "Unbounded capacity confirmed; queue/RSS growth not measured."
+  },
+  {
+    "p": "P1",
+    "area": "Idle CPU & background updates",
+    "title": "Unchanged state still triggers scans, saves and repaints",
+    "fact": "tick scans the whole library for posters every 50 ms playing or 150 ms paused. A retained path causes full settings saves every 5 seconds even in the library. Transfer snapshots are sent every 700 ms whether they changed; the seeding-policy loop wakes every 250 ms.",
+    "source": "src/ui.rs:815, 892, 1046 · src/services.rs:326, 406 · src/torrent.rs:302",
+    "fix": "Track dirty state, queue only missing posters when library state changes, cache incomplete-path sets, diff transfer snapshots and route notifications to interested views. Use wake events plus a low-frequency maintenance timer while idle.",
+    "verify": "After first watch, measure 10 minutes idle with no transfers, paused transfers and PiP. Count saves, wakeups and view renders; target zero unchanged settings writes.",
+    "confidence": "Confirmed cadence and work; sustained idle CPU/power not measured."
+  },
+  {
+    "p": "P1",
+    "area": "Startup & opening files",
+    "title": "First paint and local opening wait on unrelated work",
+    "fact": "Flick::new initializes libmpv and checks each poster path on the UI thread. open() gates all files on transfers_known; the services worker restores its saved transfer session before entering its command loop. Restored torrent rechecks can also compete for disk/CPU.",
+    "source": "src/ui.rs:369, 490, 675 · src/services.rs:300, 330 · src/torrent.rs:1230",
+    "fix": "Paint the shell first, initialize playback with explicit ownership off the critical UI path, validate posters asynchronously, and classify known local files without waiting for unrelated transfer initialization. Preserve verified-piece reads and rechecks for claimed torrent content.",
+    "verify": "Cold/warm launch and open-to-first-frame with empty/large libraries and 0/1/10 local saved transfers. Do not assume Session::start awaits every content hash; initialization and checking must be measured separately.",
+    "confidence": "Code gating confirmed; startup impact with saved transfers unmeasured."
+  },
+  {
+    "p": "P2",
+    "area": "Playback controls & scrubbing",
+    "title": "Commands repeatedly fetch all state; drag seeks are exact",
+    "fact": "Every command/property update fetches a full snapshot, including track and chapter JSON. Regular polling repeats it about every 200 ms. Each timeline mouse move issues an exact seek and also requests a separate hover decode.",
+    "source": "src/playback.rs:719 · src/ui.rs:987, 1061, 1550 · src/player_ui.rs:560",
+    "fix": "Observe player properties or split frequently changing scalar state from tracks/chapters. Coalesce seeks; use a responsive drag preview with a final exact seek on release, preserving paused-seek semantics. Cancel superseded hover work.",
+    "verify": "Rapid scrubs on long-GOP media, keyboard repeats, paused seeks and streamed local fixtures; measure last-input-to-stable-frame and queue age.",
+    "confidence": "Confirmed call paths; native helper timings measured, full seek latency unmeasured."
+  },
+  {
+    "p": "P2",
+    "area": "Posters, previews & caches",
+    "title": "Offscreen posters and abandoned decoders retain work",
+    "fact": "All cards create img(path) requests without an app-supplied bounded image cache. GPUI caches loaded assets; Flick never calls remove_asset. Poster filenames include mtime/size with no quota/cleanup. Hover preview keeps its last file/player open and only skips requests before starting decode.",
+    "source": "src/chrome_ui.rs:103 · src/thumbnails.rs:50, 126, 249 · GPUI 0.2.2 app.rs:1997 and elements/img.rs",
+    "fix": "Prioritize visible posters, bound decoded-image and disk caches, purge replaced/deleted poster artifacts, cancel stale preview work and idle-close preview decoders. Schedule poster extraction to avoid starving playback.",
+    "verify": "RSS and disk-cache size after thousands of posters, repeated replacements/deletions and long playback; cancel a slow preview/poster and verify bounded shutdown.",
+    "confidence": "Code/cache ownership confirmed; memory totals and cache hit rates unmeasured."
+  },
+  {
+    "p": "P2",
+    "area": "Shows, imports & search",
+    "title": "Derived data is repeatedly rebuilt",
+    "fact": "group_shows reparses filenames and searches the accumulated shows vector each call; Shows and adjacent_episode rebuild grouping. File-picker multi-import canonicalizes each path on the UI thread, while folder scans already run in the background. Online search already streams results from concurrent providers but creates a client for each query.",
+    "source": "src/library.rs:28, 210, 243 · src/library_ui.rs:12, 238, 1641 · src/catalog.rs:32",
+    "fix": "Cache episode parsing/grouping by library revision, use a keyed show index, background batched file validation, and reuse network clients/short-lived query caches where valid. Preserve streamed provider results and cancellation.",
+    "verify": "Many-show libraries, 10k-file imports, search type-to-paint and cancelled/repeated queries. Separate local UI delay from provider response time.",
+    "confidence": "Code confirmed; provider, network and import timings unmeasured."
+  },
+  {
+    "p": "P2",
+    "area": "HTTP downloads & transfer snapshots",
+    "title": "Resume rereads data even when no hash is needed",
+    "fact": "Part::open reads a partial file to EOF even when hash=false; it could use metadata length and seek. Hashing existing copies and rebuilding required checksums lack cancellation inside the read loop. Transfer snapshots repeatedly clone paths and check selected files through vector membership.",
+    "source": "src/fetch/http.rs:125, 376, 400 · src/torrent.rs:558, 581 · src/services.rs:406",
+    "fix": "Use metadata length for checksum-free resume, retain hashing when required, add cancellation checkpoints, diff/reuse immutable transfer metadata and use selection sets. Consider bounded multi-file concurrency only after measuring disk and server limits.",
+    "verify": "Generated partial files and loopback HTTP; explicit loopback torrent peers only. Measure resume setup separately from throughput, cancellation and integrity. Never disable checksums/rechecks or promise a faster external network.",
+    "confidence": "Unnecessary read confirmed; download/transfer throughput not benchmarked."
+  },
+  {
+    "p": "P2",
+    "area": "Rendering architecture & shutdown",
+    "title": "Software rendering and blocking worker joins need separate work",
+    "fact": "Software output scales/composes at physical target resolution, allocates each frame and sets alpha; GPUI then uploads it. Drop implementations join preview, poster, renderer and service threads, while inner operations can wait for decode/I/O deadlines.",
+    "source": "src/playback.rs:578, 1122, 1177, 1237 · src/thumbnails.rs:96, 183 · src/services.rs:284, 563",
+    "fix": "Profile decode/scale/upload independently; preserve resolution, color and subtitle sharpness. Benchmark safe copy/alpha fusion and buffer reuse. Prototype native GPU integration separately because current GPUI interop is limited. Add cooperative cancellation and a bounded shutdown protocol.",
+    "verify": "Release 1080p/4K hardware runs, frame-time distributions, dropped frames, paused CPU and power; quit during slow reads/preview/download. No GPU or zero-copy speedup is claimed here.",
+    "confidence": "Architecture/lifecycle confirmed; device-specific render and shutdown gains unmeasured."
+  }
+]

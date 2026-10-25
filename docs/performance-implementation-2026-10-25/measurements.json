@@ -1,0 +1,429 @@
+{
+  "build": "release opt-level=3, bin LTO off; no desktop window",
+  "start_loadavg": [
+    3.6845703125,
+    5.0615234375,
+    9.27587890625
+  ],
+  "runs": [
+    [
+      {
+        "kind": "implemented_library_apis",
+        "n": 100,
+        "sync_save_unchanged": {
+          "p50_ms": 0.324966,
+          "p95_ms": 0.507456,
+          "rounds": 9
+        },
+        "queue_changed_settings_ui_work": {
+          "p50_ms": 0.071406,
+          "p95_ms": 0.12996000000000002,
+          "rounds": 9
+        },
+        "sort_and_unwatched_filter": {
+          "p50_ms": 0.033906,
+          "p95_ms": 0.07333,
+          "rounds": 9
+        },
+        "all_card_metadata_lookups_no_gpui": {
+          "p50_ms": 0.084949,
+          "p95_ms": 0.100709,
+          "rounds": 9
+        },
+        "continue_watching": {
+          "p50_ms": 0.031238000000000002,
+          "p95_ms": 0.036476,
+          "rounds": 9
+        },
+        "cached_shows": {
+          "p50_ms": 3.5000000000000004e-05,
+          "p95_ms": 6.400000000000001e-05,
+          "rounds": 9
+        }
+      },
+      {
+        "kind": "implemented_library_apis",
+        "n": 1000,
+        "sync_save_unchanged": {
+          "p50_ms": 2.464639,
+          "p95_ms": 4.610826,
+          "rounds": 9
+        },
+        "queue_changed_settings_ui_work": {
+          "p50_ms": 0.718359,
+          "p95_ms": 1.167317,
+          "rounds": 9
+        },
+        "sort_and_unwatched_filter": {
+          "p50_ms": 0.32567799999999997,
+          "p95_ms": 0.35207700000000003,
+          "rounds": 9
+        },
+        "all_card_metadata_lookups_no_gpui": {
+          "p50_ms": 0.8517750000000001,
+          "p95_ms": 0.881735,
+          "rounds": 9
+        },
+        "continue_watching": {
+          "p50_ms": 0.314554,
+          "p95_ms": 0.470547,
+          "rounds": 9
+        },
+        "cached_shows": {
+          "p50_ms": 3.5000000000000004e-05,
+          "p95_ms": 8.4e-05,
+          "rounds": 9
+        }
+      },
+      {
+        "kind": "implemented_library_apis",
+        "n": 5000,
+        "sync_save_unchanged": {
+          "p50_ms": 10.5789,
+          "p95_ms": 20.400772,
+          "rounds": 9
+        },
+        "queue_changed_settings_ui_work": {
+          "p50_ms": 3.94959,
+          "p95_ms": 6.407482,
+          "rounds": 9
+        },
+        "sort_and_unwatched_filter": {
+          "p50_ms": 1.871164,
+          "p95_ms": 1.95148,
+          "rounds": 9
+        },
+        "all_card_metadata_lookups_no_gpui": {
+          "p50_ms": 4.680896000000001,
+          "p95_ms": 4.801251000000001,
+          "rounds": 9
+        },
+        "continue_watching": {
+          "p50_ms": 1.841003,
+          "p95_ms": 1.910019,
+          "rounds": 9
+        },
+        "cached_shows": {
+          "p50_ms": 3.5000000000000004e-05,
+          "p95_ms": 8.900000000000001e-05,
+          "rounds": 9
+        }
+      },
+      {
+        "kind": "implemented_library_apis",
+        "n": 20000,
+        "sync_save_unchanged": {
+          "p50_ms": 83.690025,
+          "p95_ms": 138.052976,
+          "rounds": 9
+        },
+        "queue_changed_settings_ui_work": {
+          "p50_ms": 33.109331,
+          "p95_ms": 48.23840800000001,
+          "rounds": 9
+        },
+        "sort_and_unwatched_filter": {
+          "p50_ms": 17.900694,
+          "p95_ms": 21.629901999999998,
+          "rounds": 9
+        },
+        "all_card_metadata_lookups_no_gpui": {
+          "p50_ms": 45.283449000000005,
+          "p95_ms": 62.732961,
+          "rounds": 9
+        },
+        "continue_watching": {
+          "p50_ms": 18.541912,
+          "p95_ms": 41.432297999999996,
+          "rounds": 9
+        },
+        "cached_shows": {
+          "p50_ms": 4.8e-05,
+          "p95_ms": 0.000308,
+          "rounds": 9
+        }
+      }
+    ],
+    [
+      {
+        "kind": "implemented_library_apis",
+        "n": 100,
+        "sync_save_unchanged": {
+          "p50_ms": 0.444979,
+          "p95_ms": 3.470653,
+          "rounds": 9
+        },
+        "queue_changed_settings_ui_work": {
+          "p50_ms": 0.068606,
+          "p95_ms": 0.086169,
+          "rounds": 9
+        },
+        "sort_and_unwatched_filter": {
+          "p50_ms": 0.055627,
+          "p95_ms": 0.085203,
+          "rounds": 9
+        },
+        "all_card_metadata_lookups_no_gpui": {
+          "p50_ms": 0.160602,
+          "p95_ms": 2.243832,
+          "rounds": 9
+        },
+        "continue_watching": {
+          "p50_ms": 0.071939,
+          "p95_ms": 0.082635,
+          "rounds": 9
+        },
+        "cached_shows": {
+          "p50_ms": 5.9999999999999995e-05,
+          "p95_ms": 9.7e-05,
+          "rounds": 9
+        }
+      },
+      {
+        "kind": "implemented_library_apis",
+        "n": 1000,
+        "sync_save_unchanged": {
+          "p50_ms": 4.4190439999999995,
+          "p95_ms": 5.174476,
+          "rounds": 9
+        },
+        "queue_changed_settings_ui_work": {
+          "p50_ms": 0.818739,
+          "p95_ms": 2.9210960000000004,
+          "rounds": 9
+        },
+        "sort_and_unwatched_filter": {
+          "p50_ms": 0.676725,
+          "p95_ms": 4.128209,
+          "rounds": 9
+        },
+        "all_card_metadata_lookups_no_gpui": {
+          "p50_ms": 1.8288,
+          "p95_ms": 1.879422,
+          "rounds": 9
+        },
+        "continue_watching": {
+          "p50_ms": 0.725996,
+          "p95_ms": 0.740471,
+          "rounds": 9
+        },
+        "cached_shows": {
+          "p50_ms": 5.8e-05,
+          "p95_ms": 0.000134,
+          "rounds": 9
+        }
+      },
+      {
+        "kind": "implemented_library_apis",
+        "n": 5000,
+        "sync_save_unchanged": {
+          "p50_ms": 20.558989,
+          "p95_ms": 33.339985000000006,
+          "rounds": 9
+        },
+        "queue_changed_settings_ui_work": {
+          "p50_ms": 3.5913049999999997,
+          "p95_ms": 9.21631,
+          "rounds": 9
+        },
+        "sort_and_unwatched_filter": {
+          "p50_ms": 3.435373,
+          "p95_ms": 3.777171,
+          "rounds": 9
+        },
+        "all_card_metadata_lookups_no_gpui": {
+          "p50_ms": 7.575613,
+          "p95_ms": 9.656013,
+          "rounds": 9
+        },
+        "continue_watching": {
+          "p50_ms": 3.607718,
+          "p95_ms": 4.064864,
+          "rounds": 9
+        },
+        "cached_shows": {
+          "p50_ms": 3.5000000000000004e-05,
+          "p95_ms": 0.000102,
+          "rounds": 9
+        }
+      },
+      {
+        "kind": "implemented_library_apis",
+        "n": 20000,
+        "sync_save_unchanged": {
+          "p50_ms": 189.95907,
+          "p95_ms": 277.170148,
+          "rounds": 9
+        },
+        "queue_changed_settings_ui_work": {
+          "p50_ms": 17.298713,
+          "p95_ms": 31.696039000000003,
+          "rounds": 9
+        },
+        "sort_and_unwatched_filter": {
+          "p50_ms": 20.131593,
+          "p95_ms": 33.407818999999996,
+          "rounds": 9
+        },
+        "all_card_metadata_lookups_no_gpui": {
+          "p50_ms": 38.084892,
+          "p95_ms": 50.995602,
+          "rounds": 9
+        },
+        "continue_watching": {
+          "p50_ms": 9.68501,
+          "p95_ms": 9.774173000000001,
+          "rounds": 9
+        },
+        "cached_shows": {
+          "p50_ms": 4e-05,
+          "p95_ms": 0.000141,
+          "rounds": 9
+        }
+      }
+    ],
+    [
+      {
+        "kind": "implemented_library_apis",
+        "n": 100,
+        "sync_save_unchanged": {
+          "p50_ms": 0.310661,
+          "p95_ms": 0.441408,
+          "rounds": 9
+        },
+        "queue_changed_settings_ui_work": {
+          "p50_ms": 0.080746,
+          "p95_ms": 0.105041,
+          "rounds": 9
+        },
+        "sort_and_unwatched_filter": {
+          "p50_ms": 0.032268,
+          "p95_ms": 0.032848999999999996,
+          "rounds": 9
+        },
+        "all_card_metadata_lookups_no_gpui": {
+          "p50_ms": 0.083421,
+          "p95_ms": 0.11056300000000001,
+          "rounds": 9
+        },
+        "continue_watching": {
+          "p50_ms": 0.030528999999999997,
+          "p95_ms": 0.041967,
+          "rounds": 9
+        },
+        "cached_shows": {
+          "p50_ms": 3.5000000000000004e-05,
+          "p95_ms": 5.7e-05,
+          "rounds": 9
+        }
+      },
+      {
+        "kind": "implemented_library_apis",
+        "n": 1000,
+        "sync_save_unchanged": {
+          "p50_ms": 2.509879,
+          "p95_ms": 4.520987,
+          "rounds": 9
+        },
+        "queue_changed_settings_ui_work": {
+          "p50_ms": 0.723217,
+          "p95_ms": 1.575078,
+          "rounds": 9
+        },
+        "sort_and_unwatched_filter": {
+          "p50_ms": 0.338914,
+          "p95_ms": 0.36076400000000003,
+          "rounds": 9
+        },
+        "all_card_metadata_lookups_no_gpui": {
+          "p50_ms": 0.906121,
+          "p95_ms": 1.205525,
+          "rounds": 9
+        },
+        "continue_watching": {
+          "p50_ms": 0.327229,
+          "p95_ms": 0.35191500000000003,
+          "rounds": 9
+        },
+        "cached_shows": {
+          "p50_ms": 3.6e-05,
+          "p95_ms": 6.599999999999999e-05,
+          "rounds": 9
+        }
+      },
+      {
+        "kind": "implemented_library_apis",
+        "n": 5000,
+        "sync_save_unchanged": {
+          "p50_ms": 11.669362000000001,
+          "p95_ms": 15.174488,
+          "rounds": 9
+        },
+        "queue_changed_settings_ui_work": {
+          "p50_ms": 3.040385,
+          "p95_ms": 6.770531,
+          "rounds": 9
+        },
+        "sort_and_unwatched_filter": {
+          "p50_ms": 1.8991559999999998,
+          "p95_ms": 2.295898,
+          "rounds": 9
+        },
+        "all_card_metadata_lookups_no_gpui": {
+          "p50_ms": 4.533283,
+          "p95_ms": 5.537456,
+          "rounds": 9
+        },
+        "continue_watching": {
+          "p50_ms": 2.106507,
+          "p95_ms": 2.918631,
+          "rounds": 9
+        },
+        "cached_shows": {
+          "p50_ms": 3.5000000000000004e-05,
+          "p95_ms": 9.999999999999999e-05,
+          "rounds": 9
+        }
+      },
+      {
+        "kind": "implemented_library_apis",
+        "n": 20000,
+        "sync_save_unchanged": {
+          "p50_ms": 66.975581,
+          "p95_ms": 102.83221900000001,
+          "rounds": 9
+        },
+        "queue_changed_settings_ui_work": {
+          "p50_ms": 15.607278,
+          "p95_ms": 25.805701,
+          "rounds": 9
+        },
+        "sort_and_unwatched_filter": {
+          "p50_ms": 17.282746000000003,
+          "p95_ms": 17.639888,
+          "rounds": 9
+        },
+        "all_card_metadata_lookups_no_gpui": {
+          "p50_ms": 29.203673,
+          "p95_ms": 50.934481,
+          "rounds": 9
+        },
+        "continue_watching": {
+          "p50_ms": 18.787076,
+          "p95_ms": 21.493495000000003,
+          "rounds": 9
+        },
+        "cached_shows": {
+          "p50_ms": 3.6e-05,
+          "p95_ms": 0.000148,
+          "rounds": 9
+        }
+      }
+    ]
+  ],
+  "end_loadavg": [
+    4.20751953125,
+    5.12548828125,
+    9.2509765625
+  ]
+}
