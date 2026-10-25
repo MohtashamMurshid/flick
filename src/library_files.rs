@@ -1655,7 +1655,9 @@ mod tests {
     use tempfile::TempDir;
 
     fn fixture() -> (TempDir, PathBuf, Entry) {
-        let temp = tempfile::tempdir().unwrap();
+        // Match canonical picker/folder imports and native watcher event paths
+        // (macOS temp directories can be reached via /var and /private/var).
+        let temp = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
         let path = temp.path().join("generated.mp4");
         fs::write(&path, b"generated local media fixture").unwrap();
         let entry = Entry::new(TrackedFile {
@@ -1963,6 +1965,25 @@ mod tests {
         let replacement = path.with_extension("replacement");
         fs::write(&replacement, b"different bytes").unwrap();
         fs::rename(replacement, &path).unwrap();
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::FileTimesExt;
+            // Windows identity uses creation time. Set it after the rename so
+            // timestamp granularity/file tunneling cannot alias the old file.
+            let created = entry.baseline.as_ref().unwrap().identity.created.unwrap()
+                + Duration::from_secs(60);
+            fs::OpenOptions::new()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_times(fs::FileTimes::new().set_created(created))
+                .unwrap();
+        }
+        assert_ne!(
+            entry.baseline.as_ref().unwrap().identity,
+            Identity::of(&fs::metadata(&path).unwrap()),
+            "replacement fixture must have a distinct filesystem identity"
+        );
         assert_eq!(
             check(&mut entry, now),
             Some(Change::Metadata {
@@ -1988,7 +2009,9 @@ mod tests {
         let now = Instant::now();
         check(&mut entry, now);
         let modified = entry.baseline.as_ref().unwrap().modified.unwrap() + Duration::from_secs(2);
-        fs::File::open(&path)
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
             .unwrap()
             .set_times(fs::FileTimes::new().set_modified(modified))
             .unwrap();

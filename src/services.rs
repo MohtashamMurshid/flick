@@ -1248,10 +1248,28 @@ async fn fetch_job(
 mod tests {
     use super::*;
 
+    // Keep fixture spellings distinct from engine identities on Unix too.
+    // The alias is an ancestor, so the shared files themselves stay regular.
+    fn path_alias_fixture() -> anyhow::Result<(tempfile::TempDir, tempfile::TempDir)> {
+        let parent = tempfile::tempdir()?;
+        let directory = parent.path().join("actual");
+        std::fs::create_dir(&directory)?;
+        #[cfg(unix)]
+        let directory = {
+            let alias = parent.path().join("alias");
+            std::os::unix::fs::symlink(&directory, &alias)?;
+            alias
+        };
+        let root = tempfile::tempdir_in(directory)?;
+        #[cfg(unix)]
+        assert_ne!(root.path(), root.path().canonicalize()?);
+        Ok((parent, root))
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn readiness_and_acceptance_republish_unchanged_snapshots_with_expected_completions()
     -> anyhow::Result<()> {
-        let root = tempfile::tempdir()?;
+        let (_fixture, root) = path_alias_fixture()?;
         let source = root.path().join("complete.mp4");
         std::fs::write(&source, vec![41; 65_537])?;
         let config =
@@ -1287,7 +1305,7 @@ mod tests {
         let unchanged = session.snapshots()?;
         progress.accept_download(&DownloadAcceptance {
             infohash: shared.infohash.clone(),
-            selected: vec![(source.clone(), 0)],
+            selected: vec![(source.canonicalize()?, 0)],
         });
         assert_eq!(session.snapshots()?, unchanged);
         progress.publish(&session, &events, true)?;
@@ -2008,7 +2026,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn deleted_output_retains_boundary_before_recreating_unverified_files()
     -> anyhow::Result<()> {
-        let root = tempfile::tempdir()?;
+        let (_fixture, root) = path_alias_fixture()?;
         let parent = root.path().join("owned");
         let output = parent.join("removed-output");
         std::fs::create_dir_all(&output)?;
@@ -2018,6 +2036,7 @@ mod tests {
         let seed = TransferSession::start(config.clone()).await?;
         seed.share(&output, vec![]).await?;
         seed.stop().await;
+        let canonical_output = output.canonicalize()?;
         std::fs::remove_dir_all(&output)?;
         let local = root.path().join("local.mp4");
         std::fs::write(&local, b"independent local fixture")?;
@@ -2031,7 +2050,7 @@ mod tests {
                     Ok(Event::TransferRoots(roots)) => {
                         assert_eq!(roots, vec![parent.canonicalize()?]);
                         assert!(!local.canonicalize()?.starts_with(&roots[0]));
-                        assert!(output.starts_with(&roots[0]));
+                        assert!(canonical_output.starts_with(&roots[0]));
                         boundary = true;
                     }
                     Ok(Event::Progress(progress)) => {
@@ -2191,7 +2210,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn accepted_download_precedes_completion_uses_actual_paths_and_rearms_explicit_repeats()
     -> anyhow::Result<()> {
-        let root = tempfile::tempdir()?;
+        let (_fixture, root) = path_alias_fixture()?;
         let config = |name: &str| {
             TransferConfig::local(
                 root.path().join(format!("{name}-downloads")),
@@ -2247,8 +2266,10 @@ mod tests {
                                 assert!(accepted.is_none(), "Duplicate acceptance in one round");
                                 assert_eq!(infohash, resolved.infohash);
                                 assert_eq!(selected.len(), 2);
+                                let original_destination =
+                                    original_folder.canonicalize()?.join(&infohash);
                                 assert!(selected.iter().all(|(path, _)| {
-                                    path.starts_with(original_folder.join(&infohash))
+                                    path.starts_with(&original_destination)
                                         && flick::library::is_video(path)
                                 }));
                                 accepted = Some(selected.into_iter().collect::<HashSet<_>>());
