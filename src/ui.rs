@@ -2,6 +2,8 @@
 mod chrome_ui;
 #[path = "fetch_ui.rs"]
 mod fetch_ui;
+#[path = "library_files_ui.rs"]
+mod library_files_ui;
 #[path = "library_ui.rs"]
 mod library_ui;
 #[path = "palette_ui.rs"]
@@ -17,11 +19,13 @@ use crate::{
     assets::icon,
     input::{InputEvent, TextInput},
     model::{file_title, format_time, seek_target},
-    playback::{PlaybackSnapshot, Player, PlayerEvent},
+    playback::{PlaybackSnapshot, PlayerEvent},
+    playback_actor::PlayerProxy as Player,
     services::{Command as ServiceCommand, Event as ServiceEvent, Services},
     shortcuts::Shortcut,
     store::Store,
     theme::{ActiveTheme, Appearance, Style, Theme},
+    video_frame_ui::VideoFrameView,
 };
 use chrome_ui::{h_flex, v_flex};
 use gpui::{
@@ -32,7 +36,7 @@ use gpui::{
 };
 use std::{
     cell::{Cell, RefCell},
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     path::PathBuf,
     rc::Rc,
     sync::Arc,
@@ -155,6 +159,9 @@ pub struct Flick {
     store: Store,
     path: Option<PathBuf>,
     frame: Option<Arc<RenderImage>>,
+    video_frame: Entity<VideoFrameView>,
+    library_ui_state: library_ui::LibraryUiState,
+    library_files_state: library_files_ui::LibraryFilesUiState,
     error: Option<String>,
     menu: Option<Menu>,
     focus: FocusHandle,
@@ -239,6 +246,10 @@ pub struct Flick {
     thumbnails: crate::thumbnails::Thumbnails,
     /// Videos already sent to the thumbnail worker this session.
     poster_requests: HashSet<PathBuf>,
+    poster_queue: VecDeque<PathBuf>,
+    poster_viewport: HashSet<PathBuf>,
+    posters_dirty: bool,
+    incomplete_files: HashSet<PathBuf>,
     /// Poster results not yet saved to settings.
     posters_unsaved: bool,
     /// Started on the first timeline hover.
@@ -265,8 +276,17 @@ pub struct Flick {
     status_count: usize,
     /// Whether saved transfers have reported their files.
     transfers_known: bool,
+    transfer_roots: Option<Vec<PathBuf>>,
+    transfer_availability: crate::services::TransferAvailability,
+    library_removal_epoch: u64,
+    removal_generations: HashMap<PathBuf, u64>,
+    quitting: bool,
+    open_generation: u64,
     /// A video to open once transfers are known.
     pending_open: Option<PathBuf>,
+    back_started: Option<Instant>,
+    saved_position: Option<(PathBuf, f64, bool)>,
+    scrub_target: Option<f64>,
     /// Playing a torrent file that is still downloading.
     streaming: bool,
     /// When the playback position last moved, to notice a stream waiting
@@ -275,6 +295,22 @@ pub struct Flick {
 }
 
 impl Flick {
+    pub(crate) fn prepare_quit(&mut self) {
+        if self.quitting {
+            return;
+        }
+        self.quitting = true;
+        self.services.begin_shutdown();
+        self.up_next = None;
+        self.pending_open = None;
+        self.open_generation = self.open_generation.wrapping_add(1);
+        if let Some(player) = &self.player {
+            let _ = player.set_property("pause", "yes");
+            player.set_render_target(0, 0);
+        }
+        self.snapshot.paused = true;
+    }
+
     pub fn new(path: Option<PathBuf>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let store = Store::load();
         crate::theme::apply(cx, &store.data.appearance);
@@ -366,37 +402,25 @@ impl Flick {
             });
         })
         .detach();
-        let (mut player, mut error) = match Player::new() {
-            Ok(player) => (Some(player), None),
-            Err(error) => (None, Some(format!("Playback is unavailable. {error:#}"))),
+        let streams = services.streams.clone();
+        let opener: Arc<crate::playback::StreamOpener> = Arc::new(move |uri: &str| {
+            streams
+                .open(uri)
+                .map(|stream| {
+                    Box::new(crate::services::TorrentMediaStream(stream))
+                        as Box<dyn crate::playback::MediaStream>
+                })
+                .map_err(|error| std::io::Error::other(format!("{error:#}")))
+        });
+        let (player, frames, error) = match Player::start(opener) {
+            Ok((player, frames)) => (Some(player), Some(frames), None),
+            Err(error) => (
+                None,
+                None,
+                Some(format!("Playback is unavailable. {error:#}")),
+            ),
         };
-        if let Some(player) = &player {
-            let streams = services.streams.clone();
-            let opener = Arc::new(move |uri: &str| {
-                streams
-                    .open(uri)
-                    .map(|stream| {
-                        Box::new(crate::services::TorrentMediaStream(stream))
-                            as Box<dyn crate::playback::MediaStream>
-                    })
-                    .map_err(|error| std::io::Error::other(format!("{error:#}")))
-            });
-            if let Err(error) = player.register_protocol(crate::services::STREAM_PROTOCOL, opener) {
-                tracing::warn!(%error, "Watching while downloading is unavailable");
-            }
-        }
-        let frames = player
-            .as_mut()
-            .and_then(|player| match player.render_in_background() {
-                Ok(frames) => Some(frames),
-                Err(failure) => {
-                    error = Some(format!("Playback is unavailable. {failure:#}"));
-                    None
-                }
-            });
-        if frames.is_none() {
-            player = None;
-        }
+        let video_frame = cx.new(|_| VideoFrameView::default());
         let focus = cx.focus_handle();
         focus.focus(window);
         let mut this = Self {
@@ -405,6 +429,9 @@ impl Flick {
             store,
             path: None,
             frame: None,
+            video_frame,
+            library_ui_state: library_ui::LibraryUiState::new(cx),
+            library_files_state: library_files_ui::LibraryFilesUiState::default(),
             error,
             menu: None,
             focus,
@@ -468,6 +495,10 @@ impl Flick {
             was_eof: false,
             thumbnails: crate::thumbnails::Thumbnails::start(thumbnail_cache()),
             poster_requests: HashSet::new(),
+            poster_queue: VecDeque::new(),
+            poster_viewport: HashSet::new(),
+            posters_dirty: true,
+            incomplete_files: HashSet::new(),
             posters_unsaved: false,
             previews: None,
             preview_generation: 0,
@@ -482,23 +513,28 @@ impl Flick {
             controls_changed_at: Instant::now(),
             status_count: 0,
             transfers_known: false,
+            transfer_roots: None,
+            transfer_availability: crate::services::TransferAvailability::Checking,
+            library_removal_epoch: 0,
+            removal_generations: HashMap::new(),
+            quitting: false,
+            open_generation: 0,
             pending_open: None,
+            back_started: None,
+            saved_position: None,
+            scrub_target: None,
             streaming: false,
             position_moved: (0., Instant::now()),
         };
+        this.transfers_changed(cx);
+        this.init_library_files(window, cx);
         this.apply_preferences();
-        // Posters deleted from the cache are made again.
-        for video in &mut this.store.data.library {
-            if video
-                .poster
-                .as_ref()
-                .is_some_and(|poster| !poster.is_file())
-            {
-                video.poster = None;
-            }
-        }
         cx.on_release(|this, cx| {
             this.persist();
+            this.services.begin_shutdown();
+            if let Err(error) = this.store.shutdown() {
+                tracing::warn!(%error, "Could not flush viewing preferences on exit");
+            }
             if let Some(pip) = this.pip.take() {
                 let _ = pip.update(cx, |_, window, _| window.remove_window());
             }
@@ -515,8 +551,22 @@ impl Flick {
             }
         })
         .detach();
-        if let Some(mut frames) = frames {
+        if let Some(frames) = frames {
             cx.spawn_in(window, async move |this, cx| {
+                let mut frames = match frames.await {
+                    Ok(Ok(frames)) => frames,
+                    result => {
+                        let message = match result {
+                            Ok(Err(error)) => error,
+                            _ => "Playback worker stopped during startup".into(),
+                        };
+                        let _ = this.update_in(cx, |this, _, cx| {
+                            this.error = Some(message);
+                            cx.notify();
+                        });
+                        return;
+                    }
+                };
                 while let Some(mut message) = frames.recv().await {
                     // Present only the newest of any frames that queued up.
                     while let Ok(newer) = frames.try_recv() {
@@ -546,6 +596,10 @@ impl Flick {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // A final in-flight frame can arrive after Back idles the render target.
+        if self.quitting || (self.view == View::Library && self.pip.is_none()) {
+            return;
+        }
         let Some(player) = &self.player else {
             return;
         };
@@ -567,6 +621,11 @@ impl Flick {
             return;
         };
         let next = Arc::new(RenderImage::new(vec![image::Frame::new(buffer)]));
+        let first = self.frame.is_none();
+        self.video_frame.update(cx, |view, cx| {
+            view.frame = Some(next.clone());
+            cx.notify();
+        });
         if let Some(old) = self.frame.replace(next) {
             self.drop_pip_image(&old, cx);
             let _ = window.drop_image(old);
@@ -588,7 +647,9 @@ impl Flick {
             );
             self.presented = (0, Instant::now());
         }
-        cx.notify();
+        if first && self.view == View::Player && self.pip.is_none() {
+            cx.notify();
+        }
     }
 
     fn apply_preferences(&mut self) {
@@ -608,7 +669,7 @@ impl Flick {
             return;
         };
         for (name, value) in self.store.data.appearance.subtitles.properties() {
-            if let Err(error) = player.set_property(name, &value) {
+            if let Err(error) = player.set_optional_property(name, &value) {
                 tracing::debug!(%error, name, "Subtitle style not supported by this libmpv");
             }
         }
@@ -649,13 +710,39 @@ impl Flick {
                 self.store.remember(path, s.position, s.duration);
             }
         }
-        if let Err(error) = self.store.save() {
+        if let Err(error) = self.store.queue_save() {
             tracing::warn!(%error, "Could not save viewing preferences");
         }
         self.last_saved = Instant::now();
+        self.saved_position = self
+            .path
+            .clone()
+            .map(|path| (path, self.snapshot.position, self.snapshot.paused));
+    }
+
+    fn library_changed(&mut self, cx: &mut Context<Self>) {
+        self.store.data.invalidate();
+        self.library_ui_state.invalidate();
+        self.posters_dirty = true;
+        self.library_files_changed(cx);
+        cx.notify();
+    }
+
+    fn clear_frame(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.video_frame.update(cx, |view, cx| {
+            view.frame = None;
+            cx.notify();
+        });
+        if let Some(old) = self.frame.take() {
+            self.drop_pip_image(&old, cx);
+            let _ = window.drop_image(old);
+        }
     }
 
     fn open(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        if self.quitting {
+            return;
+        }
         if path
             .extension()
             .is_some_and(|v| v.eq_ignore_ascii_case("torrent"))
@@ -669,17 +756,80 @@ impl Flick {
             self.resolve(flick::torrent::TorrentInput::Magnet(value.to_owned()), cx);
             return;
         }
-        // A partly downloaded torrent file is on disk at full size, with
-        // unverified gaps, so it must play as a stream. Until saved
-        // transfers are known, wait rather than read it directly.
-        if !self.transfers_known {
+        self.open_generation = self.open_generation.wrapping_add(1);
+        let generation = self.open_generation;
+        let was_removed = self.store.data.is_removed(&path);
+        cx.spawn_in(window, async move |this, cx| {
+            let (path, is_file) = cx
+                .background_executor()
+                .spawn(async move {
+                    let path = path.canonicalize().unwrap_or(path);
+                    let is_file = path.is_file();
+                    (path, is_file)
+                })
+                .await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                if generation != this.open_generation
+                    || (!was_removed && this.store.data.is_removed(&path))
+                {
+                    return;
+                }
+                this.open_prepared(path, is_file, window, cx);
+            });
+        })
+        .detach();
+    }
+
+    /// Saved transfer ownership must be known before direct reads inside its roots.
+    fn can_open_before_transfers(&self, path: &std::path::Path) -> bool {
+        self.transfers_known
+            || (path.is_absolute()
+                && self
+                    .store
+                    .data
+                    .video(path)
+                    .is_none_or(|video| video.torrent.is_none())
+                && self
+                    .transfer_roots
+                    .as_ref()
+                    .is_some_and(|roots| !roots.iter().any(|root| path.starts_with(root))))
+    }
+
+    fn open_prepared(
+        &mut self,
+        path: PathBuf,
+        is_file: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.can_open_before_transfers(&path) {
+            if self.view == View::Player {
+                self.handle(Control::Library, window, cx);
+            }
             self.pending_open = Some(path);
+            if let crate::services::TransferAvailability::Unavailable { message, .. } =
+                &self.transfer_availability
+            {
+                self.error = Some(format!(
+                    "This video's download state is unavailable: {message}. Restore access to the download folder, then choose Retry downloads."
+                ));
+            }
             cx.notify();
             return;
         }
-        let path = path.canonicalize().unwrap_or(path);
+        self.pending_open = None;
         let stream = self.incomplete_torrent_file(&path);
-        if stream.is_none() && !path.is_file() {
+        if stream.is_none()
+            && (self.incomplete_files.contains(&path)
+                || self.store.data.unverified_torrent_file(&path).is_some())
+        {
+            self.error = Some(
+                "This file needs torrent verification before it can be played. If its transfer is still in Downloads, resume it and wait for file checking to finish.".into(),
+            );
+            cx.notify();
+            return;
+        }
+        if stream.is_none() && !is_file {
             self.error = Some(format!("This file could not be opened: {}", path.display()));
             cx.notify();
             return;
@@ -702,11 +852,20 @@ impl Flick {
         };
         match player.load(&source) {
             Ok(()) => {
+                self.thumbnails.idle_close();
+                self.poster_requests.clear();
+                self.poster_queue.clear();
+                self.posters_dirty = true;
+                if let Some(previews) = &self.previews {
+                    previews.idle_close();
+                }
                 self.pending_resume = self.store.resume_position(&path);
                 self.file_loaded = false;
                 self.streaming = stream.is_some();
                 self.path = Some(path.clone());
-                self.store.data.add_video(&path);
+                self.library_files_restored([&path]);
+                self.store.data.restore_video(&path);
+                self.library_changed(cx);
                 if self.view != View::Player {
                     self.entered_player = Instant::now();
                 }
@@ -726,9 +885,7 @@ impl Flick {
                 }
                 self.pointer_moved_at = Instant::now();
                 self.controls_shown = true;
-                if let Some(old) = self.frame.take() {
-                    let _ = window.drop_image(old);
-                }
+                self.clear_frame(window, cx);
                 window.set_window_title(&format!("{} — Flick", file_title(&path)));
                 tracing::info!(path = %path.display(), "Opening video");
             }
@@ -746,9 +903,9 @@ impl Flick {
                 .iter()
                 .find(|file| {
                     file.selected
-                        && file.verified_bytes < file.length
-                        && (file.path == path
-                            || file.path.canonicalize().is_ok_and(|real| real == path))
+                        && file.path == path
+                        && (file.verified_bytes < file.length
+                            || matches!(download.state, flick::torrent::TransferState::Checking))
                 })
                 .map(|file| (download.infohash.clone(), file.index))
         })
@@ -758,9 +915,25 @@ impl Flick {
     fn incomplete_paths(&self) -> HashSet<PathBuf> {
         self.downloads
             .iter()
-            .flat_map(|download| &download.files)
-            .filter(|file| file.selected && file.verified_bytes < file.length)
+            .flat_map(|download| {
+                download.files.iter().filter(move |file| {
+                    !file.selected
+                        || file.verified_bytes < file.length
+                        || matches!(
+                            download.state,
+                            flick::torrent::TransferState::Checking
+                                | flick::torrent::TransferState::Error
+                        )
+                })
+            })
             .map(|file| file.path.clone())
+            .chain(
+                self.store
+                    .data
+                    .unverified_torrent_files
+                    .iter()
+                    .map(|file| file.path.clone()),
+            )
             .collect()
     }
 
@@ -811,18 +984,40 @@ impl Flick {
             || self.pointer_moved_at.elapsed() < CONTROLS_TIMEOUT
     }
 
-    /// Queues posters for library videos without one, and stores results.
-    fn update_posters(&mut self, cx: &mut Context<Self>) {
-        // Partly downloaded files have unverified gaps; wait for them.
+    fn transfers_changed(&mut self, cx: &mut Context<Self>) {
         let incomplete = self.incomplete_paths();
-        for video in &self.store.data.library {
-            if video.poster.is_none()
-                && !self.poster_requests.contains(&video.path)
-                && !incomplete.contains(&video.path)
-            {
-                self.poster_requests.insert(video.path.clone());
-                self.thumbnails.request(video.path.clone());
+        if incomplete != self.incomplete_files {
+            self.incomplete_files = incomplete;
+            self.posters_dirty = true;
+            self.library_files_changed(cx);
+        }
+    }
+
+    /// Admit a bounded backlog when idle; never rescan the library per frame.
+    fn update_posters(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let invalidations = self.thumbnails.take_cache_invalidations();
+        if invalidations.rescan_required {
+            self.reconcile_library_files();
+        }
+        if !invalidations.paths.is_empty() {
+            let evicted: HashSet<_> = invalidations.paths.into_iter().collect();
+            for poster in &evicted {
+                self.evict_library_poster(poster, window, cx);
             }
+            for video in &mut self.store.data.library {
+                if video
+                    .poster
+                    .as_ref()
+                    .is_some_and(|poster| evicted.contains(poster))
+                {
+                    video.poster = None;
+                    self.poster_requests.remove(&video.path);
+                    self.posters_dirty = true;
+                }
+            }
+            self.store.data.invalidate_metadata();
+            self.library_ui_state.invalidate();
+            cx.notify();
         }
         let mut changed = false;
         for poster in self.thumbnails.drain().collect::<Vec<_>>() {
@@ -831,7 +1026,7 @@ impl Flick {
                 .data
                 .library
                 .iter_mut()
-                .find(|video| video.path == poster.video)
+                .find(|v| v.path == poster.video)
             else {
                 continue;
             };
@@ -843,19 +1038,53 @@ impl Flick {
                     video.height = details.height;
                     changed = true;
                 }
-                // Missing or unreadable files keep the placeholder; they are
-                // tried again next launch.
                 Err(error) => tracing::debug!(path = %poster.video.display(), %error, "No poster"),
             }
         }
         if changed {
+            self.store.data.invalidate_metadata();
+            self.library_ui_state.invalidate();
             self.posters_unsaved = true;
             cx.notify();
         }
-        // Save in batches rather than once per poster.
         if self.posters_unsaved && self.last_saved.elapsed() > Duration::from_secs(2) {
             self.posters_unsaved = false;
             self.persist();
+        }
+        if self.view == View::Player || (self.playing() && self.pip.is_some()) {
+            return;
+        }
+        let visible = self
+            .library_ui_state
+            .visible_poster_paths()
+            .into_iter()
+            .collect::<HashSet<_>>();
+        if visible != self.poster_viewport {
+            for path in self.poster_viewport.difference(&visible) {
+                self.thumbnails.cancel(path);
+                self.poster_requests.remove(path);
+            }
+            self.poster_viewport = visible;
+            self.posters_dirty = true;
+        }
+        if self.posters_dirty {
+            // Offscreen work must not feed an eviction/regeneration loop once
+            // the library is larger than the disk poster quota.
+            self.poster_queue =
+                visible_poster_candidates(&self.store.data, &self.poster_viewport, |path| {
+                    self.poster_requests.contains(path)
+                        || self.incomplete_files.contains(path)
+                        || self.library_file_unavailable(path)
+                        || !self.can_open_before_transfers(path)
+                });
+            self.posters_dirty = false;
+        }
+        while let Some(path) = self.poster_queue.front() {
+            if !self.thumbnails.try_request(path.clone()) {
+                break;
+            }
+            self.poster_requests.insert(path.clone());
+            self.poster_queue.pop_front();
         }
     }
 
@@ -866,6 +1095,9 @@ impl Flick {
         let Some(path) = self.path.clone() else {
             return;
         };
+        if self.streaming || self.incomplete_files.contains(&path) {
+            return;
+        }
         if duration <= 0. || bounds.size.width <= px(0.) {
             return;
         }
@@ -891,20 +1123,27 @@ impl Flick {
 
     fn tick(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Duration {
         self.poll_services(cx);
+        if self.quitting {
+            return Duration::from_millis(500);
+        }
+        self.poll_library_files(window, cx);
         let requested =
             std::mem::take(&mut *OPEN_REQUESTS.lock().unwrap_or_else(|e| e.into_inner()));
         let mut requested = requested.into_iter();
         if let Some(first) = requested.next() {
             // Open the first; add the rest to the library.
-            self.add_library_files(requested);
+            self.import_paths(requested.collect(), window, cx);
             self.open(first, window, cx);
         }
-        if self.transfers_known
+        if self
+            .pending_open
+            .as_ref()
+            .is_some_and(|path| self.can_open_before_transfers(path))
             && let Some(path) = self.pending_open.take()
         {
             self.open(path, window, cx);
         }
-        self.update_posters(cx);
+        self.update_posters(window, cx);
         // A preview for another video, from before it opened, is dropped.
         if let Some(preview) = self.previews.as_ref().and_then(|p| p.latest())
             && preview.generation > self.preview_shown
@@ -978,15 +1217,23 @@ impl Flick {
                     }
                 }
                 PlayerEvent::EndFile => {}
+                PlayerEvent::OperationCompleted { .. } => {}
                 PlayerEvent::Error(error) => {
-                    self.file_loaded = false;
                     self.error = Some(error);
                 }
             }
         }
         if self.last_snapshot.elapsed() >= Duration::from_millis(200) || changed {
-            let next = player.snapshot();
-            changed |= (self.snapshot.position - next.position).abs() > 0.01
+            let mut next = player.snapshot();
+            // The decoder may land on an earlier keyframe during a drag. Keep
+            // the thumb at the pointer until release sends the exact seek.
+            if self.scrubbing
+                && let Some(target) = self.scrub_target
+            {
+                next.position = target;
+            }
+            changed |= (self.view == View::Player
+                && (self.snapshot.position - next.position).abs() > 0.01)
                 || self.snapshot.paused != next.paused
                 || self.snapshot.duration != next.duration;
             if (next.position - self.position_moved.0).abs() > 0.01 || next.paused {
@@ -1043,8 +1290,19 @@ impl Flick {
             // Refresh the countdown text.
             changed = true;
         }
-        if self.path.is_some() && self.last_saved.elapsed() > Duration::from_secs(5) {
+        if self.playing()
+            && (self.view == View::Player || self.pip.is_some())
+            && self.last_saved.elapsed() > Duration::from_secs(5)
+            && self
+                .saved_position
+                .as_ref()
+                .is_none_or(|(_, position, _)| (self.snapshot.position - *position).abs() >= 1.)
+        {
             self.persist();
+        }
+        if let Some(error) = self.store.take_save_error() {
+            self.error = Some(format!("Could not save viewing preferences: {error}"));
+            changed = true;
         }
         if changed {
             cx.notify();
@@ -1053,12 +1311,17 @@ impl Flick {
         // state, controls, and the timeline.
         if self.playing() {
             Duration::from_millis(50)
-        } else {
+        } else if self.view == View::Player {
             Duration::from_millis(150)
+        } else {
+            Duration::from_millis(500)
         }
     }
 
     fn command(&mut self, args: &[&str], cx: &mut Context<Self>) {
+        if self.quitting {
+            return;
+        }
         if let Some(player) = &self.player {
             if let Err(error) = player.command(args) {
                 self.error = Some(error.to_string());
@@ -1069,6 +1332,9 @@ impl Flick {
     }
 
     fn property(&mut self, name: &str, value: &str, cx: &mut Context<Self>) {
+        if self.quitting {
+            return;
+        }
         if let Some(player) = &self.player {
             if let Err(error) = player.set_property(name, value) {
                 self.error = Some(error.to_string());
@@ -1135,15 +1401,39 @@ impl Flick {
     }
 
     fn handle(&mut self, control: Control, window: &mut Window, cx: &mut Context<Self>) {
+        if self.quitting {
+            return;
+        }
         match control {
             Control::Library => {
+                self.open_generation = self.open_generation.wrapping_add(1);
+                self.pending_open = None;
+                self.back_started = Some(Instant::now());
+                self.view = View::Library;
+                self.up_next = None;
+                self.hover = None;
+                self.scrubbing = false;
+                self.scrub_target = None;
+                self.preview_generation += 1;
+                self.preview_shown = self.preview_generation;
+                if let Some(previews) = &self.previews {
+                    previews.idle_close();
+                }
+                if let Some(image) = self.preview_image.take() {
+                    let _ = window.drop_image(image);
+                }
                 self.persist();
                 // Picture in picture keeps playing while the library is used.
                 if self.pip.is_none() {
                     self.property("pause", "yes", cx);
+                    if let Some(player) = &self.player {
+                        player.set_render_target(0, 0);
+                    }
+                    self.clear_frame(window, cx);
                 }
                 self.view = View::Library;
                 self.menu = None;
+                self.posters_dirty = true;
                 window.set_window_title("Flick");
                 self.focus.focus(window);
                 cx.notify();
@@ -1226,15 +1516,7 @@ impl Flick {
     /// The next (`step` 1) or previous (-1) episode of the playing show.
     fn adjacent_episode(&self, step: isize) -> Option<PathBuf> {
         let current = self.path.as_deref()?;
-        flick::library::adjacent_episode(
-            self.store
-                .data
-                .library
-                .iter()
-                .map(|video| video.path.as_path()),
-            current,
-            step,
-        )
+        self.store.data.adjacent_episode(current, step)
     }
 
     /// Opens the OpenSubtitles search with the video's title filled in.
@@ -1434,6 +1716,12 @@ impl Flick {
     }
 
     fn key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if self.quitting {
+            return;
+        }
+        if self.handle_library_delete_key(event, window, cx) {
+            return;
+        }
         let key = event.keystroke.key.as_str();
         let modifiers = event.keystroke.modifiers;
         let command = modifiers.control || modifiers.platform;
@@ -1555,8 +1843,29 @@ impl Flick {
         if self.snapshot.duration > 0. && bounds.size.width > px(0.) {
             let ratio = f32::from(x - bounds.origin.x) / f32::from(bounds.size.width);
             let target = ratio.clamp(0., 1.) as f64 * self.snapshot.duration;
-            self.command(&["seek", &target.to_string(), "absolute+exact"], cx);
+            self.scrub_target = Some(target);
+            if let Some(player) = &self.player {
+                if let Err(error) = player.seek(target, false) {
+                    self.error = Some(error.to_string());
+                }
+                self.snapshot.position = target;
+            }
+            cx.notify();
         }
+    }
+
+    fn finish_scrub(&mut self, cx: &mut Context<Self>) {
+        self.scrubbing = false;
+        if let Some(target) = self.scrub_target.take()
+            && let Some(player) = &self.player
+            && let Err(error) = player.seek(target, true)
+        {
+            self.error = Some(error.to_string());
+        }
+        if let Some(previews) = &self.previews {
+            previews.cancel();
+        }
+        cx.notify();
     }
 
     fn volume_at(&mut self, x: Pixels, cx: &mut Context<Self>) {
@@ -1567,6 +1876,22 @@ impl Flick {
             self.property("volume", &(value * 100.).round().to_string(), cx);
         }
     }
+}
+
+/// Admission follows the viewport, so quota eviction of offscreen posters cannot
+/// generate another whole-library extraction pass.
+fn visible_poster_candidates(
+    data: &crate::store::Settings,
+    visible: &HashSet<PathBuf>,
+    blocked: impl Fn(&std::path::Path) -> bool,
+) -> VecDeque<PathBuf> {
+    visible
+        .iter()
+        .filter(|path| {
+            data.video(path).is_some_and(|video| video.poster.is_none()) && !blocked(path)
+        })
+        .cloned()
+        .collect()
 }
 
 /// Files the operating system asked Flick to open, such as from Finder's
@@ -1660,10 +1985,52 @@ fn hint_box(t: &Theme, text: SharedString) -> Div {
 
 impl Render for Flick {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.quitting {
+            let t = cx.theme();
+            return self.window_frame(
+                div()
+                    .size_full()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .bg(t.window)
+                    .text_color(t.text)
+                    .child("Closing…")
+                    .into_any_element(),
+                window,
+                cx,
+            );
+        }
+        self.library_ui_state.begin_poster_frame(window, cx);
+        tracing::trace!(
+            view = if self.view == View::Library {
+                "library"
+            } else {
+                "player"
+            },
+            "Root view rendered"
+        );
         let t = cx.theme().clone();
         self.focused = window.focused(cx);
         let content = match self.view {
-            View::Library => self.library_frame(window, cx),
+            View::Library => {
+                let started = Instant::now();
+                let content = self.library_frame(window, cx);
+                if let Some(back) = self.back_started.take() {
+                    tracing::info!(
+                        elapsed_ms = back.elapsed().as_secs_f64() * 1000.,
+                        library_build_ms = started.elapsed().as_secs_f64() * 1000.,
+                        "Back library tree submitted"
+                    );
+                    window.on_next_frame(move |_, _| {
+                        tracing::info!(
+                            elapsed_ms = back.elapsed().as_secs_f64() * 1000.,
+                            "Back library frame rendered"
+                        );
+                    });
+                }
+                content
+            }
             View::Player => self.player_frame(window, cx),
         };
         let root = div()
@@ -1700,8 +2067,10 @@ impl Render for Flick {
             }))
             .on_mouse_up(
                 MouseButton::Left,
-                cx.listener(|this, _, _, _| {
-                    this.scrubbing = false;
+                cx.listener(|this, _, _, cx| {
+                    if this.scrubbing {
+                        this.finish_scrub(cx);
+                    }
                     this.changing_volume = false;
                     this.should_move = false;
                     this.dragging_slider = None;
@@ -1709,8 +2078,10 @@ impl Render for Flick {
             )
             .on_mouse_up_out(
                 MouseButton::Left,
-                cx.listener(|this, _, _, _| {
-                    this.scrubbing = false;
+                cx.listener(|this, _, _, cx| {
+                    if this.scrubbing {
+                        this.finish_scrub(cx);
+                    }
                     this.changing_volume = false;
                     this.should_move = false;
                     this.dragging_slider = None;
@@ -1718,29 +2089,15 @@ impl Render for Flick {
             )
             .on_drop(cx.listener(|this, paths: &ExternalPaths, window, cx| {
                 if this.view == View::Library {
-                    let mut videos = Vec::new();
-                    for path in paths.paths() {
-                        if path.is_dir() {
-                            this.import_folder(path.clone(), window, cx);
-                        } else if path
-                            .extension()
-                            .is_some_and(|v| v.eq_ignore_ascii_case("torrent"))
-                        {
-                            this.resolve(flick::torrent::TorrentInput::File(path.clone()), cx);
-                        } else {
-                            videos.push(path.clone());
-                        }
-                    }
-                    this.add_library_files(videos);
-                    this.persist();
-                    cx.notify();
+                    this.import_paths(paths.paths().to_vec(), window, cx);
                 } else if let Some(path) = paths.paths().first() {
                     this.open(path.clone(), window, cx);
                 }
             }))
             .child(content)
             .children(self.card_menu_panel(cx))
-            .children(self.palette_view(window, cx));
+            .children(self.palette_view(window, cx))
+            .children(self.library_delete_panel(cx));
         self.window_frame(root.into_any_element(), window, cx)
     }
 }
@@ -1748,6 +2105,41 @@ impl Render for Flick {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn offscreen_quota_eviction_never_requeues_the_library() {
+        let mut data = crate::store::Settings::default();
+        data.restore_videos((0..5000).map(|i| PathBuf::from(format!("generated-{i}.mp4"))));
+        let visible = data
+            .library
+            .iter()
+            .take(12)
+            .map(|video| video.path.clone())
+            .collect::<HashSet<_>>();
+        let jobs = visible_poster_candidates(&data, &visible, |_| false);
+        assert_eq!(jobs.len(), 12);
+        assert!(jobs.iter().all(|path| visible.contains(path)));
+        for video in data.library.iter_mut().take(12) {
+            video.poster = Some("generated-poster.png".into());
+        }
+        data.invalidate_metadata();
+        // 4,988 missing/evicted offscreen artifacts do not start work while idle.
+        assert!(visible_poster_candidates(&data, &visible, |_| false).is_empty());
+        let next = data
+            .library
+            .iter()
+            .skip(12)
+            .take(12)
+            .map(|video| video.path.clone())
+            .collect::<HashSet<_>>();
+        let unavailable = next.iter().next().unwrap().clone();
+        let jobs = visible_poster_candidates(&data, &next, |path| path == unavailable);
+        assert_eq!(jobs.len(), 11);
+        assert!(
+            jobs.iter()
+                .all(|path| next.contains(path) && path != &unavailable)
+        );
+    }
 
     #[test]
     fn opened_urls_become_paths() {

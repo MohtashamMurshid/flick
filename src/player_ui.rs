@@ -210,10 +210,10 @@ impl Flick {
                         )),
                 )
             })
-            .when_some(
-                self.frame.clone().filter(|_| self.pip.is_none()),
-                |d, frame| d.child(img(frame).size_full().object_fit(ObjectFit::Contain)),
-            )
+            .when(self.pip.is_none(), |d| {
+                // Keep the retained surface out of the placeholder's flex row.
+                d.child(div().absolute().inset_0().child(self.video_frame.clone()))
+            })
             .when(self.frame.is_none() && self.pip.is_none(), |d| {
                 let failed = self.error.is_some();
                 d.child(
@@ -568,18 +568,22 @@ impl Flick {
             .on_mouse_move(cx.listener(|this, e: &gpui::MouseMoveEvent, _, cx| {
                 if this.scrubbing {
                     this.seek_at(e.position.x, cx);
+                } else {
+                    this.hover_timeline(e.position.x, cx);
                 }
-                this.hover_timeline(e.position.x, cx);
             }))
             .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
                 if !hovered {
                     this.hover = None;
+                    if let Some(previews) = &this.previews {
+                        previews.cancel();
+                    }
                     cx.notify();
                 }
             }))
             .on_mouse_up(
                 MouseButton::Left,
-                cx.listener(|this, _, _, _| this.scrubbing = false),
+                cx.listener(|this, _, _, cx| this.finish_scrub(cx)),
             )
             .when_some(self.timeline_preview(cx), |d, preview| d.child(preview))
     }

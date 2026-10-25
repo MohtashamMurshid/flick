@@ -154,11 +154,12 @@ impl Render for PipView {
             .map(|flick| {
                 let flick = flick.read(cx);
                 (
-                    flick.frame.clone(),
+                    flick.video_frame.clone(),
                     flick.playing(),
                     flick.path.as_deref().map(file_title).unwrap_or_default(),
                 )
             })
+            .map(|(frame, playing, title)| (Some(frame), playing, title))
             .unwrap_or_default();
         let t = cx.theme().clone();
         let control = |id: &'static str, name: &'static str, label: &'static str| {
@@ -200,9 +201,7 @@ impl Render for PipView {
                 let _ = window;
                 cx.stop_propagation();
             }))
-            .when_some(frame, |d, frame| {
-                d.child(img(frame).size_full().object_fit(ObjectFit::Contain))
-            })
+            .when_some(frame, |d, frame| d.child(frame))
             .when(self.hovered, |d| {
                 d.child(
                     v_flex()

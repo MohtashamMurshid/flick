@@ -1,0 +1,24 @@
+[package]
+name = "flick-actor-checks"
+version = "0.1.0"
+edition = "2024"
+[[bin]]
+name = "flick-actor-checks"
+path = "harness.rs"
+[dependencies]
+anyhow = "1"
+libloading = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt", "macros", "time", "sync"] }
+tracing = "0.1"
+libc = "=0.2.189"
+[dev-dependencies]
+tempfile = "3"
+[profile.dev]
+debug = 0
+[workspace]
+
+[[bin]]
+name = "flick-actor-mock-checks"
+path = "mock_harness.rs"

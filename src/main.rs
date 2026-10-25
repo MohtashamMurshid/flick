@@ -1,15 +1,19 @@
 mod assets;
 mod benchmark;
 mod input;
+mod library_files;
 mod model;
 mod playback;
+mod playback_actor;
 mod services;
 mod shortcuts;
+mod shutdown;
 mod smoke;
 mod store;
 mod theme;
 mod thumbnails;
 mod ui;
+mod video_frame_ui;
 
 use gpui::{
     App, AppContext, Application, Bounds, KeyBinding, Menu, MenuItem, WindowBackgroundAppearance,
@@ -49,9 +53,10 @@ fn main() -> anyhow::Result<()> {
     app.on_open_urls(ui::queue_open_urls);
     app.run(move |cx: &mut App| {
         input::init(cx);
-        // ⌘Q on macOS, Ctrl+Q elsewhere. Quitting closes the window first, so
-        // the player saves its position as it does when the window closes.
-        cx.on_action(|_: &Quit, cx| cx.quit());
+        shutdown::init(cx);
+        // ⌘Q on macOS, Ctrl+Q elsewhere. Clean up services off the UI thread
+        // before native quit closes the window and saves playback position.
+        cx.on_action(|_: &Quit, cx| shutdown::request(cx));
         cx.bind_keys([KeyBinding::new("secondary-q", Quit, None)]);
         // macOS shows Quit in the app menu, where people look for it.
         cx.set_menus(vec![Menu {
@@ -76,7 +81,7 @@ fn main() -> anyhow::Result<()> {
                         .await;
                     let _ = cx.update(|cx| {
                         if cx.windows().is_empty() {
-                            cx.quit();
+                            shutdown::request(cx);
                         }
                     });
                 })
@@ -108,13 +113,18 @@ fn main() -> anyhow::Result<()> {
             app_id: Some("flick".into()),
             ..Default::default()
         };
-        if let Err(error) = cx.open_window(options, |window, cx| {
-            cx.new(|cx| ui::Flick::new(path, window, cx))
+        match cx.open_window(options, |window, cx| {
+            let root = cx.new(|cx| ui::Flick::new(path, window, cx));
+            shutdown::set_root(root.downgrade(), cx);
+            root
         }) {
-            tracing::error!(%error, "Could not open the Flick window");
-            cx.quit();
+            Ok(_) => cx.activate(true),
+            Err(error) => {
+                tracing::error!(%error, "Could not open the Flick window");
+                shutdown::request(cx);
+            }
         }
-        cx.activate(true);
     });
+    services::finish_shutdown();
     Ok(())
 }

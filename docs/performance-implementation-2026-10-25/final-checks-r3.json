@@ -1,0 +1,42 @@
+[
+  {
+    "check": "fmt",
+    "command": "cargo fmt --all -- --check",
+    "exit_code": 0
+  },
+  {
+    "check": "actor-fmt",
+    "command": "cargo fmt --manifest-path tests/playback_actor_backend/Cargo.toml --all -- --check",
+    "exit_code": 0
+  },
+  {
+    "check": "clippy-desktop",
+    "command": "cargo clippy --offline --all-targets -- -D warnings",
+    "exit_code": 0
+  },
+  {
+    "check": "tests-desktop",
+    "command": "cargo test --offline --all-targets -- --test-threads=1",
+    "exit_code": 0
+  },
+  {
+    "check": "clippy-backend",
+    "command": "cargo clippy --offline --locked --no-default-features --all-targets -- -D warnings",
+    "exit_code": 0
+  },
+  {
+    "check": "tests-backend",
+    "command": "cargo test --offline --locked --no-default-features --all-targets -- --test-threads=1",
+    "exit_code": 0
+  },
+  {
+    "check": "build-desktop",
+    "command": "cargo build --offline --bin flick",
+    "exit_code": 0
+  },
+  {
+    "check": "diff",
+    "command": "git diff --check",
+    "exit_code": 0
+  }
+]

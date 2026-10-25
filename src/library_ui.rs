@@ -6,23 +6,605 @@ use super::{
 };
 use crate::store::Sort;
 use flick::library::format_bytes;
-use gpui::{AnyElement, FontWeight, anchored, deferred, linear_color_stop, linear_gradient, point};
+use gpui::{
+    AnyElement, Asset, AssetLogger, FontWeight, ImageAssetLoader, ImageCache, Resource,
+    ScrollHandle, ScrollStrategy, UniformListScrollHandle, anchored, deferred, linear_color_stop,
+    linear_gradient, point, uniform_list,
+};
 
-impl Flick {
-    pub(super) fn add_library_files(&mut self, paths: impl IntoIterator<Item = PathBuf>) {
-        let mut videos = Vec::new();
-        for path in paths {
-            match flick::library::canonical_video(&path) {
-                Ok(path) => videos.push(path),
-                Err(error) => {
-                    self.error = Some(format!("Could not add {}: {error:#}", path.display()))
+/// Derived views and retained scroll/image state. No GPUI entity is required at construction.
+#[derive(Default)]
+pub(super) struct LibraryUiState {
+    videos: RefCell<Option<VideoQuery>>,
+    history: RefCell<Option<(u64, Rc<[PathBuf]>)>>,
+    episodes: RefCell<Option<EpisodeQuery>>,
+    shows: RefCell<Option<ShowQuery>>,
+    show_labels: RefCell<Option<(u64, Vec<String>)>>,
+    show_stats: RefCell<Option<(u64, HashMap<ElementId, usize>)>>,
+    sections: RefCell<HashMap<&'static str, VirtualSection>>,
+    scrolls: RefCell<HashMap<String, UniformListScrollHandle>>,
+    page_scroll: ScrollHandle,
+    search_scroll: ScrollHandle,
+    pub(super) posters: Option<Entity<PosterCache>>,
+    visible_posters: RefCell<HashSet<PathBuf>>,
+}
+
+struct VideoQuery {
+    revision: u64,
+    query: String,
+    filter: VideoFilter,
+    sort: Sort,
+    paths: Rc<[PathBuf]>,
+}
+
+struct EpisodeQuery {
+    revision: u64,
+    key: String,
+    episodes: Rc<[(flick::library::Episode, PathBuf)]>,
+    paths: Rc<[PathBuf]>,
+}
+
+struct ShowQuery {
+    revision: u64,
+    query: String,
+    indices: Rc<[usize]>,
+    ids: Rc<[ElementId]>,
+}
+
+#[derive(Clone)]
+struct VirtualSection {
+    ids: Rc<[ElementId]>,
+    paths: Option<Rc<[PathBuf]>>,
+    columns: usize,
+    scroll: UniformListScrollHandle,
+}
+
+impl LibraryUiState {
+    pub(super) fn new(cx: &mut App) -> Self {
+        Self {
+            posters: Some(cx.new(PosterCache::new)),
+            ..Self::default()
+        }
+    }
+
+    pub(super) fn begin_poster_frame(&mut self, window: &mut Window, cx: &mut App) {
+        if let Some(posters) = &self.posters {
+            posters.update(cx, |cache, cx| cache.begin_frame(window, cx));
+        }
+    }
+
+    /// Most recently requested viewport; useful for prioritizing native poster extraction.
+    pub(super) fn visible_poster_paths(&self) -> Vec<PathBuf> {
+        self.visible_posters.borrow().iter().cloned().collect()
+    }
+
+    pub(super) fn record_visible_poster(&self, path: &std::path::Path) {
+        self.visible_posters.borrow_mut().insert(path.to_owned());
+    }
+
+    fn begin_visible_posters(&self) {
+        self.visible_posters.borrow_mut().clear();
+    }
+
+    /// Drops derived data while retaining navigation, scroll positions and poster cache.
+    pub(super) fn invalidate(&self) {
+        self.videos.borrow_mut().take();
+        self.history.borrow_mut().take();
+        self.episodes.borrow_mut().take();
+        self.shows.borrow_mut().take();
+        self.show_labels.borrow_mut().take();
+        self.show_stats.borrow_mut().take();
+    }
+
+    fn video_paths(
+        &self,
+        data: &crate::store::Settings,
+        query: &str,
+        filter: VideoFilter,
+    ) -> Rc<[PathBuf]> {
+        let revision = data.revision();
+        let query = query.to_lowercase();
+        let sort = data.library_view.sort;
+        let mut cache = self.videos.borrow_mut();
+        if let Some(cached) = cache.as_ref()
+            && cached.revision == revision
+            && cached.query == query
+            && cached.sort == sort
+            && cached.filter == filter
+        {
+            return cached.paths.clone();
+        }
+        let paths = data
+            .sorted_library(sort)
+            .into_iter()
+            .filter(|video| {
+                data.normalized_title(&video.path)
+                    .is_some_and(|title| title.contains(&query))
+            })
+            .filter(|video| match filter {
+                VideoFilter::All => true,
+                VideoFilter::Unwatched => !data.watched(&video.path),
+                VideoFilter::InProgress => data.resume_position(&video.path) > 0.,
+            })
+            .map(|video| video.path.clone())
+            .collect::<Rc<[PathBuf]>>();
+        *cache = Some(VideoQuery {
+            revision,
+            query,
+            sort,
+            filter,
+            paths: paths.clone(),
+        });
+        paths
+    }
+    fn show_unwatched(&self, data: &crate::store::Settings, show: &flick::library::Show) -> usize {
+        let revision = data.revision();
+        let mut stats = self.show_stats.borrow_mut();
+        if !stats
+            .as_ref()
+            .is_some_and(|(old_revision, _)| *old_revision == revision)
+        {
+            *stats = Some((
+                revision,
+                data.shows()
+                    .iter()
+                    .map(|show| {
+                        (
+                            show_id(show),
+                            show.episodes
+                                .iter()
+                                .filter(|(_, path)| !data.watched(path))
+                                .count(),
+                        )
+                    })
+                    .collect(),
+            ));
+        }
+        stats
+            .as_ref()
+            .unwrap()
+            .1
+            .get(&show_id(show))
+            .copied()
+            .unwrap_or(0)
+    }
+
+    fn scroll(&self, key: &str) -> UniformListScrollHandle {
+        self.scrolls
+            .borrow_mut()
+            .entry(key.to_owned())
+            .or_default()
+            .clone()
+    }
+
+    fn register(
+        &self,
+        section: &'static str,
+        ids: Rc<[ElementId]>,
+        columns: usize,
+        scroll: UniformListScrollHandle,
+    ) {
+        self.sections.borrow_mut().insert(
+            section,
+            VirtualSection {
+                ids,
+                paths: None,
+                columns,
+                scroll,
+            },
+        );
+    }
+}
+
+const POSTER_CACHE_CAPACITY: usize = 96;
+
+/// The decoder task belongs to its cache entry: eviction cancels pending work,
+/// and loaded textures are explicitly removed from every GPUI window.
+pub(super) struct PosterCache {
+    entries: HashMap<Resource, PosterEntry>,
+    lru: PosterLru,
+    weak: gpui::WeakEntity<Self>,
+    generation: u64,
+    protected: HashSet<Resource>,
+    requested: HashSet<Resource>,
+}
+
+enum PosterEntry {
+    Loading {
+        generation: u64,
+        _task: gpui::Task<()>,
+    },
+    Loaded(Result<Arc<RenderImage>, gpui::ImageCacheError>),
+}
+
+#[derive(Default)]
+struct PosterLru(std::collections::VecDeque<Resource>);
+
+impl PosterLru {
+    #[cfg(test)]
+    fn touch(&mut self, resource: &Resource) -> Option<Resource> {
+        self.touch_protected(resource, &HashSet::new())
+    }
+
+    fn touch_protected(
+        &mut self,
+        resource: &Resource,
+        protected: &HashSet<Resource>,
+    ) -> Option<Resource> {
+        let evicted = if let Some(index) = self.0.iter().position(|entry| entry == resource) {
+            self.0.remove(index);
+            None
+        } else if self.0.len() >= POSTER_CACHE_CAPACITY {
+            // A viewport can exceed the warm-cache budget on a large display.
+            // Never evict a poster still needed by this or the preceding frame.
+            self.0
+                .iter()
+                .position(|entry| !protected.contains(entry))
+                .and_then(|index| self.0.remove(index))
+        } else {
+            None
+        };
+        self.0.push_back(resource.clone());
+        evicted
+    }
+}
+
+impl PosterCache {
+    fn new(cx: &mut Context<Self>) -> Self {
+        cx.on_release(|cache, cx| {
+            for (_, entry) in std::mem::take(&mut cache.entries) {
+                if let PosterEntry::Loaded(Ok(image)) = entry {
+                    cx.drop_image(image, None);
                 }
             }
+        })
+        .detach();
+        Self {
+            entries: HashMap::new(),
+            lru: PosterLru::default(),
+            weak: cx.entity().downgrade(),
+            generation: 0,
+            protected: HashSet::new(),
+            requested: HashSet::new(),
         }
-        self.store.data.add_videos(videos);
+    }
+
+    fn begin_frame(&mut self, window: &mut Window, cx: &mut App) {
+        self.protected = std::mem::take(&mut self.requested);
+        let capacity = POSTER_CACHE_CAPACITY.max(self.protected.len());
+        while self.lru.0.len() > capacity {
+            let Some(index) = self
+                .lru
+                .0
+                .iter()
+                .position(|entry| !self.protected.contains(entry))
+            else {
+                break;
+            };
+            let resource = self.lru.0[index].clone();
+            self.remove(&resource, window, cx);
+        }
+    }
+
+    fn remove(&mut self, resource: &Resource, window: &mut Window, cx: &mut App) {
+        if let Some(PosterEntry::Loaded(Ok(image))) = self.entries.remove(resource) {
+            cx.drop_image(image, Some(window));
+        }
+        self.lru.0.retain(|entry| entry != resource);
+    }
+}
+
+impl ImageCache for PosterCache {
+    fn load(
+        &mut self,
+        resource: &Resource,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Option<Result<Arc<RenderImage>, gpui::ImageCacheError>> {
+        self.requested.insert(resource.clone());
+        self.protected.insert(resource.clone());
+        if let Some(evicted) = self.lru.touch_protected(resource, &self.protected) {
+            self.remove(&evicted, window, cx);
+        }
+        if let Some(entry) = self.entries.get(resource) {
+            return match entry {
+                PosterEntry::Loaded(result) => Some(result.clone()),
+                PosterEntry::Loading { .. } => None,
+            };
+        }
+        self.generation = self.generation.wrapping_add(1);
+        let generation = self.generation;
+        let future = AssetLogger::<ImageAssetLoader>::load(resource.clone(), cx);
+        let decode = cx.background_executor().spawn(future);
+        let weak = self.weak.clone();
+        let resource = resource.clone();
+        let loaded_resource = resource.clone();
+        let view = window.current_view();
+        let task = window.spawn(cx, async move |cx| {
+            let result = decode.await;
+            let _ = weak.update(cx, |cache, _| {
+                if matches!(cache.entries.get(&loaded_resource), Some(PosterEntry::Loading { generation: current, .. }) if *current == generation) {
+                    cache.entries.insert(loaded_resource, PosterEntry::Loaded(result));
+                }
+            });
+            cx.on_next_frame(move |_, cx| cx.notify(view));
+        });
+        self.entries.insert(
+            resource,
+            PosterEntry::Loading {
+                generation,
+                _task: task,
+            },
+        );
+        None
+    }
+}
+
+fn video_id(section: &'static str, path: &std::path::Path) -> ElementId {
+    ElementId::from((section, gpui::hash(&path)))
+}
+
+fn show_id(show: &flick::library::Show) -> ElementId {
+    ElementId::from((
+        "show",
+        gpui::hash(
+            &show
+                .episodes
+                .first()
+                .map(|(episode, _)| episode.show_key())
+                .unwrap_or_else(|| show.title.clone()),
+        ),
+    ))
+}
+
+fn first_visible_row(scroll: &UniformListScrollHandle, row_height: Pixels, rows: usize) -> usize {
+    let state = scroll.0.borrow();
+    if let Some(target) = &state.deferred_scroll_to_item {
+        return target.item_index.min(rows.saturating_sub(1));
+    }
+    let top = -f32::from(state.base_handle.offset().y);
+    ((top / f32::from(row_height).max(1.)).floor().max(0.) as usize).min(rows.saturating_sub(1))
+}
+
+fn action_id(section: &'static str, path: &std::path::Path, slot: FocusSlot) -> ElementId {
+    SharedString::from(format!("{section}:{slot:?}:{}", gpui::hash(&path))).into()
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FocusSlot {
+    Primary,
+    Remove,
+    Delete,
+}
+
+fn tab_target(
+    index: usize,
+    count: usize,
+    slot: FocusSlot,
+    reverse: bool,
+    actions: bool,
+) -> Option<(usize, FocusSlot)> {
+    use FocusSlot::*;
+    match (slot, reverse, actions) {
+        (Primary, false, true) => Some((index, Remove)),
+        (Remove, false, true) => Some((index, Delete)),
+        (Delete, true, true) => Some((index, Remove)),
+        (Remove, true, true) => Some((index, Primary)),
+        (_, true, _) => index
+            .checked_sub(1)
+            .map(|index| (index, if actions { Delete } else { Primary })),
+        (_, false, _) => (index + 1 < count).then_some((index + 1, Primary)),
+    }
+}
+
+/// Half-open card range covered by a virtual grid row, including a partial last row.
+fn grid_row_range(row: usize, columns: usize, count: usize) -> std::ops::Range<usize> {
+    let start = row.saturating_mul(columns).min(count);
+    start..start.saturating_add(columns).min(count)
+}
+
+fn validate_library_files(paths: Vec<PathBuf>) -> (Vec<PathBuf>, Vec<String>) {
+    let mut videos = Vec::with_capacity(paths.len());
+    let mut errors = Vec::new();
+    for path in paths {
+        match flick::library::canonical_video(&path) {
+            Ok(path) => videos.push(path),
+            Err(error) => errors.push(format!("Could not add {}: {error:#}", path.display())),
+        }
+    }
+    (videos, errors)
+}
+
+impl Flick {
+    /// Called when a poster artifact is replaced/deleted, if its path is known.
+    pub(super) fn evict_library_poster(
+        &mut self,
+        poster: &std::path::Path,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(cache) = &self.library_ui_state.posters {
+            let resource = Resource::from(poster.to_owned());
+            cache.update(cx, |cache, cx| cache.remove(&resource, window, cx));
+        }
+    }
+
+    /// Validate dropped/open-with batches on the executor before applying one model change.
+    pub(super) fn import_paths(
+        &mut self,
+        paths: Vec<PathBuf>,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) {
+        if paths.is_empty() {
+            return;
+        }
+        self.importing = true;
+        cx.notify();
+        cx.spawn_in(window, async move |this, cx| {
+            let (videos, torrents, errors) = cx
+                .background_executor()
+                .spawn(async move {
+                    let mut videos = Vec::new();
+                    let mut torrents = Vec::new();
+                    let mut errors = Vec::new();
+                    for path in paths {
+                        if path
+                            .extension()
+                            .is_some_and(|v| v.eq_ignore_ascii_case("torrent"))
+                        {
+                            torrents.push(path);
+                        } else if path.is_dir() {
+                            match flick::library::scan_folder(&path) {
+                                Ok(found) => videos.extend(found),
+                                Err(error) => errors
+                                    .push(format!("Could not add {}: {error:#}", path.display())),
+                            }
+                        } else {
+                            match flick::library::canonical_video(&path) {
+                                Ok(path) => videos.push(path),
+                                Err(error) => errors
+                                    .push(format!("Could not add {}: {error:#}", path.display())),
+                            }
+                        }
+                    }
+                    (videos, torrents, errors)
+                })
+                .await;
+            let _ = this.update_in(cx, |this, _, cx| {
+                this.importing = false;
+                this.library_files_restored(videos.iter());
+                this.store.data.restore_videos(videos);
+                this.library_changed(cx);
+                this.resolve_imported_torrents(torrents, errors, cx);
+                this.persist();
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Keep the single metadata request/chooser flow and report every file not admitted.
+    fn resolve_imported_torrents(
+        &mut self,
+        torrents: Vec<PathBuf>,
+        mut errors: Vec<String>,
+        cx: &mut Context<Self>,
+    ) {
+        let mut not_started = torrents.len();
+        if !self.resolving
+            && !self.quitting
+            && let Some(path) = torrents.into_iter().next()
+        {
+            self.resolve(flick::torrent::TorrentInput::File(path), cx);
+            if self.resolving {
+                not_started -= 1;
+            }
+            // Resolve clears the previous error; preserve any new admission failure.
+            if let Some(error) = self.error.take() {
+                errors.push(error);
+            }
+        }
+        if not_started > 0 {
+            let files = if not_started == 1 {
+                "file was"
+            } else {
+                "files were"
+            };
+            errors.push(format!(
+                "{not_started} torrent {files} not started. Open torrent files one at a time and retry when Flick is ready."
+            ));
+        }
+        if !errors.is_empty() {
+            self.error = Some(errors.join("\n"));
+        }
     }
 
     pub(super) fn send(&mut self, command: ServiceCommand, cx: &mut Context<Self>) {
+        if self.quitting {
+            return;
+        }
+        if let ServiceCommand::Remove { id, delete_files } = &command {
+            if !self.transfers_known
+                || self.downloads.iter().any(|download| {
+                    &download.infohash == id
+                        && matches!(download.state, flick::torrent::TransferState::Checking)
+                })
+            {
+                self.error = Some(
+                    "Wait for downloads to finish checking before removing this transfer.".into(),
+                );
+                cx.notify();
+                return;
+            }
+            if !delete_files
+                && self.downloads.iter().any(|download| {
+                    &download.infohash == id
+                        && matches!(download.state, flick::torrent::TransferState::Error)
+                })
+            {
+                self.error = Some(
+                    "Resume this transfer in Downloads so its files can be verified, then retry Remove · Keep Files. Your files and their transfer were kept.".into(),
+                );
+                cx.notify();
+                return;
+            }
+            // Keep Files is another ownership-release path. Its incomplete
+            // destinations need the same durable protection as library Delete.
+            if let Some(download) = self
+                .downloads
+                .iter()
+                .find(|download| &download.infohash == id)
+            {
+                for file in &download.files {
+                    if !file.selected
+                        || file.verified_bytes != file.length
+                        || matches!(
+                            download.state,
+                            flick::torrent::TransferState::Checking
+                                | flick::torrent::TransferState::Error
+                        )
+                    {
+                        self.store
+                            .data
+                            .quarantine_torrent_file(&file.path, id, file.index);
+                    }
+                }
+            }
+            if let Err(error) = self.store.queue_save() {
+                self.error = Some(format!(
+                    "Could not save verification state. The transfer was kept: {error}"
+                ));
+                cx.notify();
+                return;
+            }
+            let barrier = self.store.save_barrier();
+            self.transfers_changed(cx);
+            let save = cx
+                .background_executor()
+                .spawn(async move { barrier.wait() });
+            cx.spawn(async move |this, cx| {
+                let saved = save.await;
+                let _ = this.update(cx, |this, cx| {
+                    match saved {
+                        Ok(()) => {
+                            if let Err(error) = this.services.send(command) {
+                                this.error = Some(error);
+                            }
+                        }
+                        Err(error) => {
+                            this.error = Some(format!(
+                                "Could not save verification state. The transfer was kept: {error}"
+                            ))
+                        }
+                    }
+                    cx.notify();
+                });
+            })
+            .detach();
+            cx.notify();
+            return;
+        }
         if let Err(error) = self.services.send(command) {
             self.error = Some(error);
             self.resolving = false;
@@ -113,7 +695,7 @@ impl Flick {
                         Err(error) => self.subtitle_search.results = Some(Err(error)),
                     }
                 }
-                ServiceEvent::Fetch { id, update } => self.fetch_event(id, update),
+                ServiceEvent::Fetch { id, update } => self.fetch_event(id, update, cx),
                 ServiceEvent::ArchiveResolved { identifier, result } => {
                     self.archive_listed(identifier, result)
                 }
@@ -156,23 +738,110 @@ impl Flick {
                         Err(error) => self.error = Some(error),
                     }
                 }
+                ServiceEvent::TransferAvailability(availability) => {
+                    match &availability {
+                        crate::services::TransferAvailability::Checking => {
+                            self.transfer_roots = None;
+                            self.transfers_known = false;
+                            self.posters_dirty = true;
+                        }
+                        crate::services::TransferAvailability::Ready => {
+                            self.posters_dirty = true;
+                        }
+                        crate::services::TransferAvailability::Unavailable {
+                            message,
+                            roots,
+                            roots_complete,
+                        } => {
+                            self.transfers_known = false;
+                            self.transfer_roots = roots_complete.then(|| roots.clone());
+                            self.error = Some(format!(
+                                "Downloads unavailable: {message}. Restore folder access and choose Retry downloads."
+                            ));
+                            self.posters_dirty = true;
+                        }
+                    }
+                    self.transfer_availability = availability;
+                }
+                ServiceEvent::TransferRoots(roots) => {
+                    self.transfer_roots = Some(roots);
+                    self.posters_dirty = true;
+                }
                 ServiceEvent::Progress(downloads) => {
+                    let mut verified = false;
+                    for download in &downloads {
+                        if matches!(
+                            download.state,
+                            flick::torrent::TransferState::Checking
+                                | flick::torrent::TransferState::Error
+                        ) {
+                            continue;
+                        }
+                        for file in &download.files {
+                            if file.selected && file.verified_bytes == file.length {
+                                verified |= self.store.data.clear_verified_torrent_file(
+                                    &file.path,
+                                    &download.infohash,
+                                    file.index,
+                                );
+                            }
+                        }
+                    }
                     self.downloads = downloads;
+                    if !self.transfers_known {
+                        self.posters_dirty = true;
+                    }
                     self.transfers_known = true;
+                    self.transfers_changed(cx);
+                    if verified && let Err(error) = self.store.queue_save() {
+                        self.error = Some(format!("Could not save verification state: {error}"));
+                    }
+                }
+                ServiceEvent::DownloadAccepted { infohash, selected } => {
+                    // New admission invalidates any old verified snapshot. Never
+                    // let a partial re-download inherit a previous owner's proof.
+                    self.downloads
+                        .retain(|download| download.infohash != infohash);
+                    for (path, index) in &selected {
+                        self.store
+                            .data
+                            .allow_torrent_restore(path, &infohash, *index);
+                        self.store
+                            .data
+                            .quarantine_torrent_file(path, &infohash, *index);
+                    }
+                    self.library_files_restored(selected.iter().map(|(path, _)| path));
+                    self.transfers_changed(cx);
+                    self.library_changed(cx);
+                    if let Err(error) = self.store.queue_save() {
+                        self.error = Some(format!("Could not save download state: {error}"));
+                    }
                 }
                 ServiceEvent::TorrentCompleted {
                     infohash,
                     file_index,
                     path,
                 } => {
-                    self.store.data.bind_torrent(&path, &infohash, file_index);
-                    if let Err(error) = self.store.save() {
+                    // Completion is admitted by the service only after selected,
+                    // full verification of this exact engine destination.
+                    self.store
+                        .data
+                        .clear_verified_torrent_file(&path, &infohash, file_index);
+                    if !self.store.data.is_torrent_removed(&infohash, file_index) {
+                        self.store.data.bind_torrent(&path, &infohash, file_index);
+                    }
+                    self.transfers_changed(cx);
+                    self.library_changed(cx);
+                    if let Err(error) = self.store.queue_save() {
                         self.error = Some(format!("Could not save the library: {error}"));
                     }
                 }
                 ServiceEvent::Completed(path) => {
+                    // The identified Fetch event decides whether this explicit
+                    // admission predates any subsequent library removal.
                     self.store.data.add_video(&path);
-                    if let Err(error) = self.store.save() {
+                    self.library_changed(cx);
+                    if let Err(error) = self.store.queue_save() {
                         self.error = Some(format!("Could not save the library: {error}"));
                     }
                 }
@@ -211,25 +880,40 @@ impl Flick {
         });
         cx.spawn_in(window, async move |this, cx| {
             let result = receiver.await;
-            let _ = this.update_in(cx, |this, window, cx| match result {
-                Ok(Ok(Some(paths))) => {
-                    if share {
-                        if let Some(path) = paths.into_iter().next() { this.show_page(Page::Downloads, window, cx); this.send(ServiceCommand::Share(path), cx); }
-                    } else if folder {
-                        if let Some(path) = paths.into_iter().next() { this.import_folder(path, window, cx); }
-                    } else {
-                        let mut videos = Vec::new();
-                        for path in paths {
-                            if path.extension().is_some_and(|v| v.eq_ignore_ascii_case("torrent")) { this.resolve(flick::torrent::TorrentInput::File(path), cx); }
-                            else { videos.push(path); }
-                        }
-                        this.add_library_files(videos);
-                        this.persist(); cx.notify();
-                    }
+            match result {
+                Ok(Ok(Some(paths))) if !share && !folder => {
+                    let (torrents, videos): (Vec<_>, Vec<_>) = paths.into_iter().partition(|path| {
+                        path.extension().is_some_and(|v| v.eq_ignore_ascii_case("torrent"))
+                    });
+                    let _ = this.update_in(cx, |this, _, cx| {
+                        this.importing = true;
+                        cx.notify();
+                    });
+                    let (videos, errors) = cx.background_executor()
+                        .spawn(async move { validate_library_files(videos) }).await;
+                    let _ = this.update_in(cx, |this, _, cx| {
+                        this.importing = false;
+                        this.library_files_restored(videos.iter());
+                        this.store.data.restore_videos(videos);
+                        this.library_changed(cx);
+                        this.resolve_imported_torrents(torrents, errors, cx);
+                        this.persist();
+                        cx.notify();
+                    });
                 }
-                Ok(Ok(None)) => {}
-                _ => { this.error = Some("The file picker could not open. You can also drop videos into the library.".into()); cx.notify(); }
-            });
+                result => {
+                    let _ = this.update_in(cx, |this, window, cx| match result {
+                        Ok(Ok(Some(paths))) => {
+                            if let Some(path) = paths.into_iter().next() {
+                                if share { this.show_page(Page::Downloads, window, cx); this.send(ServiceCommand::Share(path), cx); }
+                                else { this.import_folder(path, window, cx); }
+                            }
+                        }
+                        Ok(Ok(None)) => {}
+                        _ => { this.error = Some("The file picker could not open. You can also drop videos into the library.".into()); cx.notify(); }
+                    });
+                }
+            }
         }).detach();
     }
 
@@ -245,7 +929,9 @@ impl Flick {
                 this.importing = false;
                 match result {
                     Ok(paths) => {
-                        this.store.data.add_videos(paths);
+                        this.library_files_restored(paths.iter());
+                        this.store.data.restore_videos(paths);
+                        this.library_changed(cx);
                         this.persist();
                     }
                     Err(error) => {
@@ -282,7 +968,7 @@ impl Flick {
             download_bps: preferences.download_bps,
             upload_bps: preferences.upload_bps,
         };
-        if let Err(error) = self.store.save() {
+        if let Err(error) = self.store.queue_save() {
             self.error = Some(format!("Could not save transfer preferences: {error}"));
         }
         self.send(command, cx);
@@ -715,6 +1401,7 @@ impl Flick {
             && !self.importing
             && !self.resolving
             && self.pending_torrent.is_none()
+            && self.pending_open.is_none()
     }
 
     /// Width available to page content, used to size card grids.
@@ -737,6 +1424,10 @@ impl Flick {
     }
 
     fn page_body(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        self.library_ui_state.begin_visible_posters();
+        if self.library_ui_state.posters.is_none() {
+            self.library_ui_state.posters = Some(cx.new(PosterCache::new));
+        }
         let t = cx.theme().clone();
         let error = self.error.clone().map(|error| {
             notice(&t, true, error).mb_4().child(self.icon_button(
@@ -764,16 +1455,22 @@ impl Flick {
             Style::Gnome => (28., 10.),
         };
         let width = self.content_width(window, cx);
+        let virtual_page = matches!(self.page, Page::Videos | Page::History | Page::Shows);
         let mut body = v_flex()
             .id("page-scroll")
             .flex_1()
             .min_h(px(0.))
-            .overflow_y_scroll()
+            .when(!virtual_page, |d| d.overflow_y_scroll())
+            .when(virtual_page, |d| d.overflow_hidden())
             .px(px(x))
             .pt(px(top))
             .pb_8();
+        if !virtual_page {
+            body =
+                self.with_scroll_keys(body, "page-scroll", &self.library_ui_state.page_scroll, cx);
+        }
         if t.style == Style::Windows {
-            let mut header = h_flex().mb_5().gap_2().child(
+            let mut header = h_flex().flex_none().mb_5().gap_2().child(
                 div()
                     .flex_1()
                     .text_size(t.font(28.))
@@ -793,12 +1490,20 @@ impl Flick {
             }
             body = body.child(header);
         }
-        body = body.children(error);
+        let has_notices = self.error.is_some()
+            || self.importing
+            || self.resolving
+            || self.pending_open.is_some()
+            || matches!(
+                self.transfer_availability,
+                crate::services::TransferAvailability::Unavailable { .. }
+            );
+        let mut notices = v_flex().w_full().children(error);
         if self.importing {
-            body = body.child(notice(&t, false, "Adding videos from your folder…").mb_4());
+            notices = notices.child(notice(&t, false, "Adding videos from your folder…").mb_4());
         }
         if self.resolving {
-            body = body.child(
+            notices = notices.child(
                 notice(&t, false, "Finding peers…")
                     .mb_4()
                     .child(self.button(
@@ -811,16 +1516,126 @@ impl Flick {
                     )),
             );
         }
-        body = body.child(match self.page {
+        if matches!(
+            self.transfer_availability,
+            crate::services::TransferAvailability::Unavailable { .. }
+        ) {
+            notices = notices.child(
+                self.button(
+                    "retry-downloads",
+                    None,
+                    "Retry downloads",
+                    false,
+                    cx,
+                    |this, _, cx| {
+                        this.error = None;
+                        match this.services.send(ServiceCommand::RetryTransfers) {
+                            Ok(()) => {
+                                this.transfer_availability =
+                                    crate::services::TransferAvailability::Checking
+                            }
+                            Err(error) => this.error = Some(error),
+                        }
+                        cx.notify();
+                    },
+                )
+                .mb_4(),
+            );
+        }
+        if self.pending_open.is_some() {
+            notices = notices.child(
+                notice(
+                    &t,
+                    false,
+                    if matches!(
+                        self.transfer_availability,
+                        crate::services::TransferAvailability::Unavailable { .. }
+                    ) {
+                        "This video is waiting for download access. Retry downloads or cancel."
+                    } else {
+                        "Checking saved downloads before opening this video…"
+                    },
+                )
+                .mb_4()
+                .child(self.button(
+                    "cancel-pending-open",
+                    None,
+                    "Cancel",
+                    false,
+                    cx,
+                    |this, _, cx| {
+                        this.pending_open = None;
+                        this.open_generation += 1;
+                        cx.notify();
+                    },
+                )),
+            );
+        }
+        if self.page == Page::Videos {
+            return body
+                .child(self.videos_page(width, notices, has_notices, cx))
+                .into_any_element();
+        }
+        if has_notices {
+            body = body.child(if virtual_page {
+                self.search_pane(notices, false, cx).into_any_element()
+            } else {
+                notices.flex_none().into_any_element()
+            });
+        }
+        let page = match self.page {
             Page::Home => self.home_page(width, cx),
-            Page::Videos => self.videos_page(width, cx),
+            Page::Videos => unreachable!("Videos owns its notices and search viewport"),
             Page::Shows => self.shows_page(width, cx),
             Page::History => self.history_page(cx),
             Page::Downloads => self.downloads_page(cx),
             Page::Appearance => self.appearance_page(cx),
             Page::Shortcuts => self.shortcuts_page(cx),
-        });
+        };
+        body = body.child(page.when(!virtual_page, |d| d.flex_none()));
         body.into_any_element()
+    }
+
+    /// Page keys work within results and file choosers, including their bottom actions.
+    fn with_scroll_keys(
+        &self,
+        el: Stateful<Div>,
+        id: &'static str,
+        scroll: &ScrollHandle,
+        cx: &Context<Self>,
+    ) -> Stateful<Div> {
+        let el = el.track_scroll(scroll);
+        let scroll = scroll.clone();
+        el.track_focus(&self.control_handle(&id.into(), cx))
+            .on_key_down(cx.listener(move |this, event: &KeyDownEvent, window, cx| {
+                let modifiers = event.keystroke.modifiers;
+                if modifiers.platform
+                    || modifiers.control
+                    || modifiers.alt
+                    || this.text_focused(window, cx)
+                {
+                    return;
+                }
+                if let Some(y) = scroll_key_offset(
+                    &event.keystroke.key,
+                    scroll.offset().y,
+                    scroll.max_offset().height,
+                    scroll.bounds().size.height,
+                ) {
+                    scroll.set_offset(point(scroll.offset().x, y));
+                    window.refresh();
+                    cx.stop_propagation();
+                }
+            }))
+    }
+
+    fn search_pane(&self, content: Div, link: bool, cx: &Context<Self>) -> Stateful<Div> {
+        self.with_scroll_keys(
+            search_pane_layout(content, link),
+            "video-search-scroll",
+            &self.library_ui_state.search_scroll,
+            cx,
+        )
     }
 
     fn welcome(&self, cx: &Context<Self>) -> Div {
@@ -1036,26 +1851,25 @@ impl Flick {
     pub(super) fn video_detail(&self, path: &std::path::Path) -> (Option<f32>, String) {
         let data = &self.store.data;
         let duration = data
-            .recent
-            .iter()
-            .find(|file| file.path == path)
+            .recent_file(path)
             .map(|file| file.duration)
             .filter(|duration| *duration > 0.)
-            .or_else(|| {
-                data.library
-                    .iter()
-                    .find(|video| video.path == path)
-                    .map(|video| video.duration)
-            })
+            .or_else(|| data.video(path).map(|video| video.duration))
             .unwrap_or(0.);
         let resume = self.store.resume_position(path);
-        if resume > 0. && duration > 0. {
+        let unavailable = self.library_file_unavailable(path);
+        let unverified = data.unverified_torrent_file(path).is_some();
+        if !unavailable && !unverified && resume > 0. && duration > 0. {
             return (
                 Some((resume / duration).clamp(0., 1.) as f32),
                 format!("{} left", format_time(duration - resume)),
             );
         }
-        let state = if data.watched(path) {
+        let state = if unavailable {
+            "Unavailable"
+        } else if unverified {
+            "Needs verification"
+        } else if data.watched(path) {
             "Watched"
         } else {
             "Not started"
@@ -1160,6 +1974,17 @@ impl Flick {
                 Rc::new(move |this, _, _| this.store.data.dismiss_from_continue(&p)),
             ));
         }
+        let p = path.clone();
+        items.push((
+            "x",
+            "Remove from Library",
+            Rc::new(move |this, w, cx| this.remove_library_video(p.clone(), w, cx)),
+        ));
+        items.push((
+            "x",
+            "Delete File…",
+            Rc::new(move |this, w, cx| this.request_delete_video(path.clone(), w, cx)),
+        ));
         let mut panel = v_flex()
             .id("card-menu-panel")
             .occlude()
@@ -1227,6 +2052,56 @@ impl Flick {
         )
     }
 
+    fn video_has_focus(
+        &self,
+        section: &'static str,
+        path: &std::path::Path,
+        cx: &Context<Self>,
+    ) -> bool {
+        self.keyboard_focused(&video_id(section, path), cx)
+            || self.keyboard_focused(&action_id(section, path, FocusSlot::Remove), cx)
+            || self.keyboard_focused(&action_id(section, path, FocusSlot::Delete), cx)
+    }
+
+    fn video_actions(
+        &self,
+        section: &'static str,
+        path: &std::path::Path,
+        cx: &Context<Self>,
+    ) -> Div {
+        h_flex()
+            .flex_none()
+            .gap_1()
+            .child(
+                self.button(
+                    action_id(section, path, FocusSlot::Remove),
+                    None,
+                    "Remove",
+                    false,
+                    cx,
+                    {
+                        let path = path.to_owned();
+                        move |this, w, cx| this.remove_library_video(path.clone(), w, cx)
+                    },
+                )
+                .text_size(cx.theme().font(11.)),
+            )
+            .child(
+                self.button(
+                    action_id(section, path, FocusSlot::Delete),
+                    None,
+                    "Delete…",
+                    false,
+                    cx,
+                    {
+                        let path = path.to_owned();
+                        move |this, w, cx| this.request_delete_video(path.clone(), w, cx)
+                    },
+                )
+                .text_size(cx.theme().font(11.)),
+            )
+    }
+
     /// A video card in a grid of `cols` columns holding `count` cards. Arrow
     /// keys move focus between cards; Enter or Space opens the video.
     #[allow(clippy::too_many_arguments)]
@@ -1243,11 +2118,11 @@ impl Flick {
         let (progress, detail) = self.video_detail(path);
         let path = path.to_owned();
         let height = (width * 9. / 16.).round();
-        let id = ElementId::from((section, index));
+        let id = video_id(section, &path);
         let group_name = SharedString::from(format!("{section}-{index}"));
         let menu_path = path.clone();
         let focused_card = self
-            .keyboard_focused(&id, cx)
+            .video_has_focus(section, &path, cx)
             .then(|| self.focused_card.clone());
         let el = v_flex()
             .id(id.clone())
@@ -1319,6 +2194,7 @@ impl Flick {
                     .text_color(t.muted)
                     .child(detail),
             )
+            .child(self.video_actions(section, &menu_path, cx))
             .when_some(focused_card, |d, cell| {
                 d.child(
                     canvas(move |bounds, _, _| cell.set(bounds), |_, _, _, _| {})
@@ -1343,20 +2219,94 @@ impl Flick {
     ) -> Stateful<Div> {
         el.on_key_down(cx.listener(move |this, event: &KeyDownEvent, window, cx| {
             let modifiers = event.keystroke.modifiers;
-            if modifiers.control || modifiers.platform || modifiers.alt || modifiers.shift {
+            if modifiers.control || modifiers.platform || modifiers.alt {
                 return;
             }
-            let Some(step) = GridStep::from_key(&event.keystroke.key) else {
+            let virtual_section = this
+                .library_ui_state
+                .sections
+                .borrow()
+                .get(section)
+                .cloned();
+            let mut target_slot = FocusSlot::Primary;
+            let target = if event.keystroke.key == "tab" {
+                let Some(section_state) = virtual_section.as_ref() else {
+                    return;
+                };
+                let actions = section_state.paths.is_some();
+                let focused = window.focused(cx);
+                let slot =
+                    section_state
+                        .paths
+                        .as_ref()
+                        .and_then(|paths| paths.get(index))
+                        .map_or(FocusSlot::Primary, |path| {
+                            if focused.as_ref()
+                                == Some(&this.control_handle(
+                                    &action_id(section, path, FocusSlot::Delete),
+                                    cx,
+                                ))
+                            {
+                                FocusSlot::Delete
+                            } else if focused.as_ref()
+                                == Some(&this.control_handle(
+                                    &action_id(section, path, FocusSlot::Remove),
+                                    cx,
+                                ))
+                            {
+                                FocusSlot::Remove
+                            } else {
+                                FocusSlot::Primary
+                            }
+                        });
+                let Some((target, slot)) = tab_target(index, count, slot, modifiers.shift, actions)
+                else {
+                    return;
+                };
+                target_slot = slot;
+                Some(target)
+            } else {
+                if modifiers.shift {
+                    return;
+                }
+                let Some(step) = GridStep::from_key(&event.keystroke.key) else {
+                    return;
+                };
+                let target = step.target(index, cols, count);
+                if target.is_none() {
+                    cx.stop_propagation();
+                    if matches!(step, GridStep::Left | GridStep::Up) {
+                        window.focus_prev();
+                    } else {
+                        window.focus_next();
+                    }
+                    this.keyboard_nav = true;
+                    cx.notify();
+                    return;
+                }
+                target
+            };
+            let Some(target) = target else {
                 return;
             };
             cx.stop_propagation();
             this.keyboard_nav = true;
-            match step.target(index, cols, count) {
-                Some(target) => this
-                    .control_handle(&ElementId::from((section, target)), cx)
-                    .focus(window),
-                None if matches!(step, GridStep::Left | GridStep::Up) => window.focus_prev(),
-                None => window.focus_next(),
+            if let Some(section_state) = virtual_section {
+                section_state
+                    .scroll
+                    .scroll_to_item(target / section_state.columns, ScrollStrategy::Center);
+                let id = if target_slot != FocusSlot::Primary {
+                    section_state
+                        .paths
+                        .as_ref()
+                        .and_then(|paths| paths.get(target))
+                        .map(|path| action_id(section, path, target_slot))
+                } else {
+                    section_state.ids.get(target).cloned()
+                };
+                if let Some(id) = id {
+                    this.control_handle(&id, cx).focus(window);
+                }
             }
             cx.notify();
         }))
@@ -1373,10 +2323,11 @@ impl Flick {
     ) -> AnyElement {
         let t = cx.theme();
         let (progress, detail) = self.video_detail(path);
-        let id = ElementId::from((section, index));
+        let id = video_id(section, path);
         let open_path = path.to_owned();
         let el = h_flex()
             .id(id.clone())
+            .w_full()
             .relative()
             .gap_3()
             .px_3()
@@ -1422,8 +2373,9 @@ impl Flick {
                         )
                     }),
             )
+            .child(self.video_actions(section, path, cx))
             .child(icon("play", 18., t.muted))
-            .when(self.keyboard_focused(&id, cx), |d| {
+            .when(self.video_has_focus(section, path, cx), |d| {
                 let cell = self.focused_card.clone();
                 d.child(
                     canvas(move |bounds, _, _| cell.set(bounds), |_, _, _, _| {})
@@ -1437,6 +2389,149 @@ impl Flick {
             .into_any_element()
     }
 
+    fn filtered_video_paths(&self) -> Rc<[PathBuf]> {
+        self.library_ui_state
+            .video_paths(&self.store.data, &self.query, self.video_filter)
+    }
+
+    fn filtered_shows(&self) -> (Rc<[usize]>, Rc<[ElementId]>) {
+        let revision = self.store.data.revision();
+        let query = self.query.to_lowercase();
+        let mut cache = self.library_ui_state.shows.borrow_mut();
+        if let Some(cached) = cache.as_ref()
+            && cached.revision == revision
+            && cached.query == query
+        {
+            return (cached.indices.clone(), cached.ids.clone());
+        }
+        let shows = self.store.data.shows();
+        let mut labels = self.library_ui_state.show_labels.borrow_mut();
+        if !labels
+            .as_ref()
+            .is_some_and(|(old_revision, _)| *old_revision == revision)
+        {
+            *labels = Some((
+                revision,
+                shows.iter().map(|show| show.title.to_lowercase()).collect(),
+            ));
+        }
+        let indices: Rc<[usize]> = labels
+            .as_ref()
+            .unwrap()
+            .1
+            .iter()
+            .enumerate()
+            .filter(|(_, title)| title.contains(&query))
+            .map(|(index, _)| index)
+            .collect();
+        let ids = indices
+            .iter()
+            .map(|index| show_id(&shows[*index]))
+            .collect::<Rc<[_]>>();
+        *cache = Some(ShowQuery {
+            revision,
+            query,
+            indices: indices.clone(),
+            ids: ids.clone(),
+        });
+        (indices, ids)
+    }
+
+    fn register_video_section(
+        &self,
+        section: &'static str,
+        paths: Rc<[PathBuf]>,
+        columns: usize,
+        scroll: UniformListScrollHandle,
+    ) {
+        let mut sections = self.library_ui_state.sections.borrow_mut();
+        if let Some(previous) = sections.get_mut(section)
+            && previous
+                .paths
+                .as_ref()
+                .is_some_and(|old| Rc::ptr_eq(old, &paths))
+        {
+            previous.columns = columns;
+            previous.scroll = scroll;
+            return;
+        }
+        let ids = paths.iter().map(|path| video_id(section, path)).collect();
+        sections.insert(
+            section,
+            VirtualSection {
+                ids,
+                paths: Some(paths),
+                columns,
+                scroll,
+            },
+        );
+    }
+
+    /// One scroll owner per page; only GPUI's requested rows create cards or images.
+    fn virtual_videos(
+        &self,
+        section: &'static str,
+        paths: Rc<[PathBuf]>,
+        columns: usize,
+        width: f32,
+        list: bool,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let count = paths.len();
+        let scroll = self.library_ui_state.scroll(section);
+        self.register_video_section(section, paths.clone(), columns, scroll.clone());
+        let entity = cx.entity().downgrade();
+        let row_height = if list {
+            cx.theme().font(88.)
+        } else {
+            px((width * 9. / 16.).round() + 16.) + cx.theme().font(104.)
+        };
+        let measure = first_visible_row(&scroll, row_height, count.div_ceil(columns));
+        uniform_list(section, count.div_ceil(columns), move |range, _, cx| {
+            let Some(entity) = entity.upgrade() else {
+                return Vec::new();
+            };
+            entity.update(cx, |this, cx| {
+                this.library_ui_state.begin_visible_posters();
+                range
+                    .map(|row_index| {
+                        let mut row = h_flex()
+                            .items_start()
+                            .gap(px(16.))
+                            .h(row_height)
+                            .w_full()
+                            .px(px(RING_INSET));
+                        for index in grid_row_range(row_index, columns, count) {
+                            let path = &paths[index];
+                            let Some(video) = this.store.data.video(path) else {
+                                continue;
+                            };
+                            row = row.child(if list {
+                                this.video_row((section, index), count, path, &video.title, cx)
+                            } else {
+                                this.video_card(
+                                    (section, index),
+                                    (columns, count),
+                                    path,
+                                    &video.title,
+                                    width,
+                                    cx,
+                                )
+                            });
+                        }
+                        row
+                    })
+                    .collect()
+            })
+        })
+        .with_width_from_item(Some(measure))
+        .track_scroll(scroll)
+        .flex_1()
+        .min_h(px(0.))
+        .w_full()
+        .into_any_element()
+    }
+
     fn home_page(&self, width: f32, cx: &Context<Self>) -> Div {
         let t = cx.theme().clone();
         let query = self.query.to_lowercase();
@@ -1445,15 +2540,28 @@ impl Flick {
         if self.query_is_link() {
             return page;
         }
+        let (continue_cols, _) = columns(width, 220., gap);
         let continuing = self
             .store
             .data
             .continue_watching()
-            .filter(|v| v.title.to_lowercase().contains(&query))
+            .filter(|v| {
+                self.store
+                    .data
+                    .normalized_recent_title(&v.path)
+                    .is_some_and(|title| title.contains(&query))
+            })
+            .take(continue_cols)
             .collect::<Vec<_>>();
         if !continuing.is_empty() {
             let (cols, card) = columns(width, 220., gap);
-            let shown = continuing.len().min(cols);
+            let shown = continuing.len();
+            self.register_video_section(
+                "continue",
+                continuing.iter().map(|v| v.path.clone()).collect(),
+                cols,
+                UniformListScrollHandle::new(),
+            );
             let cards = continuing
                 .into_iter()
                 .take(cols)
@@ -1467,15 +2575,21 @@ impl Flick {
                 .child(card_grid(cards, cols, gap))
                 .child(div().h(px(28.)));
         }
+        let (cols, card) = columns(width, 180., gap);
         let added = self
             .store
             .data
             .library
             .iter()
             .rev()
-            .filter(|v| v.title.to_lowercase().contains(&query))
+            .filter(|v| {
+                self.store
+                    .data
+                    .normalized_title(&v.path)
+                    .is_some_and(|title| title.contains(&query))
+            })
+            .take(cols * 2)
             .collect::<Vec<_>>();
-        let (cols, card) = columns(width, 180., gap);
         page = page.child(
             h_flex()
                 .justify_between()
@@ -1509,7 +2623,13 @@ impl Flick {
                 "Press Enter to search online.",
             ));
         } else {
-            let shown = added.len().min(cols * 2);
+            let shown = added.len();
+            self.register_video_section(
+                "recent",
+                added.iter().map(|v| v.path.clone()).collect(),
+                cols,
+                UniformListScrollHandle::new(),
+            );
             let cards = added
                 .into_iter()
                 .take(cols * 2)
@@ -1523,12 +2643,18 @@ impl Flick {
         page
     }
 
-    fn videos_page(&self, width: f32, cx: &Context<Self>) -> Div {
+    fn videos_page(&self, width: f32, notices: Div, has_notices: bool, cx: &Context<Self>) -> Div {
+        let search = self.search_section(cx);
+        let has_remote = has_notices || search.is_some();
+        let remote = notices.children(search);
         if self.query_is_link() {
-            return v_flex().w_full().children(self.search_section(cx));
+            return v_flex()
+                .flex_1()
+                .min_h(px(0.))
+                .w_full()
+                .child(self.search_pane(remote, true, cx));
         }
         let t = cx.theme().clone();
-        let query = self.query.to_lowercase();
         let gap = 16.;
         let filter = self.segmented(
             "video-filter",
@@ -1571,35 +2697,30 @@ impl Flick {
                 cx.notify();
             },
         );
-        let videos = self
-            .store
-            .data
-            .sorted_library(view.sort)
-            .into_iter()
-            .filter(|v| v.title.to_lowercase().contains(&query))
-            .filter(|v| match self.video_filter {
-                VideoFilter::All => true,
-                VideoFilter::Unwatched => !self.store.data.watched(&v.path),
-                VideoFilter::InProgress => self.store.resume_position(&v.path) > 0.,
-            })
-            .collect::<Vec<_>>();
-        let mut page = v_flex().w_full().children(self.search_section(cx)).child(
-            h_flex()
-                .mb_4()
-                .gap_3()
-                .flex_wrap()
-                .child(filter)
-                .child(sort)
-                .child(div().flex_1())
-                .child(
-                    div()
-                        .text_size(t.font(12.))
-                        .text_color(t.muted)
-                        .child(format!("{} videos", videos.len())),
-                )
-                .child(layout),
-        );
-        if videos.is_empty() {
+        let paths = self.filtered_video_paths();
+        let mut page = v_flex()
+            .flex_1()
+            .min_h(px(0.))
+            .w_full()
+            .when(has_remote, |d| d.child(self.search_pane(remote, false, cx)))
+            .child(
+                h_flex()
+                    .flex_none()
+                    .mb_4()
+                    .gap_3()
+                    .flex_wrap()
+                    .child(filter)
+                    .child(sort)
+                    .child(div().flex_1())
+                    .child(
+                        div()
+                            .text_size(t.font(12.))
+                            .text_color(t.muted)
+                            .child(format!("{} videos", paths.len())),
+                    )
+                    .child(layout),
+            );
+        if paths.is_empty() {
             return page.child(if self.store.data.library.is_empty() {
                 empty_state(
                     &t,
@@ -1616,56 +2737,34 @@ impl Flick {
                 )
             });
         }
-        let count = videos.len();
         if view.list {
-            let rows = videos
-                .into_iter()
-                .enumerate()
-                .map(|(i, v)| self.video_row(("library-row", i), count, &v.path, &v.title, cx))
-                .collect();
-            return page.child(group(&t, rows));
+            return page.child(self.virtual_videos("library-row", paths, 1, width, true, cx));
         }
-        let (cols, card) = columns(width, 180., gap);
-        let cards = videos
-            .into_iter()
-            .enumerate()
-            .map(|(i, v)| {
-                self.video_card(("library", i), (cols, count), &v.path, &v.title, card, cx)
-            })
-            .collect();
-        page = page.child(card_grid(cards, cols, gap));
+        let (cols, card) = columns(width - RING_INSET * 2., 180., gap);
+        page = page.child(self.virtual_videos("library", paths, cols, card, false, cx));
         page
     }
 
     /// Shows found in the library, or one show's episodes by season.
     fn shows_page(&self, width: f32, cx: &Context<Self>) -> Div {
         let t = cx.theme().clone();
-        let query = self.query.to_lowercase();
-        let shows = flick::library::group_shows(
-            self.store
-                .data
-                .library
-                .iter()
-                .map(|video| video.path.as_path()),
-        )
-        .into_iter()
-        .filter(|show| show.title.to_lowercase().contains(&query))
-        .collect::<Vec<_>>();
+        let (shows, show_ids) = self.filtered_shows();
         let selected = self.selected_show.as_ref().and_then(|key| {
-            shows.iter().find(|show| {
-                show.episodes
-                    .first()
-                    .is_some_and(|(e, _)| e.show_key() == *key)
-            })
+            shows
+                .iter()
+                .filter_map(|index| self.store.data.shows().get(*index))
+                .find(|show| {
+                    show.episodes
+                        .first()
+                        .is_some_and(|(episode, _)| episode.show_key() == *key)
+                })
         });
         if let Some(show) = selected {
-            let watched = show
-                .episodes
-                .iter()
-                .filter(|(_, path)| self.store.data.watched(path))
-                .count();
-            let mut page = v_flex().w_full().child(
+            let count = show.episodes.len();
+            let watched = count - self.library_ui_state.show_unwatched(&self.store.data, show);
+            let mut page = v_flex().flex_1().min_h(px(0.)).w_full().child(
                 h_flex()
+                    .flex_none()
                     .mb_4()
                     .gap_3()
                     .child(self.button(
@@ -1681,7 +2780,6 @@ impl Flick {
                     ))
                     .child(
                         div()
-                            .text_size(t.font(t.text_size + 5.))
                             .font_weight(FontWeight::SEMIBOLD)
                             .child(show.title.clone()),
                     )
@@ -1690,33 +2788,68 @@ impl Flick {
                         div()
                             .text_size(t.font(12.))
                             .text_color(t.muted)
-                            .child(format!(
-                                "{} episodes · {watched} watched",
-                                show.episodes.len()
-                            )),
+                            .child(format!("{count} episodes · {watched} watched")),
                     ),
             );
-            let count = show.episodes.len();
-            let mut index = 0;
-            let mut seasons = show
-                .episodes
-                .chunk_by(|(a, _), (b, _)| a.season == b.season);
-            for season in seasons.by_ref() {
-                let rows = season
-                    .iter()
-                    .map(|(episode, path)| {
-                        let title =
-                            format!("{} · {}", episode.label(), crate::model::file_title(path));
-                        let row = self.video_row(("episode", index), count, path, &title, cx);
-                        index += 1;
-                        row
+            let key = self.selected_show.as_deref().unwrap_or_default();
+            let scroll = self.library_ui_state.scroll(&format!("episodes:{key}"));
+            let revision = self.store.data.revision();
+            let (episodes, paths) = {
+                let mut cache = self.library_ui_state.episodes.borrow_mut();
+                if !cache
+                    .as_ref()
+                    .is_some_and(|cached| cached.revision == revision && cached.key == key)
+                {
+                    *cache = Some(EpisodeQuery {
+                        revision,
+                        key: key.to_owned(),
+                        episodes: show.episodes.clone().into(),
+                        paths: show.episodes.iter().map(|(_, path)| path.clone()).collect(),
+                    });
+                }
+                let cached = cache.as_ref().unwrap();
+                (cached.episodes.clone(), cached.paths.clone())
+            };
+            self.register_video_section("episode", paths, 1, scroll.clone());
+            let entity = cx.entity().downgrade();
+            let measure = first_visible_row(&scroll, t.font(88.), count);
+            page = page.child(
+                uniform_list("episode-list", count, move |range, _, cx| {
+                    let Some(entity) = entity.upgrade() else {
+                        return Vec::new();
+                    };
+                    entity.update(cx, |this, cx| {
+                        this.library_ui_state.begin_visible_posters();
+                        range
+                            .map(|index| {
+                                let (episode, path) = &episodes[index];
+                                let title = format!(
+                                    "Season {} · {} · {}",
+                                    episode.season,
+                                    episode.label(),
+                                    crate::model::file_title(path)
+                                );
+                                div()
+                                    .h(cx.theme().font(88.))
+                                    .w_full()
+                                    .px(px(RING_INSET))
+                                    .child(this.video_row(
+                                        ("episode", index),
+                                        count,
+                                        path,
+                                        &title,
+                                        cx,
+                                    ))
+                            })
+                            .collect()
                     })
-                    .collect();
-                page = page
-                    .child(section_title(&t, format!("Season {}", season[0].0.season)))
-                    .child(group(&t, rows))
-                    .child(div().h(px(20.)));
-            }
+                })
+                .with_width_from_item(Some(measure))
+                .track_scroll(scroll)
+                .flex_1()
+                .min_h(px(0.))
+                .w_full(),
+            );
             return page;
         }
         if shows.is_empty() {
@@ -1728,14 +2861,47 @@ impl Flick {
             ));
         }
         let gap = 16.;
-        let (cols, card) = columns(width, 180., gap);
+        let (cols, card) = columns(width - RING_INSET * 2., 180., gap);
         let count = shows.len();
-        let cards = shows
-            .iter()
-            .enumerate()
-            .map(|(index, show)| self.show_card(index, (cols, count), show, card, cx))
-            .collect();
-        v_flex().w_full().child(card_grid(cards, cols, gap))
+        let scroll = self.library_ui_state.scroll("shows");
+        self.library_ui_state
+            .register("show", show_ids, cols, scroll.clone());
+        let entity = cx.entity().downgrade();
+        let measure = first_visible_row(
+            &scroll,
+            px((card * 9. / 16.).round() + gap) + t.font(68.),
+            count.div_ceil(cols),
+        );
+        v_flex().flex_1().min_h(px(0.)).w_full().child(
+            uniform_list("shows-grid", count.div_ceil(cols), move |range, _, cx| {
+                let Some(entity) = entity.upgrade() else {
+                    return Vec::new();
+                };
+                entity.update(cx, |this, cx| {
+                    this.library_ui_state.begin_visible_posters();
+                    range
+                        .map(|row| {
+                            h_flex()
+                                .items_start()
+                                .gap(px(gap))
+                                .w_full()
+                                .px(px(RING_INSET))
+                                .h(px((card * 9. / 16.).round() + gap) + cx.theme().font(68.))
+                                .children(grid_row_range(row, cols, count).filter_map(|index| {
+                                    this.store.data.shows().get(shows[index]).map(|show| {
+                                        this.show_card(index, (cols, count), show, card, cx)
+                                    })
+                                }))
+                        })
+                        .collect()
+                })
+            })
+            .with_width_from_item(Some(measure))
+            .track_scroll(scroll)
+            .flex_1()
+            .min_h(px(0.))
+            .w_full(),
+        )
     }
 
     fn show_card(
@@ -1752,16 +2918,12 @@ impl Flick {
             .first()
             .map(|(e, _)| e.show_key())
             .unwrap_or_default();
-        let unwatched = show
-            .episodes
-            .iter()
-            .filter(|(_, path)| !self.store.data.watched(path))
-            .count();
+        let unwatched = self.library_ui_state.show_unwatched(&self.store.data, show);
         let detail = match unwatched {
             0 => format!("{} episodes · all watched", show.episodes.len()),
             n => format!("{} episodes · {n} unwatched", show.episodes.len()),
         };
-        let id = ElementId::from(("show", index));
+        let id = show_id(show);
         let el = v_flex()
             .id(id.clone())
             .relative()
@@ -1770,8 +2932,21 @@ impl Flick {
             .cursor_pointer()
             .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
                 this.selected_show = Some(key.clone());
-                if this.keyboard_nav {
-                    this.control_handle(&ElementId::from(("episode", 0usize)), cx)
+                if this.keyboard_nav
+                    && let Some(path) = this
+                        .store
+                        .data
+                        .shows()
+                        .iter()
+                        .find(|show| {
+                            show.episodes
+                                .first()
+                                .is_some_and(|(e, _)| e.show_key() == key)
+                        })
+                        .and_then(|show| show.episodes.first())
+                        .map(|(_, path)| path)
+                {
+                    this.control_handle(&video_id("episode", path), cx)
                         .focus(window);
                 }
                 cx.notify();
@@ -1818,17 +2993,7 @@ impl Flick {
     fn history_page(&self, cx: &Context<Self>) -> Div {
         let t = cx.theme().clone();
         let count = self.store.data.recent.len();
-        let rows = self
-            .store
-            .data
-            .recent
-            .iter()
-            .enumerate()
-            .map(|(index, video)| {
-                self.video_row(("history", index), count, &video.path, &video.title, cx)
-            })
-            .collect::<Vec<_>>();
-        if rows.is_empty() {
+        if count == 0 {
             return v_flex().child(empty_state(
                 &t,
                 "history",
@@ -1836,7 +3001,60 @@ impl Flick {
                 "Videos you play appear here so you can pick up where you left off.",
             ));
         }
-        v_flex().child(group(&t, rows))
+        let paths = {
+            let revision = self.store.data.revision();
+            let mut cache = self.library_ui_state.history.borrow_mut();
+            if !cache
+                .as_ref()
+                .is_some_and(|(old_revision, _)| *old_revision == revision)
+            {
+                *cache = Some((
+                    revision,
+                    self.store
+                        .data
+                        .recent
+                        .iter()
+                        .map(|video| video.path.clone())
+                        .collect(),
+                ));
+            }
+            cache.as_ref().unwrap().1.clone()
+        };
+        let scroll = self.library_ui_state.scroll("history");
+        self.register_video_section("history", paths.clone(), 1, scroll.clone());
+        let entity = cx.entity().downgrade();
+        let measure = first_visible_row(&scroll, t.font(88.), count);
+        v_flex().flex_1().min_h(px(0.)).w_full().child(
+            uniform_list("history-list", count, move |range, _, cx| {
+                let Some(entity) = entity.upgrade() else {
+                    return Vec::new();
+                };
+                entity.update(cx, |this, cx| {
+                    this.library_ui_state.begin_visible_posters();
+                    range
+                        .map(|index| {
+                            let path = &paths[index];
+                            let row = div().h(cx.theme().font(88.)).w_full().px(px(RING_INSET));
+                            let Some(video) = this.store.data.recent_file(path) else {
+                                return row;
+                            };
+                            row.child(this.video_row(
+                                ("history", index),
+                                count,
+                                path,
+                                &video.title,
+                                cx,
+                            ))
+                        })
+                        .collect()
+                })
+            })
+            .with_width_from_item(Some(measure))
+            .track_scroll(scroll)
+            .flex_1()
+            .min_h(px(0.))
+            .w_full(),
+        )
     }
 
     fn downloads_page(&self, cx: &Context<Self>) -> Div {
@@ -1956,7 +3174,7 @@ impl Flick {
         use flick::torrent::TransferState;
         let t = cx.theme().clone();
         let id = download.infohash.clone();
-        let paused = download.state == TransferState::Paused;
+        let paused = matches!(download.state, TransferState::Paused | TransferState::Error);
         let complete = download.verified_bytes == download.total_bytes && download.total_bytes > 0;
         let (state, color) = match download.state {
             TransferState::Checking => ("Checking files…", t.accent),
@@ -1997,7 +3215,9 @@ impl Flick {
                 false,
                 cx,
                 move |this, w, cx| {
-                    this.store.data.bind_torrent(&path, &infohash, index);
+                    this.store
+                        .data
+                        .restore_torrent_video(&path, &infohash, index);
                     this.open(path.clone(), w, cx);
                 },
             ));
@@ -2022,7 +3242,9 @@ impl Flick {
                 false,
                 cx,
                 move |this, w, cx| {
-                    this.store.data.bind_torrent(&path, &infohash, index);
+                    this.store
+                        .data
+                        .restore_torrent_video(&path, &infohash, index);
                     this.open(path.clone(), w, cx);
                 },
             ));
@@ -2340,6 +3562,29 @@ type MenuAction = dyn Fn(&mut Flick, &mut Window, &mut Context<Flick>);
 /// Rows inside grouped lists draw their focus ring inside the group.
 pub(super) const RING_INSET: f32 = 4.;
 
+fn search_pane_layout(content: Div, link: bool) -> Stateful<Div> {
+    v_flex()
+        .id("video-search-scroll")
+        .min_h(px(0.))
+        .w_full()
+        .overflow_y_scroll()
+        .when(link, |d| d.flex_1())
+        .when(!link, |d| d.flex_none().max_h(relative(0.45)))
+        // Intrinsic content must overflow the pane, never shrink to its viewport.
+        .child(content.flex_none())
+}
+
+fn scroll_key_offset(key: &str, offset: Pixels, max: Pixels, viewport: Pixels) -> Option<Pixels> {
+    let page = viewport * 0.9;
+    Some(match key {
+        "pageup" => (offset + page).min(px(0.)),
+        "pagedown" => (offset - page).max(-max),
+        "home" => px(0.),
+        "end" => -max,
+        _ => return None,
+    })
+}
+
 /// Arrow-key movement within a card grid.
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum GridStep {
@@ -2481,7 +3726,47 @@ pub(super) fn checkbox(t: &Theme, checked: bool) -> Div {
 
 #[cfg(test)]
 mod tests {
-    use super::GridStep;
+    use super::{
+        FocusSlot, GridStep, LibraryUiState, POSTER_CACHE_CAPACITY, PosterLru, VideoFilter,
+        action_id, first_visible_row, grid_row_range, scroll_key_offset, tab_target,
+        validate_library_files, video_id,
+    };
+    use crate::store::{Settings, Sort};
+    use gpui::{Resource, UniformListScrollHandle, point, px};
+    use std::{path::PathBuf, rc::Rc};
+
+    #[test]
+    fn keyboard_paging_reaches_last_result_and_chooser_actions_without_overscroll() {
+        let viewport = px(240.);
+        // 150 remote rows followed by destination and confirmation actions.
+        let content = px(150. * 64. + 140.);
+        let max = content - viewport;
+        let mut offset = px(0.);
+        for _ in 0..100 {
+            offset = scroll_key_offset("pagedown", offset, max, viewport).unwrap();
+            assert!(offset >= -max && offset <= px(0.));
+        }
+        assert_eq!(offset, -max);
+        assert_eq!(-offset + viewport, content);
+        assert_eq!(
+            scroll_key_offset("home", offset, max, viewport),
+            Some(px(0.))
+        );
+        assert_eq!(scroll_key_offset("end", px(0.), max, viewport), Some(-max));
+        for _ in 0..100 {
+            offset = scroll_key_offset("pageup", offset, max, viewport).unwrap();
+        }
+        assert_eq!(offset, px(0.));
+        for key in ["pageup", "pagedown", "home", "end"] {
+            assert_eq!(
+                scroll_key_offset(key, px(0.), px(0.), viewport),
+                Some(px(0.))
+            );
+        }
+        // Tab and arrows must continue to their existing focus/navigation handlers.
+        assert_eq!(scroll_key_offset("tab", offset, max, viewport), None);
+        assert_eq!(scroll_key_offset("down", offset, max, viewport), None);
+    }
 
     #[test]
     fn arrow_keys_move_through_a_card_grid() {
@@ -2496,5 +3781,273 @@ mod tests {
         assert_eq!(GridStep::Down.target(5, 3, 7), Some(6));
         assert_eq!(GridStep::Down.target(6, 3, 7), None);
         assert_eq!(GridStep::Down.target(0, 0, 1), None);
+    }
+
+    #[test]
+    fn virtual_grid_rows_cover_large_libraries_without_overrun() {
+        for count in [0usize, 1, 100, 1_000, 5_000, 10_000] {
+            for columns in [1, 3, 7] {
+                let rows = count.div_ceil(columns);
+                let items = (0..rows)
+                    .flat_map(|row| grid_row_range(row, columns, count))
+                    .collect::<Vec<_>>();
+                assert_eq!(items, (0..count).collect::<Vec<_>>());
+                assert_eq!(grid_row_range(rows + 1, columns, count), count..count);
+            }
+        }
+        assert_eq!(grid_row_range(1, 3, 5), 3..5);
+    }
+
+    #[test]
+    fn query_cache_reuses_results_and_invalidates_on_query_filter_sort_and_revision() {
+        let mut data = Settings::default();
+        let alpha = PathBuf::from("/fixture/Alpha.mkv");
+        let beta = PathBuf::from("/fixture/Beta.mkv");
+        data.restore_videos([alpha.clone(), beta.clone()]);
+        let state = LibraryUiState::default();
+        let added = state.video_paths(&data, "", VideoFilter::All);
+        assert_eq!(&*added, &[beta.clone(), alpha.clone()]);
+        assert!(Rc::ptr_eq(
+            &added,
+            &state.video_paths(&data, "", VideoFilter::All)
+        ));
+        let query = state.video_paths(&data, "ALPHA", VideoFilter::All);
+        assert_eq!(&*query, std::slice::from_ref(&alpha));
+        assert!(Rc::ptr_eq(
+            &query,
+            &state.video_paths(&data, "alpha", VideoFilter::All)
+        ));
+        data.library_view.sort = Sort::Title;
+        assert_eq!(
+            &*state.video_paths(&data, "", VideoFilter::All),
+            &[alpha.clone(), beta.clone()]
+        );
+        data.remember(&alpha, 30., 100.);
+        assert_eq!(
+            &*state.video_paths(&data, "", VideoFilter::InProgress),
+            std::slice::from_ref(&alpha)
+        );
+        data.mark_watched(&beta);
+        assert_eq!(
+            &*state.video_paths(&data, "", VideoFilter::Unwatched),
+            std::slice::from_ref(&alpha)
+        );
+        let before = state.video_paths(&data, "", VideoFilter::All);
+        data.remove_video(&alpha);
+        let after = state.video_paths(&data, "", VideoFilter::All);
+        assert!(!Rc::ptr_eq(&before, &after));
+        assert_eq!(&*after, &[beta]);
+    }
+
+    #[test]
+    fn poster_lru_evicts_cold_entries_and_never_exceeds_capacity() {
+        let mut lru = PosterLru::default();
+        let resource = |index| Resource::from(PathBuf::from(format!("/posters/{index}.png")));
+        for index in 0..POSTER_CACHE_CAPACITY {
+            assert_eq!(lru.touch(&resource(index)), None);
+        }
+        assert_eq!(lru.touch(&resource(0)), None);
+        assert_eq!(
+            lru.touch(&resource(POSTER_CACHE_CAPACITY)),
+            Some(resource(1))
+        );
+        for index in POSTER_CACHE_CAPACITY + 1..5_000 {
+            assert!(lru.touch(&resource(index)).is_some());
+            assert_eq!(lru.0.len(), POSTER_CACHE_CAPACITY);
+        }
+    }
+
+    #[test]
+    fn large_viewports_pin_every_visible_poster_and_evict_old_viewports() {
+        let mut lru = PosterLru::default();
+        let resource = |index| Resource::from(PathBuf::from(format!("/posters/{index}.png")));
+        let visible = (0..180)
+            .map(resource)
+            .collect::<std::collections::HashSet<_>>();
+        for index in 0..180 {
+            assert_eq!(lru.touch_protected(&resource(index), &visible), None);
+        }
+        for _ in 0..3 {
+            for index in 0..180 {
+                assert_eq!(lru.touch_protected(&resource(index), &visible), None);
+            }
+            assert_eq!(lru.0.len(), 180);
+        }
+        let next = (180..360)
+            .map(resource)
+            .collect::<std::collections::HashSet<_>>();
+        for index in 180..360 {
+            assert!(lru.touch_protected(&resource(index), &next).is_some());
+        }
+        assert_eq!(lru.0.len(), 180);
+        assert!(lru.0.iter().all(|entry| next.contains(entry)));
+    }
+
+    #[test]
+    fn tab_moves_through_actions_and_across_unrendered_row_boundaries() {
+        use FocusSlot::*;
+        assert_eq!(
+            tab_target(99, 10_000, Primary, false, true),
+            Some((99, Remove))
+        );
+        assert_eq!(
+            tab_target(99, 10_000, Remove, false, true),
+            Some((99, Delete))
+        );
+        assert_eq!(
+            tab_target(99, 10_000, Delete, false, true),
+            Some((100, Primary))
+        );
+        assert_eq!(
+            tab_target(100, 10_000, Primary, true, true),
+            Some((99, Delete))
+        );
+        assert_eq!(
+            tab_target(100, 10_000, Delete, true, true),
+            Some((100, Remove))
+        );
+        assert_eq!(
+            tab_target(100, 10_000, Remove, true, true),
+            Some((100, Primary))
+        );
+        assert_eq!(tab_target(0, 10_000, Primary, true, true), None);
+        assert_eq!(tab_target(9_999, 10_000, Delete, false, true), None);
+        assert_eq!(
+            tab_target(99, 10_000, Primary, false, false),
+            Some((100, Primary))
+        );
+    }
+
+    #[test]
+    fn virtual_measurement_follows_scroll_and_clamps_after_filtering() {
+        let scroll = UniformListScrollHandle::new();
+        scroll
+            .0
+            .borrow()
+            .base_handle
+            .set_offset(point(px(0.), px(-8_000.)));
+        assert_eq!(first_visible_row(&scroll, px(80.), 10_000), 100);
+        assert_eq!(first_visible_row(&scroll, px(80.), 5), 4);
+        assert_eq!(first_visible_row(&scroll, px(80.), 0), 0);
+    }
+
+    #[test]
+    fn stable_focus_ids_follow_paths_and_scope_actions_to_the_section() {
+        let path = PathBuf::from("/fixture/show.mkv");
+        assert_eq!(video_id("library", &path), video_id("library", &path));
+        assert_ne!(video_id("library", &path), video_id("history", &path));
+        assert_ne!(
+            action_id("library", &path, FocusSlot::Delete),
+            action_id("history", &path, FocusSlot::Delete)
+        );
+        assert_ne!(
+            action_id("library", &path, FocusSlot::Delete),
+            action_id("library", &path, FocusSlot::Remove)
+        );
+    }
+
+    #[test]
+    fn batched_import_keeps_valid_file_and_error_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("First.mkv");
+        let second = dir.path().join("Second.mp4");
+        let invalid = dir.path().join("Notes.txt");
+        let missing = dir.path().join("Missing.mkv");
+        for path in [&first, &second, &invalid] {
+            std::fs::write(path, b"local import fixture").unwrap();
+        }
+        let (videos, errors) =
+            validate_library_files(vec![second.clone(), invalid, first.clone(), missing]);
+        assert_eq!(
+            videos,
+            vec![
+                second.canonicalize().unwrap(),
+                first.canonicalize().unwrap()
+            ]
+        );
+        assert_eq!(errors.len(), 2);
+        assert!(errors[0].contains("Notes.txt"));
+        assert!(errors[1].contains("Missing.mkv"));
+    }
+
+    #[test]
+    fn ten_thousand_video_queries_reuse_the_result_set_until_data_changes() {
+        let mut data = Settings::default();
+        data.restore_videos(
+            (0..10_000).map(|index| PathBuf::from(format!("/fixture/clip{index:05}.mkv"))),
+        );
+        let state = LibraryUiState::default();
+        let paths = state.video_paths(&data, "clip", VideoFilter::All);
+        assert_eq!(paths.len(), 10_000);
+        for _ in 0..100 {
+            assert!(Rc::ptr_eq(
+                &paths,
+                &state.video_paths(&data, "clip", VideoFilter::All)
+            ));
+        }
+        assert_eq!(
+            &*state.video_paths(&data, "CLIP09999", VideoFilter::All),
+            &[PathBuf::from("/fixture/clip09999.mkv")]
+        );
+        data.library[9_999].title = "Renamed".to_owned();
+        data.invalidate();
+        assert!(
+            state
+                .video_paths(&data, "clip09999", VideoFilter::All)
+                .is_empty()
+        );
+        assert_eq!(
+            &*state.video_paths(&data, "renamed", VideoFilter::All),
+            &[PathBuf::from("/fixture/clip09999.mkv")]
+        );
+    }
+
+    #[test]
+    fn scroll_positions_survive_query_invalidation_and_remain_separate_per_page_and_show() {
+        let state = LibraryUiState::default();
+        let history = state.scroll("history");
+        history
+            .0
+            .borrow()
+            .base_handle
+            .set_offset(point(px(0.), px(-880.)));
+        let show = state.scroll("episodes:a");
+        show.0
+            .borrow()
+            .base_handle
+            .set_offset(point(px(0.), px(-176.)));
+        state.invalidate();
+        assert!(Rc::ptr_eq(&history.0, &state.scroll("history").0));
+        assert_eq!(
+            state.scroll("history").0.borrow().base_handle.offset().y,
+            px(-880.)
+        );
+        assert_eq!(
+            state.scroll("episodes:a").0.borrow().base_handle.offset().y,
+            px(-176.)
+        );
+        assert_eq!(
+            state.scroll("episodes:b").0.borrow().base_handle.offset().y,
+            px(0.)
+        );
+        assert_eq!(
+            state.scroll("library").0.borrow().base_handle.offset().y,
+            px(0.)
+        );
+    }
+
+    #[test]
+    fn show_watched_counts_refresh_after_history_changes() {
+        let mut data = Settings::default();
+        let first = PathBuf::from("/fixture/Example.S01E01.mkv");
+        let second = PathBuf::from("/fixture/Example.S01E02.mkv");
+        data.restore_videos([first.clone(), second]);
+        let show = data.shows()[0].clone();
+        let state = LibraryUiState::default();
+        assert_eq!(state.show_unwatched(&data, &show), 2);
+        data.mark_watched(&first);
+        assert_eq!(state.show_unwatched(&data, &show), 1);
+        data.mark_unwatched(&first);
+        assert_eq!(state.show_unwatched(&data, &show), 2);
     }
 }

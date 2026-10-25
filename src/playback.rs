@@ -6,8 +6,9 @@
 //! scaling and subtitle composition stay on the CPU. GPUI uploads the final
 //! BGRA image; this path is functional scaffolding, not a zero-copy GPU path.
 //!
-//! Keep this object on the UI thread. Advanced render control is deliberately
-//! disabled: synchronous client calls and rendering on one thread can otherwise
+//! Keep this object on its creating thread (the desktop uses a control worker).
+//! Advanced render control is deliberately disabled: synchronous client calls
+//! and rendering on one thread can otherwise
 //! deadlock. As upstream recommends, the desktop moves rendering to its own
 //! thread with [`Player::render_in_background`], so scaling a large frame never
 //! blocks the interface. Tests and diagnostics can still render synchronously.
@@ -16,13 +17,14 @@ use anyhow::{Context, Result, bail, ensure};
 use libloading::Library;
 use serde_json::Value;
 use std::cell::{Cell, RefCell};
+use std::collections::VecDeque;
 use std::ffi::{CStr, CString, OsString, c_char, c_int, c_ulong, c_void};
 use std::marker::PhantomData;
 #[cfg(any(test, target_os = "macos"))]
 use std::path::PathBuf;
 use std::ptr::{self, NonNull};
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread;
 
@@ -87,6 +89,73 @@ pub enum PlayerEvent {
     FileLoaded,
     EndFile,
     Error(String),
+    OperationCompleted {
+        id: OperationId,
+        result: OperationResult,
+    },
+}
+
+pub type OperationId = u64;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum OperationResult {
+    Completed,
+    Superseded,
+    Failed(String),
+}
+
+const MAX_PENDING_OPERATIONS: usize = 64;
+
+#[derive(Debug)]
+enum Operation {
+    Command(Vec<CString>),
+    Property(CString, CString),
+    Seek { seconds: f64, exact: bool },
+}
+
+#[derive(Default)]
+struct Operations {
+    next: OperationId,
+    active: Option<OperationId>,
+    pending: VecDeque<(OperationId, Operation)>,
+    completed: VecDeque<PlayerEvent>,
+    poisoned: bool,
+}
+
+impl Operations {
+    fn enqueue(&mut self, operation: Operation) -> Result<OperationId> {
+        ensure!(
+            !self.poisoned,
+            "Playback event ordering was lost; recreate the player before submitting operations"
+        );
+        // Only adjacent scrub requests coalesce: a pause/load/track command is
+        // an ordering barrier. The active seek always receives its native reply.
+        let replace = matches!(operation, Operation::Seek { .. })
+            && matches!(self.pending.back(), Some((_, Operation::Seek { .. })));
+        ensure!(
+            replace || self.pending.len() < MAX_PENDING_OPERATIONS,
+            "Playback operation queue is full"
+        );
+        // Bound undrained superseded-completion notifications as well. The UI
+        // must poll before submitting an unlimited number of requests.
+        ensure!(
+            self.completed.len() < MAX_PENDING_OPERATIONS,
+            "Playback completions must be polled before queuing more operations"
+        );
+        self.next = self
+            .next
+            .checked_add(1)
+            .context("Playback operation ID overflow")?;
+        let id = self.next;
+        if replace && let Some((id, _)) = self.pending.pop_back() {
+            self.completed.push_back(PlayerEvent::OperationCompleted {
+                id,
+                result: OperationResult::Superseded,
+            });
+        }
+        self.pending.push_back((id, operation));
+        Ok(id)
+    }
 }
 
 /// A top-to-bottom image with tightly packed B, G, R, A bytes in that order.
@@ -108,6 +177,9 @@ type ApiVersion = unsafe extern "C" fn() -> c_ulong;
 type Initialize = unsafe extern "C" fn(*mut c_void) -> c_int;
 type SetString = unsafe extern "C" fn(*mut c_void, *const c_char, *const c_char) -> c_int;
 type Command = unsafe extern "C" fn(*mut c_void, *const *const c_char) -> c_int;
+type CommandAsync = unsafe extern "C" fn(*mut c_void, u64, *const *const c_char) -> c_int;
+type SetAsync = unsafe extern "C" fn(*mut c_void, u64, *const c_char, c_int, *mut c_void) -> c_int;
+type Observe = unsafe extern "C" fn(*mut c_void, u64, *const c_char, c_int) -> c_int;
 type GetString = unsafe extern "C" fn(*mut c_void, *const c_char) -> *mut c_char;
 type Free = unsafe extern "C" fn(*mut c_void);
 type WaitEvent = unsafe extern "C" fn(*mut c_void, f64) -> *const MpvEvent;
@@ -278,6 +350,13 @@ struct MpvEvent {
     data: *mut c_void,
 }
 
+#[repr(C)]
+struct EventProperty {
+    name: *const c_char,
+    format: c_int,
+    data: *mut c_void,
+}
+
 // API >= 1.108 guarantees the playlist entry IDs in start/end events.
 #[repr(C)]
 struct EndFilePrefix {
@@ -311,6 +390,9 @@ struct Api {
     initialize: Initialize,
     set_option: SetString,
     command: Command,
+    command_async: CommandAsync,
+    set_async: SetAsync,
+    observe: Observe,
     set_property: SetString,
     get_property: GetString,
     free: Free,
@@ -386,6 +468,9 @@ impl Api {
                 initialize: *library.get(b"mpv_initialize\0")?,
                 set_option: *library.get(b"mpv_set_option_string\0")?,
                 command: *library.get(b"mpv_command\0")?,
+                command_async: *library.get(b"mpv_command_async\0")?,
+                set_async: *library.get(b"mpv_set_property_async\0")?,
+                observe: *library.get(b"mpv_observe_property\0")?,
                 set_property: *library.get(b"mpv_set_property_string\0")?,
                 get_property: *library.get(b"mpv_get_property_string\0")?,
                 free: *library.get(b"mpv_free\0")?,
@@ -439,6 +524,67 @@ fn parse_chapters(json: &str) -> Vec<Chapter> {
         .collect::<Vec<_>>();
     chapters.sort_by(|a, b| a.time.total_cmp(&b.time));
     chapters
+}
+
+const OBSERVED_PROPERTIES: &[&str] = &[
+    "pause",
+    "time-pos",
+    "duration",
+    "volume",
+    "mute",
+    "speed",
+    "eof-reached",
+    "ab-loop-a",
+    "ab-loop-b",
+    "audio-delay",
+    "paused-for-cache",
+    "track-list",
+    "chapter-list",
+];
+
+fn update_cached_property(cache: &mut PlaybackSnapshot, name: &str, value: Option<&str>) {
+    let number = |fallback| {
+        value
+            .and_then(|s| s.parse::<f64>().ok())
+            .filter(|n| n.is_finite())
+            .unwrap_or(fallback)
+    };
+    let point = || {
+        value
+            .and_then(|s| s.parse::<f64>().ok())
+            .filter(|n| n.is_finite())
+    };
+    let flag = value == Some("yes");
+    match name {
+        "pause" => cache.paused = flag,
+        "time-pos" => cache.position = number(0.).max(0.),
+        "duration" => cache.duration = number(0.).max(0.),
+        "volume" => cache.volume = number(100.),
+        "mute" => cache.muted = flag,
+        "speed" => cache.speed = number(1.),
+        "eof-reached" => cache.eof = flag,
+        "ab-loop-a" => cache.loop_start = point(),
+        "ab-loop-b" => cache.loop_end = point(),
+        "audio-delay" => cache.audio_delay = number(0.),
+        "paused-for-cache" => cache.buffering = flag,
+        "track-list" => cache.tracks = parse_tracks(value.unwrap_or_default()),
+        "chapter-list" => cache.chapters = parse_chapters(value.unwrap_or_default()),
+        _ => {}
+    }
+}
+
+fn parse_tracks(json: &str) -> Vec<Track> {
+    serde_json::from_str::<Vec<Value>>(json)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|track| Track {
+            id: track["id"].as_i64().unwrap_or_default(),
+            kind: track["type"].as_str().unwrap_or_default().to_owned(),
+            title: track["title"].as_str().unwrap_or_default().to_owned(),
+            language: track["lang"].as_str().unwrap_or_default().to_owned(),
+            selected: track["selected"].as_bool().unwrap_or(false),
+        })
+        .collect()
 }
 
 fn library_candidates() -> Vec<OsString> {
@@ -525,6 +671,13 @@ pub struct Player {
     requested_entry: Cell<Option<i64>>,
     event_entry: Cell<Option<i64>>,
     file_loaded: Cell<bool>,
+    playback_restarts: Cell<u64>,
+    started_files: Cell<u64>,
+    ended_files: Cell<u64>,
+    events_drained: Cell<bool>,
+    cached: RefCell<PlaybackSnapshot>,
+    metadata_dirty: Cell<bool>,
+    operations: RefCell<Operations>,
     redraw_requested: Box<AtomicBool>,
     /// Set by [`Player::render_in_background`]; owns the render context.
     render_thread: RefCell<Option<RenderThread>>,
@@ -566,6 +719,13 @@ impl Player {
             requested_entry: Cell::new(None),
             event_entry: Cell::new(None),
             file_loaded: Cell::new(false),
+            playback_restarts: Cell::new(0),
+            started_files: Cell::new(0),
+            ended_files: Cell::new(0),
+            events_drained: Cell::new(false),
+            cached: RefCell::new(PlaybackSnapshot::default()),
+            metadata_dirty: Cell::new(true),
+            operations: RefCell::new(Operations::default()),
             redraw_requested: Box::new(AtomicBool::new(false)),
             render_thread: RefCell::new(None),
             protocols: RefCell::new(Vec::new()),
@@ -635,6 +795,15 @@ impl Player {
                     .cast(),
             );
         }
+        // Observations initialize themselves asynchronously. cached_snapshot
+        // never waits for native property reads and is advanced by poll_events.
+        for name in OBSERVED_PROPERTIES {
+            let name = CString::new(*name)?;
+            player.api.check(
+                unsafe { (player.api.observe)(player.handle.as_ptr(), 0, name.as_ptr(), 1) },
+                "Observe playback state",
+            )?;
+        }
         Ok(player)
     }
 
@@ -653,6 +822,12 @@ impl Player {
     /// string. Paths containing spaces therefore stay one argument.
     pub fn command(&self, args: &[&str]) -> Result<()> {
         ensure!(!args.is_empty(), "Playback command needs a name");
+        if matches!(
+            args[0],
+            "loadfile" | "sub-add" | "sub-remove" | "audio-add" | "video-add" | "cycle"
+        ) {
+            self.metadata_dirty.set(true);
+        }
         let strings: Vec<CString> = args
             .iter()
             .map(|arg| CString::new(*arg).context("Playback argument contains a NUL byte"))
@@ -670,16 +845,34 @@ impl Player {
     pub fn load(&self, path: &str) -> Result<()> {
         // Forget already queued events for the previous file. IDs below also
         // filter events emitted concurrently while the new command executes.
-        self.poll_events();
+        let completions = self
+            .poll_events()
+            .into_iter()
+            .filter(|event| matches!(event, PlayerEvent::OperationCompleted { .. }));
+        self.operations.borrow_mut().completed.extend(completions);
         self.command(&["loadfile", path, "replace"])?;
         let entry = self
             .property("playlist/0/id")
             .and_then(|value| value.parse().ok())
             .context("libmpv did not identify the requested playlist entry")?;
         self.requested_entry.set(Some(entry));
+        // Replaced entries' later END_FILE events are filtered out. Keep both
+        // lifecycle counts scoped to the newly requested entry as well.
+        self.started_files.set(0);
+        self.ended_files.set(0);
+        self.events_drained.set(false);
         self.file_loaded.set(false);
+        self.metadata_dirty.set(true);
+        {
+            let mut cache = self.cached.borrow_mut();
+            cache.tracks.clear();
+            cache.chapters.clear();
+            cache.position = 0.;
+            cache.duration = 0.;
+        }
         if let Some(thread) = self.render_thread.borrow().as_ref() {
-            thread.shared.generation.fetch_add(1, Ordering::AcqRel);
+            let generation = thread.shared.generation.fetch_add(1, Ordering::AcqRel) + 1;
+            thread.frames.advance_generation(generation);
             thread.shared.update(|state| {
                 state.target = (0, 0);
                 false
@@ -690,6 +883,9 @@ impl Player {
     }
 
     pub fn set_property(&self, name: &str, value: &str) -> Result<()> {
+        if matches!(name, "aid" | "vid" | "sid" | "secondary-sid") {
+            self.metadata_dirty.set(true);
+        }
         let property = CString::new(name).context("Property name contains a NUL byte")?;
         let value = CString::new(value).context("Property value contains a NUL byte")?;
         // SAFETY: C strings and initialized native handle live through the call.
@@ -716,7 +912,24 @@ impl Player {
         Some(owned)
     }
 
+    /// Scalar reads plus cached tracks/chapters. Existing callers retain the
+    /// complete snapshot API without repeatedly parsing unchanged metadata.
     pub fn snapshot(&self) -> PlaybackSnapshot {
+        if self.metadata_dirty.get() {
+            self.refresh_metadata();
+        }
+        let mut snapshot = self.scalar_snapshot();
+        let cache = self.cached.borrow();
+        snapshot.tracks = cache.tracks.clone();
+        snapshot.chapters = cache.chapters.clone();
+        drop(cache);
+        *self.cached.borrow_mut() = snapshot.clone();
+        snapshot
+    }
+
+    /// Read only frequently changing scalar properties. Tracks and chapters
+    /// are empty; use cached_snapshot or snapshot for complete metadata.
+    pub fn scalar_snapshot(&self) -> PlaybackSnapshot {
         let number = |name, fallback| {
             self.property(name)
                 .and_then(|value| value.parse::<f64>().ok())
@@ -724,19 +937,6 @@ impl Player {
                 .unwrap_or(fallback)
         };
         let flag = |name| self.property(name).as_deref() == Some("yes");
-        let tracks = self
-            .property("track-list")
-            .and_then(|json| serde_json::from_str::<Vec<Value>>(&json).ok())
-            .unwrap_or_default()
-            .into_iter()
-            .map(|track| Track {
-                id: track["id"].as_i64().unwrap_or_default(),
-                kind: track["type"].as_str().unwrap_or_default().to_owned(),
-                title: track["title"].as_str().unwrap_or_default().to_owned(),
-                language: track["lang"].as_str().unwrap_or_default().to_owned(),
-                selected: track["selected"].as_bool().unwrap_or(false),
-            })
-            .collect();
         // ab-loop-a/b read "no" when unset.
         let point = |name| {
             self.property(name)
@@ -750,16 +950,152 @@ impl Player {
             volume: number("volume", 100.0),
             muted: flag("mute"),
             speed: number("speed", 1.0),
-            tracks,
+            tracks: Vec::new(),
             eof: flag("eof-reached"),
-            chapters: self
-                .property("chapter-list")
-                .map(|json| parse_chapters(&json))
-                .unwrap_or_default(),
+            chapters: Vec::new(),
             loop_start: point("ab-loop-a"),
             loop_end: point("ab-loop-b"),
             audio_delay: number("audio-delay", 0.0),
             buffering: flag("paused-for-cache"),
+        }
+    }
+
+    /// No native calls: returns the latest observed state. Call poll_events
+    /// regularly; the initial observations arrive asynchronously.
+    pub fn cached_snapshot(&self) -> PlaybackSnapshot {
+        self.cached.borrow().clone()
+    }
+
+    /// Native discontinuities, not command acknowledgements. Restart events
+    /// have no operation ID, so callers must also check the current position.
+    pub fn playback_restarts(&self) -> u64 {
+        self.playback_restarts.get()
+    }
+
+    /// Every accepted START_FILE for the requested entry has an END_FILE,
+    /// emitted after native teardown. Also covers failed and never-started
+    /// loads. Check native idle/empty separately, after stop and event polling.
+    pub fn files_ended(&self) -> bool {
+        self.events_drained.get()
+            && !self.operations.borrow().poisoned
+            && self.started_files.get() == self.ended_files.get()
+    }
+
+    /// Refresh just the position on the control worker, without reading track
+    /// or chapter JSON. Observed properties can lag a native command reply.
+    pub fn refresh_position(&self) -> Option<f64> {
+        let position = self
+            .property("time-pos")?
+            .parse::<f64>()
+            .ok()
+            .filter(|position| position.is_finite())?
+            .max(0.);
+        self.cached.borrow_mut().position = position;
+        Some(position)
+    }
+
+    pub fn refresh_metadata(&self) {
+        let tracks = self
+            .property("track-list")
+            .map(|json| parse_tracks(&json))
+            .unwrap_or_default();
+        let chapters = self
+            .property("chapter-list")
+            .map(|json| parse_chapters(&json))
+            .unwrap_or_default();
+        let mut cache = self.cached.borrow_mut();
+        cache.tracks = tracks;
+        cache.chapters = chapters;
+        self.metadata_dirty.set(false);
+    }
+
+    /// Enqueue a native async command. Completion order follows submission
+    /// order, including across properties and seeks. Call poll_events to make
+    /// progress. Synchronous command/property calls are separate ordering APIs.
+    pub fn command_async(&self, args: &[&str]) -> Result<OperationId> {
+        ensure!(!args.is_empty(), "Playback command needs a name");
+        let args = args
+            .iter()
+            .map(|arg| CString::new(*arg).context("Playback argument contains a NUL byte"))
+            .collect::<Result<_>>()?;
+        self.enqueue_operation(Operation::Command(args))
+    }
+
+    pub fn set_property_async(&self, name: &str, value: &str) -> Result<OperationId> {
+        self.enqueue_operation(Operation::Property(
+            CString::new(name)?,
+            CString::new(value)?,
+        ))
+    }
+
+    /// Drag with exact=false; release with exact=true. This never unpauses.
+    /// Only the newest pending contiguous seek survives coalescing.
+    pub fn seek_async(&self, seconds: f64, exact: bool) -> Result<OperationId> {
+        ensure!(seconds.is_finite(), "Seek position must be finite");
+        self.enqueue_operation(Operation::Seek {
+            seconds: seconds.max(0.),
+            exact,
+        })
+    }
+
+    pub fn operations_pending(&self) -> bool {
+        let operations = self.operations.borrow();
+        operations.active.is_some() || !operations.pending.is_empty()
+    }
+
+    fn enqueue_operation(&self, operation: Operation) -> Result<OperationId> {
+        let id = self.operations.borrow_mut().enqueue(operation)?;
+        self.start_next_operation();
+        Ok(id)
+    }
+
+    fn start_next_operation(&self) {
+        let mut operations = self.operations.borrow_mut();
+        while operations.active.is_none() {
+            let Some((id, operation)) = operations.pending.pop_front() else {
+                break;
+            };
+            let code = match operation {
+                Operation::Command(args) => {
+                    let mut pointers: Vec<_> = args.iter().map(|s| s.as_ptr()).collect();
+                    pointers.push(ptr::null());
+                    // SAFETY: mpv copies the argument array during this call.
+                    unsafe { (self.api.command_async)(self.handle.as_ptr(), id, pointers.as_ptr()) }
+                }
+                Operation::Property(name, value) => {
+                    let mut string = value.as_ptr();
+                    // MPV_FORMAT_STRING expects a char**, copied by the API.
+                    unsafe {
+                        (self.api.set_async)(
+                            self.handle.as_ptr(),
+                            id,
+                            name.as_ptr(),
+                            1,
+                            (&mut string as *mut *const c_char).cast(),
+                        )
+                    }
+                }
+                Operation::Seek { seconds, exact } => {
+                    let time = CString::new(format!("{seconds:.6}")).expect("finite seek");
+                    let mode = if exact {
+                        c"absolute+exact"
+                    } else {
+                        c"absolute+keyframes"
+                    };
+                    let pointers = [c"seek".as_ptr(), time.as_ptr(), mode.as_ptr(), ptr::null()];
+                    unsafe { (self.api.command_async)(self.handle.as_ptr(), id, pointers.as_ptr()) }
+                }
+            };
+            if code < 0 {
+                operations
+                    .completed
+                    .push_back(PlayerEvent::OperationCompleted {
+                        id,
+                        result: OperationResult::Failed(self.api.error(code)),
+                    });
+            } else {
+                operations.active = Some(id);
+            }
         }
     }
 
@@ -799,7 +1135,8 @@ impl Player {
 
     /// Drain queued events with a zero timeout; never wait for the next event.
     pub fn poll_events(&self) -> Vec<PlayerEvent> {
-        let mut events = Vec::new();
+        let mut events: Vec<_> = self.operations.borrow_mut().completed.drain(..).collect();
+        self.events_drained.set(false);
         // Bound work per UI tick, even if a malfunctioning input floods events.
         for _ in 0..256 {
             // SAFETY: the pointer is valid until the next wait_event call. All
@@ -809,22 +1146,28 @@ impl Player {
                 break;
             };
             match event.event_id {
-                0 => break, // MPV_EVENT_NONE
+                0 => {
+                    self.events_drained.set(true);
+                    break; // MPV_EVENT_NONE
+                }
                 6 => {
                     // START_FILE identifies subsequent FILE_LOADED events,
                     // which themselves carry no file or request identifier.
                     if let Some(start) = unsafe { event.data.cast::<StartFile>().as_ref() } {
                         self.event_entry.set(Some(start.playlist_entry_id));
+                        if self.requested_entry.get() == Some(start.playlist_entry_id) {
+                            self.started_files
+                                .set(self.started_files.get().wrapping_add(1));
+                        }
                     }
                 }
                 7 => {
                     // MPV_EVENT_END_FILE, with a stable reason/error prefix.
                     if let Some(end) = unsafe { event.data.cast::<EndFilePrefix>().as_ref() } {
-                        if self.requested_entry.get().is_some()
-                            && self.requested_entry.get() != Some(end.playlist_entry_id)
-                        {
+                        if self.requested_entry.get() != Some(end.playlist_entry_id) {
                             continue;
                         }
+                        self.ended_files.set(self.ended_files.get().wrapping_add(1));
                         self.file_loaded.set(false);
                         if end.reason == 4 {
                             // MPV_END_FILE_REASON_ERROR
@@ -838,17 +1181,87 @@ impl Player {
                 }
                 8 if self.event_entry.get() == self.requested_entry.get() => {
                     self.file_loaded.set(true);
+                    self.metadata_dirty.set(true);
                     events.push(PlayerEvent::FileLoaded);
                 }
-                24 => events.push(PlayerEvent::Error(
-                    "Playback event queue overflowed; some updates were lost".into(),
-                )),
+                4 | 5 => {
+                    let mut operations = self.operations.borrow_mut();
+                    if operations.active == Some(event.reply_userdata) {
+                        operations.active = None;
+                        events.push(PlayerEvent::OperationCompleted {
+                            id: event.reply_userdata,
+                            result: if event.error < 0 {
+                                OperationResult::Failed(self.api.error(event.error))
+                            } else {
+                                OperationResult::Completed
+                            },
+                        });
+                    }
+                    drop(operations);
+                    self.start_next_operation();
+                }
+                21 if self.event_entry.get() == self.requested_entry.get() => {
+                    // MPV_EVENT_PLAYBACK_RESTART (libmpv 0.37 client.h).
+                    // COMMAND_REPLY can arrive before this and time-pos.
+                    self.playback_restarts
+                        .set(self.playback_restarts.get().wrapping_add(1));
+                }
+                22 => {
+                    // SAFETY: event memory lives until the next wait_event;
+                    // STRING values are char** per mpv_event_property ABI.
+                    if let Some(property) = unsafe { event.data.cast::<EventProperty>().as_ref() }
+                        && !property.name.is_null()
+                    {
+                        let name = unsafe { CStr::from_ptr(property.name) }.to_string_lossy();
+                        let value = if property.format == 1 && !property.data.is_null() {
+                            let string = unsafe { *property.data.cast::<*const c_char>() };
+                            if string.is_null() {
+                                None
+                            } else {
+                                Some(unsafe { CStr::from_ptr(string) }.to_string_lossy())
+                            }
+                        } else {
+                            None
+                        };
+                        update_cached_property(
+                            &mut self.cached.borrow_mut(),
+                            &name,
+                            value.as_deref(),
+                        );
+                    }
+                }
+                24 => {
+                    // Lost async replies must not leave the ordered queue stuck.
+                    let mut operations = self.operations.borrow_mut();
+                    operations.poisoned = true;
+                    if let Some(id) = operations.active.take() {
+                        events.push(PlayerEvent::OperationCompleted {
+                            id,
+                            result: OperationResult::Failed(
+                                "Playback event queue overflowed".into(),
+                            ),
+                        });
+                    }
+                    for (id, _) in operations.pending.drain(..) {
+                        events.push(PlayerEvent::OperationCompleted {
+                            id,
+                            result: OperationResult::Failed(
+                                "Playback event queue overflowed".into(),
+                            ),
+                        });
+                    }
+                    self.metadata_dirty.set(true);
+                    events.push(PlayerEvent::Error(
+                        "Playback event queue overflowed; some updates were lost".into(),
+                    ));
+                }
                 _ if event.error < 0 => {
                     events.push(PlayerEvent::Error(self.api.error(event.error)));
                 }
                 _ => {}
             }
         }
+        events.extend(self.operations.borrow_mut().completed.drain(..));
         events
     }
 
@@ -898,7 +1311,8 @@ impl Player {
             "Rendering already moved to a thread"
         );
         let shared = Arc::new(RenderShared::default());
-        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (sender, receiver) = rendered_frames();
+        let frames = sender.shared.clone();
         let renderer = SendPointer(self.renderer);
         let api = self.api;
         let thread_shared = shared.clone();
@@ -910,6 +1324,7 @@ impl Player {
         self.renderer = ptr::null_mut();
         *self.render_thread.borrow_mut() = Some(RenderThread {
             shared,
+            frames,
             join: Some(join),
         });
         Ok(receiver)
@@ -929,6 +1344,10 @@ impl Player {
                 state.target = target;
                 changed
             });
+            if target == (0, 0) {
+                let generation = thread.shared.generation.load(Ordering::Acquire);
+                thread.frames.advance_generation(generation);
+            }
         }
     }
 
@@ -963,7 +1382,157 @@ impl Player {
 
 /// Frames from the render thread: the load generation and the frame, or an
 /// error message.
-pub type RenderedFrames = tokio::sync::mpsc::UnboundedReceiver<(u64, Result<VideoFrame, String>)>;
+type FrameMessage = (u64, Result<VideoFrame, String>);
+
+#[derive(Default)]
+struct FrameMailbox {
+    // Exclusive ownership of a Box transfers through atomic swap. No reader
+    // borrows a queued frame: taking it removes its pointer from the slot.
+    value: AtomicPtr<FrameMessage>,
+    minimum_generation: AtomicU64,
+    epoch: AtomicU64,
+    producer_closed: AtomicBool,
+    receiver_closed: AtomicBool,
+    wake: tokio::sync::Notify,
+}
+
+impl FrameMailbox {
+    fn clear(&self) {
+        self.epoch.fetch_add(1, Ordering::AcqRel);
+        let old = self.value.swap(ptr::null_mut(), Ordering::AcqRel);
+        if !old.is_null() {
+            // SAFETY: swap exclusively acquired the slot's Box; no borrow of
+            // queued values ever escapes another thread.
+            drop(unsafe { Box::from_raw(old) });
+        }
+    }
+
+    fn advance_generation(&self, generation: u64) {
+        self.minimum_generation
+            .fetch_max(generation, Ordering::AcqRel);
+        self.clear();
+    }
+}
+
+impl Drop for FrameMailbox {
+    fn drop(&mut self) {
+        self.clear();
+    }
+}
+
+/// A capacity-one latest-frame mailbox. Publishing uses atomic swaps: the
+/// renderer never waits for consumer capacity or a consumer-held lock.
+/// Delivered pixels belong to the caller/GPUI and cannot be recycled here.
+pub struct RenderedFrames {
+    shared: Arc<FrameMailbox>,
+}
+struct FrameSender {
+    shared: Arc<FrameMailbox>,
+}
+
+fn rendered_frames() -> (FrameSender, RenderedFrames) {
+    let shared = Arc::new(FrameMailbox::default());
+    (
+        FrameSender {
+            shared: shared.clone(),
+        },
+        RenderedFrames { shared },
+    )
+}
+
+impl FrameSender {
+    fn send(&mut self, epoch: u64, message: FrameMessage) -> Result<(), ()> {
+        if self.shared.receiver_closed.load(Ordering::Acquire) {
+            return Err(());
+        }
+        if message.0 < self.shared.minimum_generation.load(Ordering::Acquire)
+            || epoch != self.shared.epoch.load(Ordering::Acquire)
+        {
+            return Ok(());
+        }
+        let value = Box::into_raw(Box::new(message));
+        let old = self.shared.value.swap(value, Ordering::AcqRel);
+        if !old.is_null() {
+            // SAFETY: this swap transfers sole ownership of the old Box.
+            drop(unsafe { Box::from_raw(old) });
+        }
+        // Clear/receiver-drop can race publication. Remove only OUR pointer;
+        // a consumer or invalidator that already took it owns its destruction.
+        if (self.shared.receiver_closed.load(Ordering::Acquire)
+            || epoch != self.shared.epoch.load(Ordering::Acquire))
+            && self
+                .shared
+                .value
+                .compare_exchange(value, ptr::null_mut(), Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+        {
+            // SAFETY: successful CAS exclusively recovered our Box.
+            drop(unsafe { Box::from_raw(value) });
+        }
+        self.shared.wake.notify_one();
+        Ok(())
+    }
+}
+
+impl Drop for FrameSender {
+    fn drop(&mut self) {
+        self.shared.producer_closed.store(true, Ordering::Release);
+        self.shared.wake.notify_one();
+    }
+}
+
+impl RenderedFrames {
+    pub fn try_recv(&mut self) -> Result<FrameMessage, tokio::sync::mpsc::error::TryRecvError> {
+        use tokio::sync::mpsc::error::TryRecvError;
+        loop {
+            let value = self.shared.value.swap(ptr::null_mut(), Ordering::AcqRel);
+            if !value.is_null() {
+                // SAFETY: swap removed the Box, transferring exclusive ownership.
+                let message = *unsafe { Box::from_raw(value) };
+                if message.0 >= self.shared.minimum_generation.load(Ordering::Acquire) {
+                    return Ok(message);
+                }
+                continue;
+            }
+            // Acquire close before a final slot check: publication precedes
+            // producer close, so a final message cannot disappear at EOF.
+            if self.shared.producer_closed.load(Ordering::Acquire) {
+                let value = self.shared.value.swap(ptr::null_mut(), Ordering::AcqRel);
+                if !value.is_null() {
+                    let message = *unsafe { Box::from_raw(value) };
+                    if message.0 >= self.shared.minimum_generation.load(Ordering::Acquire) {
+                        return Ok(message);
+                    }
+                }
+                return Err(TryRecvError::Disconnected);
+            }
+            return Err(TryRecvError::Empty);
+        }
+    }
+
+    pub async fn recv(&mut self) -> Option<FrameMessage> {
+        loop {
+            // Register before inspecting the slot to avoid a missed publish or
+            // shutdown notification between try_recv and await.
+            let shared = self.shared.clone();
+            let notified = shared.wake.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            match self.try_recv() {
+                Ok(message) => return Some(message),
+                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => return None,
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => notified.await,
+            }
+        }
+    }
+}
+
+impl Drop for RenderedFrames {
+    fn drop(&mut self) {
+        self.shared.receiver_closed.store(true, Ordering::Release);
+        self.shared.clear();
+    }
+}
 
 /// A raw render context handed to the render thread, which becomes its only
 /// user.
@@ -1003,6 +1572,7 @@ impl RenderShared {
 
 struct RenderThread {
     shared: Arc<RenderShared>,
+    frames: Arc<FrameMailbox>,
     join: Option<thread::JoinHandle<()>>,
 }
 
@@ -1033,7 +1603,7 @@ fn render_thread(
     api: &'static Api,
     renderer: SendPointer,
     shared: Arc<RenderShared>,
-    frames: tokio::sync::mpsc::UnboundedSender<(u64, Result<VideoFrame, String>)>,
+    mut frames: FrameSender,
 ) {
     let renderer = renderer.0;
     // SAFETY: the renderer is live, and the context outlives registration.
@@ -1065,6 +1635,7 @@ fn render_thread(
             (state.target, std::mem::take(&mut state.redraw))
         };
         let generation = shared.generation.load(Ordering::Acquire);
+        let epoch = frames.shared.epoch.load(Ordering::Acquire);
         // SAFETY: this thread is the render context's only user.
         let result = unsafe { render_frame(api, renderer, &mut buffer, requested, target, None) };
         let message = match result {
@@ -1072,7 +1643,17 @@ fn render_thread(
             Ok(None) => continue,
             Err(error) => Err(format!("{error:#}")),
         };
-        if frames.send((generation, message)).is_err() {
+        // A target hidden or replaced while native rendering ran must not
+        // repopulate an idle surface with an obsolete large image.
+        let current_target = shared
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .target;
+        if current_target != target || shared.generation.load(Ordering::Acquire) != generation {
+            continue;
+        }
+        if frames.send(epoch, (generation, message)).is_err() {
             break;
         }
     }
@@ -1133,6 +1714,9 @@ unsafe fn render_frame(
             // pointer to pointer + stride * height (libmpv render.h).
             unsafe { pixels.set_len(byte_count) };
             buffer.blocks = Vec::new();
+            for pixel in pixels.as_chunks_mut::<4>().0 {
+                pixel[3] = 255;
+            }
         }
         Target::Aligned => {
             let stride = row_bytes
@@ -1169,22 +1753,43 @@ unsafe fn render_frame(
             let bytes = unsafe {
                 std::slice::from_raw_parts(buffer.blocks.as_ptr().cast::<u8>(), blocks * 64)
             };
-            for row in bytes.chunks_exact(stride) {
-                pixels.extend_from_slice(&row[..row_bytes]);
-            }
+            copy_opaque_rows(&mut pixels, bytes, stride, row_bytes);
         }
     }
     // BGR0 leaves the fourth byte undefined, and every video frame is
     // opaque, including black letterbox bars. Set alpha rather than
     // exposing decoder/format-specific alpha semantics.
-    for pixel in pixels.as_chunks_mut::<4>().0 {
-        pixel[3] = 255;
-    }
     Ok(Some(VideoFrame {
         width,
         height,
         pixels,
     }))
+}
+
+/// Copy BGR0 rows and set alpha in the same pass. Padding is never copied;
+/// color channels are preserved byte for byte, without color conversion.
+fn copy_opaque_rows(pixels: &mut Vec<u8>, bytes: &[u8], stride: usize, row_bytes: usize) {
+    let start = pixels.len();
+    let length = bytes.len() / stride * row_bytes;
+    assert!(pixels.capacity() - start >= length);
+    for (row, output) in bytes
+        .chunks_exact(stride)
+        .zip(pixels.spare_capacity_mut()[..length].chunks_exact_mut(row_bytes))
+    {
+        for (pixel, output) in row[..row_bytes]
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .zip(output.as_chunks_mut::<4>().0.iter_mut())
+        {
+            output[0].write(pixel[0]);
+            output[1].write(pixel[1]);
+            output[2].write(pixel[2]);
+            output[3].write(255);
+        }
+    }
+    // SAFETY: every byte of the added packed rows was initialized above.
+    unsafe { pixels.set_len(start + length) };
 }
 
 /// # Safety
@@ -1277,6 +1882,292 @@ mod tests {
             ]
         );
         assert!(parse_chapters("not json").is_empty());
+    }
+
+    fn frame_message(generation: u64) -> FrameMessage {
+        (
+            generation,
+            Ok(VideoFrame {
+                width: 1,
+                height: 1,
+                pixels: vec![generation as u8, 2, 3, 255],
+            }),
+        )
+    }
+
+    #[test]
+    fn stalled_receiver_retains_only_newest_frame_and_generation() {
+        let (mut sender, mut receiver) = rendered_frames();
+        for generation in 0..50_000 {
+            sender.send(0, frame_message(generation)).unwrap();
+        }
+        assert_eq!(receiver.try_recv().unwrap().0, 49_999);
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+        sender.send(0, frame_message(50_000)).unwrap();
+        sender.shared.advance_generation(50_001);
+        let epoch = sender.shared.epoch.load(Ordering::Acquire);
+        // Both a stale generation and an in-flight frame from before invalidation are rejected.
+        sender.send(epoch, frame_message(50_000)).unwrap();
+        sender.send(epoch - 1, frame_message(50_001)).unwrap();
+        assert!(receiver.try_recv().is_err());
+        sender.send(epoch, frame_message(50_001)).unwrap();
+        assert_eq!(receiver.try_recv().unwrap().0, 50_001);
+    }
+
+    #[tokio::test]
+    async fn producer_shutdown_wakes_receiver_and_preserves_final_frame() {
+        let (mut sender, mut receiver) = rendered_frames();
+        sender.send(0, frame_message(9)).unwrap();
+        drop(sender);
+        assert_eq!(receiver.recv().await.unwrap().0, 9);
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), receiver.recv())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let (sender, mut receiver) = rendered_frames();
+        let done = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(10));
+            drop(sender);
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), receiver.recv())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        done.join().unwrap();
+    }
+
+    #[test]
+    fn receiver_drop_never_blocks_producer_or_retains_pixels() {
+        let (mut sender, receiver) = rendered_frames();
+        sender.send(0, frame_message(1)).unwrap();
+        drop(receiver);
+        assert!(sender.shared.value.load(Ordering::Acquire).is_null());
+        assert!(sender.send(0, frame_message(2)).is_err());
+    }
+
+    #[test]
+    fn producer_consumer_and_invalidation_races_remain_bounded() {
+        let (mut sender, mut receiver) = rendered_frames();
+        let shared = sender.shared.clone();
+        let (done, finished) = std::sync::mpsc::channel();
+        let producer = thread::spawn(move || {
+            for generation in 0..100_000 {
+                let epoch = sender.shared.epoch.load(Ordering::Acquire);
+                if sender.send(epoch, frame_message(generation)).is_err() {
+                    break;
+                }
+            }
+            done.send(()).unwrap();
+        });
+        let invalidator = thread::spawn(move || {
+            for generation in (0..100_000).step_by(29) {
+                shared.advance_generation(generation);
+            }
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match receiver.try_recv() {
+                Ok((_, frame)) => assert_eq!(frame.unwrap().pixels.len(), 4),
+                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => break,
+                Err(_) => thread::yield_now(),
+            }
+            assert!(
+                Instant::now() < deadline,
+                "Concurrent mailbox failed to finish"
+            );
+        }
+        finished.recv_timeout(Duration::from_secs(1)).unwrap();
+        producer.join().unwrap();
+        invalidator.join().unwrap();
+    }
+
+    #[test]
+    fn scrubs_coalesce_without_crossing_ordering_barriers_and_queues_are_bounded() -> Result<()> {
+        let mut operations = Operations::default();
+        let first = operations.enqueue(Operation::Seek {
+            seconds: 1.,
+            exact: false,
+        })?;
+        let second = operations.enqueue(Operation::Seek {
+            seconds: 2.,
+            exact: true,
+        })?;
+        assert_eq!(operations.pending.len(), 1);
+        assert!(
+            matches!(operations.completed.pop_front(), Some(PlayerEvent::OperationCompleted {
+            id, result: OperationResult::Superseded }) if id == first)
+        );
+        let pause = operations.enqueue(Operation::Property(
+            CString::new("pause")?,
+            CString::new("yes")?,
+        ))?;
+        let third = operations.enqueue(Operation::Seek {
+            seconds: 3.,
+            exact: true,
+        })?;
+        assert_eq!(
+            operations
+                .pending
+                .iter()
+                .map(|(id, _)| *id)
+                .collect::<Vec<_>>(),
+            [second, pause, third]
+        );
+        while operations.pending.len() < MAX_PENDING_OPERATIONS {
+            operations.enqueue(Operation::Command(vec![CString::new("stop")?]))?;
+        }
+        assert!(
+            operations
+                .enqueue(Operation::Command(vec![CString::new("stop")?]))
+                .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn undrained_completions_are_bounded_and_lost_native_order_rejects_new_work() -> Result<()> {
+        let mut operations = Operations::default();
+        for seconds in 0..MAX_PENDING_OPERATIONS {
+            operations.enqueue(Operation::Seek {
+                seconds: seconds as f64,
+                exact: false,
+            })?;
+        }
+        assert_eq!(operations.pending.len(), 1);
+        assert_eq!(operations.completed.len(), MAX_PENDING_OPERATIONS - 1);
+        operations.enqueue(Operation::Seek {
+            seconds: 999.,
+            exact: true,
+        })?;
+        assert!(
+            operations
+                .enqueue(Operation::Seek {
+                    seconds: 1000.,
+                    exact: true
+                })
+                .is_err()
+        );
+        assert_eq!(operations.completed.len(), MAX_PENDING_OPERATIONS);
+        operations.completed.clear();
+        operations.poisoned = true;
+        assert!(
+            operations
+                .enqueue(Operation::Seek {
+                    seconds: 1000.,
+                    exact: true
+                })
+                .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn observed_snapshot_updates_scalars_tracks_and_chapters_without_polling_properties() {
+        let mut snapshot = PlaybackSnapshot::default();
+        update_cached_property(&mut snapshot, "time-pos", Some("12.5"));
+        update_cached_property(&mut snapshot, "pause", Some("yes"));
+        update_cached_property(
+            &mut snapshot,
+            "track-list",
+            Some(r#"[{"id":4,"type":"audio","selected":true}]"#),
+        );
+        update_cached_property(
+            &mut snapshot,
+            "chapter-list",
+            Some(r#"[{"time":3,"title":"x"}]"#),
+        );
+        assert_eq!(snapshot.position, 12.5);
+        assert!(snapshot.paused);
+        assert_eq!(snapshot.tracks[0].id, 4);
+        assert!(snapshot.tracks[0].selected);
+        assert_eq!(snapshot.chapters[0].time, 3.);
+        update_cached_property(&mut snapshot, "time-pos", Some("NaN"));
+        update_cached_property(&mut snapshot, "track-list", None);
+        update_cached_property(&mut snapshot, "ab-loop-a", Some("no"));
+        assert_eq!(snapshot.position, 0.);
+        assert!(snapshot.tracks.is_empty());
+        assert!(snapshot.loop_start.is_none());
+    }
+
+    #[test]
+    fn fused_aligned_copy_preserves_bgra_colors_skips_padding_and_sets_alpha() {
+        let source = [
+            1, 2, 3, 0, 4, 5, 6, 99, 88, 88, 88, 88, 7, 8, 9, 10, 11, 12, 13, 0, 77, 77, 77, 77,
+        ];
+        let mut pixels = Vec::with_capacity(16);
+        copy_opaque_rows(&mut pixels, &source, 12, 8);
+        assert_eq!(
+            pixels,
+            [1, 2, 3, 255, 4, 5, 6, 255, 7, 8, 9, 255, 11, 12, 13, 255]
+        );
+    }
+
+    #[test]
+    #[ignore = "requires native libmpv and generated FLICK_TEST_VIDEO"]
+    fn real_async_controls_complete_in_order_report_errors_and_preserve_paused_final_seek()
+    -> Result<()> {
+        let player = Player::new()?;
+        player.load(&std::env::var("FLICK_TEST_VIDEO")?)?;
+        wait_for(&player, |p| {
+            p.file_loaded.get() && p.cached_snapshot().duration > 0.
+        })?;
+        let pause = player.set_property_async("pause", "yes")?;
+        let volume = player.set_property_async("volume", "31")?;
+        let first_seek = player.seek_async(2., false)?;
+        let superseded = player.seek_async(4., false)?;
+        let final_seek = player.seek_async(8., true)?;
+        let bad = player.set_property_async("flick-no-such-property", "yes")?;
+        let speed = player.set_property_async("speed", "1.25")?;
+        let mut completed = Vec::new();
+        let mut replaced = Vec::new();
+        let mut failed = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while player.operations_pending() {
+            for event in player.poll_events() {
+                match event {
+                    PlayerEvent::OperationCompleted { id, result } => match result {
+                        OperationResult::Superseded => replaced.push(id),
+                        OperationResult::Completed => completed.push(id),
+                        OperationResult::Failed(error) => {
+                            assert_eq!(id, bad, "{error}");
+                            failed.push(id);
+                            completed.push(id);
+                        }
+                    },
+                    PlayerEvent::Error(error) => bail!(error),
+                    _ => {}
+                }
+            }
+            player.render(323, 183)?;
+            ensure!(Instant::now() < deadline, "Async controls timed out");
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(completed, [pause, volume, final_seek, bad, speed]);
+        assert_eq!(replaced, [first_seek, superseded]);
+        assert_eq!(
+            failed,
+            [bad],
+            "Invalid properties must produce a failed completion"
+        );
+        // Observe final state after async completion delivery.
+        wait_for(&player, |p| {
+            let state = p.cached_snapshot();
+            state.paused
+                && (state.position - 8.).abs() < 0.2
+                && (state.volume - 31.).abs() < 0.1
+                && (state.speed - 1.25).abs() < 0.01
+        })?;
+        let scalar = player.scalar_snapshot();
+        assert!(scalar.tracks.is_empty() && scalar.chapters.is_empty());
+        assert!(!player.snapshot().tracks.is_empty());
+        Ok(())
     }
 
     fn wait_for(player: &Player, mut condition: impl FnMut(&Player) -> bool) -> Result<()> {
@@ -1623,6 +2514,7 @@ mod tests {
                             }
                             PlayerEvent::Error(error) => bail!("{error}"),
                             PlayerEvent::EndFile => bail!("Replaced file's end event leaked"),
+                            PlayerEvent::OperationCompleted { .. } => {}
                         }
                     }
                     if player.render(323, 183)?.is_some() && player.snapshot().position >= 0.45 {
@@ -1717,7 +2609,7 @@ mod tests {
                 match event {
                     PlayerEvent::FileLoaded => loaded = true,
                     PlayerEvent::Error(error) => bail!("{error}"),
-                    PlayerEvent::EndFile => {}
+                    PlayerEvent::EndFile | PlayerEvent::OperationCompleted { .. } => {}
                 }
             }
             if let Some(frame) = player.render(321, 181)? {
@@ -1784,7 +2676,7 @@ mod tests {
                 match event {
                     PlayerEvent::Error(_) => reported_error = true,
                     PlayerEvent::EndFile => ended = true,
-                    PlayerEvent::FileLoaded => {}
+                    PlayerEvent::FileLoaded | PlayerEvent::OperationCompleted { .. } => {}
                 }
             }
             player.render(320, 180)?;

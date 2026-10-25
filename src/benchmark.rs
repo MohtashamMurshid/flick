@@ -1,5 +1,5 @@
 //! Sustained software-render benchmark. No GPUI window or transfer session.
-use crate::playback::{Player, PlayerEvent};
+use crate::playback::{OperationResult, Player, PlayerEvent};
 use anyhow::{Context, Result, bail, ensure};
 use serde::Serialize;
 use std::{
@@ -330,7 +330,11 @@ fn poll(player: &Player) -> Result<()> {
         match event {
             PlayerEvent::Error(error) => bail!(error),
             PlayerEvent::EndFile => bail!("Video ended despite loop-file=inf"),
-            PlayerEvent::FileLoaded => {}
+            PlayerEvent::OperationCompleted {
+                result: OperationResult::Failed(error),
+                ..
+            } => bail!(error),
+            PlayerEvent::FileLoaded | PlayerEvent::OperationCompleted { .. } => {}
         }
     }
     Ok(())

@@ -1,0 +1,1281 @@
+{
+  "schema_version": 1,
+  "test": "Claude H2: large viewport poster cache and 5000-entry settled library idle",
+  "utc_started": "2026-10-25T14:39:51.072594+00:00",
+  "utc_ended": "2026-10-25T14:40:51.976026+00:00",
+  "session": {
+    "display": ":93",
+    "folder": "/tmp/flick-large-display-h2-o0qgousj",
+    "pid": 4178859,
+    "n": 5000,
+    "window_id": "6291457"
+  },
+  "screen_px": [
+    3840,
+    2160
+  ],
+  "window_geometry": "WINDOW=6291457\nX=0\nY=0\nWIDTH=3840\nHEIGHT=2160\nSCREEN=0\n",
+  "display_scale": 1,
+  "text_scale": 1.0,
+  "library_entries": 5000,
+  "distinct_media_paths": 5000,
+  "distinct_poster_resource_paths": 5000,
+  "visible_poster_resources": 180,
+  "visible_full_poster_resources": 162,
+  "visible_partial_poster_resources": 18,
+  "measurement_seconds": 60.001230889,
+  "cpu_clock_ticks_per_second": 100,
+  "cpu_ticks": 129,
+  "cpu_seconds": 1.29,
+  "cpu_percent_one_core": 2.149955894048992,
+  "rss_kib_start": 577536,
+  "rss_kib_end": 576592,
+  "rss_kib_min": 576592,
+  "rss_kib_max": 577536,
+  "rss_kib_delta": -944,
+  "root_render_trace_count": 0,
+  "video_surface_render_trace_count": 0,
+  "log_bytes": 0,
+  "poster_directory_events": [],
+  "poster_open_count": 0,
+  "poster_access_count": 0,
+  "observer_selftest_events": [
+    {
+      "mask": 32,
+      "name": "Poster 00000.png",
+      "utc": "2026-10-25T14:38:49.582500+00:00"
+    },
+    {
+      "mask": 1,
+      "name": "Poster 00000.png",
+      "utc": "2026-10-25T14:38:49.582532+00:00"
+    },
+    {
+      "mask": 16,
+      "name": "Poster 00000.png",
+      "utc": "2026-10-25T14:38:49.582542+00:00"
+    }
+  ],
+  "settle_seconds": 60,
+  "settle_root_renders": 1,
+  "settle_poster_events": [
+    {
+      "mask": 32,
+      "name": "Poster 04856.png",
+      "utc": "2026-10-25T14:38:49.663074+00:00"
+    },
+    {
+      "mask": 1,
+      "name": "Poster 04856.png",
+      "utc": "2026-10-25T14:38:49.663102+00:00"
+    },
+    {
+      "mask": 16,
+      "name": "Poster 04856.png",
+      "utc": "2026-10-25T14:38:49.663110+00:00"
+    },
+    {
+      "mask": 32,
+      "name": "Poster 04855.png",
+      "utc": "2026-10-25T14:38:49.663116+00:00"
+    },
+    {
+      "mask": 1,
+      "name": "Poster 04855.png",
+      "utc": "2026-10-25T14:38:49.663123+00:00"
+    },
+    {
+      "mask": 16,
+      "name": "Poster 04855.png",
+      "utc": "2026-10-25T14:38:49.663132+00:00"
+    },
+    {
+      "mask": 32,
+      "name": "Poster 04854.png",
+      "utc": "2026-10-25T14:38:49.663139+00:00"
+    },
+    {
+      "mask": 1,
+      "name": "Poster 04854.png",
+      "utc": "2026-10-25T14:38:49.663146+00:00"
+    },
+    {
+      "mask": 16,
+      "name": "Poster 04854.png",
+      "utc": "2026-10-25T14:38:49.663152+00:00"
+    },
+    {
+      "mask": 32,
+      "name": "Poster 04853.png",
+      "utc": "2026-10-25T14:38:49.914876+00:00"
+    },
+    {
+      "mask": 1,
+      "name": "Poster 04853.png",
+      "utc": "2026-10-25T14:38:49.914915+00:00"
+    },
+    {
+      "mask": 16,
+      "name": "Poster 04853.png",
+      "utc": "2026-10-25T14:38:49.914924+00:00"
+    },
+    {
+      "mask": 32,
+      "name": "Poster 04852.png",
+      "utc": "2026-10-25T14:38:49.914931+00:00"
+    },
+    {
+      "mask": 1,
+      "name": "Poster 04852.png",
+      "utc": "2026-10-25T14:38:49.914948+00:00"
+    },
+    {
+      "mask": 16,
+      "name": "Poster 04852.png",
+      "utc": "2026-10-25T14:38:49.914957+00:00"
+    },
+    {
+      "mask": 32,
+      "name": "Poster 04851.png",
+      "utc": "2026-10-25T14:38:49.914966+00:00"
+    },
+    {
+      "mask": 1,
+      "name": "Poster 04851.png",
+      "utc": "2026-10-25T14:38:49.914982+00:00"
+    },
+    {
+      "mask": 16,
+      "name": "Poster 04851.png",
+      "utc": "2026-10-25T14:38:49.914990+00:00"
+    },
+    {
+      "mask": 32,
+      "name": "Poster 04850.png",
+      "utc": "2026-10-25T14:38:49.915002+00:00"
+    },
+    {
+      "mask": 1,
+      "name": "Poster 04850.png",
+      "utc": "2026-10-25T14:38:49.915009+00:00"
+    },
+    {
+      "mask": 16,
+      "name": "Poster 04850.png",
+      "utc": "2026-10-25T14:38:49.915015+00:00"
+    },
+    {
+      "mask": 32,
+      "name": "Poster 04849.png",
+      "utc": "2026-10-25T14:38:49.915021+00:00"
+    },
+    {
+      "mask": 1,
+      "name": "Poster 04849.png",
+      "utc": "2026-10-25T14:38:49.915028+00:00"
+    },
+    {
+      "mask": 16,
+      "name": "Poster 04849.png",
+      "utc": "2026-10-25T14:38:49.915036+00:00"
+    },
+    {
+      "mask": 32,
+      "name": "Poster 04848.png",
+      "utc": "2026-10-25T14:38:49.915043+00:00"
+    },
+    {
+      "mask": 1,
+      "name": "Poster 04848.png",
+      "utc": "2026-10-25T14:38:49.915050+00:00"
+    },
+    {
+      "mask": 16,
+      "name": "Poster 04848.png",
+      "utc": "2026-10-25T14:38:49.915058+00:00"
+    },
+    {
+      "mask": 32,
+      "name": "Poster 04847.png",
+      "utc": "2026-10-25T14:38:49.915065+00:00"
+    },
+    {
+      "mask": 1,
+      "name": "Poster 04847.png",
+      "utc": "2026-10-25T14:38:49.915072+00:00"
+    },
+    {
+      "mask": 16,
+      "name": "Poster 04847.png",
+      "utc": "2026-10-25T14:38:49.915084+00:00"
+    },
+    {
+      "mask": 32,
+      "name": "Poster 04846.png",
+      "utc": "2026-10-25T14:38:49.915092+00:00"
+    },
+    {
+      "mask": 1,
+      "name": "Poster 04846.png",
+      "utc": "2026-10-25T14:38:49.915099+00:00"
+    },
+    {
+      "mask": 16,
+      "name": "Poster 04846.png",
+      "utc": "2026-10-25T14:38:49.915106+00:00"
+    },
+    {
+      "mask": 32,
+      "name": "Poster 04845.png",
+      "utc": "2026-10-25T14:38:49.915113+00:00"
+    },
+    {
+      "mask": 1,
+      "name": "Poster 04845.png",
+      "utc": "2026-10-25T14:38:49.915125+00:00"
+    },
+    {
+      "mask": 16,
+      "name": "Poster 04845.png",
+      "utc": "2026-10-25T14:38:49.915132+00:00"
+    },
+    {
+      "mask": 32,
+      "name": "Poster 04844.png",
+      "utc": "2026-10-25T14:38:49.915139+00:00"
+    },
+    {
+      "mask": 1,
+      "name": "Poster 04844.png",
+      "utc": "2026-10-25T14:38:49.915146+00:00"
+    },
+    {
+      "mask": 16,
+      "name": "Poster 04844.png",
+      "utc": "2026-10-25T14:38:49.915152+00:00"
+    },
+    {
+      "mask": 32,
+      "name": "Poster 04843.png",
+      "utc": "2026-10-25T14:38:49.915160+00:00"
+    },
+    {
+      "mask": 1,
+      "name": "Poster 04843.png",
+      "utc": "2026-10-25T14:38:49.915166+00:00"
+    },
+    {
+      "mask": 16,
+      "name": "Poster 04843.png",
+      "utc": "2026-10-25T14:38:49.915172+00:00"
+    },
+    {
+      "mask": 32,
+      "name": "Poster 04842.png",
+      "utc": "2026-10-25T14:38:50.167867+00:00"
+    },
+    {
+      "mask": 1,
+      "name": "Poster 04842.png",
+      "utc": "2026-10-25T14:38:50.167902+00:00"
+    },
+    {
+      "mask": 16,
+      "name": "Poster 04842.png",
+      "utc": "2026-10-25T14:38:50.167909+00:00"
+    },
+    {
+      "mask": 32,
+      "name": "Poster 04841.png",
+      "utc": "2026-10-25T14:38:50.167915+00:00"
+    },
+    {
+      "mask": 1,
+      "name": "Poster 04841.png",
+      "utc": "2026-10-25T14:38:50.167922+00:00"
+    },
+    {
+      "mask": 16,
+      "name": "Poster 04841.png",
+      "utc": "2026-10-25T14:38:50.167929+00:00"
+    },
+    {
+      "mask": 32,
+      "name": "Poster 04840.png",
+      "utc": "2026-10-25T14:38:50.167936+00:00"
+    },
+    {
+      "mask": 32,
+      "name": "Poster 04839.png",
+      "utc": "2026-10-25T14:38:50.167943+00:00"
+    },
+    {
+      "mask": 1,
+      "name": "Poster 04839.png",
+      "utc": "2026-10-25T14:38:50.167959+00:00"
+    },
+    {
+      "mask": 16,
+      "name": "Poster 04839.png",
+      "utc": "2026-10-25T14:38:50.167965+00:00"
+    },
+    {
+      "mask": 1,
+      "name": "Poster 04840.png",
+      "utc": "2026-10-25T14:38:50.167972+00:00"
+    },
+    {
+      "mask": 16,
+      "name": "Poster 04840.png",
+      "utc": "2026-10-25T14:38:50.167989+00:00"
+    },
+    {
+      "mask": 32,
+      "name": "Poster 04838.png",
+      "utc": "2026-10-25T14:38:50.167995+00:00"
+    },
+    {
+      "mask": 1,
+      "name": "Poster 04838.png",
+      "utc": "2026-10-25T14:38:50.168001+00:00"
+    },
+    {
+      "mask": 16,
+      "name": "Poster 04838.png",
+      "utc": "2026-10-25T14:38:50.168012+00:00"
+    },
+    {
+      "mask": 32,
+      "name": "Poster 04837.png",
+      "utc": "2026-10-25T14:38:50.168018+00:00"
+    },
+    {
+      "mask": 1,
+      "name": "Poster 04837.png",
+      "utc": "2026-10-25T14:38:50.168024+00:00"
+    },
+    {
+      "mask": 16,
+      "name": "Poster 04837.png",
+      "utc": "2026-10-25T14:38:50.168031+00:00"
+    },
+    {
+      "mask": 32,
+      "name": "Poster 04836.png",
+      "utc": "2026-10-25T14:38:50.168037+00:00"
+    },
+    {
+      "mask": 1,
+      "name": "Poster 04836.png",
+      "utc": "2026-10-25T14:38:50.168043+00:00"
+    },
+    {
+      "mask": 16,
+      "name": "Poster 04836.png",
+      "utc": "2026-10-25T14:38:50.168049+00:00"
+    },
+    {
+      "mask": 32,
+      "name": "Poster 04835.png",
+      "utc": "2026-10-25T14:38:50.168055+00:00"
+    },
+    {
+      "mask": 1,
+      "name": "Poster 04835.png",
+      "utc": "2026-10-25T14:38:50.168061+00:00"
+    },
+    {
+      "mask": 16,
+      "name": "Poster 04835.png",
+      "utc": "2026-10-25T14:38:50.168067+00:00"
+    },
+    {
+      "mask": 32,
+      "name": "Poster 04834.png",
+      "utc": "2026-10-25T14:38:50.168073+00:00"
+    },
+    {
+      "mask": 1,
+      "name": "Poster 04834.png",
+      "utc": "2026-10-25T14:38:50.168080+00:00"
+    },
+    {
+      "mask": 16,
+      "name": "Poster 04834.png",
+      "utc": "2026-10-25T14:38:50.168086+00:00"
+    },
+    {
+      "mask": 32,
+      "name": "Poster 04833.png",
+      "utc": "2026-10-25T14:38:50.168092+00:00"
+    },
+    {
+      "mask": 1,
+      "name": "Poster 04833.png",
+      "utc": "2026-10-25T14:38:50.168098+00:00"
+    },
+    {
+      "mask": 16,
+      "name": "Poster 04833.png",
+      "utc": "2026-10-25T14:38:50.168104+00:00"
+    },
+    {
+      "mask": 32,
+      "name": "Poster 04832.png",
+      "utc": "2026-10-25T14:38:50.168110+00:00"
+    },
+    {
+      "mask": 1,
+      "name": "Poster 04832.png",
+      "utc": "2026-10-25T14:38:50.168116+00:00"
+    },
+    {
+      "mask": 16,
+      "name": "Poster 04832.png",
+      "utc": "2026-10-25T14:38:50.168122+00:00"
+    },
+    {
+      "mask": 32,
+      "name": "Poster 04831.png",
+      "utc": "2026-10-25T14:38:50.168129+00:00"
+    },
+    {
+      "mask": 1,
+      "name": "Poster 04831.png",
+      "utc": "2026-10-25T14:38:50.168134+00:00"
+    },
+    {
+      "mask": 16,
+      "name": "Poster 04831.png",
+      "utc": "2026-10-25T14:38:50.168145+00:00"
+    },
+    {
+      "mask": 32,
+      "name": "Poster 04830.png",
+      "utc": "2026-10-25T14:38:50.418352+00:00"
+    },
+    {
+      "mask": 1,
+      "name": "Poster 04830.png",
+      "utc": "2026-10-25T14:38:50.418392+00:00"
+    },
+    {
+      "mask": 16,
+      "name": "Poster 04830.png",
+      "utc": "2026-10-25T14:38:50.418408+00:00"
+    },
+    {
+      "mask": 32,
+      "name": "Poster 04829.png",
+      "utc": "2026-10-25T14:38:50.418414+00:00"
+    },
+    {
+      "mask": 1,
+      "name": "Poster 04829.png",
+      "utc": "2026-10-25T14:38:50.418425+00:00"
+    },
+    {
+      "mask": 16,
+      "name": "Poster 04829.png",
+      "utc": "2026-10-25T14:38:50.418432+00:00"
+    },
+    {
+      "mask": 32,
+      "name": "Poster 04828.png",
+      "utc": "2026-10-25T14:38:50.418440+00:00"
+    },
+    {
+      "mask": 1,
+      "name": "Poster 04828.png",
+      "utc": "2026-10-25T14:38:50.418446+00:00"
+    },
+    {
+      "mask": 16,
+      "name": "Poster 04828.png",
+      "utc": "2026-10-25T14:38:50.418452+00:00"
+    },
+    {
+      "mask": 32,
+      "name": "Poster 04827.png",
+      "utc": "2026-10-25T14:38:50.418458+00:00"
+    },
+    {
+      "mask": 1,
+      "name": "Poster 04827.png",
+      "utc": "2026-10-25T14:38:50.418465+00:00"
+    },
+    {
+      "mask": 16,
+      "name": "Poster 04827.png",
+      "utc": "2026-10-25T14:38:50.418471+00:00"
+    },
+    {
+      "mask": 32,
+      "name": "Poster 04826.png",
+      "utc": "2026-10-25T14:38:50.418477+00:00"
+    },
+    {
+      "mask": 1,
+      "name": "Poster 04826.png",
+      "utc": "2026-10-25T14:38:50.418483+00:00"
+    },
+    {
+      "mask": 16,
+      "name": "Poster 04826.png",
+      "utc": "2026-10-25T14:38:50.418489+00:00"
+    },
+    {
+      "mask": 32,
+      "name": "Poster 04825.png",
+      "utc": "2026-10-25T14:38:50.418495+00:00"
+    },
+    {
+      "mask": 1,
+      "name": "Poster 04825.png",
+      "utc": "2026-10-25T14:38:50.418502+00:00"
+    },
+    {
+      "mask": 16,
+      "name": "Poster 04825.png",
+      "utc": "2026-10-25T14:38:50.418509+00:00"
+    },
+    {
+      "mask": 32,
+      "name": "Poster 04824.png",
+      "utc": "2026-10-25T14:38:50.418516+00:00"
+    },
+    {
+      "mask": 1,
+      "name": "Poster 04824.png",
+      "utc": "2026-10-25T14:38:50.418522+00:00"
+    },
+    {
+      "mask": 16,
+      "name": "Poster 04824.png",
+      "utc": "2026-10-25T14:38:50.418528+00:00"
+    },
+    {
+      "mask": 32,
+      "name": "Poster 04823.png",
+      "utc": "2026-10-25T14:38:50.418534+00:00"
+    },
+    {
+      "mask": 1,
+      "name": "Poster 04823.png",
+      "utc": "2026-10-25T14:38:50.418546+00:00"
+    },
+    {
+      "mask": 16,
+      "name": "Poster 04823.png",
+      "utc": "2026-10-25T14:38:50.418552+00:00"
+    },
+    {
+      "mask": 32,
+      "name": "Poster 04822.png",
+      "utc": "2026-10-25T14:38:50.418559+00:00"
+    },
+    {
+      "mask": 1,
+      "name": "Poster 04822.png",
+      "utc": "2026-10-25T14:38:50.418566+00:00"
+    },
+    {
+      "mask": 16,
+      "name": "Poster 04822.png",
+      "utc": "2026-10-25T14:38:50.418573+00:00"
+    },
+    {
+      "mask": 32,
+      "name": "Poster 04821.png",
+      "utc": "2026-10-25T14:38:50.418579+00:00"
+    },
+    {
+      "mask": 1,
+      "name": "Poster 04821.png",
+      "utc": "2026-10-25T14:38:50.418585+00:00"
+    },
+    {
+      "mask": 16,
+      "name": "Poster 04821.png",
+      "utc": "2026-10-25T14:38:50.418591+00:00"
+    },
+    {
+      "mask": 32,
+      "name": "Poster 04820.png",
+      "utc": "2026-10-25T14:38:50.668805+00:00"
+    },
+    {
+      "mask": 1,
+      "name": "Poster 04820.png",
+      "utc": "2026-10-25T14:38:50.668845+00:00"
+    },
+    {
+      "mask": 16,
+      "name": "Poster 04820.png",
+      "utc": "2026-10-25T14:38:50.668853+00:00"
+    }
+  ],
+  "before_screenshot": "<repo>/docs/performance-implementation-2026-10-25/large-display-before.png",
+  "after_screenshot": "<repo>/docs/performance-implementation-2026-10-25/large-display-after.png",
+  "screenshot_file_sha256_before": "1c67b85ca3f405bfc2f2b4e7e38a0c5897613c2360d4d4c167c7e95f92d0874e",
+  "screenshot_file_sha256_after": "1c67b85ca3f405bfc2f2b4e7e38a0c5897613c2360d4d4c167c7e95f92d0874e",
+  "screenshots_pixel_identical": true,
+  "lavapipe_mapped": true,
+  "binary": "<repo>/target/debug/flick",
+  "binary_sha256": "f1f4dcc529588c128537635052e104b281605d288e34d6d19fc9818c8921eab9",
+  "running_binary_sha256_at_start": "f1f4dcc529588c128537635052e104b281605d288e34d6d19fc9818c8921eab9",
+  "running_binary_size": 169137800,
+  "target_binary_sha256_at_end": "383a489b4412f0f11ba23ce3536acef1169011fc0b90cc88c056b4f94dc39d25",
+  "binary_stat": {
+    "size": 169137800,
+    "mtime_ns": 1792939207750296395
+  },
+  "network": "Inherited seccomp filter denies AF_INET and AF_INET6 socket creation, self-tested; AF_UNIX available for isolated X11. FLICK_LOCAL_TRANSFERS=1; no playback or transfer started.",
+  "linux": "Linux-7.0.0-1011-gcp-x86_64-with-glibc2.39",
+  "limits": [
+    "Xvfb virtual display with Openbox and Lavapipe software Vulkan; no physical display validation.",
+    "No macOS validation.",
+    "No playback entered; this is native interactive library GUI evidence, not interactive playback or a backend playback test.",
+    "Poster paths are all unique; PNG content is the same generated 400x225 fixture via hardlinks.",
+    "Direct strace attachment was denied by ptrace policy; poster file reopen activity is observed through a self-tested inotify directory watcher.",
+    "Last visible poster row is clipped by the screen bottom; 162 complete posters plus 18 partially visible poster resources."
+  ],
+  "samples": [
+    {
+      "seconds": 0.0,
+      "cpu_ticks": 2089,
+      "rss_kib": 577536,
+      "vmsize_kib": 3417424,
+      "threads": 35,
+      "voluntary_context_switches": 3612,
+      "nonvoluntary_context_switches": 1849,
+      "read_bytes": "rchar: 4948320\nwchar: 93572641\nsyscr: 8992\nsyscw: 836\nread_bytes: 2052096\nwrite_bytes: 27164672\ncancelled_write_bytes: 1998848\n"
+    },
+    {
+      "seconds": 1.001196546945721,
+      "cpu_ticks": 2091,
+      "rss_kib": 577536,
+      "vmsize_kib": 3417424,
+      "threads": 35,
+      "voluntary_context_switches": 3677,
+      "nonvoluntary_context_switches": 1850,
+      "read_bytes": "rchar: 4948352\nwchar: 93572673\nsyscr: 9065\nsyscw: 840\nread_bytes: 2052096\nwrite_bytes: 27164672\ncancelled_write_bytes: 1998848\n"
+    },
+    {
+      "seconds": 2.0002845469862223,
+      "cpu_ticks": 2094,
+      "rss_kib": 577536,
+      "vmsize_kib": 3417424,
+      "threads": 35,
+      "voluntary_context_switches": 3740,
+      "nonvoluntary_context_switches": 1859,
+      "read_bytes": "rchar: 4948384\nwchar: 93572705\nsyscr: 9137\nsyscw: 844\nread_bytes: 2052096\nwrite_bytes: 27164672\ncancelled_write_bytes: 1998848\n"
+    },
+    {
+      "seconds": 3.000257062027231,
+      "cpu_ticks": 2096,
+      "rss_kib": 577536,
+      "vmsize_kib": 3417424,
+      "threads": 35,
+      "voluntary_context_switches": 3805,
+      "nonvoluntary_context_switches": 1866,
+      "read_bytes": "rchar: 4948416\nwchar: 93572737\nsyscr: 9210\nsyscw: 848\nread_bytes: 2052096\nwrite_bytes: 27164672\ncancelled_write_bytes: 1998848\n"
+    },
+    {
+      "seconds": 4.000276423059404,
+      "cpu_ticks": 2098,
+      "rss_kib": 577536,
+      "vmsize_kib": 3417424,
+      "threads": 35,
+      "voluntary_context_switches": 3869,
+      "nonvoluntary_context_switches": 1872,
+      "read_bytes": "rchar: 4948448\nwchar: 93572769\nsyscr: 9282\nsyscw: 852\nread_bytes: 2052096\nwrite_bytes: 27164672\ncancelled_write_bytes: 1998848\n"
+    },
+    {
+      "seconds": 5.001172713004053,
+      "cpu_ticks": 2101,
+      "rss_kib": 577536,
+      "vmsize_kib": 3417424,
+      "threads": 35,
+      "voluntary_context_switches": 3934,
+      "nonvoluntary_context_switches": 1881,
+      "read_bytes": "rchar: 4948480\nwchar: 93572801\nsyscr: 9355\nsyscw: 856\nread_bytes: 2052096\nwrite_bytes: 27164672\ncancelled_write_bytes: 1998848\n"
+    },
+    {
+      "seconds": 6.000270545016974,
+      "cpu_ticks": 2103,
+      "rss_kib": 576652,
+      "vmsize_kib": 3417424,
+      "threads": 35,
+      "voluntary_context_switches": 3997,
+      "nonvoluntary_context_switches": 1885,
+      "read_bytes": "rchar: 4948512\nwchar: 93572833\nsyscr: 9427\nsyscw: 860\nread_bytes: 2052096\nwrite_bytes: 27164672\ncancelled_write_bytes: 1998848\n"
+    },
+    {
+      "seconds": 7.001207923982292,
+      "cpu_ticks": 2106,
+      "rss_kib": 576652,
+      "vmsize_kib": 3417424,
+      "threads": 35,
+      "voluntary_context_switches": 4062,
+      "nonvoluntary_context_switches": 1893,
+      "read_bytes": "rchar: 4948544\nwchar: 93572865\nsyscr: 9500\nsyscw: 864\nread_bytes: 2052096\nwrite_bytes: 27164672\ncancelled_write_bytes: 1998848\n"
+    },
+    {
+      "seconds": 8.000254275975749,
+      "cpu_ticks": 2108,
+      "rss_kib": 576652,
+      "vmsize_kib": 3417424,
+      "threads": 35,
+      "voluntary_context_switches": 4126,
+      "nonvoluntary_context_switches": 1895,
+      "read_bytes": "rchar: 4948576\nwchar: 93572897\nsyscr: 9572\nsyscw: 868\nread_bytes: 2052096\nwrite_bytes: 27164672\ncancelled_write_bytes: 1998848\n"
+    },
+    {
+      "seconds": 9.001228625886142,
+      "cpu_ticks": 2110,
+      "rss_kib": 576652,
+      "vmsize_kib": 3417424,
+      "threads": 35,
+      "voluntary_context_switches": 4191,
+      "nonvoluntary_context_switches": 1895,
+      "read_bytes": "rchar: 4948608\nwchar: 93572929\nsyscr: 9645\nsyscw: 872\nread_bytes: 2052096\nwrite_bytes: 27164672\ncancelled_write_bytes: 1998848\n"
+    },
+    {
+      "seconds": 10.000279973028228,
+      "cpu_ticks": 2113,
+      "rss_kib": 576652,
+      "vmsize_kib": 3417424,
+      "threads": 35,
+      "voluntary_context_switches": 4255,
+      "nonvoluntary_context_switches": 1899,
+      "read_bytes": "rchar: 4948640\nwchar: 93572961\nsyscr: 9717\nsyscw: 876\nread_bytes: 2052096\nwrite_bytes: 27164672\ncancelled_write_bytes: 1998848\n"
+    },
+    {
+      "seconds": 11.001167825888842,
+      "cpu_ticks": 2115,
+      "rss_kib": 576652,
+      "vmsize_kib": 3417424,
+      "threads": 35,
+      "voluntary_context_switches": 4320,
+      "nonvoluntary_context_switches": 1901,
+      "read_bytes": "rchar: 4948672\nwchar: 93572993\nsyscr: 9790\nsyscw: 880\nread_bytes: 2052096\nwrite_bytes: 27164672\ncancelled_write_bytes: 1998848\n"
+    },
+    {
+      "seconds": 12.001204017084092,
+      "cpu_ticks": 2117,
+      "rss_kib": 576652,
+      "vmsize_kib": 3417424,
+      "threads": 35,
+      "voluntary_context_switches": 4385,
+      "nonvoluntary_context_switches": 1901,
+      "read_bytes": "rchar: 4948704\nwchar: 93573025\nsyscr: 9863\nsyscw: 884\nread_bytes: 2052096\nwrite_bytes: 27164672\ncancelled_write_bytes: 1998848\n"
+    },
+    {
+      "seconds": 13.000273917103186,
+      "cpu_ticks": 2119,
+      "rss_kib": 576652,
+      "vmsize_kib": 3417424,
+      "threads": 35,
+      "voluntary_context_switches": 4449,
+      "nonvoluntary_context_switches": 1901,
+      "read_bytes": "rchar: 4948736\nwchar: 93573057\nsyscr: 9935\nsyscw: 888\nread_bytes: 2052096\nwrite_bytes: 27164672\ncancelled_write_bytes: 1998848\n"
+    },
+    {
+      "seconds": 14.001590597908944,
+      "cpu_ticks": 2122,
+      "rss_kib": 576652,
+      "vmsize_kib": 3417424,
+      "threads": 35,
+      "voluntary_context_switches": 4514,
+      "nonvoluntary_context_switches": 1908,
+      "read_bytes": "rchar: 4948768\nwchar: 93573089\nsyscr: 10008\nsyscw: 892\nread_bytes: 2052096\nwrite_bytes: 27164672\ncancelled_write_bytes: 1998848\n"
+    },
+    {
+      "seconds": 15.00079134106636,
+      "cpu_ticks": 2125,
+      "rss_kib": 576652,
+      "vmsize_kib": 3417424,
+      "threads": 35,
+      "voluntary_context_switches": 4577,
+      "nonvoluntary_context_switches": 1921,
+      "read_bytes": "rchar: 4948800\nwchar: 93573121\nsyscr: 10079\nsyscw: 896\nread_bytes: 2052096\nwrite_bytes: 27164672\ncancelled_write_bytes: 1998848\n"
+    },
+    {
+      "seconds": 16.00042887707241,
+      "cpu_ticks": 2127,
+      "rss_kib": 576652,
+      "vmsize_kib": 3417424,
+      "threads": 35,
+      "voluntary_context_switches": 4640,
+      "nonvoluntary_context_switches": 1944,
+      "read_bytes": "rchar: 4948832\nwchar: 93573153\nsyscr: 10151\nsyscw: 900\nread_bytes: 2052096\nwrite_bytes: 27164672\ncancelled_write_bytes: 1998848\n"
+    },
+    {
+      "seconds": 17.000278552994132,
+      "cpu_ticks": 2129,
+      "rss_kib": 576592,
+      "vmsize_kib": 3417424,
+      "threads": 35,
+      "voluntary_context_switches": 4705,
+      "nonvoluntary_context_switches": 1977,
+      "read_bytes": "rchar: 4948864\nwchar: 93573185\nsyscr: 10224\nsyscw: 904\nread_bytes: 2052096\nwrite_bytes: 27164672\ncancelled_write_bytes: 1998848\n"
+    },
+    {
+      "seconds": 18.00048144394532,
+      "cpu_ticks": 2131,
+      "rss_kib": 576592,
+      "vmsize_kib": 3417424,
+      "threads": 35,
+      "voluntary_context_switches": 4769,
+      "nonvoluntary_context_switches": 1982,
+      "read_bytes": "rchar: 4948896\nwchar: 93573217\nsyscr: 10296\nsyscw: 908\nread_bytes: 2052096\nwrite_bytes: 27164672\ncancelled_write_bytes: 1998848\n"
+    },
+    {
+      "seconds": 19.00119929900393,
+      "cpu_ticks": 2133,
+      "rss_kib": 576592,
+      "vmsize_kib": 3417424,
+      "threads": 35,
+      "voluntary_context_switches": 4834,
+      "nonvoluntary_context_switches": 1989,
+      "read_bytes": "rchar: 4948928\nwchar: 93573249\nsyscr: 10369\nsyscw: 912\nread_bytes: 2052096\nwrite_bytes: 27164672\ncancelled_write_bytes: 1998848\n"
+    },
+    {
+      "seconds": 20.00118395895697,
+      "cpu_ticks": 2136,
+      "rss_kib": 576592,
+      "vmsize_kib": 3417424,
+      "threads": 35,
+      "voluntary_context_switches": 4899,
+      "nonvoluntary_context_switches": 1989,
+      "read_bytes": "rchar: 4948960\nwchar: 93573281\nsyscr: 10442\nsyscw: 916\nread_bytes: 2052096\nwrite_bytes: 27164672\ncancelled_write_bytes: 1998848\n"
+    },
+    {
+      "seconds": 21.000253342092037,
+      "cpu_ticks": 2137,
+      "rss_kib": 576592,
+      "vmsize_kib": 3417424,
+      "threads": 35,
+      "voluntary_context_switches": 4963,
+      "nonvoluntary_context_switches": 1989,
+      "read_bytes": "rchar: 4948992\nwchar: 93573313\nsyscr: 10514\nsyscw: 920\nread_bytes: 2052096\nwrite_bytes: 27164672\ncancelled_write_bytes: 1998848\n"
+    },
+    {
+      "seconds": 22.001251007895917,
+      "cpu_ticks": 2140,
+      "rss_kib": 576592,
+      "vmsize_kib": 3417424,
+      "threads": 35,
+      "voluntary_context_switches": 5028,
+      "nonvoluntary_context_switches": 1989,
+      "read_bytes": "rchar: 4949024\nwchar: 93573345\nsyscr: 10587\nsyscw: 924\nread_bytes: 2052096\nwrite_bytes: 27164672\ncancelled_write_bytes: 1998848\n"
+    },
+    {
+      "seconds": 23.001151042059064,
+      "cpu_ticks": 2142,
+      "rss_kib": 576592,
+      "vmsize_kib": 3417424,
+      "threads": 35,
+      "voluntary_context_switches": 5092,
+      "nonvoluntary_context_switches": 1989,
+      "read_bytes": "rchar: 4949056\nwchar: 93573377\nsyscr: 10659\nsyscw: 928\nread_bytes: 2052096\nwrite_bytes: 27164672\ncancelled_write_bytes: 1998848\n"
+    },
+    {
+      "seconds": 24.001181951956823,
+      "cpu_ticks": 2144,
+      "rss_kib": 576592,
+      "vmsize_kib": 3417424,
+      "threads": 35,
+      "voluntary_context_switches": 5157,
+      "nonvoluntary_context_switches": 1989,
+      "read_bytes": "rchar: 4949088\nwchar: 93573409\nsyscr: 10732\nsyscw: 932\nread_bytes: 2052096\nwrite_bytes: 27164672\ncancelled_write_bytes: 1998848\n"
+    },
+    {
+      "seconds": 25.001164037035778,
+      "cpu_ticks": 2146,
+      "rss_kib": 576592,
+      "vmsize_kib": 3417424,
+      "threads": 35,
+      "voluntary_context_switches": 5221,
+      "nonvoluntary_context_switches": 1989,
+      "read_bytes": "rchar: 4949120\nwchar: 93573441\nsyscr: 10804\nsyscw: 936\nread_bytes: 2052096\nwrite_bytes: 27164672\ncancelled_write_bytes: 1998848\n"
+    },
+    {
+      "seconds": 26.001167624955997,
+      "cpu_ticks": 2148,
+      "rss_kib": 576592,
+      "vmsize_kib": 3417424,
+      "threads": 35,
+      "voluntary_context_switches": 5285,
+      "nonvoluntary_context_switches": 1989,
+      "read_bytes": "rchar: 4949152\nwchar: 93573473\nsyscr: 10877\nsyscw: 940\nread_bytes: 2052096\nwrite_bytes: 27164672\ncancelled_write_bytes: 1998848\n"
+    },
+    {
+      "seconds": 27.0011113290675,
+      "cpu_ticks": 2151,
+      "rss_kib": 576592,
+      "vmsize_kib": 3417424,
+      "threads": 35,
+      "voluntary_context_switches": 5350,
+      "nonvoluntary_context_switches": 1989,
+      "read_bytes": "rchar: 4949184\nwchar: 93573505\nsyscr: 10949\nsyscw: 944\nread_bytes: 2052096\nwrite_bytes: 27164672\ncancelled_write_bytes: 1998848\n"
+    },
+    {
+      "seconds": 28.00024758791551,
+      "cpu_ticks": 2153,
+      "rss_kib": 576592,
+      "vmsize_kib": 3417424,
+      "threads": 35,
+      "voluntary_context_switches": 5414,
+      "nonvoluntary_context_switches": 1989,
+      "read_bytes": "rchar: 4949216\nwchar: 93573537\nsyscr: 11021\nsyscw: 948\nread_bytes: 2052096\nwrite_bytes: 27164672\ncancelled_write_bytes: 1998848\n"
+    },
+    {
+      "seconds": 29.001145594986156,
+      "cpu_ticks": 2155,
+      "rss_kib": 576592,
+      "vmsize_kib": 3417424,
+      "threads": 35,
+      "voluntary_context_switches": 5477,
+      "nonvoluntary_context_switches": 1995,
+      "read_bytes": "rchar: 4949248\nwchar: 93573569\nsyscr: 11093\nsyscw: 952\nread_bytes: 2052096\nwrite_bytes: 27164672\ncancelled_write_bytes: 1998848\n"
+    },
+    {
+      "seconds": 30.001159094041213,
+      "cpu_ticks": 2157,
+      "rss_kib": 576592,
+      "vmsize_kib": 3417424,
+      "threads": 35,
+      "voluntary_context_switches": 5542,
+      "nonvoluntary_context_switches": 1995,
+      "read_bytes": "rchar: 4949280\nwchar: 93573601\nsyscr: 11166\nsyscw: 956\nread_bytes: 2052096\nwrite_bytes: 27164672\ncancelled_write_bytes: 1998848\n"
+    },
+    {
+      "seconds": 31.00023946398869,
+      "cpu_ticks": 2159,
+      "rss_kib": 576592,
+      "vmsize_kib": 3417424,
+      "threads": 35,
+      "voluntary_context_switches": 5606,
+      "nonvoluntary_context_switches": 1995,
+      "read_bytes": "rchar: 4949312\nwchar: 93573633\nsyscr: 11238\nsyscw: 960\nread_bytes: 2052096\nwrite_bytes: 27164672\ncancelled_write_bytes: 1998848\n"
+    },
+    {
+      "seconds": 32.00117053091526,
+      "cpu_ticks": 2161,
+      "rss_kib": 576592,
+      "vmsize_kib": 3417424,
+      "threads": 35,
+      "voluntary_context_switches": 5670,
+      "nonvoluntary_context_switches": 1996,
+      "read_bytes": "rchar: 4949344\nwchar: 93573665\nsyscr: 11311\nsyscw: 964\nread_bytes: 2052096\nwrite_bytes: 27164672\ncancelled_write_bytes: 1998848\n"
+    },
+    {
+      "seconds": 33.0002277570311,
+      "cpu_ticks": 2163,
+      "rss_kib": 576592,
+      "vmsize_kib": 3417424,
+      "threads": 35,
+      "voluntary_context_switches": 5735,
+      "nonvoluntary_context_switches": 1997,
+      "read_bytes": "rchar: 4949376\nwchar: 93573697\nsyscr: 11383\nsyscw: 968\nread_bytes: 2052096\nwrite_bytes: 27164672\ncancelled_write_bytes: 1998848\n"
+    },
+    {
+      "seconds": 34.001171936048195,
+      "cpu_ticks": 2165,
+      "rss_kib": 576592,
+      "vmsize_kib": 3417424,
+      "threads": 35,
+      "voluntary_context_switches": 5800,
+      "nonvoluntary_context_switches": 1998,
+      "read_bytes": "rchar: 4949408\nwchar: 93573729\nsyscr: 11456\nsyscw: 972\nread_bytes: 2052096\nwrite_bytes: 27164672\ncancelled_write_bytes: 1998848\n"
+    },
+    {
+      "seconds": 35.00049589807168,
+      "cpu_ticks": 2168,
+      "rss_kib": 576592,
+      "vmsize_kib": 3417424,
+      "threads": 35,
+      "voluntary_context_switches": 5864,
+      "nonvoluntary_context_switches": 2002,
+      "read_bytes": "rchar: 4949440\nwchar: 93573761\nsyscr: 11528\nsyscw: 976\nread_bytes: 2052096\nwrite_bytes: 27164672\ncancelled_write_bytes: 1998848\n"
+    },
+    {
+      "seconds": 36.00119668105617,
+      "cpu_ticks": 2169,
+      "rss_kib": 576592,
+      "vmsize_kib": 3417424,
+      "threads": 35,
+      "voluntary_context_switches": 5929,
+      "nonvoluntary_context_switches": 2002,
+      "read_bytes": "rchar: 4949472\nwchar: 93573793\nsyscr: 11601\nsyscw: 980\nread_bytes: 2052096\nwrite_bytes: 27164672\ncancelled_write_bytes: 1998848\n"
+    },
+    {
+      "seconds": 37.000295487931,
+      "cpu_ticks": 2171,
+      "rss_kib": 576592,
+      "vmsize_kib": 3417424,
+      "threads": 35,
+      "voluntary_context_switches": 5993,
+      "nonvoluntary_context_switches": 2002,
+      "read_bytes": "rchar: 4949504\nwchar: 93573825\nsyscr: 11673\nsyscw: 984\nread_bytes: 2052096\nwrite_bytes: 27164672\ncancelled_write_bytes: 1998848\n"
+    },
+    {
+      "seconds": 38.00116187892854,
+      "cpu_ticks": 2173,
+      "rss_kib": 576592,
+      "vmsize_kib": 3417424,
+      "threads": 35,
+      "voluntary_context_switches": 6058,
+      "nonvoluntary_context_switches": 2006,
+      "read_bytes": "rchar: 4949536\nwchar: 93573857\nsyscr: 11746\nsyscw: 988\nread_bytes: 2052096\nwrite_bytes: 27164672\ncancelled_write_bytes: 1998848\n"
+    },
+    {
+      "seconds": 39.001154157100245,
+      "cpu_ticks": 2176,
+      "rss_kib": 576592,
+      "vmsize_kib": 3417424,
+      "threads": 35,
+      "voluntary_context_switches": 6122,
+      "nonvoluntary_context_switches": 2006,
+      "read_bytes": "rchar: 4949568\nwchar: 93573889\nsyscr: 11818\nsyscw: 992\nread_bytes: 2052096\nwrite_bytes: 27164672\ncancelled_write_bytes: 1998848\n"
+    },
+    {
+      "seconds": 40.00026962393895,
+      "cpu_ticks": 2178,
+      "rss_kib": 576592,
+      "vmsize_kib": 3417424,
+      "threads": 35,
+      "voluntary_context_switches": 6186,
+      "nonvoluntary_context_switches": 2006,
+      "read_bytes": "rchar: 4949600\nwchar: 93573921\nsyscr: 11890\nsyscw: 996\nread_bytes: 2052096\nwrite_bytes: 27164672\ncancelled_write_bytes: 1998848\n"
+    },
+    {
+      "seconds": 41.00028863409534,
+      "cpu_ticks": 2179,
+      "rss_kib": 576592,
+      "vmsize_kib": 3417424,
+      "threads": 35,
+      "voluntary_context_switches": 6251,
+      "nonvoluntary_context_switches": 2006,
+      "read_bytes": "rchar: 4949632\nwchar: 93573953\nsyscr: 11963\nsyscw: 1000\nread_bytes: 2052096\nwrite_bytes: 27164672\ncancelled_write_bytes: 1998848\n"
+    },
+    {
+      "seconds": 42.00028235302307,
+      "cpu_ticks": 2182,
+      "rss_kib": 576592,
+      "vmsize_kib": 3417424,
+      "threads": 35,
+      "voluntary_context_switches": 6315,
+      "nonvoluntary_context_switches": 2006,
+      "read_bytes": "rchar: 4949664\nwchar: 93573985\nsyscr: 12035\nsyscw: 1004\nread_bytes: 2052096\nwrite_bytes: 27164672\ncancelled_write_bytes: 1998848\n"
+    },
+    {
+      "seconds": 43.00119675695896,
+      "cpu_ticks": 2184,
+      "rss_kib": 576592,
+      "vmsize_kib": 3417424,
+      "threads": 35,
+      "voluntary_context_switches": 6380,
+      "nonvoluntary_context_switches": 2006,
+      "read_bytes": "rchar: 4949696\nwchar: 93574017\nsyscr: 12108\nsyscw: 1008\nread_bytes: 2052096\nwrite_bytes: 27164672\ncancelled_write_bytes: 1998848\n"
+    },
+    {
+      "seconds": 44.00120635307394,
+      "cpu_ticks": 2185,
+      "rss_kib": 576592,
+      "vmsize_kib": 3417424,
+      "threads": 35,
+      "voluntary_context_switches": 6445,
+      "nonvoluntary_context_switches": 2006,
+      "read_bytes": "rchar: 4949728\nwchar: 93574049\nsyscr: 12181\nsyscw: 1012\nread_bytes: 2052096\nwrite_bytes: 27164672\ncancelled_write_bytes: 1998848\n"
+    },
+    {
+      "seconds": 45.00114444596693,
+      "cpu_ticks": 2187,
+      "rss_kib": 576592,
+      "vmsize_kib": 3417424,
+      "threads": 35,
+      "voluntary_context_switches": 6509,
+      "nonvoluntary_context_switches": 2006,
+      "read_bytes": "rchar: 4949760\nwchar: 93574081\nsyscr: 12253\nsyscw: 1016\nread_bytes: 2052096\nwrite_bytes: 27164672\ncancelled_write_bytes: 1998848\n"
+    },
+    {
+      "seconds": 46.001215999946,
+      "cpu_ticks": 2189,
+      "rss_kib": 576592,
+      "vmsize_kib": 3417424,
+      "threads": 35,
+      "voluntary_context_switches": 6573,
+      "nonvoluntary_context_switches": 2006,
+      "read_bytes": "rchar: 4949792\nwchar: 93574113\nsyscr: 12326\nsyscw: 1020\nread_bytes: 2052096\nwrite_bytes: 27164672\ncancelled_write_bytes: 1998848\n"
+    },
+    {
+      "seconds": 47.00117976590991,
+      "cpu_ticks": 2192,
+      "rss_kib": 576592,
+      "vmsize_kib": 3417424,
+      "threads": 35,
+      "voluntary_context_switches": 6638,
+      "nonvoluntary_context_switches": 2006,
+      "read_bytes": "rchar: 4949824\nwchar: 93574145\nsyscr: 12398\nsyscw: 1024\nread_bytes: 2052096\nwrite_bytes: 27164672\ncancelled_write_bytes: 1998848\n"
+    },
+    {
+      "seconds": 48.00118044996634,
+      "cpu_ticks": 2194,
+      "rss_kib": 576592,
+      "vmsize_kib": 3417424,
+      "threads": 35,
+      "voluntary_context_switches": 6703,
+      "nonvoluntary_context_switches": 2006,
+      "read_bytes": "rchar: 4949856\nwchar: 93574177\nsyscr: 12471\nsyscw: 1028\nread_bytes: 2052096\nwrite_bytes: 27164672\ncancelled_write_bytes: 1998848\n"
+    },
+    {
+      "seconds": 49.001173317898065,
+      "cpu_ticks": 2195,
+      "rss_kib": 576592,
+      "vmsize_kib": 3417424,
+      "threads": 35,
+      "voluntary_context_switches": 6767,
+      "nonvoluntary_context_switches": 2006,
+      "read_bytes": "rchar: 4949888\nwchar: 93574209\nsyscr: 12543\nsyscw: 1032\nread_bytes: 2052096\nwrite_bytes: 27164672\ncancelled_write_bytes: 1998848\n"
+    },
+    {
+      "seconds": 50.00129303894937,
+      "cpu_ticks": 2197,
+      "rss_kib": 576592,
+      "vmsize_kib": 3417424,
+      "threads": 35,
+      "voluntary_context_switches": 6832,
+      "nonvoluntary_context_switches": 2006,
+      "read_bytes": "rchar: 4949920\nwchar: 93574241\nsyscr: 12616\nsyscw: 1036\nread_bytes: 2052096\nwrite_bytes: 27164672\ncancelled_write_bytes: 1998848\n"
+    },
+    {
+      "seconds": 51.00116818794049,
+      "cpu_ticks": 2200,
+      "rss_kib": 576592,
+      "vmsize_kib": 3417424,
+      "threads": 35,
+      "voluntary_context_switches": 6896,
+      "nonvoluntary_context_switches": 2006,
+      "read_bytes": "rchar: 4949952\nwchar: 93574273\nsyscr: 12688\nsyscw: 1040\nread_bytes: 2052096\nwrite_bytes: 27164672\ncancelled_write_bytes: 1998848\n"
+    },
+    {
+      "seconds": 52.00117032509297,
+      "cpu_ticks": 2202,
+      "rss_kib": 576592,
+      "vmsize_kib": 3417424,
+      "threads": 35,
+      "voluntary_context_switches": 6961,
+      "nonvoluntary_context_switches": 2006,
+      "read_bytes": "rchar: 4949984\nwchar: 93574305\nsyscr: 12761\nsyscw: 1044\nread_bytes: 2052096\nwrite_bytes: 27164672\ncancelled_write_bytes: 1998848\n"
+    },
+    {
+      "seconds": 53.00115570006892,
+      "cpu_ticks": 2203,
+      "rss_kib": 576592,
+      "vmsize_kib": 3417424,
+      "threads": 35,
+      "voluntary_context_switches": 7025,
+      "nonvoluntary_context_switches": 2006,
+      "read_bytes": "rchar: 4950016\nwchar: 93574337\nsyscr: 12833\nsyscw: 1048\nread_bytes: 2052096\nwrite_bytes: 27164672\ncancelled_write_bytes: 1998848\n"
+    },
+    {
+      "seconds": 54.001209744950756,
+      "cpu_ticks": 2205,
+      "rss_kib": 576592,
+      "vmsize_kib": 3417424,
+      "threads": 35,
+      "voluntary_context_switches": 7090,
+      "nonvoluntary_context_switches": 2006,
+      "read_bytes": "rchar: 4950048\nwchar: 93574369\nsyscr: 12906\nsyscw: 1052\nread_bytes: 2052096\nwrite_bytes: 27164672\ncancelled_write_bytes: 1998848\n"
+    },
+    {
+      "seconds": 55.00116688408889,
+      "cpu_ticks": 2208,
+      "rss_kib": 576592,
+      "vmsize_kib": 3417424,
+      "threads": 35,
+      "voluntary_context_switches": 7154,
+      "nonvoluntary_context_switches": 2006,
+      "read_bytes": "rchar: 4950080\nwchar: 93574401\nsyscr: 12978\nsyscw: 1056\nread_bytes: 2052096\nwrite_bytes: 27164672\ncancelled_write_bytes: 1998848\n"
+    },
+    {
+      "seconds": 56.001227306900546,
+      "cpu_ticks": 2210,
+      "rss_kib": 576592,
+      "vmsize_kib": 3417424,
+      "threads": 35,
+      "voluntary_context_switches": 7219,
+      "nonvoluntary_context_switches": 2006,
+      "read_bytes": "rchar: 4950112\nwchar: 93574433\nsyscr: 13051\nsyscw: 1060\nread_bytes: 2052096\nwrite_bytes: 27164672\ncancelled_write_bytes: 1998848\n"
+    },
+    {
+      "seconds": 57.00121427210979,
+      "cpu_ticks": 2212,
+      "rss_kib": 576592,
+      "vmsize_kib": 3417424,
+      "threads": 35,
+      "voluntary_context_switches": 7283,
+      "nonvoluntary_context_switches": 2006,
+      "read_bytes": "rchar: 4950144\nwchar: 93574465\nsyscr: 13123\nsyscw: 1064\nread_bytes: 2052096\nwrite_bytes: 27164672\ncancelled_write_bytes: 1998848\n"
+    },
+    {
+      "seconds": 58.00121739390306,
+      "cpu_ticks": 2214,
+      "rss_kib": 576592,
+      "vmsize_kib": 3417424,
+      "threads": 35,
+      "voluntary_context_switches": 7348,
+      "nonvoluntary_context_switches": 2006,
+      "read_bytes": "rchar: 4950176\nwchar: 93574497\nsyscr: 13196\nsyscw: 1068\nread_bytes: 2052096\nwrite_bytes: 27164672\ncancelled_write_bytes: 1998848\n"
+    },
+    {
+      "seconds": 59.001202716026455,
+      "cpu_ticks": 2216,
+      "rss_kib": 576592,
+      "vmsize_kib": 3417424,
+      "threads": 35,
+      "voluntary_context_switches": 7412,
+      "nonvoluntary_context_switches": 2006,
+      "read_bytes": "rchar: 4950208\nwchar: 93574529\nsyscr: 13268\nsyscw: 1072\nread_bytes: 2052096\nwrite_bytes: 27164672\ncancelled_write_bytes: 1998848\n"
+    },
+    {
+      "seconds": 60.001230889,
+      "cpu_ticks": 2218,
+      "rss_kib": 576592,
+      "vmsize_kib": 3417424,
+      "threads": 35,
+      "voluntary_context_switches": 7477,
+      "nonvoluntary_context_switches": 2006,
+      "read_bytes": "rchar: 4950240\nwchar: 93574561\nsyscr: 13341\nsyscw: 1076\nread_bytes: 2052096\nwrite_bytes: 27164672\ncancelled_write_bytes: 1998848\n"
+    }
+  ],
+  "normal_shutdown": {
+    "verified": true,
+    "method": "xdotool windowactivate --sync WINDOW; xdotool key --clearmodifiers ctrl+q",
+    "exit_code": 0,
+    "supervisor_exit_code": 0,
+    "wait_seconds": 1.10338035505265,
+    "running_binary_sha256_before_quit": "f1f4dcc529588c128537635052e104b281605d288e34d6d19fc9818c8921eab9",
+    "matches_current_target_binary": false,
+    "app_gone": true
+  },
+  "result": "PASS: 180 distinct visible poster Resource paths (162 complete plus 18 clipped), settled 5000-entry GUI idle without repaint/redecode loop over 60 seconds, normal Ctrl+Q exit 0.",
+  "acceptance_checks": {
+    "5000 distinct media paths": true,
+    "5000 distinct poster paths": true,
+    "180 visible resources": true,
+    "3840x2160 1x": true,
+    "60 second measurement": true,
+    "zero root renders": true,
+    "zero poster opens/accesses": true,
+    "identical screenshots": true,
+    "running binary hash stable": true,
+    "normal exit0": true,
+    "app gone": true,
+    "private display cleaned up": true
+  },
+  "parent_followup_note": "Parent confirmed later target rebuilds concern unrelated transfer Remove and quit open-generation; poster cache code has not changed since the initial run. No further runs were made for subsequent target hash changes."
+}

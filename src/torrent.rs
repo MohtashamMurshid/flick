@@ -6,26 +6,26 @@
 use anyhow::{Context, Result, bail, ensure};
 use fs2::FileExt;
 use librqbit::{
-    AddTorrent, AddTorrentOptions, AddTorrentResponse, CreateTorrentOptions, DhtSessionConfig,
-    ListenerMode, ListenerOptions, ManagedTorrent, Session, SessionOptions,
-    SessionPersistenceConfig, TorrentStatsState, api::TorrentIdOrHash,
-    spawn_utils::BlockingSpawner,
+    AddTorrent, AddTorrentOptions, AddTorrentResponse, DhtSessionConfig, ListenerMode,
+    ListenerOptions, ManagedTorrent, Session, SessionOptions, SessionPersistenceConfig,
+    TorrentStatsState, api::TorrentIdOrHash,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     fs::{File, OpenOptions},
     hash::{BuildHasher, Hasher},
     net::{SocketAddr, TcpListener, UdpSocket},
     num::NonZeroU32,
     path::{Component, Path, PathBuf},
     sync::{
-        Arc, RwLock,
+        Arc, Mutex, RwLock, Weak,
         atomic::{AtomicBool, Ordering},
     },
     time::Duration,
 };
 use tokio::io::AsyncReadExt;
+use tokio::sync::Notify;
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 
@@ -46,10 +46,318 @@ pub const PUBLIC_TRACKERS: &[&str] = &[
 ];
 
 const MAX_METADATA_BYTES: u64 = 16 * 1024 * 1024;
-const EMPTY_SHA1: [u8; 20] = [
-    0xda, 0x39, 0xa3, 0xee, 0x5e, 0x6b, 0x4b, 0x0d, 0x32, 0x55, 0xbf, 0xef, 0x95, 0x60, 0x18, 0x90,
-    0xaf, 0xd8, 0x07, 0x09,
-];
+mod share;
+
+/// Canonical root evidence survives malformed records and startup failures.
+/// `roots_complete` permits ruling out ownership only outside every root; it
+/// never proves that a file within a root is verified or directly playable.
+#[derive(Debug, Default)]
+pub struct SavedTransferOwnership {
+    pub roots: Vec<PathBuf>,
+    pub roots_complete: bool,
+    pub error: Option<String>,
+    saved: Option<SavedOwnership>,
+}
+
+impl SavedTransferOwnership {
+    pub fn has_saved_transfers(&self) -> bool {
+        self.saved
+            .as_ref()
+            .is_some_and(|saved| !saved.infohashes.is_empty())
+    }
+}
+
+#[derive(Debug)]
+struct SavedOwnership {
+    infohashes: HashSet<String>,
+}
+
+#[derive(Deserialize)]
+struct SavedSession {
+    torrents: HashMap<usize, SavedTorrent>,
+}
+
+#[derive(Deserialize)]
+struct SavedTorrent {
+    info_hash: String,
+    #[serde(rename = "trackers")]
+    _trackers: HashSet<String>,
+    output_folder: PathBuf,
+    #[serde(rename = "only_files")]
+    _only_files: Option<Vec<usize>>,
+    #[serde(rename = "is_paused")]
+    _is_paused: bool,
+}
+
+fn validate_saved_folder(folder: &Path) -> Result<()> {
+    ensure!(
+        folder.is_absolute()
+            && !folder
+                .components()
+                .any(|c| matches!(c, Component::ParentDir))
+            && !folder.as_os_str().as_encoded_bytes().contains(&0),
+        "Saved transfer folder must be a valid absolute path"
+    );
+    Ok(())
+}
+
+async fn read_saved_metadata(state_dir: &Path) -> Result<Option<Vec<u8>>> {
+    read_saved_metadata_file(&state_dir.join("session.json")).await
+}
+
+async fn read_saved_metadata_file(path: &Path) -> Result<Option<Vec<u8>>> {
+    let metadata = match tokio::fs::symlink_metadata(path).await {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).context("Inspect saved transfer ownership"),
+    };
+    ensure!(
+        metadata.is_file(),
+        "Saved transfer metadata is not a regular file"
+    );
+    ensure!(
+        metadata.len() <= MAX_METADATA_BYTES,
+        "Saved transfer metadata exceeds 16 MiB"
+    );
+    let file = tokio::fs::File::open(path)
+        .await
+        .context("Open saved transfer metadata")?;
+    ensure!(
+        file.metadata().await?.is_file(),
+        "Saved transfer metadata is not a regular file"
+    );
+    let mut bytes = Vec::new();
+    file.take(MAX_METADATA_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .await
+        .context("Read saved transfer metadata")?;
+    ensure!(
+        bytes.len() as u64 <= MAX_METADATA_BYTES,
+        "Saved transfer metadata exceeds 16 MiB"
+    );
+    Ok(Some(bytes))
+}
+
+/// Validate sidecar identities before librqbit can replace a saved record by ID.
+/// Missing sidecars keep the engine's existing magnet-restoration behavior.
+async fn validate_saved_metainfo(state_dir: &Path, saved: &SavedOwnership) -> Result<()> {
+    for expected in &saved.infohashes {
+        let path = state_dir.join(format!("{expected}.torrent"));
+        let Some(bytes) = read_saved_metadata_file(&path)
+            .await
+            .with_context(|| format!("Read saved torrent metadata for {expected}"))?
+        else {
+            continue;
+        };
+        let actual = tokio::task::spawn_blocking(move || -> Result<_> {
+            let metainfo =
+                librqbit::torrent_from_bytes(&bytes).context("Parse saved torrent metadata")?;
+            metainfo.info.data.validate()?;
+            Ok(metainfo.info_hash.as_string())
+        })
+        .await
+        .context("Check saved torrent metadata")??;
+        ensure!(
+            actual == *expected,
+            "Saved torrent metadata infohash does not match saved transfer {expected}"
+        );
+    }
+    Ok(())
+}
+
+/// Read before starting librqbit, whose restoration may wait for peers. Missing
+/// output folders cannot contain openable files and do not hide other roots.
+/// Unreadable/malformed metadata remains unknown, preserving any independently
+/// valid roots from a syntactically valid JSON document.
+pub async fn inspect_saved_transfer_ownership(state_dir: &Path) -> SavedTransferOwnership {
+    let mut evidence = SavedTransferOwnership::default();
+    let bytes = match read_saved_metadata(state_dir).await {
+        Ok(Some(bytes)) => bytes,
+        Ok(None) => {
+            evidence.roots_complete = true;
+            return evidence;
+        }
+        Err(error) => {
+            evidence.error = Some(format!("{error:#}"));
+            return evidence;
+        }
+    };
+    let parsed = tokio::task::spawn_blocking(move || -> Result<_> {
+        let document: serde_json::Value =
+            serde_json::from_slice(&bytes).context("Parse saved transfer metadata")?;
+        let torrents = document
+            .get("torrents")
+            .and_then(serde_json::Value::as_object)
+            .context("Saved transfer metadata has no torrent records")?;
+        // Extract each root separately: a malformed sibling record must not
+        // erase sound canonical evidence from the rest of the document.
+        let folders = torrents
+            .values()
+            .map(|record| {
+                let folder: PathBuf = serde_json::from_value(
+                    record
+                        .get("output_folder")
+                        .cloned()
+                        .context("Missing saved transfer folder")?,
+                )
+                .context("Invalid saved transfer folder")?;
+                validate_saved_folder(&folder)?;
+                Ok(folder)
+            })
+            .collect::<Vec<Result<PathBuf>>>();
+        let saved = (|| -> Result<SavedOwnership> {
+            // Keep the required fields/types aligned with librqbit 9.0.1's
+            // SerializedSessionDatabase/SerializedTorrent.
+            let saved: SavedSession =
+                serde_json::from_value(document).context("Parse saved transfer records")?;
+            let mut infohashes = HashSet::new();
+            for torrent in saved.torrents.into_values() {
+                let _ = TorrentIdOrHash::Hash(
+                    torrent
+                        .info_hash
+                        .parse()
+                        .context("Invalid saved infohash")?,
+                );
+                validate_saved_folder(&torrent.output_folder)?;
+                infohashes.insert(torrent.info_hash.to_ascii_lowercase());
+            }
+            Ok(SavedOwnership { infohashes })
+        })();
+        Ok((folders, saved))
+    })
+    .await;
+    let (folders, saved) = match parsed {
+        Ok(Ok(parsed)) => parsed,
+        Ok(Err(error)) => {
+            evidence.error = Some(format!("{error:#}"));
+            return evidence;
+        }
+        Err(error) => {
+            evidence.error = Some(format!("Read saved transfer ownership: {error}"));
+            return evidence;
+        }
+    };
+    match saved {
+        Ok(saved) => evidence.saved = Some(saved),
+        Err(error) => evidence.error = Some(format!("{error:#}")),
+    }
+    evidence.roots_complete = true;
+    for folder in folders {
+        let resolved = async {
+            let folder = folder?;
+            let mut candidate = folder.as_path();
+            let root = loop {
+                match tokio::fs::canonicalize(candidate).await {
+                    Ok(root) => break root,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        // A dangling symlink can point outside its parent; its
+                        // parent's canonical path cannot bound that output.
+                        match tokio::fs::symlink_metadata(candidate).await {
+                            Ok(metadata) => ensure!(
+                                !metadata.is_symlink(),
+                                "Saved transfer folder has an unavailable symlink target"
+                            ),
+                            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                            Err(error) => {
+                                return Err(error).context("Inspect missing saved transfer folder");
+                            }
+                        }
+                        // Keep a conservative canonical ancestor: restoration
+                        // may recreate this output before its first snapshot.
+                        candidate = candidate
+                            .parent()
+                            .context("Saved transfer folder has no available ancestor")?;
+                    }
+                    Err(error) => return Err(error).context("Resolve saved transfer folder"),
+                }
+            };
+            ensure!(
+                tokio::fs::metadata(&root).await?.is_dir(),
+                "Saved transfer folder is not a directory"
+            );
+            Ok::<_, anyhow::Error>(root)
+        }
+        .await;
+        match resolved {
+            Ok(root) => evidence.roots.push(root),
+            Err(error) => {
+                evidence.roots_complete = false;
+                evidence.error.get_or_insert_with(|| format!("{error:#}"));
+            }
+        }
+    }
+    evidence.roots.sort();
+    evidence.roots.dedup();
+    evidence
+}
+
+/// Strict convenience API for callers that require complete saved ownership.
+pub async fn saved_transfer_roots(state_dir: &Path) -> Result<Option<Vec<PathBuf>>> {
+    let evidence = inspect_saved_transfer_ownership(state_dir).await;
+    if let Some(error) = evidence.error {
+        bail!(error);
+    }
+    Ok(evidence.saved.map(|_| evidence.roots))
+}
+
+async fn read_saved_ownership(state_dir: &Path) -> Result<Option<SavedOwnership>> {
+    let evidence = inspect_saved_transfer_ownership(state_dir).await;
+    if let Some(error) = evidence.error {
+        bail!(error);
+    }
+    Ok(evidence.saved)
+}
+
+/// Lock an existing state directory without starting an engine or creating a
+/// missing directory. The caller retains this lock through its metadata read.
+async fn lock_existing_state(state_dir: &Path) -> Result<Option<File>> {
+    match tokio::fs::symlink_metadata(state_dir).await {
+        Ok(metadata) => ensure!(metadata.is_dir(), "Transfer state is not a directory"),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).context("Inspect transfer state"),
+    }
+    let lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(state_dir.join("session.lock"))
+        .context("Open transfer state lock")?;
+    lock.try_lock_exclusive()
+        .context("Another Flick transfer session owns this state directory")?;
+    Ok(Some(lock))
+}
+
+/// Missing/empty metadata proves an empty startup only while no live engine
+/// holds the directory. A held lock with no readable records remains unknown.
+pub async fn confirm_saved_transfers_empty(state_dir: &Path) -> Result<()> {
+    let Some(_lock) = lock_existing_state(state_dir).await? else {
+        return Ok(());
+    };
+    let saved = read_saved_ownership(state_dir).await?;
+    ensure!(
+        saved.is_none_or(|saved| saved.infohashes.is_empty()),
+        "Saved transfers changed during startup. Retry downloads."
+    );
+    Ok(())
+}
+
+/// Confirm an absent owner without starting an engine or any discovery. The
+/// state lock prevents racing a live owner's writes; an unreadable session or
+/// an owner still saved on disk must be retried through normal startup.
+pub async fn confirm_saved_owner_absent(state_dir: &Path, infohash: &str) -> Result<()> {
+    let _ = TorrentIdOrHash::Hash(infohash.parse().context("Invalid infohash")?);
+    let Some(_lock) = lock_existing_state(state_dir).await? else {
+        return Ok(());
+    };
+    if let Some(saved) = read_saved_ownership(state_dir).await? {
+        ensure!(
+            !saved.infohashes.contains(&infohash.to_ascii_lowercase()),
+            "This transfer is still saved. Retry downloads before deleting its file."
+        );
+    }
+    Ok(())
+}
 
 #[derive(Clone, Debug)]
 pub struct TransferConfig {
@@ -186,7 +494,7 @@ impl ResolvedTorrent {
     }
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 pub struct FileProgress {
     pub index: usize,
     pub path: PathBuf,
@@ -205,7 +513,7 @@ pub enum TransferState {
     Error,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 pub struct TransferSnapshot {
     pub infohash: String,
     pub name: String,
@@ -242,13 +550,47 @@ pub struct TransferSession {
     download_dir: PathBuf,
     cancel: CancellationToken,
     seed_completed: Arc<AtomicBool>,
+    policy_changed: Arc<Notify>,
     explicit_shares: Arc<RwLock<HashSet<String>>>,
     state_dir: PathBuf,
-    _state_lock: File,
+    snapshot_metadata: Mutex<HashMap<usize, Arc<SnapshotMetadata>>>,
+    state_lock: Mutex<Option<File>>,
+}
+
+struct SnapshotMetadata {
+    handle: Weak<ManagedTorrent>,
+    infohash: String,
+    name: String,
+    files: Vec<(PathBuf, u64)>,
 }
 
 impl TransferSession {
     pub async fn start(config: TransferConfig) -> Result<Self> {
+        Self::start_cancellable(config, CancellationToken::new()).await
+    }
+
+    /// Cancellation also reaches engine tasks spawned before restoration
+    /// returns. Dropping only the startup future would leave those tasks alive.
+    pub async fn start_cancellable(
+        config: TransferConfig,
+        cancel: CancellationToken,
+    ) -> Result<Self> {
+        let guard = cancel.clone().drop_guard();
+        let result = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => bail!("Transfer startup cancelled"),
+            result = Self::start_inner(config, cancel.clone()) => result,
+        };
+        if result.is_ok() {
+            guard.disarm();
+        }
+        result
+    }
+
+    async fn start_inner(
+        config: TransferConfig,
+        startup_cancel: CancellationToken,
+    ) -> Result<Self> {
         tokio::fs::create_dir_all(&config.download_dir)
             .await
             .context("Create download directory")?;
@@ -276,11 +618,15 @@ impl TransferSession {
                 Err(e) => return Err(e).context("Read explicit share identities"),
             },
         ));
+        let saved = read_saved_ownership(&state_dir).await?;
+        if let Some(saved) = &saved {
+            validate_saved_metainfo(&state_dir, saved).await?;
+        }
         let mut listen_addr = select_listen_addr(&config, &state_dir)?;
         // A second process can bind between our probe and librqbit's bind.
         // Retry only unusable ports, without masking unrelated startup errors.
         for attempt in 0..16 {
-            let cancel = CancellationToken::new();
+            let cancel = startup_cancel.child_token();
             let session = Session::new_with_opts(
                 download_dir.clone(),
                 session_options(&config, &state_dir, listen_addr, cancel.clone())?,
@@ -288,6 +634,22 @@ impl TransferSession {
             .await;
             match session {
                 Ok(session) => {
+                    // The engine logs and skips some failed saved torrents.
+                    // An incomplete restore must not publish an empty/partial
+                    // ownership snapshot and unlock their preallocated files.
+                    if let Some(saved) = &saved {
+                        let restored = session.with_torrents(|items| {
+                            items
+                                .map(|(_, h)| h.info_hash().as_string())
+                                .collect::<HashSet<_>>()
+                        });
+                        if !saved.infohashes.is_subset(&restored) {
+                            session.stop().await;
+                            bail!(
+                                "Not all saved transfers could be restored; ownership remains unknown"
+                            );
+                        }
+                    }
                     if config.public_discovery
                         && let Err(error) = persist_listen_port(&state_dir, listen_addr.port())
                     {
@@ -299,15 +661,18 @@ impl TransferSession {
                     let policy = seed_completed.clone();
                     let policy_cancel = cancel.clone();
                     let policy_shares = explicit_shares.clone();
+                    let policy_changed = Arc::new(Notify::new());
+                    let policy_notify = policy_changed.clone();
                     tokio::spawn(async move {
                         loop {
+                            let active = !policy.load(Ordering::Relaxed)
+                                && pause_completed_downloads(&policy_session, &policy_shares).await;
                             tokio::select! {
                                 _ = policy_cancel.cancelled() => break,
-                                _ = tokio::time::sleep(Duration::from_millis(250)) => {
-                                    if !policy.load(Ordering::Relaxed) {
-                                        pause_completed_downloads(&policy_session, &policy_shares).await;
-                                    }
-                                }
+                                _ = policy_notify.notified() => {},
+                                // Preserve completion latency while active; idle
+                                // paused/seeding sessions need no policy timer.
+                                _ = tokio::time::sleep(Duration::from_millis(250)), if active => {},
                             }
                         }
                     });
@@ -316,9 +681,11 @@ impl TransferSession {
                         download_dir,
                         cancel,
                         seed_completed,
+                        policy_changed,
                         explicit_shares,
                         state_dir,
-                        _state_lock: lock,
+                        snapshot_metadata: Mutex::new(HashMap::new()),
+                        state_lock: Mutex::new(Some(lock)),
                     });
                 }
                 Err(error) => {
@@ -348,6 +715,7 @@ impl TransferSession {
         peers: Vec<SocketAddr>,
         deadline: Duration,
     ) -> Result<ResolvedTorrent> {
+        ensure!(!self.cancel.is_cancelled(), "Transfers have shut down");
         let add = input.into_add().await?;
         let result = timeout(
             deadline,
@@ -408,6 +776,7 @@ impl TransferSession {
         selection: Option<Vec<usize>>,
         folder: &Path,
     ) -> Result<String> {
+        ensure!(!self.cancel.is_cancelled(), "Transfers have shut down");
         ensure!(
             librqbit::torrent_from_bytes(&resolved.bytes)?
                 .info_hash
@@ -444,7 +813,10 @@ impl TransferSession {
             )
             .await;
         match result {
-            Ok(_) => Ok(resolved.infohash.clone()),
+            Ok(_) => {
+                self.policy_changed.notify_one();
+                Ok(resolved.infohash.clone())
+            }
             Err(error) => {
                 // Remove only an empty reservation. Never remove partial media.
                 let _ = tokio::fs::remove_dir(&destination).await;
@@ -455,46 +827,16 @@ impl TransferSession {
 
     /// Hash and seed existing files. No metadata files are written into the source.
     pub async fn share(&self, source: &Path, trackers: Vec<String>) -> Result<SharedTorrent> {
-        let source = source.to_owned();
-        let source = tokio::task::spawn_blocking(move || {
-            validate_share_source(&source)?;
-            std::fs::canonicalize(source).context("Resolve shared path")
-        })
-        .await??;
-        let created = librqbit::create_torrent(
-            &source,
-            CreateTorrentOptions {
-                trackers: trackers.clone(),
-                ..Default::default()
-            },
-            &BlockingSpawner::new(1),
-        )
-        .await
-        .context("Hash shared files")?;
-        let output_folder = created.output_folder.clone();
-        let mut info = created.meta.info.data;
-        let total = match &info.files {
-            Some(files) => files.iter().try_fold(0u64, |sum, file| {
-                sum.checked_add(file.length)
-                    .context("Shared content is too large")
-            })?,
-            None => info.length.context("Missing shared file length")?,
-        };
-        ensure!(total > 0, "Cannot share an empty file or folder");
-        let expected_hash_bytes = total.div_ceil(u64::from(info.piece_length)) as usize * 20;
-        // librqbit 9.0.1 issue 698: only strip the specific extra empty-input
-        // hash. Re-encode the info dictionary so both metadata and magnet use
-        // the corrected infohash. Never alter any shared content.
-        if total.is_multiple_of(u64::from(info.piece_length))
-            && info.pieces.as_ref().len() == expected_hash_bytes + 20
-            && info.pieces.as_ref()[expected_hash_bytes..] == EMPTY_SHA1
-        {
-            info.pieces = info.pieces.as_ref()[..expected_hash_bytes].to_vec().into();
-        }
-        ensure!(
-            info.pieces.as_ref().len() == expected_hash_bytes,
-            "Torrent creation returned invalid piece hashes; sharing was not started"
-        );
+        ensure!(!self.cancel.is_cancelled(), "Transfers have shut down");
+        // Dropping/aborting this future also cancels its blocking hash worker.
+        // A worker never owns the engine and cannot admit a cancelled share.
+        let cancel = self.cancel.child_token();
+        let _cancel_on_drop = cancel.clone().drop_guard();
+        let created = share::create(source.to_owned(), cancel.clone())
+            .await
+            .context("Hash shared files")?;
+        let output_folder = created.output_folder;
+        let info = created.info;
         #[derive(Serialize)]
         struct Envelope<T> {
             #[serde(rename = "announce-list")]
@@ -525,6 +867,7 @@ impl TransferSession {
             !already_managed,
             "Torrent is already managed by this session"
         );
+        ensure!(!cancel.is_cancelled(), "Sharing cancelled before admission");
         let handle = self
             .session
             .add_torrent(
@@ -556,13 +899,24 @@ impl TransferSession {
     }
 
     pub fn snapshots(&self) -> Result<Vec<TransferSnapshot>> {
+        ensure!(!self.cancel.is_cancelled(), "Transfers have shut down");
         let handles = self
             .session
             .with_torrents(|items| items.map(|(_, h)| h.clone()).collect::<Vec<_>>());
-        handles
+        let live = handles
+            .iter()
+            .map(|h| Arc::as_ptr(h) as usize)
+            .collect::<HashSet<_>>();
+        self.snapshot_metadata
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|key, _| live.contains(key));
+        let mut snapshots = handles
             .iter()
             .map(|handle| self.snapshot_handle(handle))
-            .collect()
+            .collect::<Result<Vec<_>>>()?;
+        snapshots.sort_unstable_by(|a, b| a.infohash.cmp(&b.infohash));
+        Ok(snapshots)
     }
 
     pub fn snapshot(&self, infohash: &str) -> Result<TransferSnapshot> {
@@ -578,28 +932,58 @@ impl TransferSession {
             TorrentStatsState::Live if stats.finished => TransferState::Seeding,
             TorrentStatsState::Live => TransferState::Downloading,
         };
-        let selected = handle.only_files();
-        let files: Vec<FileProgress> = handle
-            .with_metadata(|metadata| {
-                metadata
-                    .file_infos
+        let selected = handle
+            .only_files()
+            .map(|indices| indices.into_iter().collect::<HashSet<_>>());
+        // Paths, lengths, names and hashes are immutable for one engine
+        // handle. Resume with explicit peers creates another handle, so cache
+        // by handle identity (with a Weak guard), never by infohash alone.
+        let key = Arc::as_ptr(handle) as usize;
+        let mut cache = self
+            .snapshot_metadata
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let metadata = cache
+            .get(&key)
+            .filter(|m| m.handle.ptr_eq(&Arc::downgrade(handle)))
+            .cloned();
+        let metadata = metadata.unwrap_or_else(|| {
+            let files = handle.with_metadata(|m| {
+                m.file_infos
                     .iter()
-                    .enumerate()
-                    .map(|(index, file)| FileProgress {
-                        index,
-                        path: handle.output_folder().join(&file.relative_filename),
-                        length: file.len,
-                        verified_bytes: stats.file_progress.get(index).copied().unwrap_or(0),
-                        selected: selected
-                            .as_ref()
-                            .is_none_or(|indices| indices.contains(&index)),
-                    })
+                    .map(|f| (handle.output_folder().join(&f.relative_filename), f.len))
                     .collect()
+            });
+            let known = files.is_ok();
+            let metadata = Arc::new(SnapshotMetadata {
+                handle: Arc::downgrade(handle),
+                infohash: handle.info_hash().as_string(),
+                name: handle.name().unwrap_or_else(|| "Unnamed torrent".into()),
+                files: files.unwrap_or_default(),
+            });
+            if known {
+                cache.insert(key, metadata.clone());
+            }
+            metadata
+        });
+        drop(cache);
+        let files = metadata
+            .files
+            .iter()
+            .enumerate()
+            .map(|(index, (path, length))| FileProgress {
+                index,
+                path: path.clone(),
+                length: *length,
+                verified_bytes: stats.file_progress.get(index).copied().unwrap_or(0),
+                selected: selected
+                    .as_ref()
+                    .is_none_or(|indices| indices.contains(&index)),
             })
-            .unwrap_or_default();
+            .collect::<Vec<_>>();
         Ok(TransferSnapshot {
-            infohash: handle.info_hash().as_string(),
-            name: handle.name().unwrap_or_else(|| "Unnamed torrent".into()),
+            infohash: metadata.infohash.clone(),
+            name: metadata.name.clone(),
             state,
             verified_bytes: files
                 .iter()
@@ -633,21 +1017,31 @@ impl TransferSession {
         if handle.is_paused() {
             return Ok(());
         }
-        self.session.pause(&handle).await
+        let result = self.session.pause(&handle).await;
+        self.policy_changed.notify_one();
+        result
     }
 
     /// Explicit peers are supplied again after restart in local-only mode.
     /// The pinned engine does not persist its initial peer list.
     pub async fn resume(&self, infohash: &str, peers: Vec<SocketAddr>) -> Result<()> {
         let handle = self.handle(infohash)?;
+        // Error has no pending initialization to wait for. Ask the engine to
+        // reopen storage and reverify retained bytes before trusting them again.
+        if matches!(handle.stats().state, TorrentStatsState::Error) {
+            self.session.unpause(&handle).await?;
+        }
         timeout(Duration::from_secs(120), handle.wait_until_initialized())
             .await
             .context("File verification timed out")??;
         if peers.is_empty() {
             if handle.live().is_some() {
+                self.policy_changed.notify_one();
                 return Ok(());
             }
-            return self.session.unpause(&handle).await;
+            let result = self.session.unpause(&handle).await;
+            self.policy_changed.notify_one();
+            return result;
         }
         // Re-register verified existing data with the explicit peer list. This
         // avoids exposing the library's private peer-injection implementation.
@@ -670,17 +1064,49 @@ impl TransferSession {
                 }),
             )
             .await?;
+        self.policy_changed.notify_one();
         Ok(())
     }
+    /// Release a ready session's owner without deleting any files. A valid
+    /// absent identity is already released; stopped/invalid sessions still fail.
+    pub async fn release_for_deletion(&self, infohash: &str) -> Result<()> {
+        ensure!(!self.cancel.is_cancelled(), "Transfers have shut down");
+        let hash = infohash.parse().context("Invalid infohash")?;
+        if self.session.get(TorrentIdOrHash::Hash(hash)).is_none() {
+            return Ok(());
+        }
+        self.remove(infohash, false).await
+    }
+
+    /// Selected destination paths from engine metadata, including during checking.
+    pub fn selected_file_paths(&self, infohash: &str) -> Result<Vec<(PathBuf, usize)>> {
+        let handle = self.handle(infohash)?;
+        let selected = handle
+            .only_files()
+            .map(|indices| indices.into_iter().collect::<HashSet<_>>());
+        handle.with_metadata(|metadata| {
+            metadata
+                .file_infos
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| selected.as_ref().is_none_or(|files| files.contains(index)))
+                .map(|(index, file)| (handle.output_folder().join(&file.relative_filename), index))
+                .collect()
+        })
+    }
+
     /// Only regular metainfo-listed files inside the torrent's output folder
     /// are eligible. Never recursively remove a directory or follow a symlink.
     pub async fn remove(&self, infohash: &str, delete_files: bool) -> Result<()> {
         let handle = self.handle(infohash)?;
-        if matches!(handle.stats().state, TorrentStatsState::Initializing { .. }) {
-            timeout(Duration::from_secs(120), handle.wait_until_initialized())
-                .await
-                .context("File verification timed out")??;
-        }
+        ensure!(
+            !matches!(handle.stats().state, TorrentStatsState::Initializing { .. }),
+            "Files are still being verified. Wait for verification to finish, then try again."
+        );
+        ensure!(
+            delete_files || !matches!(handle.stats().state, TorrentStatsState::Error),
+            "Resume this transfer in Downloads so its files can be verified, then try again. Your files and their transfer were kept."
+        );
         let root = handle.output_folder().to_owned();
         let paths = handle.with_metadata(|m| {
             m.file_infos
@@ -697,6 +1123,7 @@ impl TransferSession {
             .delete(TorrentIdOrHash::Hash(handle.info_hash()), false)
             .await?;
         self.set_explicit_share(infohash, false)?;
+        self.policy_changed.notify_one();
         if delete_files {
             for path in paths {
                 validate_delete_path(&root, &path)?;
@@ -746,8 +1173,15 @@ impl TransferSession {
         self.session.ratelimits.get_config()
     }
 
-    pub async fn set_seed_completed_downloads(&self, enabled: bool) {
+    /// Updates the policy without waiting for torrent initialization or disk
+    /// persistence. The policy task wakes immediately, including when idle.
+    pub fn request_seed_completed_downloads(&self, enabled: bool) {
         self.seed_completed.store(enabled, Ordering::Relaxed);
+        self.policy_changed.notify_one();
+    }
+
+    pub async fn set_seed_completed_downloads(&self, enabled: bool) {
+        self.request_seed_completed_downloads(enabled);
         if !enabled {
             pause_completed_downloads(&self.session, &self.explicit_shares).await;
         }
@@ -809,24 +1243,33 @@ impl TransferSession {
 
     /// Existence/preallocation is never sufficient to expose a playback path.
     pub fn completed_file(&self, infohash: &str, index: usize) -> Result<PathBuf> {
-        let snapshot = self.snapshot(infohash)?;
+        // Inspect just this file. Building every file's progress once per
+        // completed video made a fully selected multi-file torrent quadratic.
+        let handle = self.handle(infohash)?;
+        let stats = handle.stats();
         ensure!(
             !matches!(
-                snapshot.state,
-                TransferState::Checking | TransferState::Error
+                stats.state,
+                TorrentStatsState::Initializing { .. } | TorrentStatsState::Error
             ),
             "File verification is not complete"
         );
-        let file = snapshot
-            .files
-            .get(index)
+        let (path, length) = handle
+            .with_metadata(|m| {
+                m.file_infos
+                    .get(index)
+                    .map(|f| (handle.output_folder().join(&f.relative_filename), f.len))
+            })?
             .context("Unknown torrent file index")?;
         ensure!(
-            file.selected && file.verified_bytes == file.length,
+            handle
+                .only_files()
+                .is_none_or(|files| files.contains(&index))
+                && stats.file_progress.get(index).copied().unwrap_or(0) == length,
             "Selected file is not fully verified"
         );
-        ensure!(file.path.is_file(), "Completed file is missing from disk");
-        Ok(file.path.clone())
+        ensure!(path.is_file(), "Completed file is missing from disk");
+        Ok(path)
     }
 
     pub async fn stop(self) {
@@ -837,6 +1280,12 @@ impl TransferSession {
     pub async fn shutdown(&self) {
         self.cancel.cancel();
         self.session.stop().await;
+        // Player-side stream opening can retain an Arc after shutdown. A
+        // stopped session must release ownership independently of that Arc.
+        self.state_lock
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
     }
 
     /// Reads one selected file while it downloads. Reads wait for pieces
@@ -886,6 +1335,7 @@ impl TransferSession {
     }
 
     fn handle(&self, infohash: &str) -> Result<Arc<ManagedTorrent>> {
+        ensure!(!self.cancel.is_cancelled(), "Transfers have shut down");
         self.session
             .get(TorrentIdOrHash::Hash(
                 infohash.parse().context("Invalid infohash")?,
@@ -1055,16 +1505,22 @@ fn is_completed_download(handle: &ManagedTorrent, shares: &RwLock<HashSet<String
         && handle.stats().finished
 }
 
-async fn pause_completed_downloads(session: &Session, shares: &RwLock<HashSet<String>>) {
+async fn pause_completed_downloads(session: &Session, shares: &RwLock<HashSet<String>>) -> bool {
     let handles = session.with_torrents(|items| items.map(|(_, h)| h.clone()).collect::<Vec<_>>());
+    let mut active = false;
     for handle in handles {
+        let stats = handle.stats();
+        active |= matches!(stats.state, TorrentStatsState::Initializing { .. })
+            || (matches!(stats.state, TorrentStatsState::Live) && !stats.finished);
         if handle.live().is_some()
             && is_completed_download(&handle, shares)
             && let Err(error) = session.pause(&handle).await
         {
             tracing::warn!(%error, "Could not stop completed download sharing");
+            active = true; // Retry a failed pause at the normal active cadence.
         }
     }
+    active
 }
 
 #[cfg(unix)]
@@ -1178,26 +1634,6 @@ fn validate_selection(selection: Option<Vec<usize>>, count: usize) -> Result<Opt
         );
     }
     Ok(selection)
-}
-
-fn validate_share_source(path: &Path) -> Result<()> {
-    utf8_path(path)?;
-    let metadata = std::fs::symlink_metadata(path).context("Read shared path")?;
-    ensure!(
-        !metadata.is_symlink(),
-        "Choose original files instead of symbolic links"
-    );
-    if metadata.is_dir() {
-        for entry in std::fs::read_dir(path).context("Read shared directory")? {
-            validate_share_source(&entry?.path())?;
-        }
-    } else {
-        ensure!(
-            metadata.is_file(),
-            "Only regular files and folders can be shared"
-        );
-    }
-    Ok(())
 }
 
 fn session_options(
@@ -1324,6 +1760,392 @@ fn available_public_addr(mut addr: SocketAddr, mode: ListenerMode) -> Result<Soc
 mod tests {
     use super::*;
 
+    // Fail after hashing, when initialization hands storage to the paused
+    // state. This produces a real engine Error without permissions, disk-full
+    // assumptions, network traffic, or changing the generated fixture's bytes.
+    #[derive(Clone)]
+    struct FailTakeFactory(Arc<AtomicBool>);
+
+    struct FailTakeStorage {
+        inner: librqbit::storage::filesystem::FilesystemStorage,
+        fail: Arc<AtomicBool>,
+    }
+
+    impl librqbit::storage::StorageFactory for FailTakeFactory {
+        type Storage = Box<dyn librqbit::storage::TorrentStorage>;
+
+        fn create(
+            &self,
+            shared: &librqbit::ManagedTorrentShared,
+            metadata: &librqbit::TorrentMetadata,
+        ) -> Result<Self::Storage> {
+            Ok(Box::new(FailTakeStorage {
+                inner: librqbit::storage::filesystem::FilesystemStorageFactory::default()
+                    .create(shared, metadata)?,
+                fail: self.0.clone(),
+            }))
+        }
+
+        fn is_type_id(&self, type_id: std::any::TypeId) -> bool {
+            // This wrapper still stores ordinary files; allow JSON persistence
+            // to record their paths as it does for the wrapped factory.
+            librqbit::storage::filesystem::FilesystemStorageFactory::default().is_type_id(type_id)
+        }
+
+        fn clone_box(&self) -> librqbit::storage::BoxStorageFactory {
+            Box::new(self.clone())
+        }
+    }
+
+    impl librqbit::storage::TorrentStorage for FailTakeStorage {
+        fn init(
+            &mut self,
+            shared: &librqbit::ManagedTorrentShared,
+            metadata: &librqbit::TorrentMetadata,
+        ) -> Result<()> {
+            self.inner.init(shared, metadata)
+        }
+
+        fn pread_exact(&self, file: usize, offset: u64, buf: &mut [u8]) -> Result<()> {
+            self.inner.pread_exact(file, offset, buf)
+        }
+
+        fn pwrite_all(&self, file: usize, offset: u64, buf: &[u8]) -> Result<()> {
+            self.inner.pwrite_all(file, offset, buf)
+        }
+
+        fn remove_file(&self, file: usize, path: &Path) -> Result<()> {
+            self.inner.remove_file(file, path)
+        }
+
+        fn remove_directory_if_empty(&self, path: &Path) -> Result<()> {
+            self.inner.remove_directory_if_empty(path)
+        }
+
+        fn ensure_file_length(&self, file: usize, length: u64) -> Result<()> {
+            self.inner.ensure_file_length(file, length)
+        }
+
+        fn take(&self) -> Result<Box<dyn librqbit::storage::TorrentStorage>> {
+            ensure!(
+                !self.fail.load(Ordering::Relaxed),
+                "Fixture storage failure"
+            );
+            self.inner.take()
+        }
+    }
+
+    #[tokio::test]
+    async fn error_owner_refuses_retained_file_release_and_recovers_after_resume() -> Result<()> {
+        for delete_in_error in [false, true] {
+            let root = tempfile::tempdir()?;
+            let config =
+                TransferConfig::local(root.path().join("downloads"), root.path().join("state"));
+            let source = root.path().join("season");
+            std::fs::create_dir(&source)?;
+            let files = [
+                ("chosen.mp4", vec![41; 65_537]),
+                ("sibling.mp4", vec![42; 65_537]),
+            ];
+            for (name, bytes) in &files {
+                std::fs::write(source.join(name), bytes)?;
+            }
+            let created = share::create(source.clone(), CancellationToken::new()).await?;
+            #[derive(Serialize)]
+            struct Envelope<T> {
+                info: T,
+            }
+            let mut bytes = Vec::new();
+            librqbit_bencode::bencode_serialize_to_writer(
+                &Envelope { info: created.info },
+                &mut bytes,
+            )?;
+            let fail = Arc::new(AtomicBool::new(true));
+            let session = TransferSession::start(config.clone()).await?;
+            let handle = session
+                .session
+                .add_torrent(
+                    AddTorrent::from_bytes(bytes),
+                    Some(AddTorrentOptions {
+                        output_folder: Some(utf8_path(&created.output_folder)?.to_owned()),
+                        storage_factory: Some(Box::new(FailTakeFactory(fail.clone()))),
+                        overwrite: true,
+                        paused: true,
+                        ..Default::default()
+                    }),
+                )
+                .await?
+                .into_handle()
+                .context("Missing fixture owner")?;
+            let id = handle.info_hash().as_string();
+            let error = timeout(Duration::from_secs(5), handle.wait_until_initialized())
+                .await?
+                .expect_err("Fixture did not enter Error");
+            assert!(
+                error.to_string().contains("Fixture storage failure"),
+                "{error:#}"
+            );
+            session.set_explicit_share(&id, true)?;
+            let marks_path = config.state_dir.join("explicit-shares.json");
+            let marks = std::fs::read(&marks_path)?;
+            for release in [false, true, false, true] {
+                let error = timeout(Duration::from_millis(250), async {
+                    if release {
+                        session.release_for_deletion(&id).await
+                    } else {
+                        session.remove(&id, false).await
+                    }
+                })
+                .await?
+                .expect_err("Error owner was released");
+                assert!(
+                    error.to_string().contains("Resume this transfer"),
+                    "{error:#}"
+                );
+                assert!(Arc::ptr_eq(&session.handle(&id)?, &handle));
+                assert_eq!(session.snapshot(&id)?.state, TransferState::Error);
+                assert!(session.completed_file(&id, 0).is_err());
+                assert_eq!(std::fs::read(&marks_path)?, marks);
+                assert!(session.explicit_shares.read().unwrap().contains(&id));
+                for (name, bytes) in &files {
+                    assert_eq!(std::fs::read(source.join(name))?, *bytes);
+                }
+                let lock = File::open(config.state_dir.join("session.lock"))?;
+                assert!(
+                    lock.try_lock_exclusive().is_err(),
+                    "Refusal dropped state lock"
+                );
+            }
+            if delete_in_error {
+                // The explicit destructive action remains available in Error.
+                session.remove(&id, true).await?;
+                for (name, _) in &files {
+                    assert!(!source.join(name).exists());
+                }
+            } else {
+                fail.store(false, Ordering::Relaxed);
+                timeout(Duration::from_secs(5), session.resume(&id, vec![])).await??;
+                let snapshot = session.snapshot(&id)?;
+                assert!(!matches!(
+                    snapshot.state,
+                    TransferState::Checking | TransferState::Error
+                ));
+                for file in snapshot.files {
+                    assert_eq!(file.verified_bytes, file.length);
+                    assert_eq!(session.completed_file(&id, file.index)?, file.path);
+                }
+                session.release_for_deletion(&id).await?;
+                session.release_for_deletion(&id).await?;
+                for (name, bytes) in &files {
+                    assert_eq!(std::fs::read(source.join(name))?, *bytes);
+                }
+            }
+            assert!(session.snapshots()?.is_empty());
+            assert!(!session.explicit_shares.read().unwrap().contains(&id));
+            session.stop().await;
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn removing_initializing_owner_is_immediate_retriable_and_preserves_verified_removal()
+    -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let config =
+            TransferConfig::local(root.path().join("downloads"), root.path().join("state"));
+        let source = root.path().join("kept.mp4");
+        let content = vec![41; 65_537];
+        std::fs::write(&source, &content)?;
+        let created = share::create(source.clone(), CancellationToken::new()).await?;
+        #[derive(Serialize)]
+        struct Envelope<T> {
+            info: T,
+        }
+        let mut bytes = Vec::new();
+        librqbit_bencode::bencode_serialize_to_writer(
+            &Envelope { info: created.info },
+            &mut bytes,
+        )?;
+        let session = TransferSession::start(config.clone()).await?;
+        let handle = session
+            .session
+            .add_torrent(
+                AddTorrent::from_bytes(bytes),
+                Some(AddTorrentOptions {
+                    output_folder: Some(utf8_path(&created.output_folder)?.to_owned()),
+                    overwrite: true,
+                    paused: true,
+                    ..Default::default()
+                }),
+            )
+            .await?
+            .into_handle()
+            .context("Missing fixture owner")?;
+        // This single-thread runtime has not yielded since the engine spawned
+        // verification. All three refusals must return without waiting for it.
+        let id = handle.info_hash().as_string();
+        assert!(matches!(
+            handle.stats().state,
+            TorrentStatsState::Initializing { .. }
+        ));
+        for delete_files in [false, true] {
+            let error = timeout(
+                Duration::from_millis(250),
+                session.remove(&id, delete_files),
+            )
+            .await?
+            .expect_err("Initializing owner was removed");
+            assert!(error.to_string().contains("try again"), "{error:#}");
+        }
+        let error = timeout(
+            Duration::from_millis(250),
+            session.release_for_deletion(&id),
+        )
+        .await?
+        .expect_err("Initializing owner was released");
+        assert!(error.to_string().contains("try again"), "{error:#}");
+        assert_eq!(session.snapshot(&id)?.state, TransferState::Checking);
+        assert!(session.completed_file(&id, 0).is_err());
+        assert_eq!(std::fs::read(&source)?, content);
+        let lock = File::open(config.state_dir.join("session.lock"))?;
+        assert!(
+            lock.try_lock_exclusive().is_err(),
+            "Refusal dropped the state lock"
+        );
+        timeout(Duration::from_secs(5), handle.wait_until_initialized()).await??;
+        assert_eq!(session.completed_file(&id, 0)?, source.canonicalize()?);
+        session.release_for_deletion(&id).await?;
+        assert!(session.snapshot(&id).is_err());
+        assert_eq!(std::fs::read(&source)?, content);
+        session.stop().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn share_hash_abort_and_shutdown_cancel_worker_without_engine_admission() -> Result<()> {
+        use std::sync::atomic::Ordering;
+        for abort in [true, false] {
+            let root = tempfile::tempdir()?;
+            let config =
+                TransferConfig::local(root.path().join("downloads"), root.path().join("state"));
+            let source = root.path().join("large-sparse.mp4");
+            // Windows may reserve the full length instead of creating a sparse
+            // file. Both sizes leave work after the first 64 KiB cancellation
+            // fence, without reserving 64 GiB on the Windows CI disk.
+            #[cfg(windows)]
+            let length = 64 * 1024 * 1024;
+            #[cfg(not(windows))]
+            let length = 64 * 1024 * 1024 * 1024;
+            let file = File::create(&source)?;
+            file.set_len(length)?;
+            drop(file);
+            let probe = share::tests::pause_at_chunk(source.clone());
+            let session = Arc::new(TransferSession::start(config.clone()).await?);
+            let sharing = session.clone();
+            let fixture = source.clone();
+            let job = tokio::spawn(async move { sharing.share(&fixture, vec![]).await });
+            timeout(Duration::from_secs(2), async {
+                while !probe.entered.load(Ordering::SeqCst) {
+                    tokio::time::sleep(Duration::from_millis(2)).await;
+                }
+            })
+            .await
+            .context("Hasher never reached its first actual chunk")?;
+            assert!(!job.is_finished());
+            assert!(session.snapshots()?.is_empty());
+            let began = std::time::Instant::now();
+            if abort {
+                job.abort();
+                assert!(
+                    timeout(Duration::from_secs(2), job)
+                        .await?
+                        .unwrap_err()
+                        .is_cancelled()
+                );
+            } else {
+                timeout(Duration::from_secs(2), session.shutdown()).await?;
+                assert!(timeout(Duration::from_secs(2), job).await??.is_err());
+            }
+            timeout(Duration::from_secs(2), async {
+                while !probe.exited.load(Ordering::SeqCst) {
+                    tokio::time::sleep(Duration::from_millis(2)).await;
+                }
+            })
+            .await
+            .context("Cancelled hashing continued in the background")?;
+            assert!(began.elapsed() < Duration::from_secs(2));
+            assert_eq!(std::fs::metadata(&source)?.len(), length);
+            assert_eq!(File::open(&source)?.metadata()?.len(), length);
+            assert_eq!(
+                session.session.with_torrents(|torrents| torrents.count()),
+                0
+            );
+            assert!(!source.with_extension("mp4.torrent").exists());
+            session.shutdown().await;
+            let lock = File::open(config.state_dir.join("session.lock"))?;
+            lock.try_lock_exclusive()?;
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn share_multifile_hashes_span_boundaries_and_ignore_trailing_empty_files() -> Result<()>
+    {
+        use sha1::{Digest, Sha1};
+        let root = tempfile::tempdir()?;
+        let source = root.path().join("fixture");
+        std::fs::create_dir(&source)?;
+        let first = vec![31; 2 * 1024 * 1024 - 7];
+        let second = vec![42; 18];
+        std::fs::write(source.join("a.bin"), &first)?;
+        std::fs::create_dir(source.join("nested"))?;
+        std::fs::write(source.join("nested/b.bin"), &second)?;
+        std::fs::write(source.join("z-empty.bin"), [])?;
+        let config =
+            TransferConfig::local(root.path().join("downloads"), root.path().join("state"));
+        let session = TransferSession::start(config).await?;
+        let shared = session.share(&source, vec![]).await?;
+        let parsed = librqbit::torrent_from_bytes(shared.torrent_bytes())?;
+        parsed.info.data.clone().validate()?;
+        let concatenated = [first.clone(), second.clone()].concat();
+        let expected = concatenated
+            .chunks(2 * 1024 * 1024)
+            .flat_map(|chunk| Sha1::digest(chunk).to_vec())
+            .collect::<Vec<_>>();
+        assert_eq!(parsed.info.data.pieces.as_ref(), expected);
+        let files = parsed.info.data.files.as_ref().unwrap();
+        assert_eq!(
+            files.iter().map(|file| file.length).collect::<Vec<_>>(),
+            vec![first.len() as u64, second.len() as u64, 0]
+        );
+        assert_eq!(std::fs::read(source.join("a.bin"))?, first);
+        assert_eq!(std::fs::read(source.join("nested/b.bin"))?, second);
+        session.stop().await;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn share_refuses_nested_and_root_symlinks_without_source_writes() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let source = root.path().join("source");
+        std::fs::create_dir(&source)?;
+        let outside = root.path().join("outside.bin");
+        std::fs::write(&outside, b"preserved original")?;
+        let config =
+            TransferConfig::local(root.path().join("downloads"), root.path().join("state"));
+        let session = TransferSession::start(config).await?;
+        let alias = root.path().join("alias");
+        std::os::unix::fs::symlink(&source, &alias)?;
+        assert!(session.share(&alias, vec![]).await.is_err());
+        std::os::unix::fs::symlink(&outside, source.join("nested.bin"))?;
+        assert!(session.share(&source, vec![]).await.is_err());
+        assert!(session.snapshots()?.is_empty());
+        assert_eq!(std::fs::read(&outside)?, b"preserved original");
+        session.stop().await;
+        Ok(())
+    }
+
     #[test]
     fn public_trackers_are_valid_unique_supported_urls() {
         let mut seen = HashSet::new();
@@ -1353,6 +2175,330 @@ mod tests {
         assert!(!listen.enable_upnp_port_forwarding);
         assert!(listen.announce_port.is_none());
         assert!(!root.path().join("listen-port").exists());
+        Ok(())
+    }
+
+    fn saved_record(folder: &Path) -> serde_json::Value {
+        serde_json::json!({"info_hash":"0123456789abcdef0123456789abcdef01234567", "trackers":[], "output_folder":folder, "only_files":null, "is_paused":true})
+    }
+
+    async fn saved_metainfo_fixture(
+        root: &Path,
+    ) -> Result<(TransferConfig, String, Vec<u8>, PathBuf)> {
+        let config = TransferConfig::local(root.join("downloads"), root.join("state"));
+        let source = root.join("source");
+        std::fs::create_dir(&source)?;
+        std::fs::create_dir(&config.state_dir)?;
+        std::fs::write(source.join("chosen.mp4"), vec![1; 32_768])?;
+        std::fs::write(source.join("orphan-a.mp4"), vec![2; 32_768])?;
+        let created = share::create(source, CancellationToken::new()).await?;
+        #[derive(Serialize)]
+        struct Envelope<T> {
+            info: T,
+        }
+        let mut bytes = Vec::new();
+        librqbit_bencode::bencode_serialize_to_writer(
+            &Envelope { info: created.info },
+            &mut bytes,
+        )?;
+        let infohash = librqbit::torrent_from_bytes(&bytes)?.info_hash.as_string();
+        let orphan = created.output_folder.join("orphan-a.mp4");
+        std::fs::write(&orphan, vec![0; 32_768])?;
+        let mut record = saved_record(&created.output_folder);
+        record["info_hash"] = serde_json::json!(infohash);
+        record["only_files"] = serde_json::json!([0]);
+        std::fs::write(
+            config.state_dir.join("session.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({"torrents":{"0":record}}))?,
+        )?;
+        std::fs::write(config.state_dir.join(format!("{infohash}.torrent")), &bytes)?;
+        Ok((config, infohash, bytes, orphan))
+    }
+
+    #[tokio::test]
+    async fn saved_metainfo_mismatch_preserves_ownership_across_retry_and_repair() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let (config, infohash, bytes, orphan) = saved_metainfo_fixture(root.path()).await?;
+        let session_path = config.state_dir.join("session.json");
+        let saved = std::fs::read(&session_path)?;
+        let sidecar = config.state_dir.join(format!("{infohash}.torrent"));
+        let mut mismatched = bytes.clone();
+        let offset = mismatched
+            .windows(b"orphan-a.mp4".len())
+            .position(|window| window == b"orphan-a.mp4")
+            .context("Missing fixture filename")?;
+        mismatched[offset + b"orphan-".len()] = b'b';
+        assert_ne!(
+            librqbit::torrent_from_bytes(&mismatched)?
+                .info_hash
+                .as_string(),
+            infohash
+        );
+        std::fs::write(&sidecar, &mismatched)?;
+        for _ in 0..2 {
+            let error = TransferSession::start(config.clone())
+                .await
+                .err()
+                .context("Mismatched sidecar restored")?;
+            assert!(format!("{error:#}").contains("infohash does not match"));
+            assert_eq!(std::fs::read(&session_path)?, saved);
+            assert_eq!(std::fs::read(&sidecar)?, mismatched);
+            assert_eq!(std::fs::read(&orphan)?, vec![0; 32_768]);
+            assert!(!orphan.with_file_name("orphan-b.mp4").exists());
+            assert!(
+                confirm_saved_owner_absent(&config.state_dir, &infohash)
+                    .await
+                    .is_err()
+            );
+        }
+        std::fs::write(&sidecar, bytes)?;
+        let session = TransferSession::start(config).await?;
+        let snapshot = session.snapshot(&infohash)?;
+        session.stop().await;
+        assert!(
+            snapshot
+                .files
+                .iter()
+                .any(|file| file.path == orphan && !file.selected)
+        );
+        assert_eq!(std::fs::read(orphan)?, vec![0; 32_768]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn invalid_saved_metainfo_preserves_ownership_before_engine_start() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let (config, infohash, bytes, _) = saved_metainfo_fixture(root.path()).await?;
+        let session_path = config.state_dir.join("session.json");
+        let saved = std::fs::read(&session_path)?;
+        let sidecar = config.state_dir.join(format!("{infohash}.torrent"));
+        for invalid in [b"".as_slice(), b"malformed".as_slice()] {
+            std::fs::write(&sidecar, invalid)?;
+            for _ in 0..2 {
+                assert!(TransferSession::start(config.clone()).await.is_err());
+                assert_eq!(std::fs::read(&session_path)?, saved);
+                assert_eq!(std::fs::read(&sidecar)?, invalid);
+                assert!(
+                    confirm_saved_owner_absent(&config.state_dir, &infohash)
+                        .await
+                        .is_err()
+                );
+            }
+        }
+        std::fs::File::create(&sidecar)?.set_len(MAX_METADATA_BYTES + 1)?;
+        let error = TransferSession::start(config.clone()).await.err().unwrap();
+        assert!(format!("{error:#}").contains("16 MiB"));
+        assert_eq!(std::fs::read(&session_path)?, saved);
+        std::fs::remove_file(&sidecar)?;
+        std::fs::create_dir(&sidecar)?;
+        assert!(TransferSession::start(config.clone()).await.is_err());
+        assert_eq!(std::fs::read(&session_path)?, saved);
+        std::fs::remove_dir(&sidecar)?;
+        #[cfg(unix)]
+        {
+            let target = config.state_dir.join("fixture.torrent");
+            std::fs::write(&target, &bytes)?;
+            std::os::unix::fs::symlink(&target, &sidecar)?;
+            assert!(TransferSession::start(config.clone()).await.is_err());
+            assert_eq!(std::fs::read(&session_path)?, saved);
+            std::fs::remove_file(&sidecar)?;
+        }
+        // A genuinely missing sidecar still permits the existing magnet path;
+        // the preflight alone never forgets or proves absence of that owner.
+        let ownership = read_saved_ownership(&config.state_dir).await?.unwrap();
+        validate_saved_metainfo(&config.state_dir, &ownership).await?;
+        assert_eq!(std::fs::read(&session_path)?, saved);
+        assert!(
+            confirm_saved_owner_absent(&config.state_dir, &infohash)
+                .await
+                .is_err()
+        );
+        std::fs::write(sidecar, bytes)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn saved_ownership_is_bounded_strict_and_conservative() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let state = root.path().join("state");
+        std::fs::create_dir(&state)?;
+        assert_eq!(saved_transfer_roots(&state).await?, None);
+        let path = state.join("session.json");
+        std::fs::write(&path, br#"{"torrents":{}}"#)?;
+        assert_eq!(saved_transfer_roots(&state).await?, Some(Vec::new()));
+        let folder = root.path().join("output");
+        std::fs::create_dir(&folder)?;
+        let valid =
+            serde_json::json!({"torrents":{"0":saved_record(&folder), "1":saved_record(&folder)}});
+        std::fs::write(&path, serde_json::to_vec(&valid)?)?;
+        assert_eq!(
+            saved_transfer_roots(&state).await?,
+            Some(vec![folder.canonicalize()?])
+        );
+        for invalid in [
+            serde_json::json!({}),
+            serde_json::json!({"torrents":[]}),
+            serde_json::json!({"torrents":{"0":{ "output_folder":folder }}}),
+            serde_json::json!({"torrents":{"bad":saved_record(&folder)}}),
+            serde_json::json!({"torrents":{"0":saved_record(Path::new("relative"))}}),
+            serde_json::json!({"torrents":{"0":saved_record(&folder.join("../output"))}}),
+        ] {
+            std::fs::write(&path, serde_json::to_vec(&invalid)?)?;
+            assert!(
+                saved_transfer_roots(&state).await.is_err(),
+                "Accepted {invalid}"
+            );
+        }
+        std::fs::write(&path, b"malformed")?;
+        assert!(saved_transfer_roots(&state).await.is_err());
+        let file = OpenOptions::new().write(true).open(&path)?;
+        file.set_len(MAX_METADATA_BYTES + 1)?;
+        assert!(
+            saved_transfer_roots(&state)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("16 MiB")
+        );
+        drop(file);
+        std::fs::remove_file(&path)?;
+        std::fs::create_dir(&path)?;
+        assert!(saved_transfer_roots(&state).await.is_err());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn missing_saved_output_uses_canonical_ancestor_without_losing_other_roots() -> Result<()>
+    {
+        let root = tempfile::tempdir()?;
+        let online = root.path().join("online");
+        let parent = root.path().join("owned");
+        std::fs::create_dir(&online)?;
+        std::fs::create_dir(&parent)?;
+        let missing = parent.join("removed").join("season");
+        let saved =
+            serde_json::json!({"torrents":{"0":saved_record(&online), "1":saved_record(&missing)}});
+        std::fs::write(
+            root.path().join("session.json"),
+            serde_json::to_vec(&saved)?,
+        )?;
+        let evidence = inspect_saved_transfer_ownership(root.path()).await;
+        assert!(evidence.error.is_none(), "{:?}", evidence.error);
+        assert!(evidence.roots_complete);
+        assert!(evidence.has_saved_transfers());
+        let mut expected = vec![online.canonicalize()?, parent.canonicalize()?];
+        expected.sort();
+        assert_eq!(evidence.roots, expected);
+        assert!(!missing.exists(), "Ownership inspection recreated output");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn malformed_saved_records_retain_independent_canonical_root_evidence() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let known = root.path().join("known");
+        std::fs::create_dir(&known)?;
+        let path = root.path().join("session.json");
+        for broken in [
+            serde_json::json!({}),
+            serde_json::json!({"output_folder":"relative"}),
+        ] {
+            let saved = serde_json::json!({"torrents":{"0":saved_record(&known), "1":broken}});
+            std::fs::write(&path, serde_json::to_vec(&saved)?)?;
+            let evidence = inspect_saved_transfer_ownership(root.path()).await;
+            assert_eq!(evidence.roots, vec![known.canonicalize()?]);
+            assert!(!evidence.roots_complete);
+            assert!(evidence.error.is_some());
+            assert!(!evidence.has_saved_transfers());
+            assert!(saved_transfer_roots(root.path()).await.is_err());
+        }
+        // Broken non-location fields need not discard complete root coverage.
+        let saved = serde_json::json!({"torrents":{"0": {"output_folder":known}}});
+        std::fs::write(&path, serde_json::to_vec(&saved)?)?;
+        let evidence = inspect_saved_transfer_ownership(root.path()).await;
+        assert_eq!(evidence.roots, vec![known.canonicalize()?]);
+        assert!(evidence.roots_complete);
+        assert!(evidence.error.is_some());
+        // One unusable output does not erase valid sibling evidence either.
+        let regular = root.path().join("file-instead-of-directory");
+        std::fs::write(&regular, b"not a folder")?;
+        let saved =
+            serde_json::json!({"torrents":{"0":saved_record(&known), "1":saved_record(&regular)}});
+        std::fs::write(&path, serde_json::to_vec(&saved)?)?;
+        let evidence = inspect_saved_transfer_ownership(root.path()).await;
+        assert_eq!(evidence.roots, vec![known.canonicalize()?]);
+        assert!(!evidence.roots_complete);
+        assert!(evidence.error.is_some());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn absent_saved_owner_confirmation_never_starts_or_mutates_a_transfer() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let state = root.path().join("state");
+        let absent = "1111111111111111111111111111111111111111";
+        confirm_saved_owner_absent(&state, absent).await?;
+        assert!(!state.exists());
+        assert!(confirm_saved_owner_absent(&state, "invalid").await.is_err());
+        std::fs::create_dir(&state)?;
+        let output = root.path().join("output");
+        std::fs::create_dir(&output)?;
+        let saved =
+            serde_json::to_vec(&serde_json::json!({"torrents":{"0":saved_record(&output)}}))?;
+        std::fs::write(state.join("session.json"), &saved)?;
+        confirm_saved_owner_absent(&state, absent).await?;
+        assert!(
+            confirm_saved_owner_absent(&state, "0123456789abcdef0123456789abcdef01234567")
+                .await
+                .is_err()
+        );
+        assert_eq!(std::fs::read(state.join("session.json"))?, saved);
+        assert_eq!(std::fs::read_dir(&output)?.count(), 0);
+        let lock = std::fs::File::open(state.join("session.lock"))?;
+        lock.try_lock_exclusive()?;
+        assert!(confirm_saved_owner_absent(&state, absent).await.is_err());
+        drop(lock);
+        std::fs::write(state.join("session.json"), b"corrupt")?;
+        assert!(confirm_saved_owner_absent(&state, absent).await.is_err());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn saved_ownership_canonicalizes_symlink_roots() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let folder = root.path().join("actual");
+        std::fs::create_dir(&folder)?;
+        let alias = root.path().join("alias");
+        std::os::unix::fs::symlink(&folder, &alias)?;
+        std::fs::write(
+            root.path().join("session.json"),
+            serde_json::to_vec(&serde_json::json!({"torrents":{"0":saved_record(&alias)}}))?,
+        )?;
+        assert_eq!(
+            saved_transfer_roots(root.path()).await?,
+            Some(vec![folder.canonicalize()?])
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dangling_output_symlink_cannot_prove_a_canonical_parent_boundary() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let known = root.path().join("known");
+        std::fs::create_dir(&known)?;
+        let alias = root.path().join("alias");
+        std::os::unix::fs::symlink(root.path().join("unavailable-target"), &alias)?;
+        let saved = serde_json::json!({"torrents":{"0":saved_record(&known), "1":saved_record(&alias.join("output"))}});
+        std::fs::write(
+            root.path().join("session.json"),
+            serde_json::to_vec(&saved)?,
+        )?;
+        let evidence = inspect_saved_transfer_ownership(root.path()).await;
+        assert!(evidence.error.is_some());
+        assert!(!evidence.roots_complete);
+        assert_eq!(evidence.roots, vec![known.canonicalize()?]);
         Ok(())
     }
 
