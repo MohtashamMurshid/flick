@@ -6,11 +6,396 @@ Flick targets Windows, macOS, and Linux. A CI configuration is not evidence of a
 
 | Platform | Native compilation and tests | Desktop playback | Native GPU video path |
 | --- | --- | --- | --- |
-| Linux | Native debug build, formatting, strict Clippy, and 26 ordinary tests pass on 2026-10-24; 3 real-libmpv tests passed earlier | Xvfb/Openbox session exercised in all three interface styles; null audio | Deferred |
+| Linux | Native debug build, formatting, strict Clippy, all ordinary tests, and all five real-libmpv tests pass on 2026-10-24 | Xvfb/Openbox session exercised for the review backlog and in all three interface styles; null audio | Deferred; hardware decoding unverified without a GPU |
 | Windows | Workflow configured; not run here | Pending native machine | Deferred |
 | macOS | Debug compilation, formatting, strict Clippy, 23 tests, and an opt-in native resolution test pass on 2026-10-25 | Library/search/resume and public Sintel playback observed; CoreAudio output active | Deferred |
 
 The presentation adapter transfers decoded BGRA frames through CPU memory into GPUI images. It sizes frames to physical video bounds without a fixed resolution, axis, or pixel-budget cap. Checked native dimensions and allocation failures produce explicit errors. GPU rendering of those images does not establish hardware video decoding or zero-copy presentation. Treat this as a functional prototype. Hardware decoding, efficient GPU surface sharing, HDR correctness, battery use, and claims of being faster than VLC remain unverified.
+
+### Windows listen-port failure in CI on 2026-10-25
+
+Pull request #3 ran CI twice at `051da49`. In the `pull_request` run, the `Transfers without desktop / windows-latest` job failed `torrent::tests::public_port_is_persisted_reused_and_replaced_when_busy` with "Probe transfer UDP listen address: An attempt was made to access a socket in a way forbidden by its access permissions (os error 10013)". The same job passed in the `push` run. Windows refuses ports in its excluded ranges, which Hyper-V and WinNAT reserve inside 49152–65535, with that access error instead of "address in use". TCP and UDP ranges differ, so a random port could pass the TCP probe and fail the UDP one. The test exposed a real defect: public desktop sessions on Windows could fail to start whenever the saved or random port fell in a reserved range.
+
+The fix treats a refused bind like a busy one, both when probing ports and when librqbit's own bind fails at startup, so Flick moves to another port. The new `torrent::tests::refused_ports_are_replaced_like_busy_ones` uses port 1, which unprivileged Linux processes cannot bind, as the stand-in for a reserved port. The test returns early where that bind succeeds. With the fix reverted, it failed on this VM with "Permission denied (os error 13)"; with the fix, it passed.
+
+On Linux (Ubuntu 24.04.5, Rust 1.99.0): `cargo fmt --check`, strict Clippy with and without default features, and `cargo test` all passed: 44 library tests, 48 desktop tests and 9 local transfer tests, with 11 ignored. No desktop playback was run. After the push, both `Transfers without desktop / windows-latest` runs passed at `1896f19`.
+
+### Pull request #3 review fixes on 2026-10-25
+
+CodeRabbit reviewed `051da49` and left 12 comments and one nitpick. All were checked against the code and fixed:
+
+- **Episodes:** Next and previous episode skipped to another copy of the same episode, such as a 720p and a 1080p file. They now step past copies, in both directions.
+- **Watched state:** opening a video counted as watching it, so sampled episodes showed as watched and an in-progress video offered only "Mark as Unwatched". History and torrent records now carry a `finished` flag. It is set by Mark as Watched, or by stopping within the last 10 seconds after playing at least half. Watching again keeps it, Mark as Unwatched clears it, and torrent media follows its torrent's record, like the resume position. Sorting by last watched now builds its order once instead of searching history for every comparison.
+- **Exit with posters queued:** closing Flick waited for the poster worker to finish every queued video. A closed queue still delivers what was sent, so the worker now checks a stop flag and quits after its current file.
+- **Shortcuts:** rebinding accepted keys Flick handles before looking up shortcuts, so they never ran: Ctrl or ⌘ with O, K, comma or L, Escape with modifiers, and Tab with Alt. These are refused, and hand-edited settings that use them are unset. A test also checks that no default binding is reserved.
+- **Subtitles:** the fallback folder applied only to permission errors, not read-only file systems, and it downloaded the subtitle a second time, using another download from the OpenSubtitles daily quota. `Client::download` now returns the subtitle in memory, and only saving is retried.
+- **Transfers:** if the transfer runtime could not be created, local files stayed pending because no empty transfer list was sent. It is sent now.
+- **Packaging test:** `packaging/macos/test-package-script.sh` used GNU `sed -i` and a `\n` replacement, which BSD `sed` on macOS handles differently. It now rewrites files with `grep -v` and `mv`, and joins lines with `paste`.
+- **Documentation:** removed stale statements that streaming is unimplemented (README, `docs/TRANSFERS.md`, `docs/SHARING_PLAN.md`), limited the HTTPS resume claim to what is tested, described the conditional license and SBOM copies in `THIRD_PARTY_NOTICES.md`, and stopped claiming a Flick license for the picture-in-picture icon, since the project has none yet.
+
+Checks on Linux: `cargo fmt --check`, strict Clippy with and without default features, and `cargo test` passed (44 library, 48 desktop and 9 local transfer tests; 11 ignored). New assertions cover duplicate episode copies, watched state through `remember`, Mark as Watched and Unwatched for local and torrent media, and the reserved keys. ShellCheck reported nothing, and the packaging test passed all 35 checks under GNU tools; it has not run with BSD tools. The exit-time poster fix, the read-only fallback and the runtime failure path have no automated test and were not exercised interactively. No desktop playback was run.
+
+### macOS packaging script on 2026-10-24
+
+Backlog item 25 adds `scripts/package-macos.sh`, hardened-runtime entitlements and an app icon in `packaging/macos/`, the `macos-package` CI job, and [Packaging for macOS](PACKAGING.md). All of it was written and checked on Linux, so **no macOS packaging result exists yet**. A real `Flick.app`, its relinked libraries, signatures, notarization, the DMG, Gatekeeper, and playback from the bundle are unverified. They need the CI job or a Mac. No Rust source changed, so no cargo checks were rerun, and no desktop build or interactive playback was attempted.
+
+Environment: Ubuntu 24.04.5 x86_64, GNU bash 5.2.21, ShellCheck 0.9.0, Python 3.12.3 with PyYAML 6.0.1, and librsvg 2.58.0.
+
+- `bash -n scripts/package-macos.sh` passed, and ShellCheck reported nothing for it or for `packaging/macos/test-package-script.sh`. The test script disables SC2016 and SC2012 for its `bash -c` assertions. Neither check ran under macOS's `/bin/bash` 3.2. The script avoids bash 4 features, and the CI job runs it with `/bin/bash`.
+- `scripts/package-macos.sh --dry-run` printed the settings and plan, listed the macOS tools as missing, and created no output directory. Python's `plistlib` parsed the Info.plist it prints: bundle id `app.Flick.Flick`, version 0.1.0, `NSHighResolutionCapable`, and three document types. Both entitlements files parse. The minimum macOS shown is a placeholder; real packaging computes it from the binaries.
+- These inputs were each refused with a specific message: an unknown option, a missing option value, a partial Apple ID credential set, two credential sets, notarization with an ad-hoc identity, an invalid build number, bundle id, or `--min-macos`, and a missing entitlements file. An existing `Flick.app` was refused without `--force` and only reported in a dry run. Packaging and `--verify` on Linux were refused.
+- `bash packaging/macos/test-package-script.sh` passed 35 checks. It runs the real script against a fake Homebrew prefix of text "Mach-O" files, with stand-ins for `otool`, `install_name_tool`, `codesign`, `lipo`, `plutil`, `sips`, `iconutil`, `xattr`, `hdiutil`, `ditto`, and `brew`. It covered:
+  - the closure walk through absolute, `@rpath`, `@loader_path`, weak, and framework dependencies, with Swift's OS rpath kept;
+  - relinking to `@loader_path`, removal of duplicate build-prefix rpaths, and untouched originals;
+  - the minimum macOS, license and SBOM collection with warnings, and GPL reporting;
+  - signing order, DMG contents, `--verify` acceptance and rejection, `--force`, and a missing dependency that leaves no output.
+
+  The stand-ins follow the documented `otool` output format; real Apple tools were not involved. The harness found one real defect, which was fixed: an `awk … exit` or `head -n 1` reader closed its pipe early, and under `pipefail` the writer's SIGPIPE stopped the script without a message.
+- PyYAML parsed `.github/workflows/ci.yml`. The existing `transfers` and `validate` jobs are identical to the previous revision. actionlint was unavailable and not run, and **the new job has not run**.
+- The documented formula versions, licenses, and build flags for mpv, FFmpeg, LuaJIT, and VapourSynth came from Homebrew's formula API and `homebrew-core` sources on this date. They were not observed in an installed keg.
+
+### Link downloads on 2026-10-24
+
+Backlog items 26 and 31 add downloads from pasted web links. `src/fetch.rs` has no GPUI dependency and is separate from the torrent session. It runs yt-dlp as a separate process for video pages, downloads direct HTTPS files, and lists Internet Archive items from archive.org's metadata API. `src/services.rs` runs these jobs on the existing background runtime without starting the torrent session, and `src/fetch_ui.rs` shows them on the Downloads page. Internet Archive search results now download over HTTPS instead of through the Archive's torrent. librqbit 9.0.1 is still the newest crates.io release, and its metainfo parser has no web seed (`url-list`) support.
+
+Environment: Ubuntu 24.04.5 x86_64, Rust 1.99.0, system yt-dlp 2024.04.09 at `/usr/bin/yt-dlp`, FFmpeg 6.1.1, libmpv 0.37.0, and Xvfb with Openbox and Mesa Lavapipe, using null audio.
+
+Automated checks, all passing:
+
+- `cargo fmt --all -- --check`, `cargo clippy --locked --all-targets -- -D warnings`, and `cargo clippy --locked --no-default-features --all-targets -- -D warnings`. The upstream `proc-macro-error2` future-compatibility notice remains.
+- `cargo test --locked --all-targets` passes 55 tests: 34 library, 18 desktop, and 3 transfer integration tests. Five tests are ignored by default: the four libmpv tests and one opt-in yt-dlp test. `cargo test --locked --no-default-features --all-targets` passes 37, with the same yt-dlp test ignored.
+- The `--no-default-features` normal dependency tree still contains no GPUI, Blade graphics, Cocoa, Metal, or winit.
+- The 28 new tests use no Internet access. A generated `/bin/sh` stand-in for yt-dlp reports progress, a title, and a saved file; fails with exit code 1; exits without saving; reports a file outside the destination; or sleeps after starting a background child. The tests check the argument list, with `--` immediately before the URL, and the removal of partial files after failure. Cancellation must stop the stand-in's whole process group: a mutation that disabled the process group made the test fail. Further tests cover a missing program, discovery through `FLICK_YTDLP`, `PATH`, and extra folders, progress and print parsing, rejected schemes and credentials, and safe file names. Plain-HTTP loopback servers cover resuming after a dropped connection with `Range` and `If-Range`, resuming or restarting an existing part file, checksum failures, never overwriting an unrelated file, reusing an identical copy, cancellation, HTTP refusals, refusing a concurrent download of the same file, and HTML answers. A page at a video-like address falls back to yt-dlp. Archive tests parse a metadata fixture and select files from it. The services test checks that link downloads run and cancel while the torrent session cannot start. The stand-in tests are Unix-only.
+- `cargo test --locked --no-default-features --lib installed_ytdlp -- --ignored` passes with the system yt-dlp and FFmpeg, using only a loopback server. A throttled download was cancelled, which left no files or temporary folder, and a second download saved byte-identical content.
+
+The HTTPS client itself, with TLS and `https_only`, is covered only by the manual checks below. No automated test uses a TLS server.
+
+Manual Internet checks, run with the `flick-fetch` diagnostic into temporary folders:
+
+- **Internet Archive over HTTPS.** [`Nabisco_2`](https://archive.org/details/Nabisco_2) is a public-domain Prelinger item. Its listing preselected the two originals: an MPEG-2 file and a HiRes MPEG-4. The three archive.org derivatives were listed but not selected. The first `get` was killed externally after saving and verifying the first file, leaving an empty part file for the second. The cause was not determined; the shell running it was terminated, and Flick logged no error. Running `get` again reused the verified first file without downloading it, completed the second, and removed the part file. Both SHA-1s matched archive.org's metadata (`d723d45d…` and `58a234df…`), and FFmpeg decoded both as about 10.5 seconds of video with audio.
+- **YouTube.** With the system yt-dlp 2024.04.09, YouTube's API answered `HTTP Error 400: Bad Request` ("Precondition check failed"). yt-dlp then reported `[youtube] aqz-KE-bpKQ: Requested format is not available`. Flick showed that error unchanged, and the folder stayed empty. The official yt-dlp 2026.10.21 standalone release was then downloaded into a new temporary folder and selected with `FLICK_YTDLP`. With it, the Blender Foundation's CC BY [Big Buck Bunny 60fps 4K](https://www.youtube.com/watch?v=aqz-KE-bpKQ) downloaded and merged into one 722,512,905-byte WebM: AV1 3840×2160 with Opus audio, 634.6 seconds. A second run was interrupted with SIGINT at 184 MB of 712 MB. It reported `Cancelled`, left the folder empty, and left no yt-dlp or FFmpeg process. YouTube did not block this host.
+- **Wikimedia Commons.** The public-domain NASA clip [`NASA Probe Sparrow Motion.webm`](https://commons.wikimedia.org/wiki/File:NASA_Probe_Sparrow_Motion.webm) exposed a bug. Its page address ends in `.webm`, so the first build saved the 97 KB HTML page as a video. Direct downloads now refuse HTML answers, and a pasted link then falls back to yt-dlp. After the fix, the system yt-dlp received `HTTP Error 403: Forbidden` from Wikimedia, and Flick showed that error. yt-dlp 2026.10.21 downloaded the clip: VP9 1280×720, 4.2 seconds.
+- **X** was not tried, because no suitable public-domain post was at hand.
+
+Interactive desktop checks, using the debug build under a separate Xvfb display with temporary settings and download folders. Video-page downloads came from a loopback HTTP server that served generated 12-second clips, with one path throttled. The Archive check used the public Internet, and the search also queried TPB and YTS. No torrent content was downloaded. The following were observed:
+
+- The welcome page shows **Paste Link**. The GNOME Downloads header shows the same action as an icon; its label was not inspected.
+- Typing a loopback page URL in search and pressing Enter cleared the field and opened Downloads. The **Link Downloads** row showed yt-dlp's title, a progress bar, the size, speed, and time remaining, and the sidebar badge counted the download.
+- The cancel button's tooltip read "Cancel download". Cancelling removed the row and the badge. It left nothing in the download folder, including the hidden temporary folder, and no yt-dlp process remained.
+- With the address copied to the clipboard from Flick's own search field, **Paste Link** downloaded the clip. Play opened it in the player. About three seconds later, the test pattern's timestamp read 2.33 seconds. The video then appeared under Recently Added.
+- A 404 page showed yt-dlp's error in the row. After the file was added to the loopback server, **Try Again** downloaded it. With `FLICK_YTDLP` set to a missing path, the row showed "FLICK_YTDLP is set to …, which is not a file."
+- Searching "Nabisco Bumper" returned the Internet Archive item, labelled "Downloads over HTTPS · choose files first". Download opened a file chooser with formats, sizes, the original-file defaults, and the destination. Changing the selection updated the total. Download Selected showed "File 1 of 2", saved both files into a `Nabisco Bumper` folder with matching SHA-1s, and added them to the library. Play showed the film.
+- Entering `https://archive.org/details/Nabisco_2` in search and choosing Download Selected downloaded the default originals. The MPEG-2 file was fetched. The identical HiRes MPEG-4 already on disk was reused instead of being copied under a numbered name. The row named the `Nabisco Bumper` folder.
+- Closing the window during a throttled yt-dlp download exited Flick within half a second. The hidden temporary folder was removed, and no yt-dlp process remained.
+
+Two problems found during this pass were fixed and rechecked in the GUI. The retry icon showed a "10" seek glyph and is now a **Try Again** button. A multi-file row named the parent folder instead of the item folder.
+
+[Link download in progress](screenshots/flick-gnome-light-link-download.png) and [the Internet Archive file chooser](screenshots/flick-gnome-light-archive-files.png).
+
+`review-backlog` at `0874128` was then merged into this branch. That work added keyboard access, text scaling, Shows, and the transfer-reliability changes. Link rows and the Archive chooser now use scaled text, and Archive file rows join the Tab order like torrent file rows.
+
+On the merged tree, these checks pass: formatting, both strict Clippy runs, and the dependency isolation check. `cargo test --locked --all-targets` passes 78 tests: 39 library, 35 desktop, and 4 transfer integration. Six are ignored: five libmpv tests and the yt-dlp test. `--no-default-features` passes 43, with one ignored. The opt-in yt-dlp loopback test also passes.
+
+A short GUI check of the merged build used loopback media and one archive.org listing, and showed the following:
+
+- A link download completed.
+- Tab reached **Paste Link**, whose tooltip read "Paste Link", then Share Files…, then the row's Play and remove buttons. The remove button's tooltip read "Remove from list · keep files".
+- Enter on the remove button removed the row and kept the file.
+- Tab moved a focus ring through the Archive chooser's file rows, and Space toggled the focused file.
+
+Not verified:
+
+- **macOS and Windows.** In particular, on Windows the yt-dlp console window is suppressed with `CREATE_NO_WINDOW`, and cancellation ends the process tree with `taskkill /T`. Neither was compiled or run in this session; Windows CI has not run them.
+- **Downloads on other sites.** X downloads, playlist addresses, and sites that require signing in were not tried.
+- **Edge cases.** A full disk and resuming an HTTPS download after a real crash, beyond the one external interruption above, are untested.
+
+All downloaded media, generated clips, and the downloaded yt-dlp release were deleted after these checks.
+### Watching while downloading on 2026-10-24
+
+This covers backlog item 23 and stage 4 in [PLAN.md](../PLAN.md), on the same Ubuntu VM and Xvfb session.
+
+Automated checks: `cargo test --locked --all-targets` and `--no-default-features` pass, including the new local-peer test `streams_read_verified_bytes_while_downloading`. A 12 MiB generated file is shared over loopback and downloaded at 512 KiB/s. While it downloads, the stream returns exactly the source's first 200,000 bytes. A seek 50,000 bytes before the end then returns the source's final bytes before the download completes, which shows the tail was fetched ahead of the middle. With the download paused, a read blocked in the middle of the file ends when cancelled, and later reads fail. The opt-in `real_custom_protocol_streams_play` test plays the 720p fixture through a registered libmpv protocol, seeks to 8 s, and reports an unknown stream as a load error.
+
+Interactive check: `flick-transfer share` seeded a generated 60-second 1280×720 H.264/AAC file (20.6 MB) on 127.0.0.1:47123. Its MP4 index (`moov`) is at the end of the file, at byte 21,535,740 of 21,601,163. A fresh Flick session used `FLICK_LOCAL_TRANSFERS=1`, `FLICK_INITIAL_PEERS=127.0.0.1:47123`, and `FLICK_DOWNLOAD_LIMIT=300000`. Pasting the magnet in search resolved the file. Download Selected started it, and at 0 KB of 20.6 MB at 285 KB/s the row offered Watch Now. Watch Now showed the first frame after 549 ms. Pressing 9 to seek to 0:54 showed "Buffering…" over the previous frame, and 14 seconds later playback had reached the end at 0:59.97. An earlier run at 400 KB/s seeked to 0:48 and resumed there.
+
+Tried and reverted: enabling mpv's demuxer cache for streams, so mpv would report buffering itself, delayed the first frame from about 0.5 s to 10 s at 300 KB/s. Flick instead shows Buffering when a stream that should be playing has not advanced for a second.
+
+Not verified: public swarms, rapid repeated seeks, subtitles inside streamed files, replacing a file during playback, and macOS or Windows.
+
+### Library, player, and rendering features on 2026-10-24
+
+This covers backlog items 7, 14, 16, 17, 20, 21, and 22 in [PLAN.md](../PLAN.md), on the same Ubuntu VM, Xvfb/Openbox/Lavapipe session, isolated settings, and generated fixtures as the backlog pass above. Two copies of the 12-second clip were arranged as `Harbor Show/Season 1/01 - Arrival.mp4` and `02 - Departure.mp4`, and the 6-second 4K clip was added to the library. Other agents' builds and benchmarks were running, with load averages of 10–14 on four vCPUs, so no timing below is a performance result.
+
+Automated checks on the merged tree: formatting; strict Clippy with and without desktop features; and `cargo test --locked --all-targets` (43 shared-library, 44 desktop, and four local-transfer tests; nine opt-in tests ignored). These opt-in native tests pass with `FLICK_AUDIO=null FLICK_TEST_VIDEO=<720p clip>`:
+
+- `playback::tests::real_render_thread_delivers_tagged_frames`: frames arrive at the target size, a zero target stops rendering, each load advances the generation, a resize re-renders while paused, and dropping the player while it plays joins the render thread.
+- `thumbnails::tests::real_posters_are_written_with_details`: a 400-pixel PNG poster that is not black, with duration 12.02 s, 1280×720, and `h264`; a missing file reports an error.
+- `thumbnails::tests::real_previews_follow_the_newest_request`: previews at 2 s and 8 s differ.
+- The six earlier playback tests also pass after the render-thread refactor, and the smoke test passes.
+
+Interactive observations under Xvfb:
+
+- **Shows (item 17):** the episodes appeared as one show, Harbor Show, listed under Season 1. At the end of episode 1, an "Up next in 7 s" card offered Cancel and Play Now; without input, episode 2 opened. Cancel kept episode 1 open past the countdown. Shift+P returned to episode 1. The first Cancel attempt clicked before the frame after the pointer move rendered; the retry worked.
+- **Posters (item 16):** posters for all six videos were generated in the background, at roughly 2–3 seconds each under this load. Cards showed the posters with 4K and 720p badges and durations such as "Not started · 0:06".
+- **Timeline previews (item 20):** hovering the timeline showed the frame at 0:07 above the pointer.
+- **Picture in picture (item 21):** P opened the video in a separate window while the main window showed "Playing in picture in picture". Back to the library kept it playing: the timecode advanced from 0:05.7 to 0:11.9. Dragging moved it, hovering showed its controls, and its return button closed it and restored the player. Openbox placed it at the bottom left and let the main window cover it, so staying above other windows is unverified on X11.
+- **Render thread (item 14):** the 4K clip, paused seeks (the picture updated at 6.03 s and 9.63 s while paused), and picture in picture all worked through the render thread. During the load above, 20 frames were presented in 5.3 s with 72 frames dropped; this is not a measure of the change.
+- **Fades (item 7):** player controls hid on schedule and were removed. Burst captures went from shown to hidden without an intermediate frame, so the 180 ms fade itself was not observed at this capture rate.
+- **OpenSubtitles (item 22):** Find Online opened with "Harbor lights" filled in. Without a key, Search explained where to add one and offered Open Appearance. With `FLICK_OPENSUBTITLES_KEY` set to a deliberately invalid value, one live search to api.opensubtitles.com showed "OpenSubtitles rejected the API key." A successful live search and download were not attempted, because no key was available.
+
+Fixed during this pass: picture in picture first crashed with "cannot read Flick while it is already being updated", because the new window's first render read the main view during its update. Opening is now deferred to the next turn of the event loop.
+
+Not verified: macOS floating panels and Windows tool windows for picture in picture; Wayland, where no always-on-top request exists; and macOS Reduce motion and Windows animation settings.
+### Transfer controls and torrent resume on 2026-10-24
+
+Backlog item 24 and the matching stage-2 implementation boxes are complete. Downloads adds an explicit file-list confirmation for permanent removal, upload activity, exact metainfo export through the native save picker, and Pause All / Resume All. Appearance has a Transfers group with a persisted seeding preference and live download/upload limits. The welcome page and Downloads request the seeding choice until answered; until then, verified completed downloads pause. Explicit shares remain active independently of this preference, including after restart. Torrent media binds to `(infohash, file index)` alongside its path-based history. No playback rendering or benchmark files changed; `src/ui.rs` only gained transfer UI state and the settings argument for service startup.
+
+Checking uses the engine's examined-byte counter and total separately from verified download progress. Initial share creation exposes no percentage in librqbit 9.0.1, so that phase shows “Checking files…” without inventing progress. Uploaded totals are the native live-state counter, not lifetime accounting. Empty folders remain after deletion. Arbitrary manually moved files need a torrent association before identity-based resume can apply.
+
+Environment: Linux x86_64, Rust `1.99.0 (b940084d7 2026-09-28)`, pinned GPUI 0.2.2 and librqbit 9.0.1. Executed checks:
+
+- `cargo check --locked --no-default-features --all-targets`: passed (4m 30s); backend checking, not a desktop build.
+- `cargo check --locked --all-targets`: passed (10m 14s); desktop checking, not interactive playback.
+- `cargo fmt --all -- --check`: passed. An initial `cargo fmt --all` during editing reported a match-arm syntax error, corrected before the final checks.
+- `cargo clippy --locked --all-targets -- -D warnings`: passed (5m 43s including a build-lock wait).
+- `cargo clippy --locked --no-default-features --all-targets -- -D warnings`: passed (10.63s).
+- `cargo test --locked --all-targets`: passed (6m 26s compile; 39 shared-library, 41 desktop, and eight local-transfer tests passed). Eight opt-in tests were ignored: one installed-yt-dlp test and seven native libmpv/thumbnail tests. This command also linked the desktop app binary used below.
+- `cargo test --locked --no-default-features --all-targets`: passed (1m 17s compile; 39 library and eight local-transfer tests passed, one installed-yt-dlp test ignored).
+
+The new integration fixtures cover guarded deletion with unrelated files in the same folder, symlink-parent refusal and preservation of outside content (Unix), exact shared/downloaded metainfo export and file-list/infohash round-trip, refusal to export over managed content, both configured and live bandwidth limits, automatic completion pause, restart verification with seeding disabled, global pause/resume, and persisted explicit-share identity. Store regressions cover path changes, independent file indices and hashes, preservation of old path/local history, watched/unwatched state, and backward-compatible transfer preferences. All automated transfer tests use generated local content, explicit loopback peers where needed, and no public trackers, DHT, or UPnP.
+
+Interactive transfer check: `target/debug/flick` (built by the full test command) ran under task-owned Xvfb `:98`, Openbox, Mesa Lavapipe (`VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.json`), and `FLICK_AUDIO=null`. `FLICK_SETTINGS_PATH`, `FLICK_DATA_DIR`, and `FLICK_DOWNLOAD_DIR` pointed into `/tmp/flick-gap-ui-okun7f8m`; `FLICK_LOCAL_TRANSFERS=1` disabled public discovery. A `flick-transfer` seed shared a generated 262,144-byte non-video fixture, and its explicit loopback listener was passed in `FLICK_INITIAL_PEERS`. Observed:
+
+- Shift+Tab reached **Pause When Complete** with a visible focus ring; Enter saved `seed_completed: false` and removed the first-run choice.
+- Entering the fixture's magnet in search resolved its metadata from the local seed. **Download Selected** saved byte-identical content and the row showed **Complete · sharing paused**, the upload fields, and the close-Flick note.
+- The Transfers settings switch saved `seed_completed: true`. Shift+Tab reached both bandwidth sliders; Right changed each to 256 KiB/s, confirmed in the settings file. The upload slider's focus ring and tooltip were visible.
+- **Resume All** changed the completed transfer to **Sharing**, and **Pause All** paused it again. The transfer row was inspected in all three interface styles on Linux; this does not establish native macOS/Windows behavior.
+- **Remove and Delete Files…** listed the fixture's full path and explained permanence. Shift+Tab reached **Delete Listed Files** with a visible ring; Shift+Tab again and Enter activated Cancel and kept the fixture. Reopening and keyboard-confirming deletion removed the downloaded fixture and its row, kept an unrelated sibling with byte-identical contents, and kept the seed's original file.
+- The app was closed through its window control. The supervisor stopped its seed, Openbox, and Xvfb by their recorded PIDs. An earlier launch supervisor exited too soon and its processes were terminated before interaction; the subsequent supervised run supplied the observations above. Generated incremental/check-only artifacts from this worktree were removed to stay within available disk space; no other worktree's files were removed.
+
+Screenshots: [first-run keyboard choice](screenshots/flick-transfer-seeding-choice.png), [settings and keyboard slider](screenshots/flick-transfer-settings.png), [file-list confirmation](screenshots/flick-transfer-delete-confirmation.png), and [macOS-style transfer row on Linux](screenshots/flick-transfer-mac-row.png).
+
+Native export save picking, visible hashing progress on a large fixture, interactive torrent-media resume, and actual playback were not exercised. Export and identity resume have automated coverage; this non-video GUI download does not establish the complete share → download → Play acceptance pass. No separate `cargo build` command was run. The existing native libmpv/thumbnail and installed-yt-dlp opt-in tests were not run. The upstream `proc-macro-error2` 2.0.1 future-compatibility notice remains. Final `cargo fmt --all -- --check` and `git diff --check` also passed after the documentation update.
+
+
+### Review backlog: playback, keyboard, and accessibility on 2026-10-24
+
+This covers backlog items 1, 2, 4–12, 18, and 19 in [PLAN.md](../PLAN.md). Environment: the same Ubuntu 24.04.5 x86_64 VM (four vCPUs, no GPU), Rust 1.99.0, GPUI 0.2.2, and libmpv 0.37.0. Interactive checks used Xvfb with Openbox and Mesa Lavapipe, null audio, isolated settings, and generated fixtures: the 12-second 1280×720 H.264/AAC clip with SRT captions from `scripts/make-test-video.sh`, and a 6-second 3840×2160 `testsrc2` clip.
+
+Automated checks:
+
+- `cargo fmt --all -- --check`, `cargo clippy --locked --all-targets -- -D warnings`, and `cargo clippy --locked --no-default-features --all-targets -- -D warnings` pass.
+- `cargo test --locked --all-targets` passes. New desktop tests cover shortcut binding, conflicts, persistence, and keystroke normalization; WCAG contrast for every style, scheme, accent, and contrast mode; appearance clamping and subtitle properties; grid arrow navigation; A–B loop steps; chapter parsing; Continue Watching dismissal, watched marks, and sorting; and double-click word selection in read-only fields.
+- All five opt-in libmpv tests pass with `FLICK_AUDIO=null FLICK_TEST_VIDEO=<720p clip>`: real playback, paused-seek image change, lifecycle/subtitles/EOF, the uncapped 10000×2 and 7680×4320 targets, and the new check that direct and aligned render targets produce byte-identical frames.
+- `FLICK_AUDIO=null cargo run --locked -- --smoke-test <720p clip>` passes: six frames, first software presentation submission at 373 ms, and a paused seek to 6.07 s.
+
+Rendering into the frame GPUI receives (item 12) was measured with the identical-pixel test in a release build. libmpv rendered a paused 4K frame 20 times per size; numbers are milliseconds per frame, including scaling, so they bound the copy's share rather than isolating it. Other builds were running on the VM, so treat the runs as rough comparisons:
+
+| Target size | Aligned buffer + copy, run 1 | Direct, run 1 | Aligned, run 2 | Direct, run 2 |
+| --- | --- | --- | --- | --- |
+| 1920×1080 | 32.25 | 24.22 | 37.11 | 32.90 |
+| 1917×1080 (rows not a 64-byte multiple) | — | — | 50.34 | 32.56 |
+| 3840×2160 | 74.61 | 59.34 | 86.27 | 81.78 |
+
+The direct target was faster at every size, although glibc's large allocations are only 16-byte aligned, so it is now the default whenever the frame meets BGR0's four-byte alignment. The format changed from mpv's undocumented `bgra` to the documented `bgr0`, with alpha still forced opaque.
+
+`hwdec=auto-copy` (item 11) was exercised only without a GPU. libmpv probed VDPAU, found no driver, and decoded in software; `hwdec-current` was empty, and Flick now logs and reports it. Hardware decoding on VideoToolbox, D3D11, or VAAPI remains unverified.
+
+Interactive observations under Xvfb:
+
+- Back from fullscreen kept the library fullscreen (1280×860, no title bar), and Escape returned the window to 1100×740 (item 1).
+- Double-clicking a library card opened the video and left the window at 1100×740 (item 2). The magnet and download-folder fields render as read-only fields; selecting and copying their text was not exercised.
+- Tab moved through the sidebar, toolbar, search field, See All, and cards with a visible focus ring. A focused toolbar button showed its tooltip below it. Right arrow moved between cards. Shift+F10 opened the card menu with Play focused, and Tab, Tab, Enter chose Mark as Unwatched, which reset the card to "Not started" and cleared its saved history (items 4, 5, and 18). The GNOME header showed the same ring and focus tooltip.
+- In the macOS style, a 28 px toolbar button now has a 28×44 hit area. An earlier attempt to widen hit areas collapsed the toolbar, because GPUI 0.2.2 gives rows with negative horizontal margins no width; widths are unchanged (item 6).
+- Number keys sought to 10% and 20%. After the loop fix described below, `b`, a pause, then `b` showed "Loop 0:02–0:03" and an accent span on the timeline, and `]` showed "Audio delay +50 ms" (item 19). Frame step, J/K/L, and chapter keys were not exercised interactively; the fixtures have no chapters.
+- On the Keyboard Shortcuts page, Change followed by `n` rebound Mute; settings stored `{"mute": "n"}`, and the row offered Restore (item 10).
+- Text size 130% enlarged text live. High contrast brightened secondary text and borders. Auto contrast followed GNOME's `org.gnome.desktop.a11y.interface high-contrast` setting through an isolated keyfile GSettings backend, on and off (item 7).
+- Yellow subtitles with the Box background and a raised position rendered as a translucent box behind each line. libmpv 0.37 has no `sub-border-style`, which Flick skips; `sub-back-color` with a shadow offset produced the box (item 8).
+- Finding peers… and its Cancel button were exercised with a stalled loopback peer and local-only transfers. Cancel cleared the notice, and no late result appeared 12 seconds later. Without a peer, local-only resolution fails immediately, which is expected.
+
+Fixed during this pass: the A–B key used mpv's three-state `ab-loop` cycle, which kept stale state and could store the end before the start; it now sets an ordered start and end itself. Earlier, a capture taken after the 12-second clip reached its end showed the player paused at the seek target. That is `keep-open` pausing at the end, not a bug.
+
+Not verified: macOS and Windows, including macOS's `increaseContrast` and Windows' HighContrast flags read through `defaults` and `reg`; screen readers (GPUI 0.2.2 exposes no accessibility tree); audible output; and hardware decoding.
+
+### Benchmark harness on 2026-10-24
+
+Backlog item 15 uses the real `Player` software renderer in the desktop binary without opening GPUI or starting transfers. Environment: Ubuntu 24.04.5 x86_64, Linux 7.0.0-1011-gcp, four vCPUs, 15 GiB RAM, no GPU; pinned Rust 1.99.0 (`b940084d7`), GPUI 0.2.2, libmpv 0.37.0 at `/lib/x86_64-linux-gnu/libmpv.so.2`, FFmpeg 6.1.1. Standard release profile: thin LTO, one codegen unit, stripped debuginfo. Other work can run concurrently on this VM; load snapshots below label these as shared-VM observations rather than controlled performance comparisons.
+
+The fixtures are generated locally with no audio: 12-second H.264 `testsrc2`, yuv420p, 30 fps, 360 frames. `ffprobe` confirmed both dimensions, frame rate/count, codec, and duration after encoding completed. An earlier probe during encoding reported `moov atom not found`; probing the completed file passed. Encoding and compilation finish before the timed runs. The benchmark starts after its first software submission, loops with `loop-file=inf`, polls native events, and calls `Player::render` on 16 ms deadlines at the source resolution. Metrics and their limits are defined in the [performance gate](#performance-gate).
+
+Commands used to prepare the release binary and fixtures (`benchmark_dir` was `/tmp/flick-benchmark-validation.ZoKckK`):
+
+```sh
+cargo build --locked --release --bin flick
+benchmark_dir=$(mktemp -d /tmp/flick-benchmark-validation.XXXXXX)
+ffmpeg -hide_banner -loglevel warning -nostdin -n \
+  -f lavfi -i 'testsrc2=size=3840x2160:rate=30:duration=12' \
+  -an -c:v libx264 -preset veryfast -crf 23 -threads 4 -pix_fmt yuv420p \
+  -color_primaries bt709 -color_trc bt709 -colorspace bt709 \
+  -movflags +faststart -f mp4 "$benchmark_dir/4k.mp4"
+ffmpeg -hide_banner -loglevel warning -nostdin -n \
+  -f lavfi -i 'testsrc2=size=1920x1080:rate=30:duration=12' \
+  -an -c:v libx264 -preset veryfast -crf 23 -threads 4 -pix_fmt yuv420p \
+  -color_primaries bt709 -color_trc bt709 -colorspace bt709 \
+  -movflags +faststart -f mp4 "$benchmark_dir/1080p.mp4"
+```
+
+An initial timed attempt was stopped before completion after a sanity report exposed startup-only decoder reporting (`vulkan-copy` in an early sanity report despite no physical GPU). The harness was corrected to retain both initial and final decoder status, then rebuilt and rechecked before the recorded full run. That incomplete attempt is not a performance baseline. A subsequent 4K attempt received SIGTERM before completion while another desktop instance was restarted on the shared VM. To avoid process-name collisions, recorded measurements used a copy of the release executable named `measure`; `cmp` and SHA-256 confirmed identical bytes (`42d6cd91c84923eb3856953da9d23c517baf8c386b8cf343635f35eb44cd6e85`). Neither interrupted attempt produced a final JSON report or counts as a full run.
+
+Native measurements used these commands (`measure` is the byte-identical release executable), with `uptime` immediately before and after each process (UTC times and complete load lines follow):
+
+```sh
+cp -- target/release/flick "$benchmark_dir/measure"
+cmp -- target/release/flick "$benchmark_dir/measure"
+
+env -u FLICK_HWDEC FLICK_AUDIO=null FLICK_MPV_LIBRARY=/lib/x86_64-linux-gnu/libmpv.so.2 \
+  "$benchmark_dir/measure" --benchmark "$benchmark_dir/4k.mp4" \
+  --seconds 300 --size 3840x2160 --interval-ms 16
+env -u FLICK_HWDEC FLICK_AUDIO=null FLICK_MPV_LIBRARY=/lib/x86_64-linux-gnu/libmpv.so.2 \
+  "$benchmark_dir/measure" --benchmark "$benchmark_dir/1080p.mp4" \
+  --seconds 60 --size 1920x1080 --interval-ms 16
+FLICK_AUDIO=null FLICK_HWDEC=no FLICK_MPV_LIBRARY=/lib/x86_64-linux-gnu/libmpv.so.2 \
+  "$benchmark_dir/measure" --benchmark "$benchmark_dir/4k.mp4" \
+  --seconds 60 --size 3840x2160 --interval-ms 16
+```
+
+All three processes exited 0. Each reported `hardware_decoder_initial: null` and `hardware_decoder: null`: decoding ended in software with both default `auto-copy` and explicit `no`. CPU and memory figures are observations under varying contention, not a controlled decoder comparison. The default mode did not establish hardware acceleration on this VM.
+
+| Run | Wall seconds | Software submissions | Nominal source frames | CPU % (100% = one CPU) | Process peak RSS MiB | Average RSS MiB | Frame-producing render p95 ms | Observed VO drops |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 4K, default auto-copy, 300 s | 300.150 | 1965 | 9004.50 | 150.70 | 421.74 | 419.03 | 160.06 | 4226 |
+| 1080p, default auto-copy, 60 s | 60.000 | 1659 | 1800.01 | 84.90 | 209.61 | 206.93 | 32.76 | 116 |
+| 4K, hwdec=no, 60 s | 60.134 | 406 | 1804.02 | 150.60 | 343.33 | 336.64 | 141.52 | 874 |
+
+Decoder drop-counter increases were zero in all three runs. The nominal source-frame estimate is not an independent loss measurement. VO counters reset at loop boundaries; observed increases can undercount unsampled drops, as described below. Linux `/proc` RSS and `getrusage` peak RSS are independently sampled kernel readings and can differ slightly.
+
+UTC process times and raw `uptime` snapshots:
+
+4K, default auto-copy, 300 s: 2026-10-24T21:18:24.496103+00:00 → 2026-10-24T21:23:26.315653+00:00.
+
+```text
+before: 21:18:24 up 12 days, 10:53,  0 user,  load average: 10.73, 11.70, 10.87
+after:  21:23:26 up 12 days, 10:58,  0 user,  load average: 12.43, 12.85, 11.68
+```
+
+1080p, default auto-copy, 60 s: 2026-10-24T21:23:26.334058+00:00 → 2026-10-24T21:24:27.201214+00:00.
+
+```text
+before: 21:23:26 up 12 days, 10:58,  0 user,  load average: 12.43, 12.85, 11.68
+after:  21:24:27 up 12 days, 10:59,  0 user,  load average: 9.62, 11.92, 11.44
+```
+
+4K, hwdec=no, 60 s: 2026-10-24T21:24:27.210218+00:00 → 2026-10-24T21:25:28.078114+00:00.
+
+```text
+before: 21:24:27 up 12 days, 10:59,  0 user,  load average: 9.62, 11.92, 11.44
+after:  21:25:28 up 12 days, 11:00,  0 user,  load average: 12.63, 12.40, 11.64
+```
+
+Raw stdout JSON, unchanged (one document per completed measurement):
+
+4K, default auto-copy, 300 s:
+
+```json
+{"schema_version":1,"presentation":"headless-software-bgr0-submissions","build_profile":"release","os":"linux","arch":"x86_64","video":"/tmp/flick-benchmark-validation.ZoKckK/4k.mp4","requested_seconds":300,"elapsed_seconds":300.149863567,"startup_seconds":1.302696756,"interval_ms":16,"target_size":[3840,2160],"frames_presented":1965,"expected_frames":9004.495907010001,"skipped_tick_deadlines":16623,"source":{"width":3840,"height":2160,"fps":30.0,"fps_property":"container-fps","codec":"H.264 / AVC / MPEG-4 AVC / MPEG-4 part 10"},"hardware_decoder":null,"hardware_decoder_initial":null,"flick_hwdec":null,"effective_hwdec":"auto-copy","mpv_version":"mpv 0.37.0","flick_audio":"null","frame_drop_count":{"initial":0,"last":37,"observed_increase":4226,"observed_resets":17,"unavailable_samples":0},"decoder_frame_drop_count":{"initial":0,"last":0,"observed_increase":0,"observed_resets":0,"unavailable_samples":0},"render_call_ms":{"count":2137,"p50":93.59176,"p95":156.876228,"p99":347.332086,"max":636.003359},"frame_render_ms":{"count":1965,"p50":95.563071,"p95":160.058036,"p99":353.126377,"max":636.003359},"cpu":{"user_seconds":449.444793,"system_seconds":2.8861239999999997,"average_percent":150.7016900239336},"memory":{"process_peak_rss_bytes":442228736,"sampled_peak_rss_bytes":442523648,"time_weighted_average_rss_bytes":439389474.10235876,"samples":276,"covered_seconds":300.149863567}}
+```
+
+1080p, default auto-copy, 60 s:
+
+```json
+{"schema_version":1,"presentation":"headless-software-bgr0-submissions","build_profile":"release","os":"linux","arch":"x86_64","video":"/tmp/flick-benchmark-validation.ZoKckK/1080p.mp4","requested_seconds":60,"elapsed_seconds":60.000252412,"startup_seconds":0.602556541,"interval_ms":16,"target_size":[1920,1080],"frames_presented":1659,"expected_frames":1800.00757236,"skipped_tick_deadlines":1381,"source":{"width":1920,"height":1080,"fps":30.0,"fps_property":"container-fps","codec":"H.264 / AVC / MPEG-4 AVC / MPEG-4 part 10"},"hardware_decoder":null,"hardware_decoder_initial":null,"flick_hwdec":null,"effective_hwdec":"auto-copy","mpv_version":"mpv 0.37.0","flick_audio":"null","frame_drop_count":{"initial":0,"last":0,"observed_increase":116,"observed_resets":4,"unavailable_samples":0},"decoder_frame_drop_count":{"initial":0,"last":0,"observed_increase":0,"observed_resets":0,"unavailable_samples":0},"render_call_ms":{"count":2369,"p50":13.250145,"p95":30.550722,"p99":42.981763,"max":272.099101},"frame_render_ms":{"count":1659,"p50":16.229157,"p95":32.763816,"p99":53.194814,"max":272.099101},"cpu":{"user_seconds":50.433640999999994,"system_seconds":0.508305,"average_percent":84.90288615821164},"memory":{"process_peak_rss_bytes":219795456,"sampled_peak_rss_bytes":220164096,"time_weighted_average_rss_bytes":216987031.34934205,"samples":60,"covered_seconds":60.000252412}}
+```
+
+4K, hwdec=no, 60 s:
+
+```json
+{"schema_version":1,"presentation":"headless-software-bgr0-submissions","build_profile":"release","os":"linux","arch":"x86_64","video":"/tmp/flick-benchmark-validation.ZoKckK/4k.mp4","requested_seconds":60,"elapsed_seconds":60.133878383,"startup_seconds":0.549841166,"interval_ms":16,"target_size":[3840,2160],"frames_presented":406,"expected_frames":1804.01635149,"skipped_tick_deadlines":3326,"source":{"width":3840,"height":2160,"fps":30.0,"fps_property":"container-fps","codec":"H.264 / AVC / MPEG-4 AVC / MPEG-4 part 10"},"hardware_decoder":null,"hardware_decoder_initial":null,"flick_hwdec":"no","effective_hwdec":"no","mpv_version":"mpv 0.37.0","flick_audio":"null","frame_drop_count":{"initial":0,"last":140,"observed_increase":874,"observed_resets":3,"unavailable_samples":0},"decoder_frame_drop_count":{"initial":0,"last":0,"observed_increase":0,"observed_resets":0,"unavailable_samples":0},"render_call_ms":{"count":433,"p50":96.260296,"p95":141.069883,"p99":164.80947,"max":216.291837},"frame_render_ms":{"count":406,"p50":97.785993,"p95":141.51701,"p99":164.80947,"max":216.291837},"cpu":{"user_seconds":90.04964799999999,"system_seconds":0.5118699999999999,"average_percent":150.5998289736156},"memory":{"process_peak_rss_bytes":360009728,"sampled_peak_rss_bytes":360173568,"time_weighted_average_rss_bytes":352992668.19098395,"samples":57,"covered_seconds":60.133878383}}
+```
+
+Checks on the final implementation:
+
+- `cargo fmt --all -- --check`: passed.
+- `cargo clippy --locked --all-targets -- -D warnings`: passed.
+- `cargo clippy --locked --no-default-features --all-targets -- -D warnings`: passed.
+- `cargo test --locked --all-targets`: passed, 53 tests total (10 library, 39 desktop binary, 4 local transfer integration); 6 opt-in native tests ignored. The desktop tests include 5 new pure benchmark tests covering arguments, JSON shape, percentiles/CPU math, counter resets/RSS integration, and deadline skipping.
+- `cargo test --locked --no-default-features --all-targets`: passed, 14 tests (10 library, 4 local transfer integration). No desktop or libmpv dependency is initialized by this suite.
+- `cargo build --locked --release --bin flick`: passed. The initial build took 29m58s; the final relink took 5m18s. Cargo emitted an existing future-compatibility notice for `proc-macro-error2` 2.0.1; exit status was zero. No dependency was added or updated.
+- `FLICK_AUDIO=null FLICK_MPV_LIBRARY=/lib/x86_64-linux-gnu/libmpv.so.2 FLICK_TEST_VIDEO="$benchmark_dir/1080p.mp4" cargo test --locked --bin flick benchmark::tests::native_benchmark -- --ignored --nocapture`: passed, one real-libmpv test. Final corrected debug test: 53 software submissions in 2.000326136 s at 320×180; initial and final hardware decoder both `null`.
+- `bash -n scripts/benchmark.sh` and `bash scripts/benchmark.sh --help`: passed. Six script argument-error cases (unknown flag, zero seconds, odd target width, missing size, duplicate size, extra positional argument) returned exit 2 with empty stdout. The release CLI help and four invalid benchmark argument cases also passed without opening GPUI; invalid requests returned nonzero with empty stdout.
+- A two-second release sanity run at 320×180 preceded the recorded measurements. Each report was parsed as a single JSON document and checked for release profile, elapsed duration, frame/call count consistency, source size/fps/codec, populated mpv version/drop counters, and positive Linux CPU/RSS readings.
+
+End-to-end fixture script check:
+
+```sh
+env -u FLICK_HWDEC FLICK_AUDIO=null FLICK_MPV_LIBRARY=/lib/x86_64-linux-gnu/libmpv.so.2 \
+  bash scripts/benchmark.sh 2
+```
+
+Passed: generated a fresh local 4K fixture, ran the release binary for 2.063616042 s, produced one parseable stdout JSON document (16 software submissions), and removed its temporary fixture/directory. Diagnostics stayed on stderr. Raw stdout:
+
+```json
+{"schema_version":1,"presentation":"headless-software-bgr0-submissions","build_profile":"release","os":"linux","arch":"x86_64","video":"/tmp/flick-benchmark.xJ83UR/testsrc2-3840x2160-30fps.mp4","requested_seconds":2,"elapsed_seconds":2.063616042,"startup_seconds":1.1011311990000001,"interval_ms":16,"target_size":[3840,2160],"frames_presented":16,"expected_frames":61.90848126,"skipped_tick_deadlines":110,"source":{"width":3840,"height":2160,"fps":30.0,"fps_property":"container-fps","codec":"H.264 / AVC / MPEG-4 AVC / MPEG-4 part 10"},"hardware_decoder":null,"hardware_decoder_initial":null,"flick_hwdec":null,"effective_hwdec":"auto-copy","mpv_version":"mpv 0.37.0","flick_audio":"null","frame_drop_count":{"initial":1,"last":44,"observed_increase":43,"observed_resets":0,"unavailable_samples":0},"decoder_frame_drop_count":{"initial":0,"last":0,"observed_increase":0,"observed_resets":0,"unavailable_samples":0},"render_call_ms":{"count":18,"p50":76.844495,"p95":145.241529,"p99":145.241529,"max":145.241529},"frame_render_ms":{"count":16,"p50":77.32964100000001,"p95":145.241529,"p99":145.241529,"max":145.241529},"cpu":{"user_seconds":3.9602260000000005,"system_seconds":0.13266299999999998,"average_percent":198.3357813032547},"memory":{"process_peak_rss_bytes":430698496,"sampled_peak_rss_bytes":431112192,"time_weighted_average_rss_bytes":359625981.11761004,"samples":4,"covered_seconds":2.063616042}}
+```
+
+The separately prepared manual fixture videos and copied `measure` executable were removed after the completed runs; raw JSON and runner logs remained in the task-owned temporary directory during this session.
+
+These are headless native playback measurements and desktop compilation/unit-test evidence. No interactive playback, display scanout, GPUI upload, audible sound, A/V synchronization, native GPU path, or VLC/mpv comparison was tested in this pass. The synthetic fixtures exercise software conversion and allocation and do not represent every codec or real-world file. Generated media is not committed.
+
+### Public discovery and listener comparison on 2026-10-24
+
+Environment: Ubuntu 24.04.5, x86_64, Linux 7.0.0-1011-gcp, four vCPUs (Intel Xeon at 2.20 GHz), 15 GiB RAM. Rust 1.99.0 (`b940084d7`), pinned librqbit 9.0.1, unoptimized development binary with debug symbols disabled. Other Rust compilation was running on this VM during the measurements; these are short public-swarm observations, not a controlled hardware benchmark or a general speed claim.
+
+The tracker list was fetched from Torlink's [`src/sources/magnet.ts`](https://github.com/baairon/torlink/blob/df059311d0898b7245dd842153c1ff7c892275ee/src/sources/magnet.ts), revision `df059311d0898b7245dd842153c1ff7c892275ee`. Its 11 entries are shared by search magnets and public sessions. Public sessions enable DHT persistence at `state/dht.json`, saved listen-port selection, and UPnP; automated tests keep public discovery and port mapping off. The engine dumps DHT state every 60 seconds. These completed swarm trials were shorter than that interval, so they do not establish an observed DHT save/reload. The pinned UPnP implementation requests TCP mappings only. No successful router UPnP mapping was observed or claimed.
+
+#### Manual public transfers (item 32)
+
+Only the authorized legal [Sintel torrent](https://webtorrent.io/torrents/sintel.torrent) was used. Its v1 infohash is `08ada5a7a6183aae1e09d831df6748d566095a10`. Each run had new state and download directories, public discovery enabled, no rate limit, and a 120-second maximum window. The modes alternated TCP, TCP+uTP, TCP, TCP+uTP for each input type. A separate UDP tracker connect probe to `tracker.opentrackr.org:1337` returned a valid transaction-matching 16-byte response in 0.181 seconds.
+
+The exact diagnostic command was the following, with `ROOT`, `MODE`, and `INPUT` taking the values below (no `cargo run` startup time is included):
+
+```sh
+target/debug/flick-transfer --state-dir "$ROOT/$MODE-$RUN/state" \
+  --download-dir "$ROOT/$MODE-$RUN/downloads" --public --transport "$MODE" \
+  benchmark "$INPUT" --window-seconds 120
+```
+
+For the HTTPS input, `ROOT=/tmp/flick-public-comparison-cxp8oizq` and `INPUT=https://webtorrent.io/torrents/sintel.torrent`. For the magnet input, `ROOT=/tmp/flick-magnet-comparison-emm3tk3r` and `INPUT=magnet:?xt=urn:btih:08ada5a7a6183aae1e09d831df6748d566095a10`. `MODE` was `tcp-only` or `tcp-and-utp`, and `RUN` was `1` or `2`. The magnet hash was independently extracted from the fetched torrent's raw info dictionary with Python's SHA-1 implementation.
+
+Raw elapsed seconds below start after session initialization. HTTPS metadata time includes fetching and parsing the `.torrent`; magnet metadata time requires peer metadata exchange. First verified bytes, completion, and live peers are sampled every 250 ms, so timestamps have that observation granularity. Every run exited successfully after verifying all **129,302,391 bytes**. Peak counts refer to live connections, not all discovered addresses. Live peers were zero in every completion snapshot after the engine closed download connections.
+
+| Input | Mode | Run | Started UTC | Metadata (s) | First verified (s) | Complete (s) | Peak live peers |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| HTTPS | tcp-only | 1 | 2026-10-24T19:50:38.327080+00:00 | 1.310116839 | 3.020489838 | 15.830994119 | 40 |
+| HTTPS | tcp-and-utp | 1 | 2026-10-24T19:50:57.729253+00:00 | 1.166109137 | 3.069033728 | 15.925069505 | 40 |
+| HTTPS | tcp-only | 2 | 2026-10-24T19:51:14.870466+00:00 | 1.295604750 | 2.650823181 | 16.308498002 | 39 |
+| HTTPS | tcp-and-utp | 2 | 2026-10-24T19:51:32.395585+00:00 | 1.178779639 | 3.351984547 | 14.645966774 | 40 |
+| Magnet | tcp-only | 1 | 2026-10-24T19:52:08.513763+00:00 | 1.038129572 | 2.285118184 | 18.061256893 | 39 |
+| Magnet | tcp-and-utp | 1 | 2026-10-24T19:52:27.795379+00:00 | 1.303690219 | 2.692355322 | 13.791851801 | 31 |
+| Magnet | tcp-only | 2 | 2026-10-24T19:52:46.275931+00:00 | 0.999187247 | 3.043522763 | 17.812040816 | 39 |
+| Magnet | tcp-and-utp | 2 | 2026-10-24T19:53:05.468146+00:00 | 1.061685472 | 2.338047551 | 14.677042284 | 31 |
+
+Mean completion time was 16.069746061 seconds for TCP versus 15.285518140 for TCP+uTP with HTTPS metadata, and 17.936648855 versus 14.234447043 with magnet metadata. TCP+uTP was faster in the magnet trials and comparable in the HTTPS trials. Public desktop and diagnostic sessions now default to `TcpAndUtp`; local sessions retain TCP. In 9.0.1 the same uTP listener socket enables outgoing uTP while outgoing TCP stays enabled; no separate outgoing-uTP option exists. Mixed-mode logs confirmed TCP and UDP listeners on the same port. These results do not isolate how many bytes traveled over each protocol.
+
+The uTP engine warned that its receive buffer was 8,388,608 bytes rather than the requested 167,772,160 bytes; `net.core.rmem_max` and `net.core.wmem_max` were both 4,194,304. No kernel settings were changed. All eight download directories, including downloaded media, were deleted after the processes stopped. Raw JSON samples and engine logs remained in the two task-owned `/tmp` roots during this session; no downloaded media is committed.
+
+#### Checks and scope
+
+- `cargo build --locked --no-default-features --bin flick-transfer`: passed (4m 52s). This builds the backend diagnostic, not the desktop.
+- `cargo test --locked --no-default-features --all-targets`: passed, 10 unit tests and four local transfer tests. Generated local fixtures and explicit loopback peers covered sharing, selected-file download, pause/restart/resume, byte verification, invalid inputs, actionable metadata timeout, and no public state files in local mode.
+- `cargo fmt --all -- --check`: passed.
+- `cargo clippy --locked --all-targets -- -D warnings`: passed (7m 39s). Cargo also printed a nonfatal future-incompatibility notice for dependency `proc-macro-error2` 2.0.1.
+- Final `cargo clippy --locked --no-default-features --all-targets -- -D warnings`: passed after the correction below.
+- `cargo test --locked --all-targets`: passed, 32 tests (10 shared-library, 18 desktop, four local-transfer tests); four native libmpv playback tests remained ignored. The desktop cancellation test passed against a generated fixture and a stalled explicit loopback peer.
+- Final `cargo test --locked --no-default-features --all-targets`: passed again, 14 tests (10 unit, four local-transfer tests).
+- `cargo build --locked`: passed; the Linux desktop application and diagnostic linked successfully. Cargo elapsed times included waiting on the same worktree's build lock. A linked desktop binary is not evidence of interactive playback.
+- Initial `cargo clippy --locked --no-default-features --all-targets -- -D warnings` found `collapsible_if` in the new startup code. The conditional was corrected before final checks.
+- An exploratory `cargo check --locked --all-targets` was interrupted during dependency compilation (exit 130) to build the diagnostic first. It is not a passing desktop check.
+
+The desktop resolve notice now says “Finding peers…” and offers Cancel; the worker waits up to five minutes and acknowledges cancellation after aborting the old task. Automated cancellation coverage uses a generated fixture and a stalled explicit loopback peer. This session has not exercised that button interactively or run desktop playback.
+
+#### Web-seed research (item 31, research only)
+
+The [upstream release list](https://github.com/ikatson/rqbit/releases) and GitHub latest-release API returned v9.0.1 (published 2026-08-20); no newer upstream release was found. [Issue 500](https://github.com/ikatson/rqbit/issues/500) remains open for BEP 19 web seeds. Its discussion links a separate fork implementing HTTP sources, not a newer upstream release. The pinned source has no `url-list` downloader. The dependency was not changed. The Sintel metadata's web-seed URL was present but these measurements used BitTorrent peers; the separate URL-download backend owns direct Archive HTTPS downloads.
 
 ### Native interface styles on 2026-10-24
 
@@ -173,7 +558,7 @@ xcrun --find metal
 xcrun --find metallib
 ```
 
-GPUI 0.2.2 builds Metal shaders and uses libclang to generate platform bindings. GitHub's macOS runners supply Xcode; the workflow checks the selected installation. Install a libmpv build matching the machine's architecture for playback. FFmpeg is needed only to generate fixtures. A real desktop session is needed to exercise the player.
+GPUI 0.2.2 builds Metal shaders and uses libclang to generate platform bindings. GitHub's macOS runners supply Xcode; the workflow checks the selected installation. Install a libmpv build matching the machine's architecture for playback. FFmpeg is needed only to generate fixtures. A real desktop session is needed to exercise the player. To build a self-contained `Flick.app` and DMG, see [Packaging for macOS](PACKAGING.md); the earlier development `Flick.app` and `Flick Preview.app` bundles in this record were local wrappers around a debug binary, and nothing here shows that they carried libmpv.
 
 ### Windows
 
@@ -248,7 +633,15 @@ For a headless Linux smoke test, record exactly which interactions and frame obs
 
 Compare release builds of Flick, VLC, and mpv on the same machine, file, display resolution, output scaling, and decoder settings. Record cold and warm runs separately. Measure launch to first displayed frame, file open to first displayed frame, seek to stable playback, dropped frames, process memory, CPU use, and paused CPU use. Measure power consumption when supported by the machine. Include multiple runs and the range of results.
 
-Do not report FPS from a screen refresh callback as decoded FPS. Do not compare a CPU fallback on one player against hardware decoding on another without identifying the difference. No performance results have been recorded yet.
+The repeatable software-path baseline is `FLICK_AUDIO=null bash scripts/benchmark.sh`: it generates a local 12-second 3840×2160/30 fps H.264 `testsrc2` fixture, builds/runs the release desktop binary with `--locked`, loops for 300 seconds, and removes the media afterward. Use `bash scripts/benchmark.sh 60 --size 1920x1080` for a shorter comparison, or `target/release/flick --benchmark VIDEO --seconds 300 --size 3840x2160 --interval-ms 16` for an existing local file. Set `FLICK_HWDEC=no` for a software-decoder comparison; the default is `auto-copy`. Keep fixture encoding, target size, decoder, interval, release settings, and machine load fixed when checking regressions. Repeat runs on an idle machine before setting numeric regression thresholds.
+
+The measurement begins after the first software frame; startup is reported separately. Hardware-decoder status is captured both at that first submission and at the end, because initial auto-probing can report a candidate before falling back. The main `hardware_decoder` field is the final status. A deadline-based render tick defaults to 16 ms, skipping overdue ticks without catch-up bursts. `frames_presented` counts `Player::render` results containing a frame, not distinct decoded frames or visible display scanouts. `expected_frames` is source fps × measured wall time (an estimate for variable-rate sources); its difference from submissions is not an mpv dropped-frame counter. `render_call_ms` includes calls returning no frame, while `frame_render_ms` covers only frame-producing calls; both use nearest-rank p50/p95/p99/max. Rendering may overrun the requested duration by one call.
+
+JSON CPU user/system seconds are process `getrusage` deltas during measurement, including libmpv worker threads; 100% average CPU means one occupied logical CPU, so values may exceed 100%. Linux RSS comes from `/proc/self/status` at roughly one-second intervals and the endpoints: the average is a sample-and-hold time-weighted estimate, and its covered time is reported. Sampling retains the current output frame, but does not model GPUI retaining/uploading it. Process peak RSS comes from `getrusage` and includes startup; sampled peak covers the measured window. RSS is reported in bytes. Other Unix platforms retain CPU and peak RSS but report sampled/average RSS as unavailable; Windows resource metrics are unavailable. Unavailable values are JSON `null`, never invented zeroes. The build profile label follows the normal debug-assertions setting (standard Cargo debug/release builds).
+
+Drop counters include the initial and last mpv values, observed positive increases, observed decreases/resets, and unavailable-sample counts. Seeking/looping can reset mpv counters; per-tick accumulation preserves observed increases across detected resets but can miss drops at an unsampled boundary or a reset that catches up before the next sample. Treat these as observed lower bounds, not exact end-to-end frame loss. Property semantics follow the [mpv 0.37 manual](https://github.com/mpv-player/mpv/blob/v0.37.0/DOCS/man/input.rst).
+
+This harness measures decode, software scaling/composition, output allocation, and polling overhead. GPUI upload/composition, interactive responsiveness, display scanout, audio synchronization, paused CPU, seek latency, native GPU presentation, and power still require separate native measurements. The sustained Linux baseline is recorded above; no VLC/mpv comparison was measured. Do not report FPS from a screen refresh callback as decoded FPS, or compare a CPU fallback against hardware decoding without identifying the difference.
 
 ## Upstream references
 

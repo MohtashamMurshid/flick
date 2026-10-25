@@ -1,15 +1,16 @@
 //! The libmpv boundary and a portable software presentation baseline.
 //!
 //! libmpv is loaded at runtime, so building Flick does not need native mpv
-//! development headers or a link-time library. The renderer intentionally uses
-//! software decoding, scaling, and subtitle composition. GPUI uploads the final
+//! development headers or a link-time library. Decoding uses the platform's
+//! hardware decoder when one is available and copies frames back to memory;
+//! scaling and subtitle composition stay on the CPU. GPUI uploads the final
 //! BGRA image; this path is functional scaffolding, not a zero-copy GPU path.
 //!
 //! Keep this object on the UI thread. Advanced render control is deliberately
 //! disabled: synchronous client calls and rendering on one thread can otherwise
-//! deadlock. Even without advanced control, upstream recommends separating the
-//! client and renderer threads to avoid stalls. That is part of the later GPU
-//! integration work, rather than a performance claim for this baseline.
+//! deadlock. As upstream recommends, the desktop moves rendering to its own
+//! thread with [`Player::render_in_background`], so scaling a large frame never
+//! blocks the interface. Tests and diagnostics can still render synchronously.
 
 use anyhow::{Context, Result, bail, ensure};
 use libloading::Library;
@@ -21,8 +22,9 @@ use std::marker::PhantomData;
 use std::path::PathBuf;
 use std::ptr::{self, NonNull};
 use std::rc::Rc;
-use std::sync::OnceLock;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::thread;
 
 #[derive(Clone, Debug)]
 pub struct PlaybackSnapshot {
@@ -34,6 +36,20 @@ pub struct PlaybackSnapshot {
     pub speed: f64,
     pub tracks: Vec<Track>,
     pub eof: bool,
+    pub chapters: Vec<Chapter>,
+    /// A–B loop points in seconds, when set.
+    pub loop_start: Option<f64>,
+    pub loop_end: Option<f64>,
+    /// Seconds; positive delays audio relative to video.
+    pub audio_delay: f64,
+    /// Waiting for stream data, such as torrent pieces.
+    pub buffering: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Chapter {
+    pub title: String,
+    pub time: f64,
 }
 
 impl Default for PlaybackSnapshot {
@@ -47,6 +63,11 @@ impl Default for PlaybackSnapshot {
             speed: 1.0,
             tracks: Vec::new(),
             eof: false,
+            chapters: Vec::new(),
+            loop_start: None,
+            loop_end: None,
+            audio_delay: 0.0,
+            buffering: false,
         }
     }
 }
@@ -96,6 +117,150 @@ type Render = unsafe extern "C" fn(*mut c_void, *mut RenderParam) -> c_int;
 type RenderUpdate = unsafe extern "C" fn(*mut c_void) -> u64;
 type RenderCallback = unsafe extern "C" fn(*mut c_void);
 type SetRenderCallback = unsafe extern "C" fn(*mut c_void, Option<RenderCallback>, *mut c_void);
+type StreamOpen = unsafe extern "C" fn(*mut c_void, *mut c_char, *mut StreamCallbacks) -> c_int;
+type StreamAdd = unsafe extern "C" fn(*mut c_void, *const c_char, *mut c_void, StreamOpen) -> c_int;
+
+/// `mpv_stream_cb_info` from libmpv/stream_cb.h.
+#[repr(C)]
+struct StreamCallbacks {
+    cookie: *mut c_void,
+    read: Option<unsafe extern "C" fn(*mut c_void, *mut c_char, u64) -> i64>,
+    seek: Option<unsafe extern "C" fn(*mut c_void, i64) -> i64>,
+    size: Option<unsafe extern "C" fn(*mut c_void) -> i64>,
+    close: Option<unsafe extern "C" fn(*mut c_void)>,
+    cancel: Option<unsafe extern "C" fn(*mut c_void)>,
+}
+
+/// libmpv's MPV_ERROR_LOADING_FAILED and MPV_ERROR_UNSUPPORTED.
+const MPV_ERROR_LOADING_FAILED: c_int = -13;
+const MPV_ERROR_UNSUPPORTED: i64 = -18;
+
+/// A readable, seekable source behind a custom URL scheme, such as a
+/// torrent file that is still downloading. Reads may block until verified
+/// data is available; libmpv calls them on its demuxer thread.
+pub trait MediaStream: Send {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize>;
+    fn seek(&mut self, offset: u64) -> std::io::Result<u64>;
+    fn size(&self) -> Option<u64>;
+    /// Makes a blocked read fail promptly; called from another thread.
+    fn canceller(&self) -> Arc<dyn Fn() + Send + Sync>;
+}
+
+/// Opens a stream for a URI of a registered protocol.
+pub type StreamOpener = dyn Fn(&str) -> std::io::Result<Box<dyn MediaStream>> + Send + Sync;
+
+struct StreamCookie {
+    stream: Mutex<Box<dyn MediaStream>>,
+    cancel: Arc<dyn Fn() + Send + Sync>,
+}
+
+/// Runs a callback body without letting a panic cross into C.
+fn guarded<T>(fallback: T, body: impl FnOnce() -> T) -> T {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(body)).unwrap_or(fallback)
+}
+
+unsafe extern "C" fn stream_open(
+    opener: *mut c_void,
+    uri: *mut c_char,
+    info: *mut StreamCallbacks,
+) -> c_int {
+    guarded(MPV_ERROR_LOADING_FAILED, || {
+        // SAFETY: the opener is the Arc boxed by register_protocol, alive
+        // until the core is destroyed; uri and info are valid for this call.
+        let opener = unsafe { &*opener.cast::<Arc<StreamOpener>>() };
+        let Ok(uri) = unsafe { CStr::from_ptr(uri) }.to_str() else {
+            return MPV_ERROR_LOADING_FAILED;
+        };
+        let stream = match opener(uri) {
+            Ok(stream) => stream,
+            Err(error) => {
+                tracing::warn!(%error, uri, "Could not open stream");
+                return MPV_ERROR_LOADING_FAILED;
+            }
+        };
+        let cookie = Box::new(StreamCookie {
+            cancel: stream.canceller(),
+            stream: Mutex::new(stream),
+        });
+        // SAFETY: libmpv passes a writable info struct.
+        let info = unsafe { &mut *info };
+        info.cookie = Box::into_raw(cookie).cast();
+        info.read = Some(stream_read);
+        info.seek = Some(stream_seek);
+        info.size = Some(stream_size);
+        info.close = Some(stream_close);
+        info.cancel = Some(stream_cancel);
+        0
+    })
+}
+
+/// # Safety
+///
+/// `cookie` must come from `stream_open` and not yet be closed.
+unsafe fn cookie<'a>(cookie: *mut c_void) -> &'a StreamCookie {
+    // SAFETY: guaranteed by the caller.
+    unsafe { &*cookie.cast::<StreamCookie>() }
+}
+
+unsafe extern "C" fn stream_read(cookie_ptr: *mut c_void, buffer: *mut c_char, bytes: u64) -> i64 {
+    guarded(-1, || {
+        // SAFETY: libmpv passes its cookie and a buffer of `bytes` bytes.
+        let cookie = unsafe { cookie(cookie_ptr) };
+        let len = usize::try_from(bytes).unwrap_or(usize::MAX).min(1 << 20);
+        let buffer = unsafe { std::slice::from_raw_parts_mut(buffer.cast::<u8>(), len) };
+        let mut stream = cookie.stream.lock().unwrap_or_else(|e| e.into_inner());
+        match stream.read(buffer) {
+            Ok(read) => read as i64,
+            Err(error) => {
+                tracing::debug!(%error, "Stream read failed");
+                -1
+            }
+        }
+    })
+}
+
+unsafe extern "C" fn stream_seek(cookie_ptr: *mut c_void, offset: i64) -> i64 {
+    guarded(MPV_ERROR_UNSUPPORTED, || {
+        // SAFETY: libmpv passes its cookie.
+        let cookie = unsafe { cookie(cookie_ptr) };
+        let Ok(offset) = u64::try_from(offset) else {
+            return MPV_ERROR_UNSUPPORTED;
+        };
+        let mut stream = cookie.stream.lock().unwrap_or_else(|e| e.into_inner());
+        stream
+            .seek(offset)
+            .ok()
+            .and_then(|at| i64::try_from(at).ok())
+            .unwrap_or(-1)
+    })
+}
+
+unsafe extern "C" fn stream_size(cookie_ptr: *mut c_void) -> i64 {
+    guarded(MPV_ERROR_UNSUPPORTED, || {
+        // SAFETY: libmpv passes its cookie.
+        let cookie = unsafe { cookie(cookie_ptr) };
+        let stream = cookie.stream.lock().unwrap_or_else(|e| e.into_inner());
+        stream
+            .size()
+            .and_then(|size| i64::try_from(size).ok())
+            .unwrap_or(MPV_ERROR_UNSUPPORTED)
+    })
+}
+
+unsafe extern "C" fn stream_cancel(cookie_ptr: *mut c_void) {
+    guarded((), || {
+        // SAFETY: libmpv passes its cookie; cancel never takes the stream
+        // lock, which a blocked read holds.
+        (unsafe { cookie(cookie_ptr) }.cancel)()
+    })
+}
+
+unsafe extern "C" fn stream_close(cookie_ptr: *mut c_void) {
+    guarded((), || {
+        // SAFETY: close is libmpv's last call for this cookie.
+        drop(unsafe { Box::from_raw(cookie_ptr.cast::<StreamCookie>()) })
+    })
+}
 
 unsafe extern "C" fn request_redraw(context: *mut c_void) {
     // SAFETY: callback storage is boxed before registration, stays at a stable
@@ -157,6 +322,8 @@ struct Api {
     render_update: RenderUpdate,
     set_render_callback: SetRenderCallback,
     render_free: Free,
+    /// Absent from libmpv builds without the stream callback API.
+    stream_add: Option<StreamAdd>,
     _library: Library,
 }
 
@@ -230,6 +397,7 @@ impl Api {
                 render_update: *library.get(b"mpv_render_context_update\0")?,
                 set_render_callback: *library.get(b"mpv_render_context_set_update_callback\0")?,
                 render_free: *library.get(b"mpv_render_context_free\0")?,
+                stream_add: library.get(b"mpv_stream_cb_add_ro\0").ok().map(|f| *f),
                 _library: library,
             })
         }
@@ -254,6 +422,25 @@ impl Api {
     }
 }
 
+/// Chapters from mpv's `chapter-list` JSON, sorted by start time.
+fn parse_chapters(json: &str) -> Vec<Chapter> {
+    let mut chapters = serde_json::from_str::<Vec<Value>>(json)
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|chapter| {
+            let time = chapter["time"]
+                .as_f64()
+                .filter(|t| t.is_finite() && *t >= 0.)?;
+            Some(Chapter {
+                title: chapter["title"].as_str().unwrap_or_default().to_owned(),
+                time,
+            })
+        })
+        .collect::<Vec<_>>();
+    chapters.sort_by(|a, b| a.time.total_cmp(&b.time));
+    chapters
+}
+
 fn library_candidates() -> Vec<OsString> {
     if let Some(path) = std::env::var_os("FLICK_MPV_LIBRARY") {
         return vec![path];
@@ -267,16 +454,19 @@ fn library_candidates() -> Vec<OsString> {
     #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
     let names = ["libmpv.so"];
 
-    let mut candidates: Vec<OsString> = names.iter().map(OsString::from).collect();
+    // A copy shipped with Flick wins over one found on the search path, so a
+    // bundled app never picks up a different libmpv by accident.
+    let mut candidates: Vec<OsString> = Vec::new();
     if let Ok(executable) = std::env::current_exe()
         && let Some(directory) = executable.parent()
     {
         for name in names {
-            candidates.push(directory.join(name).into_os_string());
             #[cfg(target_os = "macos")]
             candidates.push(directory.join("../Frameworks").join(name).into_os_string());
+            candidates.push(directory.join(name).into_os_string());
         }
     }
+    candidates.extend(names.iter().map(OsString::from));
     #[cfg(target_os = "macos")]
     for directory in ["/opt/homebrew/lib", "/usr/local/lib"] {
         for name in names {
@@ -286,8 +476,8 @@ fn library_candidates() -> Vec<OsString> {
     candidates
 }
 
-// mpv requires at least four-byte alignment for BGRA; 64-byte alignment for
-// both pointer and stride also avoids unnecessary conversion fallback copies.
+// mpv requires at least four-byte alignment for BGR0. The fallback buffer
+// uses 64-byte pointer and stride alignment, mpv's fast path.
 #[derive(Clone)]
 #[repr(C, align(64))]
 struct RenderBlock([u8; 64]);
@@ -297,7 +487,33 @@ struct RenderBuffer {
     width: u32,
     height: u32,
     stride: usize,
+    /// Allocated only for [`Target::Aligned`] frames.
     blocks: Vec<RenderBlock>,
+}
+
+/// Where libmpv writes a frame before GPUI receives it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Target {
+    /// Straight into the tightly packed frame handed to GPUI: no extra copy.
+    Direct,
+    /// Into a persistent 64-byte-aligned buffer, then copied row by row.
+    Aligned,
+}
+
+impl Target {
+    /// GPUI needs tightly packed rows and takes ownership of each frame, so
+    /// libmpv renders straight into the frame whenever the allocation meets
+    /// BGR0's four-byte pixel alignment. On Linux this beat the aligned copy
+    /// at every measured size, even without 64-byte rows or pointers (see
+    /// docs/VALIDATION.md). Rust only guarantees one-byte alignment for a
+    /// byte vector, so the aligned buffer remains the fallback.
+    fn choose(pointer: usize) -> Self {
+        if pointer.is_multiple_of(4) {
+            Self::Direct
+        } else {
+            Self::Aligned
+        }
+    }
 }
 
 /// A single-thread-bound libmpv instance. It is intentionally neither Send nor
@@ -310,12 +526,35 @@ pub struct Player {
     event_entry: Cell<Option<i64>>,
     file_loaded: Cell<bool>,
     redraw_requested: Box<AtomicBool>,
+    /// Set by [`Player::render_in_background`]; owns the render context.
+    render_thread: RefCell<Option<RenderThread>>,
+    /// Openers for registered protocols. libmpv keeps protocols until the
+    /// core is destroyed, and fields drop after `Drop::drop` destroys it.
+    /// Each is boxed because libmpv holds a thin pointer to the Arc, which
+    /// must not move when the vector grows.
+    #[allow(clippy::vec_box)]
+    protocols: RefCell<Vec<Box<Arc<StreamOpener>>>>,
     api: &'static Api,
     _main_thread: PhantomData<Rc<()>>,
 }
 
 impl Player {
     pub fn new() -> Result<Self> {
+        Self::create(&[])
+    }
+
+    /// A silent player for poster frames and previews: no audio output,
+    /// audio decoding, or subtitles.
+    pub fn silent() -> Result<Self> {
+        Self::create(&[
+            ("ao", "null"),
+            ("aid", "no"),
+            ("sid", "no"),
+            ("mute", "yes"),
+        ])
+    }
+
+    fn create(extra: &[(&str, &str)]) -> Result<Self> {
         let api = Api::load()?;
         // SAFETY: the checked function pointer belongs to the loaded library.
         let handle = NonNull::new(unsafe { (api.create)() })
@@ -328,9 +567,13 @@ impl Player {
             event_entry: Cell::new(None),
             file_loaded: Cell::new(false),
             redraw_requested: Box::new(AtomicBool::new(false)),
+            render_thread: RefCell::new(None),
+            protocols: RefCell::new(Vec::new()),
             api,
             _main_thread: PhantomData,
         };
+        // FLICK_HWDEC=no compares against pure software decoding.
+        let hwdec = std::env::var("FLICK_HWDEC").unwrap_or_else(|_| "auto-copy".into());
         // Any failure after creating the handle drops player and releases it.
         for (name, value) in [
             ("config", "no"),
@@ -338,7 +581,8 @@ impl Player {
             ("input-default-bindings", "no"),
             ("input-vo-keyboard", "no"),
             ("vo", "libmpv"),
-            ("hwdec", "no"),
+            // Copy-back decoding keeps the software renderer's frame access.
+            ("hwdec", hwdec.as_str()),
             ("vd-lavc-dr", "no"),
             ("keep-open", "yes"),
             ("idle", "yes"),
@@ -351,6 +595,9 @@ impl Player {
         // timed null audio device without changing production defaults.
         if std::env::var("FLICK_AUDIO").as_deref() == Ok("null") {
             player.option("ao", "null")?;
+        }
+        for (name, value) in extra {
+            player.option(name, value)?;
         }
         // SAFETY: the handle is live, and all initialization options are set.
         player.api.check(
@@ -431,6 +678,13 @@ impl Player {
             .context("libmpv did not identify the requested playlist entry")?;
         self.requested_entry.set(Some(entry));
         self.file_loaded.set(false);
+        if let Some(thread) = self.render_thread.borrow().as_ref() {
+            thread.shared.generation.fetch_add(1, Ordering::AcqRel);
+            thread.shared.update(|state| {
+                state.target = (0, 0);
+                false
+            });
+        }
         // A previous file may have been paused or held at EOF.
         self.set_property("pause", "no")
     }
@@ -483,6 +737,12 @@ impl Player {
                 selected: track["selected"].as_bool().unwrap_or(false),
             })
             .collect();
+        // ab-loop-a/b read "no" when unset.
+        let point = |name| {
+            self.property(name)
+                .and_then(|value| value.parse::<f64>().ok())
+                .filter(|value| value.is_finite())
+        };
         PlaybackSnapshot {
             paused: flag("pause"),
             position: number("time-pos", 0.0).max(0.0),
@@ -492,7 +752,49 @@ impl Player {
             speed: number("speed", 1.0),
             tracks,
             eof: flag("eof-reached"),
+            chapters: self
+                .property("chapter-list")
+                .map(|json| parse_chapters(&json))
+                .unwrap_or_default(),
+            loop_start: point("ab-loop-a"),
+            loop_end: point("ab-loop-b"),
+            audio_delay: number("audio-delay", 0.0),
+            buffering: flag("paused-for-cache"),
         }
+    }
+
+    /// The video's display size after aspect correction, once known.
+    pub fn video_size(&self) -> Option<(u32, u32)> {
+        let dimension = |name| {
+            self.property(name)
+                .and_then(|value| value.parse::<u32>().ok())
+                .filter(|value| *value > 0)
+        };
+        Some((dimension("video-params/dw")?, dimension("video-params/dh")?))
+    }
+
+    /// The video codec's short name, such as `h264`.
+    pub fn video_codec(&self) -> Option<String> {
+        self.property("video-codec-name")
+            .or_else(|| self.property("current-tracks/video/codec"))
+            .filter(|value| !value.is_empty())
+    }
+
+    /// Frames mpv dropped because presentation fell behind.
+    pub fn dropped_frames(&self) -> Option<u64> {
+        self.property("frame-drop-count")?.parse().ok()
+    }
+
+    /// Read a libmpv diagnostic property without changing playback state.
+    /// Unavailable properties stay `None`, rather than being reported as zero.
+    pub fn diagnostic_property(&self, name: &str) -> Option<String> {
+        self.property(name)
+    }
+
+    /// The active hardware decoder, or `None` while decoding in software.
+    pub fn hardware_decoder(&self) -> Option<String> {
+        self.property("hwdec-current")
+            .filter(|value| !value.is_empty() && value != "no")
     }
 
     /// Drain queued events with a zero timeout; never wait for the next event.
@@ -552,111 +854,390 @@ impl Player {
 
     /// Render only when a new frame or changed target size needs presentation.
     /// libmpv performs aspect-preserving scaling and letterboxing itself.
+    /// After [`Player::render_in_background`], frames come from the render
+    /// thread instead and this returns `None`.
     pub fn render(&self, width: u32, height: u32) -> Result<Option<VideoFrame>> {
-        if width == 0 || height == 0 || !self.file_loaded.get() {
+        self.render_to(width, height, None)
+    }
+
+    fn render_to(
+        &self,
+        width: u32,
+        height: u32,
+        force: Option<Target>,
+    ) -> Result<Option<VideoFrame>> {
+        if width == 0 || height == 0 || !self.file_loaded.get() || self.renderer.is_null() {
             return Ok(None);
         }
-        ensure!(
-            c_int::try_from(width).is_ok() && c_int::try_from(height).is_ok(),
-            "The requested video dimensions cannot be represented by libmpv"
-        );
-        let mut buffer = self.buffer.borrow_mut();
-        let resized = buffer.width != width || buffer.height != height;
-        // SAFETY: this method is only called on the Player's single thread.
-        let updates = unsafe { (self.api.render_update)(self.renderer) };
         // Keep callback notifications even when libmpv's 200ms presentation
         // timeout has already promoted next_frame to cur_frame. In that case
         // update() returns no pending frame, but cur_frame still needs drawing.
         // Relying only on update() freezes paused seek previews at the old image.
         let requested = self.redraw_requested.swap(false, Ordering::AcqRel);
-        if updates & 1 == 0 && !resized && !requested {
-            return Ok(None);
+        // SAFETY: the renderer is live and only used on this Player's thread.
+        unsafe {
+            render_frame(
+                self.api,
+                self.renderer,
+                &mut self.buffer.borrow_mut(),
+                requested,
+                (width, height),
+                force,
+            )
         }
-        if resized {
-            let stride = (width as usize)
-                .checked_mul(4)
-                .and_then(|bytes| bytes.checked_add(63))
+    }
+
+    /// Moves rendering to a dedicated thread, so software scaling never
+    /// blocks the caller. libmpv's update callback wakes the thread, which
+    /// renders at the size set by [`Player::set_render_target`] and sends
+    /// each frame with the load generation it belongs to. Upstream
+    /// recommends separating client calls from rendering this way.
+    pub fn render_in_background(&mut self) -> Result<RenderedFrames> {
+        ensure!(
+            !self.renderer.is_null(),
+            "Rendering already moved to a thread"
+        );
+        let shared = Arc::new(RenderShared::default());
+        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+        let renderer = SendPointer(self.renderer);
+        let api = self.api;
+        let thread_shared = shared.clone();
+        let join = thread::Builder::new()
+            .name("flick-render".into())
+            .spawn(move || render_thread(api, renderer, thread_shared, sender))
+            .context("Start the video render thread")?;
+        // The thread owns and frees the render context from here on.
+        self.renderer = ptr::null_mut();
+        *self.render_thread.borrow_mut() = Some(RenderThread {
+            shared,
+            join: Some(join),
+        });
+        Ok(receiver)
+    }
+
+    /// The physical size the render thread draws at; zero stops drawing,
+    /// for example while the library is shown.
+    pub fn set_render_target(&self, width: u32, height: u32) {
+        let target = if self.file_loaded.get() {
+            (width, height)
+        } else {
+            (0, 0)
+        };
+        if let Some(thread) = self.render_thread.borrow().as_ref() {
+            thread.shared.update(|state| {
+                let changed = state.target != target;
+                state.target = target;
+                changed
+            });
+        }
+    }
+
+    /// Serves `protocol://…` URIs from streams made by `opener`, so they can
+    /// be loaded like files.
+    pub fn register_protocol(&self, protocol: &str, opener: Arc<StreamOpener>) -> Result<()> {
+        let add = self
+            .api
+            .stream_add
+            .context("This libmpv build cannot play from Flick streams")?;
+        let name = CString::new(protocol).context("Protocol name contains a NUL byte")?;
+        let opener = Box::new(opener);
+        let user_data = (&*opener as *const Arc<StreamOpener>).cast_mut().cast();
+        // SAFETY: the handle is live; the boxed opener keeps a stable address
+        // and is kept until after the core is destroyed.
+        self.api.check(
+            unsafe { add(self.handle.as_ptr(), name.as_ptr(), user_data, stream_open) },
+            &format!("Register {protocol} streams"),
+        )?;
+        self.protocols.borrow_mut().push(opener);
+        Ok(())
+    }
+
+    /// The generation of frames for the file most recently loaded.
+    pub fn frame_generation(&self) -> u64 {
+        self.render_thread
+            .borrow()
+            .as_ref()
+            .map_or(0, |thread| thread.shared.generation.load(Ordering::Acquire))
+    }
+}
+
+/// Frames from the render thread: the load generation and the frame, or an
+/// error message.
+pub type RenderedFrames = tokio::sync::mpsc::UnboundedReceiver<(u64, Result<VideoFrame, String>)>;
+
+/// A raw render context handed to the render thread, which becomes its only
+/// user.
+struct SendPointer(*mut c_void);
+
+// SAFETY: libmpv render contexts may be used from any one thread at a time;
+// after the handoff only the render thread touches this pointer.
+unsafe impl Send for SendPointer {}
+
+#[derive(Default)]
+struct RenderState {
+    target: (u32, u32),
+    redraw: bool,
+    stop: bool,
+}
+
+#[derive(Default)]
+struct RenderShared {
+    state: Mutex<RenderState>,
+    wake: Condvar,
+    /// Incremented by each load, so frames from a replaced file are ignored.
+    generation: AtomicU64,
+}
+
+impl RenderShared {
+    /// Changes the state and wakes the render thread when `change` says so.
+    fn update(&self, change: impl FnOnce(&mut RenderState) -> bool) {
+        let wake = match self.state.lock() {
+            Ok(mut state) => change(&mut state),
+            Err(poisoned) => change(&mut poisoned.into_inner()),
+        };
+        if wake {
+            self.wake.notify_one();
+        }
+    }
+}
+
+struct RenderThread {
+    shared: Arc<RenderShared>,
+    join: Option<thread::JoinHandle<()>>,
+}
+
+impl Drop for RenderThread {
+    fn drop(&mut self) {
+        self.shared.update(|state| {
+            state.stop = true;
+            true
+        });
+        if let Some(join) = self.join.take() {
+            let _ = join.join();
+        }
+    }
+}
+
+unsafe extern "C" fn wake_render_thread(context: *mut c_void) {
+    // SAFETY: the context is the render thread's Arc<RenderShared>, which
+    // the thread keeps alive until it unregisters this callback. A brief
+    // lock is the only work done on libmpv's thread.
+    let shared = unsafe { &*context.cast::<RenderShared>() };
+    shared.update(|state| {
+        state.redraw = true;
+        true
+    });
+}
+
+fn render_thread(
+    api: &'static Api,
+    renderer: SendPointer,
+    shared: Arc<RenderShared>,
+    frames: tokio::sync::mpsc::UnboundedSender<(u64, Result<VideoFrame, String>)>,
+) {
+    let renderer = renderer.0;
+    // SAFETY: the renderer is live, and the context outlives registration.
+    unsafe {
+        (api.set_render_callback)(
+            renderer,
+            Some(wake_render_thread),
+            Arc::as_ptr(&shared).cast_mut().cast(),
+        );
+    }
+    let mut buffer = RenderBuffer::default();
+    loop {
+        let (target, requested) = {
+            let mut state = shared.state.lock().unwrap_or_else(|e| e.into_inner());
+            loop {
+                if state.stop {
+                    break;
+                }
+                let visible = state.target.0 > 0 && state.target.1 > 0;
+                let resized = state.target != (buffer.width, buffer.height);
+                if visible && (state.redraw || resized) {
+                    break;
+                }
+                state = shared.wake.wait(state).unwrap_or_else(|e| e.into_inner());
+            }
+            if state.stop {
+                break;
+            }
+            (state.target, std::mem::take(&mut state.redraw))
+        };
+        let generation = shared.generation.load(Ordering::Acquire);
+        // SAFETY: this thread is the render context's only user.
+        let result = unsafe { render_frame(api, renderer, &mut buffer, requested, target, None) };
+        let message = match result {
+            Ok(Some(frame)) => Ok(frame),
+            Ok(None) => continue,
+            Err(error) => Err(format!("{error:#}")),
+        };
+        if frames.send((generation, message)).is_err() {
+            break;
+        }
+    }
+    // SAFETY: unregister before freeing; the core is destroyed only after
+    // this thread is joined.
+    unsafe {
+        (api.set_render_callback)(renderer, None, ptr::null_mut());
+        (api.render_free)(renderer);
+    }
+}
+
+/// Renders the current frame into a new packed BGRA frame when libmpv has a
+/// new frame, the size changed, or a redraw was requested.
+///
+/// # Safety
+///
+/// `renderer` must be a live render context used by no other thread.
+unsafe fn render_frame(
+    api: &Api,
+    renderer: *mut c_void,
+    buffer: &mut RenderBuffer,
+    requested: bool,
+    (width, height): (u32, u32),
+    force: Option<Target>,
+) -> Result<Option<VideoFrame>> {
+    ensure!(
+        c_int::try_from(width).is_ok() && c_int::try_from(height).is_ok(),
+        "The requested video dimensions cannot be represented by libmpv"
+    );
+    let resized = buffer.width != width || buffer.height != height;
+    // SAFETY: guaranteed by the caller.
+    let updates = unsafe { (api.render_update)(renderer) };
+    if updates & 1 == 0 && !resized && !requested {
+        return Ok(None);
+    }
+    if resized {
+        tracing::debug!(width, height, "Video presentation resized");
+    }
+    buffer.width = width;
+    buffer.height = height;
+    let row_bytes = (width as usize)
+        .checked_mul(4)
+        .context("Video row size exceeds this platform's address space")?;
+    let byte_count = row_bytes
+        .checked_mul(height as usize)
+        .context("Video frame size overflow")?;
+    let mut pixels = Vec::<u8>::new();
+    pixels
+        .try_reserve_exact(byte_count)
+        .context("Allocate video frame at display resolution")?;
+    match force.unwrap_or_else(|| Target::choose(pixels.as_ptr().addr())) {
+        Target::Direct => {
+            // SAFETY: the reserved capacity holds row_bytes * height bytes
+            // and outlives the call. Pointer and stride are at least
+            // four-byte aligned (BGR0's pixel size).
+            unsafe { render_into(api, renderer, pixels.as_mut_ptr(), row_bytes, width, height)? };
+            // SAFETY: on success libmpv overwrites every byte from the
+            // pointer to pointer + stride * height (libmpv render.h).
+            unsafe { pixels.set_len(byte_count) };
+            buffer.blocks = Vec::new();
+        }
+        Target::Aligned => {
+            let stride = row_bytes
+                .checked_add(63)
                 .map(|bytes| bytes / 64 * 64)
                 .context("Video row size exceeds this platform's address space")?;
-            let byte_count = stride
+            let blocks = stride
                 .checked_mul(height as usize)
-                .context("Video surface exceeds this platform's address space")?;
-            let blocks = byte_count / 64;
-            let additional = blocks.saturating_sub(buffer.blocks.len());
-            buffer
-                .blocks
-                .try_reserve_exact(additional)
-                .context("Allocate video presentation surface")?;
-            buffer.blocks.resize(blocks, RenderBlock([0; 64]));
-            buffer.width = width;
-            buffer.height = height;
-            buffer.stride = stride;
-            tracing::debug!(width, height, "Video presentation resized");
+                .context("Video surface exceeds this platform's address space")?
+                / 64;
+            if buffer.stride != stride || buffer.blocks.len() != blocks {
+                let additional = blocks.saturating_sub(buffer.blocks.len());
+                buffer
+                    .blocks
+                    .try_reserve_exact(additional)
+                    .context("Allocate video presentation surface")?;
+                buffer.blocks.resize(blocks, RenderBlock([0; 64]));
+                buffer.stride = stride;
+            }
+            // SAFETY: the block vector has 64-byte alignment and
+            // stride * height writable bytes, including row padding.
+            unsafe {
+                render_into(
+                    api,
+                    renderer,
+                    buffer.blocks.as_mut_ptr().cast(),
+                    stride,
+                    width,
+                    height,
+                )?
+            };
+            // SAFETY: RenderBlock has no padding, contains initialized u8
+            // values, and the vector covers exactly stride * height bytes.
+            let bytes = unsafe {
+                std::slice::from_raw_parts(buffer.blocks.as_ptr().cast::<u8>(), blocks * 64)
+            };
+            for row in bytes.chunks_exact(stride) {
+                pixels.extend_from_slice(&row[..row_bytes]);
+            }
         }
-        let mut dimensions = [width as c_int, height as c_int];
-        let mut stride = buffer.stride; // MPV_RENDER_PARAM_SW_STRIDE is size_t*.
-        let mut block_for_time: c_int = 0;
-        let mut params = [
-            RenderParam {
-                kind: 17, // SW_SIZE: int[2]
-                data: dimensions.as_mut_ptr().cast(),
-            },
-            RenderParam {
-                kind: 18, // SW_FORMAT: char*
-                data: c"bgra".as_ptr().cast_mut().cast(),
-            },
-            RenderParam {
-                kind: 19, // SW_STRIDE: size_t*
-                data: (&mut stride as *mut usize).cast(),
-            },
-            RenderParam {
-                kind: 20, // SW_POINTER: pointer to writable aligned pixels.
-                data: buffer.blocks.as_mut_ptr().cast(),
-            },
-            RenderParam {
-                kind: 12, // BLOCK_FOR_TARGET_TIME: int*, don't sleep on UI.
-                data: (&mut block_for_time as *mut c_int).cast(),
-            },
-            RenderParam::end(),
-        ];
-        // SAFETY: all params outlive this call. The block vector has 64-byte
-        // alignment and stride * height writable bytes, including row padding.
-        self.api.check(
-            unsafe { (self.api.render)(self.renderer, params.as_mut_ptr()) },
-            "Render video frame",
-        )?;
-        let byte_count = buffer.stride * height as usize;
-        // SAFETY: RenderBlock has no padding, contains initialized u8 values,
-        // and the contiguous vector covers exactly byte_count bytes.
-        let bytes =
-            unsafe { std::slice::from_raw_parts(buffer.blocks.as_ptr().cast::<u8>(), byte_count) };
-        let row_bytes = width as usize * 4;
-        let mut pixels = Vec::new();
-        pixels
-            .try_reserve_exact(
-                row_bytes
-                    .checked_mul(height as usize)
-                    .context("Video frame size overflow")?,
-            )
-            .context("Allocate video frame at display resolution")?;
-        for row in bytes.chunks_exact(buffer.stride) {
-            pixels.extend_from_slice(&row[..row_bytes]);
-        }
-        // Every video frame is opaque, including black letterbox bars. Force
-        // alpha rather than exposing decoder/format-specific alpha semantics.
-        for pixel in pixels.as_chunks_mut::<4>().0 {
-            pixel[3] = 255;
-        }
-        Ok(Some(VideoFrame {
-            width,
-            height,
-            pixels,
-        }))
     }
+    // BGR0 leaves the fourth byte undefined, and every video frame is
+    // opaque, including black letterbox bars. Set alpha rather than
+    // exposing decoder/format-specific alpha semantics.
+    for pixel in pixels.as_chunks_mut::<4>().0 {
+        pixel[3] = 255;
+    }
+    Ok(Some(VideoFrame {
+        width,
+        height,
+        pixels,
+    }))
+}
+
+/// # Safety
+///
+/// `renderer` must be a live render context used by no other thread, and
+/// `pixels` must be valid for writes of `stride * height` bytes and, like
+/// `stride`, aligned to at least four bytes.
+unsafe fn render_into(
+    api: &Api,
+    renderer: *mut c_void,
+    pixels: *mut u8,
+    stride: usize,
+    width: u32,
+    height: u32,
+) -> Result<()> {
+    let mut dimensions = [width as c_int, height as c_int];
+    let mut stride = stride; // MPV_RENDER_PARAM_SW_STRIDE is size_t*.
+    let mut block_for_time: c_int = 0;
+    let mut params = [
+        RenderParam {
+            kind: 17, // SW_SIZE: int[2]
+            data: dimensions.as_mut_ptr().cast(),
+        },
+        RenderParam {
+            kind: 18, // SW_FORMAT: char*
+            data: c"bgr0".as_ptr().cast_mut().cast(),
+        },
+        RenderParam {
+            kind: 19, // SW_STRIDE: size_t*
+            data: (&mut stride as *mut usize).cast(),
+        },
+        RenderParam {
+            kind: 20, // SW_POINTER: pointer to writable pixels.
+            data: pixels.cast(),
+        },
+        RenderParam {
+            kind: 12, // BLOCK_FOR_TARGET_TIME: int*, don't sleep on UI.
+            data: (&mut block_for_time as *mut c_int).cast(),
+        },
+        RenderParam::end(),
+    ];
+    // SAFETY: all params outlive this call; the caller guarantees the
+    // target memory, alignment, and exclusive use of the renderer.
+    api.check(
+        unsafe { (api.render)(renderer, params.as_mut_ptr()) },
+        "Render video frame",
+    )
 }
 
 impl Drop for Player {
     fn drop(&mut self) {
+        // The render thread frees its context; join it before the core goes.
+        self.render_thread.get_mut().take();
         // SAFETY: the renderer must be freed before the core; the library is
         // still owned by self.api and outlives both operations, even when
         // initialization only partially succeeded. No callbacks retain self.
@@ -676,6 +1257,27 @@ mod tests {
     use std::io::Write;
     use std::thread;
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn chapter_lists_parse_sort_and_skip_invalid_entries() {
+        let chapters = parse_chapters(
+            r#"[{"title":"Two","time":60.5},{"time":0},{"title":"Bad","time":-1},{"title":"x"}]"#,
+        );
+        assert_eq!(
+            chapters,
+            vec![
+                Chapter {
+                    title: String::new(),
+                    time: 0.
+                },
+                Chapter {
+                    title: "Two".into(),
+                    time: 60.5
+                },
+            ]
+        );
+        assert!(parse_chapters("not json").is_empty());
+    }
 
     fn wait_for(player: &Player, mut condition: impl FnMut(&Player) -> bool) -> Result<()> {
         let deadline = Instant::now() + Duration::from_secs(8);
@@ -737,6 +1339,187 @@ mod tests {
             assert_eq!((frame.width, frame.height), (width, height));
             assert_eq!(frame.pixels.len(), width as usize * height as usize * 4);
         }
+        Ok(())
+    }
+
+    /// A registered protocol plays like a file, reading through callbacks.
+    #[test]
+    #[ignore = "requires native libmpv and FLICK_TEST_VIDEO"]
+    fn real_custom_protocol_streams_play() -> Result<()> {
+        struct FileStream {
+            file: std::fs::File,
+            size: u64,
+            reads: Arc<std::sync::atomic::AtomicUsize>,
+        }
+        impl MediaStream for FileStream {
+            fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+                use std::io::Read;
+                self.reads.fetch_add(1, Ordering::Relaxed);
+                self.file.read(buffer)
+            }
+            fn seek(&mut self, offset: u64) -> std::io::Result<u64> {
+                use std::io::Seek;
+                self.file.seek(std::io::SeekFrom::Start(offset))
+            }
+            fn size(&self) -> Option<u64> {
+                Some(self.size)
+            }
+            fn canceller(&self) -> Arc<dyn Fn() + Send + Sync> {
+                Arc::new(|| {})
+            }
+        }
+        let clip = PathBuf::from(std::env::var("FLICK_TEST_VIDEO")?);
+        let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let opened = reads.clone();
+        let player = Player::new()?;
+        player.register_protocol(
+            "flicktest",
+            Arc::new(move |uri: &str| {
+                if uri != "flicktest://clip" {
+                    return Err(std::io::Error::other("unknown stream"));
+                }
+                let file = std::fs::File::open(&clip)?;
+                let size = file.metadata()?.len();
+                Ok(Box::new(FileStream {
+                    file,
+                    size,
+                    reads: opened.clone(),
+                }) as Box<dyn MediaStream>)
+            }),
+        )?;
+        player.load("flicktest://clip")?;
+        wait_for(&player, |p| {
+            p.file_loaded.get() && p.snapshot().position > 0.5
+        })?;
+        assert!(reads.load(Ordering::Relaxed) > 0);
+        player.command(&["seek", "8", "absolute+exact"])?;
+        wait_for(&player, |p| p.snapshot().position >= 8.)?;
+        // An unknown stream fails like a missing file.
+        player.load("flicktest://missing")?;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if player
+                .poll_events()
+                .iter()
+                .any(|event| matches!(event, PlayerEvent::Error(_)))
+            {
+                break;
+            }
+            ensure!(Instant::now() < deadline, "Unknown stream did not fail");
+            thread::sleep(Duration::from_millis(10));
+        }
+        Ok(())
+    }
+
+    /// The render thread delivers frames at the target size, stops at a zero
+    /// target, tags frames with the load generation, and shuts down while
+    /// playing.
+    #[test]
+    #[ignore = "requires native libmpv and FLICK_TEST_VIDEO"]
+    fn real_render_thread_delivers_tagged_frames() -> Result<()> {
+        let clip = std::env::var("FLICK_TEST_VIDEO")?;
+        let mut player = Player::new()?;
+        let mut frames = player.render_in_background()?;
+        assert!(
+            player.render(320, 180)?.is_none(),
+            "Synchronous rendering is off"
+        );
+        fn wait(
+            player: &Player,
+            frames: &mut RenderedFrames,
+            size: (u32, u32),
+            generation: u64,
+        ) -> Result<()> {
+            let deadline = Instant::now() + Duration::from_secs(8);
+            loop {
+                for event in player.poll_events() {
+                    if let PlayerEvent::Error(error) = event {
+                        bail!("{error}");
+                    }
+                }
+                player.set_render_target(size.0, size.1);
+                while let Ok((tag, frame)) = frames.try_recv() {
+                    let frame = frame.map_err(anyhow::Error::msg)?;
+                    if tag == generation && (frame.width, frame.height) == size {
+                        assert_eq!(frame.pixels.len(), size.0 as usize * size.1 as usize * 4);
+                        return Ok(());
+                    }
+                }
+                ensure!(Instant::now() < deadline, "No frame from the render thread");
+                thread::sleep(Duration::from_millis(10));
+            }
+        }
+        player.load(&clip)?;
+        let first = player.frame_generation();
+        wait(&player, &mut frames, (321, 181), first)?;
+        // A zero target stops rendering while playback continues.
+        player.set_render_target(0, 0);
+        thread::sleep(Duration::from_millis(300));
+        while frames.try_recv().is_ok() {}
+        thread::sleep(Duration::from_millis(300));
+        assert!(frames.try_recv().is_err(), "Rendered with a zero target");
+        player.load(&clip)?;
+        let second = player.frame_generation();
+        assert!(second > first);
+        wait(&player, &mut frames, (640, 360), second)?;
+        // A resize re-renders even when paused.
+        player.set_property("pause", "yes")?;
+        wait(&player, &mut frames, (480, 270), second)?;
+        player.set_property("pause", "no")?;
+        drop(player);
+        Ok(())
+    }
+
+    /// Both presentation targets must produce identical pixels; timings show
+    /// what the direct target saves. Run with --nocapture and a release build
+    /// for meaningful numbers.
+    #[test]
+    #[ignore = "requires native libmpv and FLICK_TEST_VIDEO"]
+    fn real_presentation_targets_match_and_report_cost() -> Result<()> {
+        let clip = std::env::var("FLICK_TEST_VIDEO")?;
+        let player = Player::new()?;
+        player.load(&clip)?;
+        wait_for(&player, |p| {
+            p.file_loaded.get() && p.snapshot().position > 0.2
+        })?;
+        player.set_property("pause", "yes")?;
+        // Let the pause settle so every render below shows the same frame.
+        for _ in 0..4 {
+            player.poll_events();
+            player.render(323, 183)?;
+            thread::sleep(Duration::from_millis(150));
+        }
+        // 1917 px rows are not a multiple of 64 bytes.
+        for (width, height) in [(1920, 1080), (1917, 1080), (3840, 2160)] {
+            let mut frames = Vec::new();
+            for target in [Target::Aligned, Target::Direct] {
+                let rounds = 20;
+                let mut elapsed = Duration::ZERO;
+                let mut last = None;
+                for _ in 0..rounds {
+                    player.redraw_requested.store(true, Ordering::Release);
+                    let started = Instant::now();
+                    let frame = player
+                        .render_to(width, height, Some(target))?
+                        .context("Requested redraw produced no frame")?;
+                    elapsed += started.elapsed();
+                    last = Some(frame);
+                }
+                let frame = last.context("No frame rendered")?;
+                assert_eq!(frame.pixels.len(), width as usize * height as usize * 4);
+                assert!(frame.pixels.as_chunks::<4>().0.iter().all(|p| p[3] == 255));
+                println!(
+                    "{width}x{height} {target:?}: {:.2} ms/frame",
+                    elapsed.as_secs_f64() * 1000. / rounds as f64
+                );
+                frames.push(frame.pixels);
+            }
+            assert!(
+                frames[0] == frames[1],
+                "Direct and aligned targets rendered different pixels at {width}x{height}"
+            );
+        }
+        println!("hardware decoder: {:?}", player.hardware_decoder());
         Ok(())
     }
 

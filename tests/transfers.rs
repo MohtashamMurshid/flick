@@ -199,6 +199,9 @@ async fn state_lock_invalid_inputs_and_existing_destinations_are_safe() -> Resul
         let root = TempDir::new()?;
         let cfg = config(root.path(), "client");
         let session = TransferSession::start(cfg.clone()).await?;
+        // Local startup must never create public discovery/port mapping state.
+        assert!(!cfg.state_dir.join("dht.json").exists());
+        assert!(!cfg.state_dir.join("listen-port").exists());
         let result: Result<()> = async {
             assert!(TransferSession::start(cfg.clone()).await.is_err());
             assert!(
@@ -291,4 +294,441 @@ async fn state_lock_invalid_inputs_and_existing_destinations_are_safe() -> Resul
     })
     .await
     .context("Invalid-input test timed out")?
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn metadata_timeout_explains_recovery_without_starting_a_download() -> Result<()> {
+    timeout(Duration::from_secs(10), async {
+        let root = TempDir::new()?;
+        let source = root.path().join("fixture.bin");
+        tokio::fs::write(&source, content(65_537)).await?;
+        let seed = TransferSession::start(config(root.path(), "seed")).await?;
+        let shared = seed.share(&source, vec![]).await?;
+        seed.stop().await;
+        let cfg = config(root.path(), "receiver");
+        let session = TransferSession::start(cfg.clone()).await?;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let peer = listener.local_addr()?;
+        let stalled = tokio::spawn(async move {
+            let (_socket, _) = listener.accept().await?;
+            std::future::pending::<()>().await;
+            Ok::<_, std::io::Error>(())
+        });
+        let result: Result<()> = async {
+            let error = session
+                .resolve(
+                    TorrentInput::Magnet(shared.magnet),
+                    vec![peer],
+                    Duration::from_millis(200),
+                )
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("active seeders"), "{error}");
+            assert!(error.contains(".torrent file"), "{error}");
+            assert!(session.snapshots()?.is_empty());
+            assert!(std::fs::read_dir(&cfg.download_dir)?.next().is_none());
+            Ok(())
+        }
+        .await;
+        stalled.abort();
+        session.stop().await;
+        result
+    })
+    .await
+    .context("Metadata timeout regression timed out")?
+}
+
+/// A file can be played while it downloads: reads return only verified
+/// bytes in order, a seek near the end fetches those pieces early, and
+/// cancelling ends a read that is waiting for pieces.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn streams_read_verified_bytes_while_downloading() -> Result<()> {
+    timeout(Duration::from_secs(120), async {
+        let root = TempDir::new()?;
+        let source = root.path().join("movie.mp4");
+        let bytes = std::sync::Arc::new(content(12 * 1024 * 1024 + 4099));
+        tokio::fs::write(&source, bytes.as_slice()).await?;
+        let seed = TransferSession::start(config(root.path(), "seed")).await?;
+        let shared = seed.share(&source, vec![]).await?;
+        let peer = seed.listen_addr().context("Missing loopback listener")?;
+        let mut receiver_config = config(root.path(), "receiver");
+        // Slow enough that every check below happens before completion.
+        receiver_config.download_limit_bytes_per_second = NonZeroU32::new(512 * 1024);
+        let receiver = TransferSession::start(receiver_config).await?;
+        let resolved = receiver
+            .resolve(
+                TorrentInput::Magnet(shared.magnet),
+                vec![peer],
+                Duration::from_secs(10),
+            )
+            .await?;
+        let id = receiver.download(&resolved, Some(vec![0])).await?;
+        receiver.resume(&id, vec![peer]).await?;
+        let stream = receiver.open_stream(&id, 0).await?;
+        assert_eq!(stream.len(), bytes.len() as u64);
+        let mut stream = stream.into_blocking(&tokio::runtime::Handle::current());
+        let total = bytes.len() as u64;
+        let incomplete = |stage: &str| -> Result<()> {
+            let verified = receiver.snapshot(&id)?.verified_bytes;
+            ensure!(verified < total, "The download finished before {stage}");
+            Ok(())
+        };
+
+        let expected = bytes.clone();
+        stream = tokio::task::spawn_blocking(move || {
+            let mut start = vec![0; 200_000];
+            let mut filled = 0;
+            while filled < start.len() {
+                let read = stream.read(&mut start[filled..])?;
+                ensure!(read > 0, "Early end of stream");
+                filled += read;
+            }
+            ensure!(
+                start == expected[..start.len()],
+                "Stream start differs from source"
+            );
+            Ok::<_, anyhow::Error>(stream)
+        })
+        .await??;
+        incomplete("the start was read")?;
+
+        let expected = bytes.clone();
+        let tail = total - 50_000;
+        stream = tokio::task::spawn_blocking(move || {
+            ensure!(stream.seek(tail)? == tail, "Seek landed elsewhere");
+            let mut end = Vec::new();
+            let mut buffer = vec![0; 16 * 1024];
+            loop {
+                let read = stream.read(&mut buffer)?;
+                if read == 0 {
+                    break;
+                }
+                end.extend_from_slice(&buffer[..read]);
+            }
+            ensure!(
+                end == expected[tail as usize..],
+                "Stream end differs from source"
+            );
+            Ok::<_, anyhow::Error>(stream)
+        })
+        .await??;
+        // The end arrived ahead of the middle, so the seek was prioritized.
+        incomplete("the end was read")?;
+
+        // A read waiting on a paused download ends when cancelled.
+        receiver.pause(&id).await?;
+        let cancel = stream.canceller();
+        let middle = total / 2 + 777;
+        let waiting = tokio::task::spawn_blocking(move || {
+            stream.seek(middle)?;
+            let mut buffer = vec![0; 64 * 1024];
+            // Read through verified data until a missing piece blocks.
+            loop {
+                match stream.read(&mut buffer) {
+                    Ok(0) => return Ok::<_, anyhow::Error>(false),
+                    Ok(_) => continue,
+                    Err(_) => return Ok(stream.read(&mut buffer).is_err()),
+                }
+            }
+        });
+        sleep(Duration::from_millis(500)).await;
+        cancel.cancel();
+        let failed_after_cancel = timeout(Duration::from_secs(5), waiting)
+            .await
+            .context("Cancelling did not end the waiting read")???;
+        ensure!(failed_after_cancel, "Reads continued after cancelling");
+        receiver.stop().await;
+        seed.stop().await;
+        Ok(())
+    })
+    .await
+    .context("Streaming test timed out")?
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn export_limits_completion_policy_and_delete_owned_files() -> Result<()> {
+    timeout(Duration::from_secs(45), async {
+        let root = TempDir::new()?;
+        let source = root.path().join("fixture");
+        tokio::fs::create_dir_all(source.join("nested")).await?;
+        tokio::fs::write(source.join("clip.bin"), content(262_145)).await?;
+        tokio::fs::write(source.join("nested/notes.txt"), b"torrent-owned notes").await?;
+        let seed = TransferSession::start(config(root.path(), "seed")).await?;
+        let mut cfg = config(root.path(), "receiver");
+        cfg.download_limit_bytes_per_second = NonZeroU32::new(2 * 1024 * 1024);
+        cfg.upload_limit_bytes_per_second = NonZeroU32::new(1024 * 1024);
+        cfg.seed_completed_downloads = false;
+        let receiver = TransferSession::start(cfg.clone()).await?;
+        let result: Result<()> = async {
+            assert_eq!(
+                receiver.limits().download_bps,
+                cfg.download_limit_bytes_per_second
+            );
+            assert_eq!(
+                receiver.limits().upload_bps,
+                cfg.upload_limit_bytes_per_second
+            );
+            receiver.set_limits(NonZeroU32::new(4 * 1024 * 1024), None);
+            assert_eq!(
+                receiver.limits().download_bps.unwrap().get(),
+                4 * 1024 * 1024
+            );
+            assert_eq!(receiver.limits().upload_bps, None);
+            receiver.set_limits(None, NonZeroU32::new(524_288));
+            assert_eq!(receiver.limits().download_bps, None);
+            assert_eq!(receiver.limits().upload_bps.unwrap().get(), 524_288);
+            let shared = seed.share(&source, vec![]).await?;
+            let exported_seed = root.path().join("seed.torrent");
+            seed.export_torrent(&shared.infohash, &exported_seed)
+                .await?;
+            assert_eq!(
+                tokio::fs::read(&exported_seed).await?,
+                shared.torrent_bytes()
+            );
+            let resolved = receiver
+                .resolve(
+                    TorrentInput::File(exported_seed),
+                    vec![seed.listen_addr().unwrap()],
+                    Duration::from_secs(3),
+                )
+                .await?;
+            let id = receiver.download(&resolved, None).await?;
+            receiver
+                .wait_for_completion(&id, Duration::from_secs(15))
+                .await?;
+            timeout(Duration::from_secs(3), async {
+                while receiver.snapshot(&id)?.state != TransferState::Paused {
+                    sleep(Duration::from_millis(20)).await;
+                }
+                Ok::<_, anyhow::Error>(())
+            })
+            .await??;
+            assert_eq!(
+                seed.snapshot(&id)?.state,
+                TransferState::Seeding,
+                "explicit sharing ignores download preference"
+            );
+            assert!(
+                seed.snapshot(&id)?.uploaded_bytes > 0,
+                "local seeder reports uploaded payload"
+            );
+            let exported = root.path().join("downloaded.torrent");
+            receiver.export_torrent(&id, &exported).await?;
+            assert_eq!(tokio::fs::read(&exported).await?, shared.torrent_bytes());
+            let again = receiver
+                .resolve(TorrentInput::File(exported), vec![], Duration::from_secs(3))
+                .await?;
+            assert_eq!(again.infohash, resolved.infohash);
+            assert_eq!(
+                again
+                    .files
+                    .iter()
+                    .map(|f| (&f.relative_path, f.length))
+                    .collect::<Vec<_>>(),
+                resolved
+                    .files
+                    .iter()
+                    .map(|f| (&f.relative_path, f.length))
+                    .collect::<Vec<_>>()
+            );
+            let snapshot = receiver.snapshot(&id)?;
+            for file in &snapshot.files {
+                assert_eq!(
+                    tokio::fs::read(receiver.completed_file(&id, file.index)?).await?,
+                    tokio::fs::read(source.join(&resolved.files[file.index].relative_path)).await?
+                );
+            }
+            let own_file = snapshot.files[0].path.clone();
+            assert!(receiver.export_torrent(&id, &own_file).await.is_err());
+            let keep = own_file.parent().unwrap().join("unrelated.keep");
+            tokio::fs::write(&keep, b"keep this").await?;
+            let sibling = cfg.download_dir.join("outside.keep");
+            tokio::fs::write(&sibling, b"outside torrent").await?;
+            receiver.resume_all(vec![]).await?;
+            assert_eq!(receiver.snapshot(&id)?.state, TransferState::Paused);
+            receiver.set_seed_completed_downloads(true).await;
+            receiver.resume_all(vec![]).await?;
+            assert_eq!(receiver.snapshot(&id)?.state, TransferState::Seeding);
+            receiver.set_seed_completed_downloads(false).await;
+            assert_eq!(receiver.snapshot(&id)?.state, TransferState::Paused);
+            receiver.remove(&id, true).await?;
+            for file in snapshot.files {
+                assert!(!file.path.exists());
+            }
+            assert_eq!(tokio::fs::read(keep).await?, b"keep this");
+            assert_eq!(tokio::fs::read(sibling).await?, b"outside torrent");
+            assert!(receiver.snapshot(&id).is_err());
+            Ok(())
+        }
+        .await;
+        receiver.stop().await;
+        seed.stop().await;
+        result
+    })
+    .await
+    .context("Transfer features regression timed out")?
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn global_pause_resume_and_explicit_sharing_survive_restart() -> Result<()> {
+    timeout(Duration::from_secs(25), async {
+        let root = TempDir::new()?;
+        let cfg = config(root.path(), "seed");
+        let seed = TransferSession::start(cfg.clone()).await?;
+        for (name, byte) in [("a.bin", 41), ("b.bin", 42)] {
+            let path = root.path().join(name);
+            tokio::fs::write(&path, vec![byte; 65_537]).await?;
+            let shared = seed.share(&path, vec![]).await?;
+            seed.remove(&shared.infohash, false).await?;
+            // Even a source in an infohash-named folder remains an explicit
+            // share, including after reopening persisted session state.
+            let folder = root.path().join(&shared.infohash);
+            tokio::fs::create_dir(&folder).await?;
+            let moved = folder.join(name);
+            tokio::fs::rename(&path, &moved).await?;
+            assert_eq!(seed.share(&moved, vec![]).await?.infohash, shared.infohash);
+        }
+        seed.set_seed_completed_downloads(false).await;
+        seed.pause_all().await?;
+        assert!(
+            seed.snapshots()?
+                .iter()
+                .all(|s| s.state == TransferState::Paused)
+        );
+        seed.pause_all().await?; // Idempotent.
+        seed.resume_all(vec![]).await?;
+        assert!(
+            seed.snapshots()?
+                .iter()
+                .all(|s| s.state == TransferState::Seeding)
+        );
+        seed.stop().await;
+        let mut cfg = cfg;
+        cfg.seed_completed_downloads = false;
+        let reopened = TransferSession::start(cfg).await?;
+        let result: Result<()> = async {
+            timeout(Duration::from_secs(5), async {
+                loop {
+                    let snapshots = reopened.snapshots()?;
+                    if snapshots.len() == 2
+                        && snapshots.iter().all(|s| s.state == TransferState::Seeding)
+                    {
+                        break;
+                    }
+                    sleep(Duration::from_millis(20)).await;
+                }
+                Ok::<_, anyhow::Error>(())
+            })
+            .await??;
+            reopened.pause_all().await?;
+            reopened.resume_all(vec![]).await?;
+            assert_eq!(reopened.snapshots()?.len(), 2);
+            Ok(())
+        }
+        .await;
+        reopened.stop().await;
+        result
+    })
+    .await
+    .context("Global pause regression timed out")?
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn deletion_refuses_symlinks_and_preserves_outside_files() -> Result<()> {
+    timeout(Duration::from_secs(20), async {
+        let root = TempDir::new()?;
+        let source = root.path().join("shared");
+        tokio::fs::create_dir_all(source.join("nested")).await?;
+        let file = source.join("nested/fixture.bin");
+        tokio::fs::write(&file, content(65_537)).await?;
+        let session = TransferSession::start(config(root.path(), "seed")).await?;
+        let result: Result<()> = async {
+            let shared = session.share(&source, vec![]).await?;
+            session.pause(&shared.infohash).await?;
+            let outside = root.path().join("outside");
+            tokio::fs::rename(source.join("nested"), &outside).await?;
+            std::os::unix::fs::symlink(&outside, source.join("nested"))?;
+            assert!(session.remove(&shared.infohash, true).await.is_err());
+            assert_eq!(
+                tokio::fs::read(outside.join("fixture.bin")).await?,
+                content(65_537)
+            );
+            assert!(session.snapshot(&shared.infohash).is_ok());
+            tokio::fs::remove_file(source.join("nested")).await?;
+            tokio::fs::rename(&outside, source.join("nested")).await?;
+            let keep = source.join("nested/unrelated.txt");
+            tokio::fs::write(&keep, b"not listed in metainfo").await?;
+            session.remove(&shared.infohash, true).await?;
+            assert!(!file.exists());
+            assert_eq!(tokio::fs::read(keep).await?, b"not listed in metainfo");
+            Ok(())
+        }
+        .await;
+        session.stop().await;
+        result
+    })
+    .await
+    .context("Delete safety regression timed out")?
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn completed_download_rechecks_and_stops_sharing_on_restart() -> Result<()> {
+    timeout(Duration::from_secs(30), async {
+        let root = TempDir::new()?;
+        let source = root.path().join("restart.bin");
+        let bytes = content(65_537);
+        tokio::fs::write(&source, &bytes).await?;
+        let seed = TransferSession::start(config(root.path(), "seed")).await?;
+        let cfg = config(root.path(), "receiver");
+        let receiver = TransferSession::start(cfg.clone()).await?;
+        let result: Result<String> = async {
+            let shared = seed.share(&source, vec![]).await?;
+            let resolved = receiver
+                .resolve(
+                    TorrentInput::Bytes(shared.torrent_bytes().to_vec()),
+                    vec![seed.listen_addr().unwrap()],
+                    Duration::from_secs(3),
+                )
+                .await?;
+            let id = receiver.download(&resolved, None).await?;
+            receiver
+                .wait_for_completion(&id, Duration::from_secs(10))
+                .await?;
+            assert_eq!(receiver.snapshot(&id)?.state, TransferState::Seeding);
+            Ok(id)
+        }
+        .await;
+        receiver.stop().await;
+        seed.stop().await;
+        let id = result?;
+        let mut cfg = cfg;
+        cfg.seed_completed_downloads = false;
+        let reopened = TransferSession::start(cfg).await?;
+        let result: Result<()> = async {
+            timeout(Duration::from_secs(5), async {
+                loop {
+                    let snapshot = reopened.snapshot(&id)?;
+                    if snapshot.state == TransferState::Paused {
+                        assert_eq!(snapshot.verified_bytes, bytes.len() as u64);
+                        assert_eq!(
+                            tokio::fs::read(reopened.completed_file(&id, 0)?).await?,
+                            bytes
+                        );
+                        break;
+                    }
+                    sleep(Duration::from_millis(20)).await;
+                }
+                Ok::<_, anyhow::Error>(())
+            })
+            .await??;
+            Ok(())
+        }
+        .await;
+        reopened.stop().await;
+        result
+    })
+    .await
+    .context("Completion restart regression timed out")?
 }

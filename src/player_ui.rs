@@ -6,6 +6,15 @@ use super::{
 };
 use gpui::{AnyElement, FontWeight, Rgba, linear_color_stop, linear_gradient};
 
+/// Fraction of the video's duration at `time`, for timeline markers.
+fn timeline_fraction(time: f64, duration: f64) -> f32 {
+    if duration > 0. {
+        (time / duration).clamp(0., 1.) as f32
+    } else {
+        0.
+    }
+}
+
 const ON_VIDEO: u32 = 0xffffff;
 const ON_VIDEO_HOVER: u32 = 0xffffff26;
 
@@ -25,7 +34,7 @@ impl Flick {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let t = cx.theme().clone();
-        let show = self.controls_shown;
+        let show = self.controls_shown || self.controls_fading(cx);
         let controls_height = controls_height(t.style);
         let menu = self.menu_panel(cx);
         div()
@@ -33,9 +42,11 @@ impl Flick {
             .size_full()
             .bg(rgb(0x000000))
             .child(self.video_surface(cx))
-            .when(show, |d| d.child(self.player_titlebar(window, cx)))
+            .when(show, |d| {
+                d.child(self.fade("titlebar-fade", self.player_titlebar(window, cx), 0., cx))
+            })
             .when(show && self.file_loaded, |d| {
-                d.child(self.player_controls(window, cx))
+                d.child(self.fade("controls-fade", self.player_controls(window, cx), 8., cx))
             })
             .when_some(self.error.clone(), |d, error| {
                 d.child(
@@ -66,6 +77,84 @@ impl Flick {
                         .child(panel),
                 )
             })
+            .when(self.buffering(), |d| {
+                d.child(
+                    h_flex().absolute().inset_0().justify_center().child(
+                        div()
+                            .px_4()
+                            .py_2()
+                            .rounded_full()
+                            .bg(rgba(0x000000b3))
+                            .text_color(rgb(ON_VIDEO))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child("Buffering…"),
+                    ),
+                )
+            })
+            .when_some(self.up_next_card(cx), |d, card| {
+                d.child(
+                    div()
+                        .absolute()
+                        .right(px(16.))
+                        .bottom(px(controls_height + 8.))
+                        .child(card),
+                )
+            })
+            .when_some(self.status.as_ref(), |d, (text, _)| {
+                let pill = h_flex()
+                    .top(px(t.titlebar_height.max(44.) + 12.))
+                    .left_0()
+                    .right_0()
+                    .justify_center()
+                    .child(
+                        div()
+                            .px_3()
+                            .py_1p5()
+                            .rounded_full()
+                            .bg(rgba(0x000000b3))
+                            .text_color(rgb(ON_VIDEO))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(text.clone()),
+                    );
+                if t.reduce_motion {
+                    d.child(pill)
+                } else {
+                    d.child(pill.with_animation(
+                        ("status-fade", self.status_count),
+                        Animation::new(Duration::from_millis(140)),
+                        |pill, delta| pill.opacity(delta),
+                    ))
+                }
+            })
+            .into_any_element()
+    }
+
+    /// Fades player chrome in or out and, with `slide`, moves it that many
+    /// pixels. Reduced motion shows and hides it at once.
+    fn fade(
+        &self,
+        key: &'static str,
+        element: impl IntoElement + 'static,
+        slide: f32,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        if cx.theme().reduce_motion {
+            return element.into_any_element();
+        }
+        let shown = self.controls_shown;
+        div()
+            .absolute()
+            .inset_0()
+            .child(element)
+            .with_animation(
+                (key, self.controls_changes),
+                Animation::new(super::FADE).with_easing(gpui::ease_in_out),
+                move |el, delta| {
+                    let visible = if shown { delta } else { 1. - delta };
+                    let offset = (1. - visible) * slide;
+                    el.opacity(visible).top(px(offset)).bottom(px(-offset))
+                },
+            )
             .into_any_element()
     }
 
@@ -91,15 +180,41 @@ impl Flick {
             .on_click(cx.listener(|this, event: &ClickEvent, window, cx| {
                 this.focus.focus(window);
                 if event.click_count() == 2 {
-                    window.toggle_fullscreen();
+                    if this.accepts_video_double_click() {
+                        window.toggle_fullscreen();
+                    }
                 } else if this.menu.take().is_some() {
                     cx.notify();
                 }
             }))
-            .when_some(self.frame.clone(), |d, frame| {
-                d.child(img(frame).size_full().object_fit(ObjectFit::Contain))
+            .when(self.pip.is_some(), |d| {
+                d.child(
+                    v_flex()
+                        .items_center()
+                        .gap_3()
+                        .text_color(rgb(ON_VIDEO))
+                        .child(icon("picture-in-picture", 40., rgba(0xffffffb3)))
+                        .child(
+                            div()
+                                .text_size(t.font(20.))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .child("Playing in picture in picture"),
+                        )
+                        .child(self.button(
+                            "pip-return",
+                            Some("maximize"),
+                            "Show Here",
+                            true,
+                            cx,
+                            |this, _, cx| this.close_pip(true, cx),
+                        )),
+                )
             })
-            .when(self.frame.is_none(), |d| {
+            .when_some(
+                self.frame.clone().filter(|_| self.pip.is_none()),
+                |d, frame| d.child(img(frame).size_full().object_fit(ObjectFit::Contain)),
+            )
+            .when(self.frame.is_none() && self.pip.is_none(), |d| {
                 let failed = self.error.is_some();
                 d.child(
                     v_flex()
@@ -113,7 +228,7 @@ impl Flick {
                         ))
                         .child(
                             div()
-                                .text_size(px(20.))
+                                .text_size(t.font(20.))
                                 .font_weight(FontWeight::SEMIBOLD)
                                 .child(if failed {
                                     "Unable to open video"
@@ -156,28 +271,69 @@ impl Flick {
             size,
             rgb(ON_VIDEO),
             rgba(ON_VIDEO_HOVER),
+            None,
             cx,
             move |this, w, cx| this.handle(control, w, cx),
         )
     }
 
+    /// A labeled overlay button, used when "Show button labels" is on.
+    fn overlay_label_button(
+        &self,
+        id: &'static str,
+        name: &'static str,
+        label: &'static str,
+        control: Control,
+        cx: &Context<Self>,
+    ) -> Stateful<Div> {
+        let t = cx.theme();
+        let el = h_flex()
+            .id(id)
+            .relative()
+            .flex_none()
+            .gap_1p5()
+            .h(px(30.))
+            .px_2p5()
+            .rounded(px(t.radius))
+            .bg(rgba(0x00000066))
+            .text_color(rgb(ON_VIDEO))
+            .cursor_pointer()
+            .hover(|s| s.bg(rgba(ON_VIDEO_HOVER)))
+            .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                cx.stop_propagation();
+                this.handle(control, window, cx);
+            }))
+            .child(icon(name, 16., rgb(ON_VIDEO)))
+            .child(label);
+        self.focusable(el, &id.into(), None, t.radius, (0., 0.), cx)
+    }
+
     fn player_titlebar(&self, window: &Window, cx: &Context<Self>) -> Stateful<Div> {
         let t = cx.theme();
         let title = self.path.as_deref().map(file_title).unwrap_or_default();
-        let back = self.overlay_button(
-            "player-back",
-            "arrow-left",
-            "Back to Library",
-            Control::Library,
-            cx,
-        );
-        let keys = self.overlay_button(
-            "player-keys",
-            "keyboard",
-            "Keyboard shortcuts (?)",
-            Control::Keys,
-            cx,
-        );
+        let labels = self.store.data.appearance.show_labels;
+        let back = if labels {
+            self.overlay_label_button("player-back", "arrow-left", "Library", Control::Library, cx)
+        } else {
+            self.overlay_button(
+                "player-back",
+                "arrow-left",
+                "Back to Library",
+                Control::Library,
+                cx,
+            )
+        };
+        let keys = if labels {
+            self.overlay_label_button("player-keys", "keyboard", "Shortcuts", Control::Keys, cx)
+        } else {
+            self.overlay_button(
+                "player-keys",
+                "keyboard",
+                "Keyboard shortcuts (?)",
+                Control::Keys,
+                cx,
+            )
+        };
         let controls = self.window_controls(window, true, cx);
         let bar = div()
             .id("player-titlebar")
@@ -222,7 +378,7 @@ impl Flick {
                     div()
                         .flex_1()
                         .min_w(px(0.))
-                        .text_size(px(12.))
+                        .text_size(t.font(12.))
                         .overflow_hidden()
                         .whitespace_nowrap()
                         .child(format!("{title} – Flick")),
@@ -254,8 +410,9 @@ impl Flick {
             Style::Windows => (44., t.accent, t.on_accent),
             Style::Gnome => (38., rgba(0xffffff26), rgb(ON_VIDEO)),
         };
-        div()
+        let el = div()
             .id("play")
+            .relative()
             .flex_none()
             .flex()
             .items_center()
@@ -274,7 +431,15 @@ impl Flick {
                 name,
                 if t.style == Style::Mac { 26. } else { 20. },
                 fg,
-            ))
+            ));
+        self.focusable(
+            el,
+            &"play".into(),
+            Some(tip.into()),
+            size / 2.,
+            (0., 0.),
+            cx,
+        )
     }
 
     fn timeline_bar(&self, cx: &Context<Self>) -> Stateful<Div> {
@@ -323,6 +488,41 @@ impl Flick {
             Style::Windows => 18.,
             Style::Gnome => 14.,
         };
+        let duration = self.snapshot.duration;
+        let chapters = self
+            .snapshot
+            .chapters
+            .iter()
+            .filter(|chapter| chapter.time > 0. && chapter.time < duration)
+            .map(|chapter| {
+                div()
+                    .absolute()
+                    .top(px(-2.))
+                    .left(relative(timeline_fraction(chapter.time, duration)))
+                    .w(px(2.))
+                    .h(px(8.))
+                    .rounded_full()
+                    .bg(rgba(0xffffffcc))
+            })
+            .collect::<Vec<_>>();
+        let loop_span = self.snapshot.loop_start.map(|start| {
+            let a = timeline_fraction(start, duration);
+            let b = self
+                .snapshot
+                .loop_end
+                .map_or(a, |end| timeline_fraction(end, duration));
+            div()
+                .absolute()
+                .top(px(-2.))
+                .left(relative(a))
+                .w(relative((b - a).max(0.)))
+                .min_w(px(2.))
+                .h(px(8.))
+                .rounded(px(2.))
+                .border_1()
+                .border_color(t.accent)
+                .bg(t.accent_tint(0.35))
+        });
         div()
             .id("timeline")
             .relative()
@@ -344,6 +544,8 @@ impl Flick {
                     .rounded_full()
                     .bg(rgba(0xffffff40))
                     .child(div().w(relative(progress)).h_full().rounded_full().bg(fill))
+                    .children(chapters)
+                    .children(loop_span)
                     .when_some(knob, |d, knob| {
                         d.child(
                             div()
@@ -367,11 +569,78 @@ impl Flick {
                 if this.scrubbing {
                     this.seek_at(e.position.x, cx);
                 }
+                this.hover_timeline(e.position.x, cx);
+            }))
+            .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
+                if !hovered {
+                    this.hover = None;
+                    cx.notify();
+                }
             }))
             .on_mouse_up(
                 MouseButton::Left,
                 cx.listener(|this, _, _, _| this.scrubbing = false),
             )
+            .when_some(self.timeline_preview(cx), |d, preview| d.child(preview))
+    }
+
+    /// The frame and time under the pointer, above the timeline.
+    fn timeline_preview(&self, cx: &Context<Self>) -> Option<Div> {
+        let (fraction, time) = self.hover?;
+        let t = cx.theme();
+        let width = 192.;
+        let chapter = self
+            .snapshot
+            .chapters
+            .iter()
+            .rev()
+            .find(|chapter| chapter.time <= time && !chapter.title.is_empty())
+            .map(|chapter| chapter.title.clone());
+        Some(
+            div()
+                .absolute()
+                .bottom(px(22.))
+                .left(relative(fraction))
+                .ml(px(-width / 2. - 4.))
+                .child(
+                    v_flex()
+                        .w(px(width + 8.))
+                        .p_1()
+                        .gap_1()
+                        .items_center()
+                        .rounded(px(t.radius + 2.))
+                        .bg(rgba(0x000000d9))
+                        .border_1()
+                        .border_color(rgba(0xffffff26))
+                        .shadow_lg()
+                        .text_color(rgb(ON_VIDEO))
+                        .when_some(self.preview_image.clone(), |d, image| {
+                            d.child(
+                                img(image)
+                                    .w(px(width))
+                                    .h(px(width * 9. / 16.))
+                                    .rounded(px(t.radius))
+                                    .object_fit(ObjectFit::Contain),
+                            )
+                        })
+                        .when_some(chapter, |d, chapter| {
+                            d.child(
+                                div()
+                                    .max_w(px(width))
+                                    .overflow_hidden()
+                                    .whitespace_nowrap()
+                                    .text_size(t.font(11.))
+                                    .child(chapter),
+                            )
+                        })
+                        .child(
+                            div()
+                                .text_size(t.font(11.5))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .child(format_time(time)),
+                        ),
+                ),
+        )
     }
 
     fn volume_slider(&self, width: f32, cx: &Context<Self>) -> Stateful<Div> {
@@ -431,16 +700,18 @@ impl Flick {
     }
 
     fn speed_button(&self, cx: &Context<Self>) -> Stateful<Div> {
-        div()
+        let t = cx.theme();
+        let el = div()
             .id("speed")
+            .relative()
             .flex_none()
             .h(px(30.))
             .px_2()
             .flex()
             .items_center()
-            .rounded(px(cx.theme().radius))
+            .rounded(px(t.radius))
             .cursor_pointer()
-            .text_size(px(12.))
+            .text_size(t.font(12.))
             .text_color(rgb(ON_VIDEO))
             .hover(|s| s.bg(rgba(ON_VIDEO_HOVER)))
             .tooltip(|_, cx| {
@@ -448,7 +719,15 @@ impl Flick {
                     .into()
             })
             .child(format!("{}×", self.snapshot.speed))
-            .on_click(cx.listener(|this, _, window, cx| this.handle(Control::Speed, window, cx)))
+            .on_click(cx.listener(|this, _, window, cx| this.handle(Control::Speed, window, cx)));
+        self.focusable(
+            el,
+            &"speed".into(),
+            Some("Playback speed".into()),
+            t.radius,
+            (0., 0.),
+            cx,
+        )
     }
 
     fn player_controls(&self, window: &Window, cx: &Context<Self>) -> AnyElement {
@@ -464,7 +743,7 @@ impl Flick {
             div()
                 .flex_none()
                 .min_w(px(44.))
-                .text_size(px(11.5))
+                .text_size(t.font(11.5))
                 .text_color(rgba(0xffffffc0))
                 .child(text)
         };
@@ -504,6 +783,13 @@ impl Flick {
             Control::Tracks,
             cx,
         );
+        let pip = self.overlay_button(
+            "pip",
+            "picture-in-picture",
+            "Picture in picture (P)",
+            Control::Pip,
+            cx,
+        );
         let full = self.overlay_button(
             "fullscreen",
             if fullscreen { "minimize" } else { "maximize" },
@@ -528,7 +814,7 @@ impl Flick {
                     v_flex()
                         .id("player-hud")
                         .w(relative(0.72))
-                        .max_w(px(580.))
+                        .max_w(px(640.))
                         .px_4()
                         .pt_2()
                         .pb_3()
@@ -544,7 +830,7 @@ impl Flick {
                             h_flex()
                                 .child(
                                     h_flex()
-                                        .w(px(130.))
+                                        .w(px(164.))
                                         .gap_1()
                                         .child(mute)
                                         .child(self.volume_slider(72., cx)),
@@ -560,11 +846,12 @@ impl Flick {
                                 )
                                 .child(
                                     h_flex()
-                                        .w(px(130.))
+                                        .w(px(164.))
                                         .justify_end()
                                         .gap_1()
                                         .child(self.speed_button(cx))
                                         .child(tracks)
+                                        .child(pip)
                                         .child(full),
                                 ),
                         )
@@ -608,7 +895,10 @@ impl Flick {
                                     .flex_1()
                                     .min_w(px(0.))
                                     .gap_3()
-                                    .child(thumbnail(&title, 44., 44., 4.))
+                                    .child(match self.path.as_deref() {
+                                        Some(path) => self.poster(path, &title, 44., 44., 4., cx),
+                                        None => thumbnail(&title, 44., 44., 4.),
+                                    })
                                     .child(
                                         v_flex()
                                             .min_w(px(0.))
@@ -621,7 +911,7 @@ impl Flick {
                                             )
                                             .child(
                                                 div()
-                                                    .text_size(px(12.))
+                                                    .text_size(t.font(12.))
                                                     .text_color(rgba(0xffffffb3))
                                                     .child("Now playing"),
                                             ),
@@ -641,6 +931,7 @@ impl Flick {
                                     .gap_1()
                                     .child(self.speed_button(cx))
                                     .child(tracks)
+                                    .child(pip)
                                     .child(mute)
                                     .child(self.volume_slider(88., cx))
                                     .child(full),
@@ -671,9 +962,230 @@ impl Flick {
                 .child(mute)
                 .child(self.volume_slider(72., cx))
                 .child(tracks)
+                .child(pip)
                 .child(full)
                 .into_any_element(),
         }
+    }
+
+    /// The next episode's countdown, with Play Now and Cancel.
+    fn up_next_card(&self, cx: &Context<Self>) -> Option<Div> {
+        let (path, started) = self.up_next.as_ref()?;
+        let t = cx.theme();
+        let left = super::UP_NEXT_DELAY
+            .saturating_sub(started.elapsed())
+            .as_secs_f32()
+            .ceil();
+        let next = path.clone();
+        Some(
+            v_flex()
+                .w(px(300.))
+                .gap_2()
+                .p_3()
+                .rounded(px(t.card_radius))
+                .bg(t.popover)
+                .border_1()
+                .border_color(t.border)
+                .shadow_lg()
+                .text_color(t.text)
+                .child(
+                    div()
+                        .text_size(t.font(12.))
+                        .text_color(t.muted)
+                        .child(format!("Up next in {left:.0} s")),
+                )
+                .child(
+                    div()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .overflow_hidden()
+                        .whitespace_nowrap()
+                        .child(file_title(path)),
+                )
+                .child(
+                    h_flex()
+                        .gap_2()
+                        .justify_end()
+                        .child(self.button(
+                            "up-next-cancel",
+                            None,
+                            "Cancel",
+                            false,
+                            cx,
+                            |this, _, cx| {
+                                this.up_next = None;
+                                cx.notify();
+                            },
+                        ))
+                        .child(self.button(
+                            "up-next-play",
+                            Some("play"),
+                            "Play Now",
+                            true,
+                            cx,
+                            move |this, w, cx| {
+                                this.persist();
+                                this.open(next.clone(), w, cx);
+                            },
+                        )),
+                ),
+        )
+    }
+
+    /// OpenSubtitles search: query, results, and their state.
+    fn subtitle_search_view(&self, cx: &Context<Self>) -> Div {
+        let t = cx.theme();
+        let search = &self.subtitle_search;
+        let mut view = v_flex().gap_2().px_1().pb_1().child(
+            h_flex()
+                .gap_2()
+                .child(self.text_field(&self.subtitle_query, cx).flex_1())
+                .child(self.button(
+                    "subtitle-search",
+                    Some("search"),
+                    "Search",
+                    true,
+                    cx,
+                    |this, _, cx| this.search_subtitles(cx),
+                )),
+        );
+        let note = |text: String, color| {
+            div()
+                .px_1()
+                .text_size(t.font(12.))
+                .text_color(color)
+                .child(text)
+        };
+        match &search.results {
+            None if search.searching => view = view.child(note("Searching…".into(), t.muted)),
+            None => {}
+            Some(Err(error)) => {
+                view = view.child(note(error.clone(), t.danger));
+                if self.store.data.subtitle_key().is_empty() {
+                    view = view.child(self.button(
+                        "subtitle-settings",
+                        Some("palette"),
+                        "Open Appearance",
+                        false,
+                        cx,
+                        |this, w, cx| this.show_page(Page::Appearance, w, cx),
+                    ));
+                }
+            }
+            Some(Ok(results)) if results.is_empty() => {
+                view = view.child(note(
+                    "No subtitles found. Try another title or language.".into(),
+                    t.muted,
+                ));
+            }
+            Some(Ok(results)) => {
+                for (index, result) in results.iter().take(30).enumerate() {
+                    let id = ElementId::from(("subtitle-result", index));
+                    let downloading = search.downloading == Some(result.file_id);
+                    let choice = result.clone();
+                    let mut detail = vec![result.language.to_uppercase()];
+                    if result.hash_match {
+                        detail.push("Exact match".into());
+                    }
+                    if result.hearing_impaired {
+                        detail.push("SDH".into());
+                    }
+                    detail.push(format!("{} downloads", result.downloads));
+                    let row = v_flex()
+                        .id(id.clone())
+                        .relative()
+                        .px_2()
+                        .py_1p5()
+                        .rounded(px(t.radius))
+                        .cursor_pointer()
+                        .hover(|s| s.bg(t.selection))
+                        .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                            this.download_subtitle(choice.clone(), cx)
+                        }))
+                        .child(
+                            div()
+                                .overflow_hidden()
+                                .whitespace_nowrap()
+                                .child(result.release.clone()),
+                        )
+                        .child(
+                            div()
+                                .text_size(t.font(11.5))
+                                .text_color(if result.hash_match {
+                                    t.accent_text
+                                } else {
+                                    t.muted
+                                })
+                                .child(if downloading {
+                                    "Downloading…".to_owned()
+                                } else {
+                                    detail.join(" · ")
+                                }),
+                        );
+                    view = view.child(self.focusable(row, &id, None, t.radius, (-2., -2.), cx));
+                }
+            }
+        }
+        view.child(
+            h_flex()
+                .justify_between()
+                .pt_1()
+                .child(self.button(
+                    "subtitle-back",
+                    Some("arrow-left"),
+                    "Back",
+                    false,
+                    cx,
+                    |this, _, cx| {
+                        this.menu = Some(Menu::Tracks);
+                        cx.notify();
+                    },
+                ))
+                .child(
+                    div()
+                        .text_size(t.font(11.))
+                        .text_color(t.muted)
+                        .child("From OpenSubtitles.com"),
+                ),
+        )
+    }
+
+    /// Audio delay, adjustable in 50 ms steps, with a reset.
+    fn audio_delay_row(&self, cx: &Context<Self>) -> Div {
+        let t = cx.theme();
+        let delay = self.snapshot.audio_delay;
+        h_flex()
+            .gap_1()
+            .px_2()
+            .py_1()
+            .child(
+                div()
+                    .flex_1()
+                    .child(format!("Audio delay {:+.0} ms", delay * 1000.)),
+            )
+            .child(self.icon_button(
+                "audio-earlier",
+                "minus",
+                "Audio earlier by 50 ms",
+                cx,
+                |this, w, cx| this.shortcut(Shortcut::AudioDelayDown, w, cx),
+            ))
+            .child(self.icon_button(
+                "audio-later",
+                "plus",
+                "Audio later by 50 ms",
+                cx,
+                |this, w, cx| this.shortcut(Shortcut::AudioDelayUp, w, cx),
+            ))
+            .when(delay.abs() > 0.0005, |d| {
+                d.child(self.icon_button(
+                    "audio-delay-reset",
+                    "rotate-ccw",
+                    "Reset audio delay",
+                    cx,
+                    |this, _, cx| this.property("audio-delay", "0", cx),
+                ))
+            })
+            .text_color(t.text)
     }
 
     fn menu_panel(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
@@ -682,10 +1194,13 @@ impl Flick {
         let title = match menu {
             Menu::Tracks => "Audio & subtitles",
             Menu::Keys => "Keyboard shortcuts",
+            Menu::FindSubtitles => "Find subtitles",
         };
         let option = |id: SharedString, label: String, selected: bool| {
-            h_flex()
-                .id(id)
+            let id = ElementId::from(id);
+            let el = h_flex()
+                .id(id.clone())
+                .relative()
                 .gap_2()
                 .p_2()
                 .rounded(px(t.radius))
@@ -696,7 +1211,8 @@ impl Flick {
                         .size(px(16.))
                         .when(selected, |d| d.child(icon("check", 16., t.accent))),
                 )
-                .child(label)
+                .child(label);
+            self.focusable(el, &id, None, t.radius, (-2., -2.), cx)
         };
         let mut panel = v_flex()
             .id("panel")
@@ -711,7 +1227,7 @@ impl Flick {
             .rounded(px(t.card_radius))
             .shadow_lg()
             .text_color(t.text)
-            .text_size(px(13.))
+            .text_size(t.font(13.))
             .child(
                 div()
                     .px_2()
@@ -727,7 +1243,7 @@ impl Flick {
                             .px_2()
                             .pt_2()
                             .pb_1()
-                            .text_size(px(11.))
+                            .text_size(t.font(11.))
                             .text_color(t.muted)
                             .child(title),
                     );
@@ -753,6 +1269,9 @@ impl Flick {
                                 })),
                         );
                     }
+                    if kind == "audio" {
+                        panel = panel.child(self.audio_delay_row(cx));
+                    }
                     if kind == "sub" {
                         let off = !self
                             .snapshot
@@ -772,33 +1291,43 @@ impl Flick {
                         .pb_1()
                         .border_t_1()
                         .border_color(t.border)
+                        .flex()
+                        .flex_wrap()
+                        .gap_2()
                         .child(self.button(
                             "load-subtitle",
                             Some("captions"),
-                            "Load Subtitle File…",
+                            "Load File…",
                             false,
                             cx,
                             |this, w, cx| this.handle(Control::Subtitle, w, cx),
+                        ))
+                        .child(self.button(
+                            "find-subtitles",
+                            Some("search"),
+                            "Find Online…",
+                            false,
+                            cx,
+                            |this, w, cx| this.find_subtitles(w, cx),
                         )),
                 );
             }
+            Menu::FindSubtitles => {
+                panel = panel.child(self.subtitle_search_view(cx));
+            }
             Menu::Keys => {
-                let command = if cfg!(target_os = "macos") {
-                    "⌘"
-                } else {
-                    "Ctrl+"
-                };
-                for (key, action) in [
-                    ("Space".to_owned(), "Play / pause"),
-                    ("←  →".to_owned(), "Seek 10 seconds"),
-                    ("↑  ↓".to_owned(), "Change volume"),
-                    ("F / Esc".to_owned(), "Fullscreen / exit"),
-                    ("M".to_owned(), "Mute"),
-                    (format!("{command}O"), "Open video"),
-                    (format!("{command}L"), "Load subtitles"),
-                    (format!("{command}K"), "Search"),
-                    (format!("{command},"), "Appearance"),
-                ] {
+                let bindings = &self.store.data.shortcuts;
+                let rows = Shortcut::ALL
+                    .into_iter()
+                    .filter(|shortcut| !bindings.binding(*shortcut).is_empty())
+                    .map(|shortcut| {
+                        (
+                            crate::shortcuts::display(bindings.binding(shortcut)),
+                            shortcut.label(),
+                        )
+                    })
+                    .chain([("0 – 9".to_owned(), "Jump to 0–90%")]);
+                for (key, action) in rows {
                     panel = panel.child(
                         h_flex()
                             .justify_between()
@@ -806,9 +1335,17 @@ impl Flick {
                             .px_2()
                             .py_1p5()
                             .child(action)
-                            .child(div().text_size(px(12.)).text_color(t.muted).child(key)),
+                            .child(div().text_size(t.font(12.)).text_color(t.muted).child(key)),
                     );
                 }
+                panel = panel.child(
+                    div()
+                        .px_2()
+                        .pt_2()
+                        .text_size(t.font(11.))
+                        .text_color(t.muted)
+                        .child("Change these in Keyboard Shortcuts."),
+                );
             }
         }
         Some(panel.into_any_element())

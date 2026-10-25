@@ -109,3 +109,154 @@ jobs:
 
       - name: Build the release application
         run: cargo build --locked --release
+
+  macos-package:
+    name: Package / macOS app and DMG
+    runs-on: macos-latest
+    timeout-minutes: 75
+    env:
+      HOMEBREW_NO_AUTO_UPDATE: '1'
+      HOMEBREW_NO_INSTALL_CLEANUP: '1'
+      HOMEBREW_NO_ENV_HINTS: '1'
+      # Steps cannot test secrets directly; expose only whether they are set.
+      # Pull requests from forks receive no secrets and package ad-hoc only.
+      HAS_DEVELOPER_ID: ${{ secrets.MACOS_CERTIFICATE_P12 != '' && secrets.MACOS_CERTIFICATE_PASSWORD != '' && secrets.MACOS_CODESIGN_IDENTITY != '' }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Verify macOS Metal tools
+        run: |
+          xcode-select -p
+          xcrun --find metal
+          xcrun --find metallib
+
+      - name: Install mpv, FFmpeg, and ShellCheck
+        run: brew install mpv ffmpeg shellcheck
+
+      - name: Check the packaging scripts
+        run: |
+          shellcheck scripts/package-macos.sh packaging/macos/test-package-script.sh
+          /bin/bash -n scripts/package-macos.sh
+          /bin/bash scripts/package-macos.sh --dry-run
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.99.0
+
+      - uses: Swatinem/rust-cache@v2
+
+      # /bin/bash is the 3.2 release that ships with macOS, which most users run.
+      - name: Package an ad-hoc signed app and DMG
+        run: /bin/bash scripts/package-macos.sh --output-dir "$RUNNER_TEMP/adhoc"
+
+      - name: Check the ad-hoc bundle
+        run: |
+          app="$RUNNER_TEMP/adhoc/Flick.app"
+          /bin/bash scripts/package-macos.sh --verify "$app"
+          codesign --verify --deep --strict --verbose=2 "$app"
+          if otool -L "$app"/Contents/MacOS/flick "$app"/Contents/Frameworks/* \
+            | grep -E '^[[:space:]]+(/opt/homebrew|/usr/local)/'; then
+            echo '::error::The bundle still references Homebrew libraries.'
+            exit 1
+          fi
+          codesign --display --entitlements - "$app"
+          plutil -p "$app/Contents/Info.plist"
+          ls -l "$app/Contents/Frameworks" "$RUNNER_TEMP"/adhoc/*.dmg
+          cat "$app/Contents/Resources/Licenses/bundled-libraries/MANIFEST.tsv"
+
+      - name: Import the Developer ID certificate
+        if: env.HAS_DEVELOPER_ID == 'true'
+        env:
+          MACOS_CERTIFICATE_P12: ${{ secrets.MACOS_CERTIFICATE_P12 }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+        run: |
+          keychain="$RUNNER_TEMP/flick-signing.keychain-db"
+          keychain_password=$(uuidgen)
+          printf '%s' "$MACOS_CERTIFICATE_P12" | base64 --decode > "$RUNNER_TEMP/certificate.p12"
+          security create-keychain -p "$keychain_password" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$keychain_password" "$keychain"
+          security import "$RUNNER_TEMP/certificate.p12" -k "$keychain" -f pkcs12 \
+            -P "$MACOS_CERTIFICATE_PASSWORD" -T /usr/bin/codesign -T /usr/bin/security
+          rm -f "$RUNNER_TEMP/certificate.p12"
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$keychain_password" "$keychain" > /dev/null
+          security list-keychains -d user -s "$keychain" $(security list-keychains -d user | tr -d '"')
+          echo "FLICK_CODESIGN_KEYCHAIN=$keychain" >> "$GITHUB_ENV"
+
+      # Notarization runs only when all three notary secrets are set as well.
+      - name: Package with the Developer ID, then notarize and staple
+        if: env.HAS_DEVELOPER_ID == 'true'
+        env:
+          FLICK_CODESIGN_IDENTITY: ${{ secrets.MACOS_CODESIGN_IDENTITY }}
+          FLICK_NOTARY_APPLE_ID: ${{ secrets.MACOS_NOTARY_APPLE_ID }}
+          FLICK_NOTARY_TEAM_ID: ${{ secrets.MACOS_NOTARY_TEAM_ID }}
+          FLICK_NOTARY_PASSWORD: ${{ secrets.MACOS_NOTARY_PASSWORD }}
+        run: |
+          /bin/bash scripts/package-macos.sh --skip-build --output-dir "$RUNNER_TEMP/signed"
+          /bin/bash scripts/package-macos.sh --verify "$RUNNER_TEMP/signed/Flick.app"
+
+      - name: Generate a test video
+        run: bash scripts/make-test-video.sh "$RUNNER_TEMP/flick-test.mp4"
+
+      # With the Cellar and opt links moved away, any remaining reference to a
+      # Homebrew library fails to load instead of silently succeeding.
+      - name: Hide Homebrew's libraries
+        run: |
+          prefix=$(brew --prefix)
+          echo "FLICK_HIDDEN_HOMEBREW=$prefix" >> "$GITHUB_ENV"
+          mv "$prefix/Cellar" "$prefix/Cellar.hidden"
+          mv "$prefix/opt" "$prefix/opt.hidden"
+          test ! -e "$prefix/lib/libmpv.2.dylib"
+
+      - name: Play the test video with the bundled libmpv
+        run: |
+          test -z "${FLICK_MPV_LIBRARY:-}"
+          # A clean environment: no FLICK_MPV_LIBRARY and no DYLD_* variables.
+          smoke() {
+            env -i HOME="$HOME" TMPDIR="$RUNNER_TEMP" PATH=/usr/bin:/bin:/usr/sbin:/sbin FLICK_AUDIO=null \
+              "$1/Contents/MacOS/flick" --smoke-test "$RUNNER_TEMP/flick-test.mp4"
+          }
+          smoke "$RUNNER_TEMP/adhoc/Flick.app"
+          mount="$RUNNER_TEMP/flick-dmg"
+          mkdir -p "$mount"
+          hdiutil attach -nobrowse -readonly -mountpoint "$mount" "$RUNNER_TEMP"/adhoc/Flick-*.dmg
+          status=0
+          smoke "$mount/Flick.app" || status=$?
+          hdiutil detach "$mount"
+          if [ "$HAS_DEVELOPER_ID" = true ]; then
+            smoke "$RUNNER_TEMP/signed/Flick.app" || status=$?
+          fi
+          exit "$status"
+
+      - name: Restore Homebrew's libraries
+        if: always() && env.FLICK_HIDDEN_HOMEBREW != ''
+        run: |
+          prefix="$FLICK_HIDDEN_HOMEBREW"
+          if [ -d "$prefix/Cellar.hidden" ]; then mv "$prefix/Cellar.hidden" "$prefix/Cellar"; fi
+          if [ -d "$prefix/opt.hidden" ]; then mv "$prefix/opt.hidden" "$prefix/opt"; fi
+
+      - name: Remove the signing keychain
+        if: always() && env.FLICK_CODESIGN_KEYCHAIN != ''
+        run: security delete-keychain "$FLICK_CODESIGN_KEYCHAIN"
+
+      - name: Upload the ad-hoc DMG
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: flick-macos-adhoc
+          path: |
+            ${{ runner.temp }}/adhoc/*.dmg
+            ${{ runner.temp }}/adhoc/Flick.app/Contents/Resources/Licenses/bundled-libraries/MANIFEST.tsv
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload the Developer ID DMG
+        if: ${{ !cancelled() && env.HAS_DEVELOPER_ID == 'true' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: flick-macos-signed
+          path: ${{ runner.temp }}/signed/*.dmg
+          if-no-files-found: error
+          retention-days: 14

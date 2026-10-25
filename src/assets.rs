@@ -45,6 +45,7 @@ embedded_icons!(
     "sun",
     "eye-off",
     "magnet",
+    "picture-in-picture",
 );
 
 pub struct Assets;

@@ -12,6 +12,8 @@ pub struct SearchResult {
     pub size_bytes: u64,
     pub seeders: u64,
     pub source: String,
+    /// Internet Archive items download over HTTPS rather than by torrent.
+    pub archive_id: Option<String>,
 }
 impl SearchResult {
     pub fn input(&self) -> crate::torrent::TorrentInput {
@@ -224,6 +226,7 @@ fn parse_archive(value: serde_json::Value) -> Result<Vec<SearchResult>> {
             size_bytes: 0,
             seeders: 0,
             source: "Internet Archive".into(),
+            archive_id: Some(id.into()),
         });
     }
     Ok(items)
@@ -243,7 +246,15 @@ fn item(
         return None;
     }
     let infohash = hash.to_ascii_lowercase();
-    let magnet = librqbit::Magnet::from_id20(infohash.parse().ok()?, vec![], None).to_string();
+    let magnet = librqbit::Magnet::from_id20(
+        infohash.parse().ok()?,
+        crate::torrent::PUBLIC_TRACKERS
+            .iter()
+            .map(|s| (*s).to_owned())
+            .collect(),
+        None,
+    )
+    .to_string();
     Some(SearchResult {
         name,
         infohash: Some(infohash),
@@ -252,6 +263,7 @@ fn item(
         size_bytes,
         seeders,
         source: source.into(),
+        archive_id: None,
     })
 }
 #[cfg(test)]
@@ -310,6 +322,15 @@ mod tests {
             {"id":"3","info_hash":"bad","name":"Invalid","category":"201"}
         ])).unwrap();
         assert_eq!(rows.len(), 1);
+        for result in rows.iter() {
+            let url = reqwest::Url::parse(&result.magnet).unwrap();
+            let trackers: Vec<_> = url
+                .query_pairs()
+                .filter(|(key, _)| key == "tr")
+                .map(|(_, value)| value.into_owned())
+                .collect();
+            assert_eq!(trackers, crate::torrent::PUBLIC_TRACKERS);
+        }
         assert_eq!(rows[0].size_bytes, 1234);
         assert_eq!(rows[0].infohash, Some("a".repeat(40)));
         assert_eq!(
@@ -332,6 +353,7 @@ mod tests {
             serde_json::json!({"response":{"docs":[{"identifier":"sample?x=1","title":"Sample"}]}}),
         )
         .unwrap();
+        assert_eq!(results[0].archive_id.as_deref(), Some("sample?x=1"));
         let url = reqwest::Url::parse(results[0].torrent_url.as_ref().unwrap()).unwrap();
         assert_eq!(url.host_str(), Some("archive.org"));
         assert!(url.query().is_none());

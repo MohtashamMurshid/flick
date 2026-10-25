@@ -2,7 +2,9 @@
 
 ## Torlink
 
-The native search adapters in `src/catalog.rs` are derived from baairon/torlink source adapters.
+The native search adapters in `src/catalog.rs` are derived from baairon/torlink source adapters. The shared public tracker list in `src/torrent.rs` comes from
+[`src/sources/magnet.ts`](https://github.com/baairon/torlink/blob/df059311d0898b7245dd842153c1ff7c892275ee/src/sources/magnet.ts)
+at revision `df059311d0898b7245dd842153c1ff7c892275ee`.
 
 MIT License
 
@@ -25,6 +27,18 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+
+## Libraries bundled in the macOS app
+
+The source repository contains no libmpv or FFmpeg code. A `Flick.app` built by `scripts/package-macos.sh` redistributes libmpv and every non-system library it loads, copied from the build machine's installation (by default Homebrew). `Flick.app/Contents/Resources/Licenses/` always gets a manifest listing each library's formula, version, declared license, and source URL. It gets a library's license texts and Homebrew's SBOM only when the installed keg provides them; for a library with no license files, the manifest records `NONE FOUND` and the packager prints a warning. That folder also holds this file, the Inter font license (`assets/fonts/OFL.txt`), and the Hugeicons license (`assets/icons/LICENSE`).
+
+The exact set changes with each Homebrew update; the manifest in each bundle records what it ships. On 2026-10-24 Homebrew's formulae declared, among others:
+
+- mpv 0.41.0: GPL-2.0-or-later AND LGPL-2.1-or-later, built with mpv's GPL configuration and LuaJIT.
+- FFmpeg 9.0.2: GPL-3.0-or-later (`--enable-gpl --enable-version3`, with x264 and x265).
+- LuaJIT: MIT.
+
+Distributing such a bundle distributes GPL binaries. Flick's own license, the corresponding-source offer, Rust crate notices, and codec patents are unresolved. See [Packaging for macOS](docs/PACKAGING.md#licenses-and-what-the-bundle-ships) before publishing a build.
 
 ## GPUI text input example
 

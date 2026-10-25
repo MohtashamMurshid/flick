@@ -18,6 +18,7 @@ Share lets the user choose a file or folder, hashes its contents, seeds those ex
 
 - `playback`: libmpv lifecycle, video rendering, tracks, timing, seeking, and sound.
 - `torrent`: one librqbit session with explicit storage, stable torrent/file identifiers, validated file selection, progress, seeding, and lifecycle management. It must not depend on GPUI, application history, or libmpv.
+- `fetch`: link downloads, separate from the torrent session and GPUI: yt-dlp as an external process for video pages, and HTTPS files for direct links and Internet Archive items.
 - `ui`: GPUI views and input. The transfer service runs on a background Tokio runtime; the UI consumes typed state/events and never blocks on hashing, metadata, filesystem scanning, or a network wait.
 - `store`: desktop viewing settings and resume history. Transfer persistence uses a separate directory and is locked against multiple owners.
 
@@ -52,7 +53,7 @@ Native GPU presentation, hardware decode, HDR, battery use, audible synchronizat
 
 ## Watching during downloads
 
-Use librqbit's verified stream reads, either through a loopback-only authenticated range server or a libmpv stream callback. Choose that boundary after the complete-file workflow is stable. A local partial file is never a playback source just because its full-size directory entry exists.
+Use librqbit's verified stream reads, either through a loopback-only authenticated range server or a libmpv stream callback. The desktop now uses the libmpv stream callback (`flicktorrent://`); see [transfers](TRANSFERS.md). A local partial file is never a playback source just because its full-size directory entry exists.
 
 Handle buffering, startup/container metadata, seeks to unavailable pieces, client disconnects, cancellation, and downloads that cannot keep up. Do not expose a remote control or file server by default.
 
