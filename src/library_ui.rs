@@ -35,9 +35,7 @@ impl Flick {
         if self.search_link(&query, cx) {
             return;
         }
-        if query.starts_with("magnet:")
-            || (query.len() == 40 && query.bytes().all(|b| b.is_ascii_hexdigit()))
-        {
+        if is_torrent_link(&query) {
             self.resolve(flick::torrent::TorrentInput::Magnet(query), cx);
             return;
         }
@@ -395,7 +393,7 @@ impl Flick {
                             .child(title),
                     )
                     .child(self.action_icons(cx))
-                    .child(self.search_field(window, cx).w(t.font(220.)));
+                    .child(self.search_field(window, cx).w(t.font(250.)));
                 div()
                     .flex()
                     .size_full()
@@ -478,7 +476,7 @@ impl Flick {
                         d.child(self.icon_toggle(
                             "toggle-search",
                             "search",
-                            "Search (Ctrl+K)",
+                            "Search",
                             search_visible,
                             cx,
                             |this, w, cx| {
@@ -913,7 +911,61 @@ impl Flick {
             )
     }
 
+    /// Whether the search text is a link to download rather than words.
+    fn query_is_link(&self) -> bool {
+        let query = self.query.trim();
+        is_torrent_link(query) || flick::fetch::web_link(query).is_some()
+    }
+
+    /// A download offer for a pasted YouTube, X, web, or magnet link. Enter
+    /// or the button starts it, the same way.
+    fn link_suggestion(&self, cx: &Context<Self>) -> Option<Div> {
+        let t = cx.theme().clone();
+        let query = self.query.trim();
+        let (title, detail): (String, String) = if is_torrent_link(query) {
+            (
+                "Download this torrent".into(),
+                "Magnet link · Press Enter to see its files".into(),
+            )
+        } else {
+            match flick::fetch::web_link(query)? {
+                Ok(link @ flick::fetch::WebLink::Archive(_)) => (
+                    format!("Download from {}", link.site()),
+                    "Choose files first · Press Enter".into(),
+                ),
+                Ok(link @ flick::fetch::WebLink::Page(_)) => (
+                    format!("Download video from {}", link.site()),
+                    format!("{query} · Press Enter"),
+                ),
+                Err(error) => return Some(notice(&t, true, format!("{error:#}")).mb_6()),
+            }
+        };
+        let button = self.button(
+            "download-link",
+            Some("download"),
+            "Download",
+            true,
+            cx,
+            |this, _, cx| this.search(cx),
+        );
+        Some(
+            v_flex()
+                .mb_8()
+                .child(section_title(&t, "Link"))
+                .child(group(
+                    &t,
+                    vec![
+                        row(&t, Some("download"), title, Some(detail.into()), button)
+                            .into_any_element(),
+                    ],
+                )),
+        )
+    }
+
     fn search_section(&self, cx: &Context<Self>) -> Option<Div> {
+        if self.query_is_link() {
+            return self.link_suggestion(cx);
+        }
         let t = cx.theme().clone();
         if self.searching && self.search_results.is_none() {
             return Some(notice(&t, false, "Searching for videos online…").mb_6());
@@ -922,24 +974,7 @@ impl Flick {
         let mut rows = Vec::new();
         for (index, result) in results.items.iter().enumerate() {
             let source = result.clone();
-            let detail = if result.archive_id.is_some() {
-                format!(
-                    "{} · Downloads over HTTPS · choose files first",
-                    result.source
-                )
-            } else if result.torrent_url.is_some() {
-                format!(
-                    "{} · File sizes are shown before downloading",
-                    result.source
-                )
-            } else {
-                format!(
-                    "{} · {} · {} seeders",
-                    result.source,
-                    format_bytes(result.size_bytes),
-                    result.seeders
-                )
-            };
+            let detail = result_detail(result);
             rows.push(
                 row(
                     &t,
@@ -998,34 +1033,37 @@ impl Flick {
         Some(section)
     }
 
-    fn video_detail(&self, path: &std::path::Path) -> (Option<f32>, String) {
-        let Some(history) = self.store.data.recent.iter().find(|v| v.path == path) else {
-            let duration = self
-                .store
-                .data
-                .library
-                .iter()
-                .find(|video| video.path == path)
-                .map_or(0., |video| video.duration);
-            return (
-                None,
-                if duration > 0. {
-                    format!("Not started · {}", format_time(duration))
-                } else {
-                    "Not started".into()
-                },
-            );
-        };
+    pub(super) fn video_detail(&self, path: &std::path::Path) -> (Option<f32>, String) {
+        let data = &self.store.data;
+        let duration = data
+            .recent
+            .iter()
+            .find(|file| file.path == path)
+            .map(|file| file.duration)
+            .filter(|duration| *duration > 0.)
+            .or_else(|| {
+                data.library
+                    .iter()
+                    .find(|video| video.path == path)
+                    .map(|video| video.duration)
+            })
+            .unwrap_or(0.);
         let resume = self.store.resume_position(path);
-        if resume > 0. && history.duration > 0. {
-            (
-                Some((resume / history.duration).clamp(0., 1.) as f32),
-                format!("{} left", format_time(history.duration - resume)),
-            )
-        } else if history.duration > 0. {
-            (None, format!("Watched · {}", format_time(history.duration)))
+        if resume > 0. && duration > 0. {
+            return (
+                Some((resume / duration).clamp(0., 1.) as f32),
+                format!("{} left", format_time(duration - resume)),
+            );
+        }
+        let state = if data.watched(path) {
+            "Watched"
         } else {
-            (None, "Watched".into())
+            "Not started"
+        };
+        if duration > 0. {
+            (None, format!("{state} · {}", format_time(duration)))
+        } else {
+            (None, state.into())
         }
     }
 
@@ -1404,6 +1442,9 @@ impl Flick {
         let query = self.query.to_lowercase();
         let gap = 16.;
         let mut page = v_flex().w_full().children(self.search_section(cx));
+        if self.query_is_link() {
+            return page;
+        }
         let continuing = self
             .store
             .data
@@ -1483,6 +1524,9 @@ impl Flick {
     }
 
     fn videos_page(&self, width: f32, cx: &Context<Self>) -> Div {
+        if self.query_is_link() {
+            return v_flex().w_full().children(self.search_section(cx));
+        }
         let t = cx.theme().clone();
         let query = self.query.to_lowercase();
         let gap = 16.;
@@ -2371,6 +2415,33 @@ fn card_grid(cards: Vec<AnyElement>, cols: usize, gap: f32) -> Div {
         );
     }
     grid
+}
+
+/// Where an online result comes from and how it downloads.
+pub(super) fn result_detail(result: &flick::catalog::SearchResult) -> String {
+    if result.archive_id.is_some() {
+        format!(
+            "{} · Downloads over HTTPS · choose files first",
+            result.source
+        )
+    } else if result.torrent_url.is_some() {
+        format!(
+            "{} · File sizes are shown before downloading",
+            result.source
+        )
+    } else {
+        format!(
+            "{} · {} · {} seeders",
+            result.source,
+            format_bytes(result.size_bytes),
+            result.seeders
+        )
+    }
+}
+
+/// A magnet link or a bare 40-character infohash.
+pub(super) fn is_torrent_link(text: &str) -> bool {
+    text.starts_with("magnet:") || (text.len() == 40 && text.bytes().all(|b| b.is_ascii_hexdigit()))
 }
 
 fn empty_state(t: &Theme, name: &'static str, title: &'static str, detail: &'static str) -> Div {

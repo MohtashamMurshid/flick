@@ -116,7 +116,7 @@ impl Shortcut {
 /// Whether Flick handles `binding` itself before looking up shortcuts, so a
 /// shortcut bound to it would never run. That covers Tab and Escape with
 /// any modifiers, Enter, number keys, and the fixed Ctrl or ⌘ commands:
-/// O (open), K (search), comma (settings), and L (subtitles).
+/// O (open), K (search), comma (settings), L (subtitles), and Q (quit).
 fn reserved(binding: &str) -> bool {
     let mut key = binding;
     let mut command = false;
@@ -131,7 +131,7 @@ fn reserved(binding: &str) -> bool {
     match key {
         "escape" => true,
         "tab" => !command,
-        "o" | "k" | "," | "l" => command,
+        "o" | "k" | "," | "l" | "q" => command,
         _ => binding == "enter" || percent_key(binding).is_some(),
     }
 }
@@ -248,6 +248,18 @@ pub fn normalize(keystroke: &Keystroke) -> String {
     parts.join("-")
 }
 
+/// The platform's command key with `key`: `⌘K` on macOS, `Ctrl+K` elsewhere.
+pub fn command(key: &str) -> String {
+    display(&format!(
+        "{}-{key}",
+        if cfg!(target_os = "macos") {
+            "cmd"
+        } else {
+            "ctrl"
+        }
+    ))
+}
+
 /// A readable form of a binding, such as `Shift+L`, `←`, or `⌘O`.
 pub fn display(binding: &str) -> String {
     if binding.is_empty() {
@@ -362,6 +374,8 @@ mod tests {
             "ctrl-shift-k",
             "super-,",
             "cmd-l",
+            "cmd-q",
+            "ctrl-q",
         ] {
             assert!(bindings.assign(Shortcut::Mute, key).is_err(), "{key}");
         }

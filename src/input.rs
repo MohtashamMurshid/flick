@@ -46,6 +46,9 @@ pub struct TextInput {
     /// Read-only fields keep selection and copying but reject edits, so
     /// values such as magnet links and paths can be selected and copied.
     read_only: bool,
+    /// Text size in points, before the user's text scale. Defaults to the
+    /// theme's body size.
+    size: Option<f32>,
 }
 
 impl TextInput {
@@ -610,6 +613,7 @@ impl Element for TextElement {
 
 impl Render for TextInput {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let size = self.size.unwrap_or(cx.theme().text_size);
         div()
             .flex()
             .key_context("TextInput")
@@ -637,8 +641,8 @@ impl Render for TextInput {
             .overflow_hidden()
             .items_center()
             .text_color(cx.theme().text)
-            .text_size(cx.theme().font(cx.theme().text_size))
-            .line_height(cx.theme().font(20.))
+            .text_size(cx.theme().font(size))
+            .line_height(cx.theme().font((size * 1.5).round().max(20.)))
             .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
                 if this.read_only {
                     return;
@@ -673,7 +677,7 @@ impl TextInput {
         Self {
             focus_handle: cx.focus_handle().tab_stop(true),
             content: "".into(),
-            placeholder: "Search library or find videos online".into(),
+            placeholder: "Search or find videos".into(),
             selected_range: 0..0,
             selection_reversed: false,
             marked_range: None,
@@ -682,7 +686,14 @@ impl TextInput {
             is_selecting: false,
             scroll_x: px(0.),
             read_only: false,
+            size: None,
         }
+    }
+
+    /// Draws the text at `size` points, such as a large search field.
+    pub fn with_size(mut self, size: f32) -> Self {
+        self.size = Some(size);
+        self
     }
 
     /// An editable field with its own placeholder.
