@@ -30,7 +30,7 @@ SOFTWARE.
 
 ## Libraries bundled in the macOS app
 
-The source repository contains no libmpv or FFmpeg code. A `Flick.app` built by `scripts/package-macos.sh` redistributes libmpv and every non-system library it loads, copied from the build machine's installation (by default Homebrew). Their license texts, Homebrew's SBOM, and a manifest listing each library's formula, version, declared license, and source URL are placed in `Flick.app/Contents/Resources/Licenses/`. That folder also holds this file, the Inter font license (`assets/fonts/OFL.txt`), and the Hugeicons license (`assets/icons/LICENSE`).
+The source repository contains no libmpv or FFmpeg code. A `Flick.app` built by `scripts/package-macos.sh` redistributes libmpv and every non-system library it loads, copied from the build machine's installation (by default Homebrew). `Flick.app/Contents/Resources/Licenses/` always gets a manifest listing each library's formula, version, declared license, and source URL. It gets a library's license texts and Homebrew's SBOM only when the installed keg provides them; for a library with no license files, the manifest records `NONE FOUND` and the packager prints a warning. That folder also holds this file, the Inter font license (`assets/fonts/OFL.txt`), and the Hugeicons license (`assets/icons/LICENSE`).
 
 The exact set changes with each Homebrew update; the manifest in each bundle records what it ships. On 2026-10-24 Homebrew's formulae declared, among others:
 

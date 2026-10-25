@@ -18,7 +18,22 @@ Pull request #3 ran CI twice at `051da49`. In the `pull_request` run, the `Trans
 
 The fix treats a refused bind like a busy one, both when probing ports and when librqbit's own bind fails at startup, so Flick moves to another port. The new `torrent::tests::refused_ports_are_replaced_like_busy_ones` uses port 1, which unprivileged Linux processes cannot bind, as the stand-in for a reserved port. The test returns early where that bind succeeds. With the fix reverted, it failed on this VM with "Permission denied (os error 13)"; with the fix, it passed.
 
-On Linux (Ubuntu 24.04.5, Rust 1.99.0): `cargo fmt --check`, strict Clippy with and without default features, and `cargo test` all passed: 44 library tests, 48 desktop tests and 9 local transfer tests, with 11 ignored. No desktop playback was run, and the fix has not yet run on Windows.
+On Linux (Ubuntu 24.04.5, Rust 1.99.0): `cargo fmt --check`, strict Clippy with and without default features, and `cargo test` all passed: 44 library tests, 48 desktop tests and 9 local transfer tests, with 11 ignored. No desktop playback was run. After the push, both `Transfers without desktop / windows-latest` runs passed at `1896f19`.
+
+### Pull request #3 review fixes on 2026-10-25
+
+CodeRabbit reviewed `051da49` and left 12 comments and one nitpick. All were checked against the code and fixed:
+
+- **Episodes:** Next and previous episode skipped to another copy of the same episode, such as a 720p and a 1080p file. They now step past copies, in both directions.
+- **Watched state:** opening a video counted as watching it, so sampled episodes showed as watched and an in-progress video offered only "Mark as Unwatched". History and torrent records now carry a `finished` flag. It is set by Mark as Watched, or by stopping within the last 10 seconds after playing at least half. Watching again keeps it, Mark as Unwatched clears it, and torrent media follows its torrent's record, like the resume position. Sorting by last watched now builds its order once instead of searching history for every comparison.
+- **Exit with posters queued:** closing Flick waited for the poster worker to finish every queued video. A closed queue still delivers what was sent, so the worker now checks a stop flag and quits after its current file.
+- **Shortcuts:** rebinding accepted keys Flick handles before looking up shortcuts, so they never ran: Ctrl or ⌘ with O, K, comma or L, Escape with modifiers, and Tab with Alt. These are refused, and hand-edited settings that use them are unset. A test also checks that no default binding is reserved.
+- **Subtitles:** the fallback folder applied only to permission errors, not read-only file systems, and it downloaded the subtitle a second time, using another download from the OpenSubtitles daily quota. `Client::download` now returns the subtitle in memory, and only saving is retried.
+- **Transfers:** if the transfer runtime could not be created, local files stayed pending because no empty transfer list was sent. It is sent now.
+- **Packaging test:** `packaging/macos/test-package-script.sh` used GNU `sed -i` and a `\n` replacement, which BSD `sed` on macOS handles differently. It now rewrites files with `grep -v` and `mv`, and joins lines with `paste`.
+- **Documentation:** removed stale statements that streaming is unimplemented (README, `docs/TRANSFERS.md`, `docs/SHARING_PLAN.md`), limited the HTTPS resume claim to what is tested, described the conditional license and SBOM copies in `THIRD_PARTY_NOTICES.md`, and stopped claiming a Flick license for the picture-in-picture icon, since the project has none yet.
+
+Checks on Linux: `cargo fmt --check`, strict Clippy with and without default features, and `cargo test` passed (44 library, 48 desktop and 9 local transfer tests; 11 ignored). New assertions cover duplicate episode copies, watched state through `remember`, Mark as Watched and Unwatched for local and torrent media, and the reserved keys. ShellCheck reported nothing, and the packaging test passed all 35 checks under GNU tools; it has not run with BSD tools. The exit-time poster fix, the read-only fallback and the runtime failure path have no automated test and were not exercised interactively. No desktop playback was run.
 
 ### macOS packaging script on 2026-10-24
 

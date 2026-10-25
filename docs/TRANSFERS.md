@@ -81,7 +81,7 @@ Press Ctrl+C to stop sharing successfully. Interrupting inspect or download befo
 - The pinned engine can append an extra empty piece when creating torrents whose total size is exactly divisible by the piece length. The adapter removes only that known invalid trailing hash and re-encodes the info dictionary before calculating/exporting the magnet. The regression independently checks piece content and the infohash with SHA-1. Other invalid creation output is rejected before starting a seed.
 - Shared content is verified in place before it is announced. Metadata is exported only to an explicitly chosen diagnostic output, rather than written into the shared folder automatically. Symbolic links and special files are refused.
 - Snapshots expose checking/downloading/paused/seeding/error state, selected files, verified progress, peers, and transfer speeds. `completed_file` rejects incomplete or unselected files. A partial file's existence is not a playback guarantee.
-- Streaming incomplete downloads, further provider maintenance, installer packaging, and cross-platform GUI acceptance remain in [the plan](../PLAN.md).
+- Further provider maintenance, installer packaging, and cross-platform GUI acceptance remain in [the plan](../PLAN.md).
 
 ## Isolated desktop checks
 

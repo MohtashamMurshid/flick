@@ -255,6 +255,8 @@ impl Services {
                     Err(error) => {
                         let _ = events_tx
                             .send(Event::Error(format!("Downloads could not start: {error}")));
+                        // No transfers exist, so local files can open.
+                        let _ = events_tx.send(Event::Progress(Vec::new()));
                         return;
                     }
                 };
@@ -484,15 +486,22 @@ fn subtitles(command: Command, events: &mpsc::Sender<Event>) -> Option<Command> 
             tokio::spawn(async move {
                 let saved = async {
                     let client = flick::subtitles::Client::new(&key)?;
-                    match client.download(&result, &folder, &stem).await {
+                    let subtitle = client.download(&result).await?;
+                    // Videos on read-only media get the subtitle in the
+                    // fallback folder, without downloading it again.
+                    match subtitle.save(&folder, &stem) {
                         Err(error)
                             if error.chain().any(|cause| {
                                 cause.downcast_ref::<std::io::Error>().is_some_and(|e| {
-                                    e.kind() == std::io::ErrorKind::PermissionDenied
+                                    matches!(
+                                        e.kind(),
+                                        std::io::ErrorKind::PermissionDenied
+                                            | std::io::ErrorKind::ReadOnlyFilesystem
+                                    )
                                 })
                             }) =>
                         {
-                            client.download(&result, &fallback, &stem).await
+                            subtitle.save(&fallback, &stem)
                         }
                         saved => saved,
                     }

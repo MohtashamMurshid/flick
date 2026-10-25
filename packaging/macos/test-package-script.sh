@@ -136,7 +136,8 @@ case " $* " in
     [[ " $* " == *" --options runtime "* ]] && flags=${flags:+$flags,}runtime
     file=$(main_of "$target")
     if head -n 1 "$file" | grep -q '^FAKE-MACHO'; then
-      sed -i '/^signed /d' "$file"; echo "signed $flags" >> "$file"
+      grep -v '^signed ' "$file" > "$file.tmp" || true
+      mv "$file.tmp" "$file"; echo "signed $flags" >> "$file"
     fi ;;
 esac
 EOF
@@ -144,7 +145,7 @@ EOF
 stub lipo <<'EOF'
 #!/usr/bin/env bash
 [[ $1 == -archs ]] || exit 1
-sed -n 's/^arch //p' "$2" | tr '\n' ' ' | sed 's/ $/\n/'
+sed -n 's/^arch //p' "$2" | paste -s -d ' ' -
 EOF
 
 stub plutil <<'EOF'
@@ -347,7 +348,10 @@ echo "dep /opt/homebrew/opt/x264/lib/libx264.164.dylib" >> "$root/Tampered.app/C
 check "--verify rejects a Homebrew reference" bash -c '! bash "$1" --verify "$2" > "$3" 2>&1 && grep -q "otool -L still lists Homebrew paths" "$3"' _ "$script" "$root/Tampered.app" "$root/verify.log"
 rm -rf "$root/Tampered.app"
 cp -R "$app" "$root/Unsigned.app"
-sed -i '/^signed /d' "$root/Unsigned.app/Contents/Frameworks/libintl.8.dylib"
+# BSD sed has no GNU-style -i, so rewrite the file instead.
+unsigned=$root/Unsigned.app/Contents/Frameworks/libintl.8.dylib
+grep -v '^signed ' "$unsigned" > "$unsigned.tmp" || true
+mv "$unsigned.tmp" "$unsigned"
 check "--verify rejects an unsigned dylib" bash -c '! bash "$1" --verify "$2" > /dev/null 2>&1' _ "$script" "$root/Unsigned.app"
 check "refuses to overwrite without --force" \
   bash -c '! bash "$1" --skip-build --output-dir "$2" > "$3" 2>&1 && grep -q "refusing to overwrite" "$3"' _ "$script" "$out" "$root/force.log"

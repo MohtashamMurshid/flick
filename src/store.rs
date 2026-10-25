@@ -56,6 +56,8 @@ pub struct TorrentResume {
     pub path: PathBuf,
     pub position: f64,
     pub duration: f64,
+    #[serde(default)]
+    pub finished: bool,
 }
 
 /// How All Videos is sorted and laid out.
@@ -106,6 +108,9 @@ pub struct RecentFile {
     /// Removed from Continue Watching until the video is played again. The
     /// saved position is kept, so opening it still resumes.
     pub dismissed: bool,
+    /// Played to the end or marked watched. Opening a video alone does not
+    /// set it, and watching again keeps it until marked unwatched.
+    pub finished: bool,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -193,6 +198,7 @@ impl Settings {
             return;
         }
         self.add_video(path);
+        let finished = self.watched(path);
         self.recent.retain(|file| file.path != path);
         let mut file = RecentFile {
             path: path.to_owned(),
@@ -200,8 +206,10 @@ impl Settings {
             position,
             duration,
             dismissed: false,
+            finished,
         };
         file.sanitize();
+        file.finished |= reached_end(file.position, file.duration);
         if let Some(identity) = self
             .library
             .iter()
@@ -216,6 +224,7 @@ impl Settings {
                     path: path.to_owned(),
                     position: file.position,
                     duration: file.duration,
+                    finished: file.finished,
                 },
             );
         }
@@ -243,6 +252,7 @@ impl Settings {
                 path: path.to_owned(),
                 position: file.position,
                 duration: file.duration,
+                finished: file.finished,
             });
         }
     }
@@ -275,6 +285,7 @@ impl Settings {
             position: duration,
             duration,
             dismissed: false,
+            finished: true,
         };
         match index {
             Some(index) => self.recent[index] = file,
@@ -295,6 +306,7 @@ impl Settings {
                     path: path.to_owned(),
                     position: duration,
                     duration,
+                    finished: true,
                 },
             );
         }
@@ -319,13 +331,30 @@ impl Settings {
                     path: path.to_owned(),
                     position: 0.0,
                     duration: 0.0,
+                    finished: false,
                 },
             );
         }
     }
 
+    /// Whether the video was played to the end or marked watched. Torrent
+    /// media follows its torrent's record, like the resume position.
     pub fn watched(&self, path: &Path) -> bool {
-        self.recent.iter().any(|file| file.path == path)
+        if let Some(identity) = self
+            .library
+            .iter()
+            .find(|v| v.path == path)
+            .and_then(|v| v.torrent.as_ref())
+            && let Some(saved) = self
+                .torrent_history
+                .iter()
+                .find(|h| &h.identity == identity)
+        {
+            return saved.finished;
+        }
+        self.recent
+            .iter()
+            .any(|file| file.path == path && file.finished)
     }
 
     /// Library videos in the chosen order. Ties keep the order of addition.
@@ -334,12 +363,20 @@ impl Settings {
         match sort {
             Sort::Added => {}
             Sort::Title => videos.sort_by_cached_key(|video| video.title.to_lowercase()),
-            Sort::Watched => videos.sort_by_key(|video| {
-                self.recent
+            Sort::Watched => {
+                let order = self
+                    .recent
                     .iter()
-                    .position(|file| file.path == video.path)
-                    .unwrap_or(usize::MAX)
-            }),
+                    .enumerate()
+                    .map(|(index, file)| (file.path.as_path(), index))
+                    .collect::<std::collections::HashMap<_, _>>();
+                videos.sort_by_key(|video| {
+                    order
+                        .get(video.path.as_path())
+                        .copied()
+                        .unwrap_or(usize::MAX)
+                });
+            }
         }
         videos
     }
@@ -429,6 +466,12 @@ impl RecentFile {
             self.title = file_title(&self.path);
         }
     }
+}
+
+/// Within the last 10 seconds, where resuming stops, after playing at least
+/// half, so closing a short clip right after opening it does not count.
+fn reached_end(position: f64, duration: f64) -> bool {
+    duration > 0.0 && duration - position < 10.0 && position >= duration / 2.0
 }
 
 fn eligible_resume(position: f64, duration: f64) -> f64 {
@@ -606,11 +649,15 @@ mod tests {
         );
         assert_eq!(loaded.resume_position(Path::new("another.mkv")), 0.0);
         assert_eq!(loaded.resume_position(Path::new("other-hash.mkv")), 0.0);
+        // Watched state follows the torrent too, whichever path played it.
+        assert!(!loaded.data.watched(original));
         loaded.data.mark_watched(moved);
         assert_eq!(loaded.resume_position(original), 0.0);
+        assert!(loaded.data.watched(original));
         loaded.data.remember(moved, 60.0, 200.0);
         loaded.data.mark_unwatched(moved);
         assert_eq!(loaded.resume_position(original), 0.0);
+        assert!(!loaded.data.watched(original));
         loaded.save().unwrap();
         assert_eq!(
             Store::load_from(settings_path).resume_position(original),
@@ -771,6 +818,16 @@ mod tests {
         assert_eq!(settings.resume_position(Path::new("b.mkv")), 40.0);
         settings.remember(Path::new("b.mkv"), 41.0, 120.0);
         assert_eq!(continuing(&settings)[0], Path::new("b.mkv"));
+
+        // Opening or sampling a video does not count as watching it.
+        assert!(!settings.watched(Path::new("b.mkv")));
+        settings.remember(Path::new("short.mkv"), 0.0, 8.0);
+        assert!(!settings.watched(Path::new("short.mkv")));
+        // Reaching the end does, and watching again keeps it.
+        settings.remember(Path::new("b.mkv"), 115.0, 120.0);
+        assert!(settings.watched(Path::new("b.mkv")));
+        settings.remember(Path::new("b.mkv"), 30.0, 120.0);
+        assert!(settings.watched(Path::new("b.mkv")));
 
         settings.mark_watched(Path::new("a.mkv"));
         assert_eq!(settings.resume_position(Path::new("a.mkv")), 0.0);

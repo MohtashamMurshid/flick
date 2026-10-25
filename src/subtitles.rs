@@ -108,14 +108,9 @@ impl Client {
         Ok(results)
     }
 
-    /// Downloads a subtitle into `folder`, named after the video and
-    /// language, without overwriting an existing file.
-    pub async fn download(
-        &self,
-        result: &SubtitleResult,
-        folder: &Path,
-        video_stem: &str,
-    ) -> Result<PathBuf> {
+    /// Downloads a subtitle into memory. Each call uses one download from
+    /// the account's daily quota, so save the result rather than repeating it.
+    pub async fn download(&self, result: &SubtitleResult) -> Result<Subtitle> {
         let response = self
             .http
             .post(self.base.join("download")?)
@@ -150,10 +145,28 @@ impl Client {
         )
         .await?;
         ensure!(!bytes.is_empty(), "The subtitle file was empty");
-        let language =
-            crate::fetch::safe_file_name(&result.language).unwrap_or_else(|| "sub".into());
+        Ok(Subtitle {
+            language: crate::fetch::safe_file_name(&result.language)
+                .unwrap_or_else(|| "sub".into()),
+            extension,
+            bytes,
+        })
+    }
+}
+
+/// A downloaded subtitle that has not been saved yet.
+pub struct Subtitle {
+    language: String,
+    extension: String,
+    bytes: Vec<u8>,
+}
+
+impl Subtitle {
+    /// Saves into `folder`, named after the video and language, without
+    /// overwriting an existing file.
+    pub fn save(&self, folder: &Path, video_stem: &str) -> Result<PathBuf> {
         let stem = crate::fetch::safe_file_name(video_stem).unwrap_or_else(|| "subtitles".into());
-        write_new(folder, &stem, &language, &extension, &bytes)
+        write_new(folder, &stem, &self.language, &self.extension, &self.bytes)
     }
 }
 
@@ -429,13 +442,15 @@ mod tests {
         assert!(search.contains("moviehash=0123456789abcdef"));
         assert!(search.contains("query=the+movie"));
         let root = tempfile::tempdir()?;
-        let first = client
-            .download(&results[0], root.path(), "../Movie")
-            .await?;
+        let subtitle = client.download(&results[0]).await?;
+        let first = subtitle.save(root.path(), "../Movie")?;
         assert_eq!(first, root.path().join("Movie.en.srt"));
         assert!(std::fs::read_to_string(&first)?.contains("Hello"));
         // A second download keeps the first.
-        let second = client.download(&results[0], root.path(), "Movie").await?;
+        let second = client
+            .download(&results[0])
+            .await?
+            .save(root.path(), "Movie")?;
         assert_eq!(second, root.path().join("Movie.en (2).srt"));
         let bad = Client::with_base(reqwest::Client::new(), &base, "wrong")?;
         let error = bad.search("x", None, "en").await.unwrap_err().to_string();

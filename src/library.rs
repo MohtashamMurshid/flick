@@ -238,6 +238,8 @@ pub fn group_shows<'a>(paths: impl IntoIterator<Item = &'a Path>) -> Vec<Show> {
 }
 
 /// The episode after (or before, with `step` -1) `current` within its show.
+/// Other copies of the current episode, such as a 720p and a 1080p file, are
+/// skipped.
 pub fn adjacent_episode<'a>(
     paths: impl IntoIterator<Item = &'a Path>,
     current: &Path,
@@ -249,9 +251,16 @@ pub fn adjacent_episode<'a>(
             .first()
             .is_some_and(|(e, _)| e.show_key() == key)
     })?;
-    let index = show.episodes.iter().position(|(_, p)| p == current)?;
-    let target = index.checked_add_signed(step)?;
-    show.episodes.get(target).map(|(_, path)| path.clone())
+    let mut index = show.episodes.iter().position(|(_, p)| p == current)?;
+    let number = |e: &Episode| (e.season, e.episode);
+    let here = number(&show.episodes[index].0);
+    loop {
+        index = index.checked_add_signed(step)?;
+        let (episode, path) = show.episodes.get(index)?;
+        if number(episode) != here {
+            return Some(path.clone());
+        }
+    }
 }
 
 pub fn format_bytes(bytes: u64) -> String {
@@ -353,6 +362,28 @@ mod tests {
         assert_eq!(next("/tv/The Expanse S02E01.mkv", 1), None);
         assert_eq!(next("/tv/the expanse S01E01.mkv", -1), None);
         assert_eq!(next("/films/Sintel.mp4", 1), None);
+
+        // Two copies of one episode step past each other, in both directions.
+        let copies = [
+            "/tv/Show.S01E01.mkv",
+            "/tv/Show.S01E02.720p.mkv",
+            "/tv/Show.S01E02.1080p.mkv",
+            "/tv/Show.S01E03.mkv",
+        ]
+        .map(PathBuf::from);
+        let next = |current: &str, step| {
+            adjacent_episode(
+                copies.iter().map(PathBuf::as_path),
+                Path::new(current),
+                step,
+            )
+        };
+        for copy in ["/tv/Show.S01E02.720p.mkv", "/tv/Show.S01E02.1080p.mkv"] {
+            assert_eq!(next(copy, 1), Some(PathBuf::from("/tv/Show.S01E03.mkv")));
+            assert_eq!(next(copy, -1), Some(PathBuf::from("/tv/Show.S01E01.mkv")));
+        }
+        let previous = next("/tv/Show.S01E03.mkv", -1).and_then(|p| parse_episode(&p));
+        assert_eq!(previous.map(|e| e.label()).as_deref(), Some("S01E02"));
     }
 
     #[test]

@@ -10,7 +10,11 @@ use crate::playback::{Player, PlayerEvent};
 use anyhow::{Context, Result, bail, ensure};
 use std::{
     path::{Path, PathBuf},
-    sync::mpsc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    },
     thread,
     time::{Duration, Instant, UNIX_EPOCH},
 };
@@ -39,6 +43,8 @@ pub struct Thumbnails {
     requests: Option<mpsc::Sender<PathBuf>>,
     results: mpsc::Receiver<Poster>,
     worker: Option<thread::JoinHandle<()>>,
+    /// Set on drop so the worker skips files still queued.
+    stop: Arc<AtomicBool>,
 }
 
 impl Thumbnails {
@@ -47,11 +53,16 @@ impl Thumbnails {
     pub fn start(cache: Option<PathBuf>) -> Self {
         let (requests, queue) = mpsc::channel::<PathBuf>();
         let (sender, results) = mpsc::channel();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stopped = stop.clone();
         let worker = thread::Builder::new()
             .name("flick-thumbnails".into())
             .spawn(move || {
                 let mut player = None;
                 for video in queue {
+                    if stopped.load(Ordering::Relaxed) {
+                        break;
+                    }
                     let result = cache
                         .as_deref()
                         .context("No cache directory is available for thumbnails")
@@ -67,6 +78,7 @@ impl Thumbnails {
             requests: worker.is_some().then_some(requests),
             results,
             worker,
+            stop,
         }
     }
 
@@ -83,7 +95,9 @@ impl Thumbnails {
 
 impl Drop for Thumbnails {
     fn drop(&mut self) {
-        // Closing the queue ends the worker after its current file.
+        // A closed queue still yields what was sent, so the flag makes the
+        // worker stop after its current file instead of finishing the queue.
+        self.stop.store(true, Ordering::Relaxed);
         self.requests.take();
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();

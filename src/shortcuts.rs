@@ -113,8 +113,28 @@ impl Shortcut {
     }
 }
 
-/// Keys Flick reserves for navigation, text editing, and fixed commands.
-const RESERVED: [&str; 4] = ["tab", "shift-tab", "escape", "enter"];
+/// Whether Flick handles `binding` itself before looking up shortcuts, so a
+/// shortcut bound to it would never run. That covers Tab and Escape with
+/// any modifiers, Enter, number keys, and the fixed Ctrl or ⌘ commands:
+/// O (open), K (search), comma (settings), and L (subtitles).
+fn reserved(binding: &str) -> bool {
+    let mut key = binding;
+    let mut command = false;
+    while let Some((modifier, rest)) = key.split_once('-') {
+        match modifier {
+            "ctrl" | "cmd" | "super" => command = true,
+            "alt" | "shift" => {}
+            _ => break,
+        }
+        key = rest;
+    }
+    match key {
+        "escape" => true,
+        "tab" => !command,
+        "o" | "k" | "," | "l" => command,
+        _ => binding == "enter" || percent_key(binding).is_some(),
+    }
+}
 
 /// The user's bindings. Only changes from the defaults are stored, so new
 /// shortcuts in later versions get their defaults.
@@ -144,9 +164,7 @@ impl Bindings {
         shortcut: Shortcut,
         keystroke: &str,
     ) -> Result<Option<Shortcut>, String> {
-        if RESERVED.contains(&keystroke)
-            || keystroke.len() == 1 && keystroke.chars().all(|c| c.is_ascii_digit())
-        {
+        if reserved(keystroke) {
             return Err(format!(
                 "{} is reserved. Choose another key.",
                 display(keystroke)
@@ -196,7 +214,7 @@ impl Bindings {
             .partition(|shortcut| !self.0.contains_key(shortcut));
         for shortcut in defaults.into_iter().chain(changed) {
             let binding = self.binding(shortcut).to_owned();
-            if !binding.is_empty() && !seen.insert(binding) {
+            if !binding.is_empty() && (reserved(&binding) || !seen.insert(binding)) {
                 self.0.insert(shortcut, String::new());
             }
         }
@@ -299,6 +317,7 @@ mod tests {
         let mut seen = std::collections::HashSet::new();
         for shortcut in Shortcut::ALL {
             assert!(seen.insert(bindings.binding(shortcut)), "{shortcut:?}");
+            assert!(!reserved(shortcut.default_binding()), "{shortcut:?}");
             assert_eq!(bindings.lookup(shortcut.default_binding()), Some(shortcut));
         }
         let json = serde_json::to_string(&bindings).unwrap();
@@ -330,10 +349,38 @@ mod tests {
     #[test]
     fn reserved_and_number_keys_cannot_be_bound() {
         let mut bindings = Bindings::default();
-        assert!(bindings.assign(Shortcut::Mute, "tab").is_err());
-        assert!(bindings.assign(Shortcut::Mute, "5").is_err());
-        assert_eq!(bindings.assign(Shortcut::Mute, "shift-m"), Ok(None));
-        assert_eq!(bindings.lookup("shift-m"), Some(Shortcut::Mute));
+        for key in [
+            "tab",
+            "alt-tab",
+            "shift-tab",
+            "escape",
+            "shift-escape",
+            "enter",
+            "5",
+            "ctrl-o",
+            "cmd-o",
+            "ctrl-shift-k",
+            "super-,",
+            "cmd-l",
+        ] {
+            assert!(bindings.assign(Shortcut::Mute, key).is_err(), "{key}");
+        }
+        for key in [
+            "shift-m",
+            "ctrl-tab",
+            "alt-enter",
+            "ctrl-5",
+            "ctrl--",
+            "-",
+            "ctrl-f",
+        ] {
+            assert!(bindings.assign(Shortcut::Mute, key).is_ok(), "{key}");
+            assert_eq!(bindings.lookup(key), Some(Shortcut::Mute));
+        }
+        // A reserved key in hand-edited settings is unset.
+        let mut edited: Bindings = serde_json::from_str(r#"{"mute":"ctrl-o"}"#).unwrap();
+        edited.sanitize();
+        assert_eq!(edited.binding(Shortcut::Mute), "");
     }
 
     #[test]
