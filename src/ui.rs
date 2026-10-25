@@ -768,6 +768,7 @@ impl Flick {
     fn text_focused(&self, window: &Window, cx: &Context<Self>) -> bool {
         [
             &self.search_input,
+            &self.palette_input,
             &self.magnet_field,
             &self.folder_field,
             &self.subtitle_query,
