@@ -20,7 +20,7 @@ Flick plays video inside its window with libmpv: play and pause, seeking, volume
 
 libmpv uses the platform's hardware decoder when available (`hwdec=auto-copy`). Set `FLICK_HWDEC=no` to compare against software decoding. libmpv renders into the frame GPUI uploads. This frame transfer follows the display's physical video bounds with no fixed resolution or pixel-budget cap, and native dimension or allocation failures are reported instead of silently lowering resolution. Efficient native GPU video presentation is a separate milestone; this version makes no claim of being faster than VLC.
 
-The captions icon opens **Audio & subtitles** to select tracks, adjust audio delay, load a subtitle file, or find subtitles on OpenSubtitles.com. Finding subtitles needs a free personal API key from OpenSubtitles, entered in **Appearance** or set with `FLICK_OPENSUBTITLES_KEY`. The key is stored in `settings.json`.
+The captions icon opens **Audio & subtitles** to select tracks, adjust audio delay, load a subtitle file, or find subtitles on OpenSubtitles.com. Finding subtitles needs a free personal API key from OpenSubtitles, entered in **Appearance** or set with `FLICK_OPENSUBTITLES_KEY`. A key entered in Appearance is stored in `settings.json`; the environment variable overrides it and is never stored.
 
 ## Torrents and Watch Now
 
@@ -93,13 +93,23 @@ Flick draws its interface in a macOS, Windows 11, or GNOME style and matches the
 
 ## Settings and environment variables
 
-Preferences are saved to `settings.json` in the operating system's per-user application configuration directory.
+Preferences are saved to `settings.json` in the operating system's per-user application configuration directory. If the file can't be read or parsed, Flick starts with default settings.
 
 | Variable | Effect |
 | --- | --- |
+| `FLICK_SETTINGS_PATH` | Full path to a settings file to use instead of `settings.json` in the configuration directory. |
+| `FLICK_DATA_DIR` | Base folder for torrent state (in `transfers`) and cached posters (in `thumbnails`). By default, torrent state goes in the platform's data directory and posters in its cache directory. |
 | `FLICK_DOWNLOAD_DIR` | Folder for link downloads. Default: `Downloads/Flick` in your home folder. |
 | `FLICK_YTDLP` | Full path to yt-dlp, checked before `PATH`. |
-| `FLICK_OPENSUBTITLES_KEY` | OpenSubtitles API key, instead of entering it in Appearance. |
+| `FLICK_OPENSUBTITLES_KEY` | OpenSubtitles API key. It overrides a key entered in Appearance and is never written to `settings.json`. |
 | `FLICK_MPV_LIBRARY` | Full path to the libmpv shared library, used instead of searching the usual locations. |
 | `FLICK_HWDEC` | Set to `no` to turn off hardware decoding. |
-| `FLICK_AUDIO` | Set to `null` for automated tests without an audio device. |
+
+These variables exist for development and testing:
+
+| Variable | Effect |
+| --- | --- |
+| `FLICK_AUDIO` | Set to `null` to play without an audio device. |
+| `FLICK_LOCAL_TRANSFERS` | Set to any value to keep torrent transfers on this computer: Flick listens on `127.0.0.1` over TCP only and turns off public discovery. |
+| `FLICK_INITIAL_PEERS` | Comma-separated `ip:port` peers to add at startup. Entries that don't parse are skipped. |
+| `FLICK_DOWNLOAD_LIMIT` | Torrent download limit in bytes per second, overriding the saved limit. Zero and values that aren't whole numbers are ignored. |
