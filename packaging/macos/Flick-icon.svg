@@ -1,18 +1,27 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
-  <!-- Flick app icon, drawn for Flick. The play glyph follows assets/icons/play.svg. -->
-  <defs>
-    <linearGradient id="body" x1="0" y1="0" x2="0" y2="1">
-      <stop offset="0" stop-color="#3a9bff"/>
-      <stop offset="1" stop-color="#0050d8"/>
-    </linearGradient>
-    <filter id="shadow" x="-10%" y="-10%" width="120%" height="125%">
-      <feGaussianBlur in="SourceAlpha" stdDeviation="14"/>
-      <feOffset dy="10" result="blur"/>
-      <feComponentTransfer><feFuncA type="linear" slope="0.35"/></feComponentTransfer>
-      <feMerge><feMergeNode/><feMergeNode in="SourceGraphic"/></feMerge>
-    </filter>
-  </defs>
-  <rect x="100" y="100" width="824" height="824" rx="185" fill="url(#body)" filter="url(#shadow)"/>
-  <path transform="translate(512 512) scale(25) translate(-11.4 -12)" fill="#ffffff"
-        d="M18.8906 12.846C18.5371 14.189 16.8667 15.138 13.5257 17.0361C10.296 18.8709 8.6812 19.7884 7.37983 19.4196C6.8418 19.2671 6.35159 18.9776 5.95624 18.5787C5 17.6139 5 15.7426 5 12C5 8.2574 5 6.3861 5.95624 5.42132C6.35159 5.02245 6.8418 4.73288 7.37983 4.58042C8.6812 4.21165 10.296 5.12907 13.5257 6.96393C16.8667 8.86197 18.5371 9.811 18.8906 11.154C19.0365 11.7084 19.0365 12.2916 18.8906 12.846Z"/>
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024" role="img" aria-labelledby="title">
+<!-- Flick app icon: the firefly, drawn for Flick. -->
+<title id="title">Flick app icon</title>
+<defs>
+<clipPath id="tile">
+<rect x="100" y="100" width="824" height="824" rx="185"/>
+</clipPath>
+<filter id="shadow" x="-10%" y="-10%" width="120%" height="125%">
+<feGaussianBlur in="SourceAlpha" stdDeviation="14"/>
+<feOffset dy="10" result="blur"/>
+<feComponentTransfer>
+<feFuncA type="linear" slope="0.35"/>
+</feComponentTransfer>
+<feMerge>
+<feMergeNode/>
+<feMergeNode in="SourceGraphic"/>
+</feMerge>
+</filter>
+</defs>
+<rect x="100" y="100" width="824" height="824" rx="185" fill="#27132F" filter="url(#shadow)"/>
+<g clip-path="url(#tile)">
+<circle cx="371.64" cy="594.83" r="296.64" fill="#FFB627" fill-opacity="0.07"/>
+<circle cx="371.64" cy="594.83" r="201.88" fill="#FFB627" fill-opacity="0.1"/>
+</g>
+<path fill="#D3AEE2" d="M562.07 545.39C562.07 515.62 584.94 491.2 614.07 488.74Q616.51 392.48 684.65 345.31Q689.7 341.81 695.74 342.91Q701.79 344.01 705.29 349.06Q708.78 354.12 707.68 360.16Q706.59 366.21 701.53 369.7Q644.63 409.1 643.66 493.03Q686.75 417.73 774.57 402.23Q780.62 401.16 785.65 404.69Q790.68 408.21 791.75 414.26Q792.82 420.31 789.3 425.34Q785.77 430.38 779.72 431.45Q702.78 445.02 666.62 512.82Q666.39 513.26 666.13 513.68C672.23 522.74 675.79 533.65 675.79 545.39C675.79 576.79 650.33 602.25 618.93 602.25C587.52 602.25 562.07 576.79 562.07 545.39ZM515.1 505.84C491.94 520.31 443.84 485.11 407.66 427.21C371.49 369.32 360.93 310.66 384.09 296.19C407.25 281.72 455.35 316.92 491.52 374.81C527.7 432.7 538.25 491.37 515.1 505.84ZM374.18 467.92 374.18 467.92Q359.27 459.31 342.04 459.31Q335.97 459.31 330.19 460.38C262.72 418.96 220.47 367.47 234.78 342.67C247.04 321.45 296.94 326.34 354.71 351.84Q362.75 392.66 390.89 437.69Q419.37 483.27 453 508.45C449.23 508.01 445.3 507.41 441.23 506.63Z"/>
+<path fill="#FFB627" d="M364.29 485.05 502.54 564.87C513.23 571.06 519.82 582.48 519.82 594.83C519.82 607.19 513.23 618.61 502.54 624.8L364.29 704.62C350.52 712.57 333.56 712.57 319.79 704.62C306.02 696.67 297.54 681.98 297.54 666.08V523.59C297.54 507.69 306.02 493 319.79 485.05C333.56 477.1 350.52 477.1 364.29 485.05Z"/>
 </svg>

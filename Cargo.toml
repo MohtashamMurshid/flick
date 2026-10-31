@@ -3,7 +3,12 @@ name = "flick"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.99"
-description = "A focused desktop video player built with Rust and GPUI"
+description = "A desktop video player with a built-in library, torrent streaming, and link downloads, built with Rust, GPUI, and libmpv"
+license = "MIT"
+repository = "https://github.com/MohtashamMurshid/flick"
+readme = "README.md"
+keywords = ["video-player", "mpv", "gpui", "bittorrent", "desktop"]
+categories = ["multimedia::video", "gui"]
 publish = false
 default-run = "flick"
 
