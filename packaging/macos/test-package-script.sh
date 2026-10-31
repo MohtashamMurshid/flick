@@ -327,7 +327,7 @@ check "dylibs are signed before the app, and the app with the ad-hoc entitlement
 
 lic=$app/Contents/Resources/Licenses
 manifest=$lic/bundled-libraries/MANIFEST.tsv
-check "Flick's own notices are copied" test -f "$lic/Flick-THIRD_PARTY_NOTICES.md" -a -f "$lic/Inter-OFL.txt" -a -f "$lic/Hugeicons-LICENSE.txt"
+check "Flick's own license and notices are copied" test -f "$lic/Flick-LICENSE.txt" -a -f "$lic/Flick-THIRD_PARTY_NOTICES.md" -a -f "$lic/Inter-OFL.txt" -a -f "$lic/Hugeicons-LICENSE.txt"
 check "license files come from each keg, not READMEs" \
   bash -c 'test -f "$1/mpv-0.40.0/LICENSE.GPL" -a -f "$1/mpv-0.40.0/Copyright" -a ! -e "$1/mpv-0.40.0/README.md" -a -f "$1/ffmpeg-7.1.1/COPYING.LGPLv2.1" -a -f "$1/luajit-2.1.1736781742/COPYRIGHT"' _ "$lic/bundled-libraries"
 check "multi-line formula licenses are read" grep -q $'^libmpv.2.dylib\tmpv\t0.40.0\tall_of: \\[ "GPL-2.0-or-later", "LGPL-2.1-or-later", \\]\thttps://github.com/mpv-player' "$manifest"

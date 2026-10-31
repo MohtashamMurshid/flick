@@ -81,7 +81,7 @@ Press Ctrl+C to stop sharing successfully. Interrupting inspect or download befo
 - The pinned engine can append an extra empty piece when creating torrents whose total size is exactly divisible by the piece length. The adapter removes only that known invalid trailing hash and re-encodes the info dictionary before calculating/exporting the magnet. The regression independently checks piece content and the infohash with SHA-1. Other invalid creation output is rejected before starting a seed.
 - Shared content is verified in place before it is announced. Metadata is exported only to an explicitly chosen diagnostic output, rather than written into the shared folder automatically. Symbolic links and special files are refused.
 - Snapshots expose checking/downloading/paused/seeding/error state, selected files, verified progress, peers, and transfer speeds. `completed_file` rejects incomplete or unselected files. A partial file's existence is not a playback guarantee.
-- Further provider maintenance, installer packaging, and cross-platform GUI acceptance remain in [the plan](../PLAN.md).
+- Further provider maintenance, installer packaging, and cross-platform GUI acceptance remain in [the plan](PLAN.md).
 
 ## Isolated desktop checks
 
@@ -95,7 +95,7 @@ The DHT routing table and peer store are saved to `dht.json` in the transfer sta
 
 The desktop allows five minutes to find peers with torrent metadata. Its “Finding peers…” notice has a Cancel button that stops the pending resolution. Cancellation leaves existing downloads running. A timeout suggests checking connectivity, choosing active seeders, or opening a `.torrent` file.
 
-The diagnostic accepts `--transport tcp-only` or `--transport tcp-and-utp`. Public sessions default to TCP plus uTP after the [recorded Sintel comparison](VALIDATION.md#2026-10-24-public-discovery-and-listener-comparison); local sessions default to TCP. In librqbit 9.0.1 the uTP listener socket also enables outgoing uTP; TCP remains enabled. To measure a legal public torrent, use fresh directories for each run and pass its magnet to `benchmark`:
+The diagnostic accepts `--transport tcp-only` or `--transport tcp-and-utp`. Public sessions default to TCP plus uTP after the [recorded Sintel comparison](VALIDATION.md#public-discovery-and-listener-comparison-on-2026-10-24); local sessions default to TCP. In librqbit 9.0.1 the uTP listener socket also enables outgoing uTP; TCP remains enabled. To measure a legal public torrent, use fresh directories for each run and pass its magnet to `benchmark`:
 
 ```sh
 cargo run --locked --no-default-features --bin flick-transfer -- \

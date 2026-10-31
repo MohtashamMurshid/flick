@@ -1,6 +1,6 @@
 # Playback, downloads, and sharing
 
-Direction agreed on 2026-10-24. This plan describes the intended product; unchecked items in [PLAN.md](../PLAN.md) are not implemented promises.
+Direction agreed on 2026-10-24. This plan describes the intended product; unchecked items in [PLAN.md](PLAN.md) are not implemented promises.
 
 ## User experience
 

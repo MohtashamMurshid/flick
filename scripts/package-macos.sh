@@ -386,7 +386,7 @@ entitlements=$(absolute_path "$entitlements")
 [[ -f $entitlements ]] || die "entitlements file not found: $entitlements"
 icon_source=$packaging_dir/Flick-icon-1024.png
 [[ -f $icon_source ]] || die "icon source not found: $icon_source"
-for notice in "$repo_root/THIRD_PARTY_NOTICES.md" "$repo_root/assets/fonts/OFL.txt" "$repo_root/assets/icons/LICENSE"; do
+for notice in "$repo_root/LICENSE" "$repo_root/THIRD_PARTY_NOTICES.md" "$repo_root/assets/fonts/OFL.txt" "$repo_root/assets/icons/LICENSE"; do
   [[ -f $notice ]] || die "notice file not found: $notice"
 done
 
@@ -563,9 +563,9 @@ Plan
      outside the OS, and no /opt/homebrew or /usr/local path in otool -L.
   8. Write Info.plist (below), PkgInfo, and Flick.icns (sips and iconutil from
      $icon_source).
-  9. Copy Flick's notices and each bundled library's license files from its
-     Homebrew keg into Contents/Resources/Licenses, with MANIFEST.tsv recording
-     formula, version, declared license, and source URL.
+  9. Copy Flick's license and notices, and each bundled library's license files
+     from its Homebrew keg, into Contents/Resources/Licenses, with MANIFEST.tsv
+     recording formula, version, declared license, and source URL.
  10. xattr -cr, then codesign --options runtime each dylib, then the app with the
      entitlements; codesign --verify --deep --strict.
  11. $( [[ $notary_mode != none ]] && printf 'Notarize the app (xcrun notarytool submit --wait, %s), staple and validate it.' "$notary_mode" || printf 'Skip notarization (no credentials set).')
@@ -880,6 +880,7 @@ log "Copying license texts"
 licenses=$resources/Licenses
 libraries_dir=$licenses/bundled-libraries
 mkdir -p "$libraries_dir"
+cp "$repo_root/LICENSE" "$licenses/Flick-LICENSE.txt"
 cp "$repo_root/THIRD_PARTY_NOTICES.md" "$licenses/Flick-THIRD_PARTY_NOTICES.md"
 cp "$repo_root/assets/fonts/OFL.txt" "$licenses/Inter-OFL.txt"
 cp "$repo_root/assets/icons/LICENSE" "$licenses/Hugeicons-LICENSE.txt"
@@ -964,9 +965,9 @@ gpl_formulas=$(awk -F '\t' 'NR > 1 && $4 ~ /(^|[^L])GPL/ { print $2 }' "$manifes
 cat > "$licenses/README.txt" <<README
 Flick $version for macOS ($arch)
 
-Flick's own third-party notices are in Flick-THIRD_PARTY_NOTICES.md, with the
-Inter font license (Inter-OFL.txt) and the Hugeicons license
-(Hugeicons-LICENSE.txt).
+Flick is released under the MIT License (Flick-LICENSE.txt). Its third-party
+notices are in Flick-THIRD_PARTY_NOTICES.md, with the Inter font license
+(Inter-OFL.txt) and the Hugeicons license (Hugeicons-LICENSE.txt).
 
 Contents/Frameworks holds libmpv and the libraries it needs, copied unmodified
 except for install names and code signatures from $([[ -n $cellar ]] && printf 'the Homebrew installation in %s' "$prefix" || printf '%s' "$(dirname "$libmpv_real")").

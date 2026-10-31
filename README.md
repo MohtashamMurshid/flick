@@ -1,52 +1,86 @@
-# Flick
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/brand/flick-horizontal-reversed.svg">
+    <img alt="Flick" src="docs/brand/flick-horizontal-color.svg" width="300">
+  </picture>
+</p>
 
-A desktop video player built in Rust with GPUI and libmpv, now adding native torrent downloads and file sharing. Start with the [implementation plan](PLAN.md), [playback and sharing design](docs/SHARING_PLAN.md), and [validation record](docs/VALIDATION.md).
+<p align="center">
+  A desktop video player that keeps your library in order, plays torrents while they download, and saves videos from links.
+</p>
 
-[View the empty window](docs/screenshots/flick-empty.png) or [playback with subtitles](docs/screenshots/flick-player.png).
+<p align="center">
+  <a href="https://github.com/MohtashamMurshid/flick/actions/workflows/ci.yml"><img alt="Native builds" src="https://github.com/MohtashamMurshid/flick/actions/workflows/ci.yml/badge.svg"></a>
+  <a href="LICENSE"><img alt="MIT License" src="https://img.shields.io/badge/license-MIT-blue.svg"></a>
+  <img alt="Rust 1.99" src="https://img.shields.io/badge/rust-1.99-orange.svg">
+  <img alt="macOS, Windows, Linux" src="https://img.shields.io/badge/platforms-macOS%20%7C%20Windows%20%7C%20Linux-lightgrey.svg">
+</p>
 
-Flick draws its interface in a macOS, Windows 11, or GNOME style and matches the running system by default. Each style has its own window chrome, sidebar, controls, typography, and player: a floating HUD on macOS, a transport bar on Windows, and a rounded OSD on GNOME. Choose the style, a light or dark scheme, and an accent color in **Appearance**. Icons come from the free Hugeicons set. The native style uses the platform UI font; other styles use the closest installed font or the bundled Inter. See [asset sources and licenses](assets/README.md).
+<p align="center">
+  <img alt="Flick's library in the macOS style" src="docs/screenshots/release/mac-home.png" width="820">
+</p>
 
-Flick opens to your library, with Continue watching, All videos, Shows, History, and Downloads. Shows groups episodes named like `Show S01E02`, `Show 1x02`, or `Show/Season 1/02`, and the next episode starts after a short countdown. Add videos or a folder, filter local titles, or search online for videos to download. Choose torrent files and a destination; completed verified videos join the library. **Watch Now** plays a video while it downloads, reading only verified pieces and fetching those near the playhead first; a seek into missing pieces shows Buffering until they arrive. Paste a YouTube, X, or other video page link to download it with [yt-dlp](#downloading-from-web-links), or download Internet Archive results and links over HTTPS. Share a file or folder and copy its magnet link. The [development diagnostic](docs/TRANSFERS.md) uses the same native transfer backend. The broad [headless agent proposal](docs/HEADLESS_PLAN.md) is deferred. See [PLAN.md](PLAN.md) for implemented versus planned work.
+Flick is built in Rust with [GPUI](https://crates.io/crates/gpui) for the interface and [libmpv](https://mpv.io) for playback. It looks at home on macOS, Windows 11, and GNOME, and plays nearly anything mpv can.
 
-This first prototype provides video inside the application window, play and pause, seeking, volume and mute, playback speed, fullscreen, audio/subtitle selection with audio delay, external subtitle loading, recent files, and resume positions. Playback controls appear after media loads. libmpv uses the platform's hardware decoder when available (`hwdec=auto-copy`; set `FLICK_HWDEC=no` to compare against software decoding) and renders into the frame GPUI uploads. The software frame-transfer path follows the display's physical video bounds with no fixed resolution or pixel-budget cap. Native dimension/allocator failures are reported instead of silently lowering resolution. Efficient native GPU video presentation is a separate milestone; this version makes no claim of being faster than VLC.
+> [!NOTE]
+> Flick is an early release. There are no prebuilt downloads yet; build it from source with the steps below. [Validation](docs/VALIDATION.md) records exactly what has been tested on each platform.
 
-## Run locally
+## Features
 
-Install [Rust through rustup](https://rust-lang.org/tools/install/), which selects the repository's pinned 1.99.0 toolchain, and the platform's desktop build prerequisites described in [validation](docs/VALIDATION.md#native-build-prerequisites). Install a compatible libmpv shared library for playback:
+- **A library that remembers.** Continue Watching, All Videos, History, and Downloads. Shows groups episodes named like `Show S01E02` and starts the next one after a short countdown.
+- **Watch Now.** Start a torrent and watch it while it downloads. Flick plays only verified pieces and fetches the ones near the playhead first.
+- **Torrents built in.** Pick the files you want, pause and resume, set bandwidth limits, export `.torrent` files, and share a file or folder as a magnet link.
+- **Downloads from links.** Paste a YouTube, X, or other video page and Flick saves it with [yt-dlp](https://github.com/yt-dlp/yt-dlp). Direct HTTPS video links and Internet Archive items download without it, and Archive files are checked against their published SHA-1.
+- **A full player.** Hardware decoding, subtitle files and OpenSubtitles search, audio and subtitle tracks with audio delay, playback speed, frame stepping, chapters, an A–B loop, picture in picture, and resume positions.
+- **Command center.** Press ⌘K or Ctrl+K to find a video, search online, paste a link, or run any command.
+- **Native look on every platform.** macOS, Windows 11, and GNOME styles, each with its own chrome and player controls. Light and dark schemes, accent colors, and WCAG AA contrast in every combination.
+- **Keyboard first.** Tab and the arrow keys move through the library and controls, and player shortcuts can be rebound.
 
-- Ubuntu 24.04: `sudo apt-get install libmpv2`.
-- macOS: `brew install mpv`; full Xcode is required to build GPUI's Metal shaders.
-- Windows: install an mpv shared-library build matching the app's architecture. Put its DLL and dependencies beside `flick.exe`, or set `FLICK_MPV_LIBRARY` to the DLL's absolute path.
+<table>
+  <tr>
+    <td><img alt="Sintel playing in the Windows 11 style" src="docs/screenshots/release/windows-player.png"></td>
+    <td><img alt="The library in the GNOME style" src="docs/screenshots/release/gnome-home.png"></td>
+  </tr>
+  <tr>
+    <td align="center">Windows 11 style</td>
+    <td align="center">GNOME style</td>
+  </tr>
+</table>
 
-From the repository root:
+<sub>Screenshots taken on macOS, which is why every style shows macOS window buttons. Films are Blender open movies © Blender Foundation, <a href="https://www.blender.org">blender.org</a>: Big Buck Bunny, Sintel, and Tears of Steel (<a href="https://creativecommons.org/licenses/by/3.0/">CC BY 3.0</a>), Elephants Dream (<a href="https://creativecommons.org/licenses/by/2.5/">CC BY 2.5</a>), and Cosmos Laundromat and Spring (<a href="https://creativecommons.org/licenses/by/4.0/">CC BY 4.0</a>).</sub>
 
-```sh
-cargo run --locked
-cargo run --locked -- "/path/to/video.mp4"
-```
+## Getting started
 
-If Rust was just installed and `cargo` is not on the current shell's path, open a new terminal or run `. "$HOME/.cargo/env"` on macOS/Linux first. On this development machine, `~/.cargo/bin/cargo` also works directly.
+1. Install [Rust through rustup](https://rust-lang.org/tools/install/). It picks up the repository's pinned toolchain (1.99.0) automatically.
+2. Install your platform's desktop build prerequisites, listed in [Validation](docs/VALIDATION.md#native-build-prerequisites).
+3. Install libmpv:
+   - **Ubuntu 24.04:** `sudo apt-get install libmpv2`
+   - **macOS:** `brew install mpv`. Building also needs full Xcode for GPUI's Metal shaders.
+   - **Windows:** an mpv shared-library build that matches your architecture. Put its DLL and dependencies beside `flick.exe`, or set `FLICK_MPV_LIBRARY` to the DLL's full path.
+4. Clone and run:
 
-A new library opens to a welcome page with **Open Video…**, **Add Folder…**, and **Paste Link**. Afterward, Flick opens to **Home**, with Continue Watching and Recently Added; the sidebar also has All Videos, History, Downloads, and Appearance. Use **Add Videos…** or **Add Folder…** to build the library, or drop files/folders into it. Click a video to play or continue it. The back arrow returns to the library and pauses playback. Passing a local path on the command line opens that video directly. Type in the search field to filter local videos; press Enter for download results, or paste a magnet link or web address to see a download suggestion and press Enter to start it. Search uses TPB, Internet Archive, and YTS independently and reports unavailable sources. The Linux file picker uses the desktop portal; drag and drop and command-line paths remain available when no portal service is running. The captions icon opens **Audio & subtitles** to select tracks, adjust audio delay, load a subtitle file, or find subtitles on OpenSubtitles.com. Finding subtitles needs a free personal API key from OpenSubtitles, entered in **Appearance** or set with `FLICK_OPENSUBTITLES_KEY`; it is stored in `settings.json`. While a video plays, its controls hide after 2.5 seconds without pointer movement, and subtitles move above the controls whenever they show. Turn hiding off in **Appearance**. Icon controls have descriptive tooltips.
+   ```sh
+   git clone https://github.com/MohtashamMurshid/flick.git
+   cd flick
+   cargo run --locked
+   ```
 
-Downloads shows torrent download and upload rates, verification progress, and Pause All / Resume All. Export exact metainfo with **Export .torrent…**. Removing a transfer keeps its files unless you choose **Remove and Delete Files…** and confirm the listed paths. First run asks whether completed downloads keep sharing; change this and the live torrent bandwidth limits in **Appearance → Transfers**. Explicit shares keep sharing independently of that download preference, and all transfers stop when Flick closes. Verified torrent videos also save resume by infohash and file index, so re-downloading into another destination retains your position. See [transfer controls](docs/TRANSFERS.md#desktop-transfer-controls).
+   To open a file directly: `cargo run --locked -- "/path/to/video.mp4"`.
 
-Press ⌘K on macOS or Ctrl+K elsewhere, from the library or the player, to open the **command center**. One large field finds library videos and plays them, searches online and lists the results there, offers to download a pasted YouTube, X, web, or magnet link, and runs commands such as Open Video, Add Folder, Downloads, Appearance, Fullscreen, Picture in Picture, and Quit. Arrow keys choose a row, Enter runs it, and Escape or a click outside closes it. The library's search field shows the shortcut; clicking it opens the command center too.
+If `cargo` isn't found right after installing Rust, open a new terminal or run `. "$HOME/.cargo/env"` first.
 
-## Downloading from web links
+Optional extras:
 
-Paste an `http`/`https` address into the command center or the search field; Flick names the site (YouTube, X, Vimeo, Internet Archive, or the host) and offers the download, which Enter starts. You can also copy it and choose **Paste Link** on the Downloads page. Downloads appear under **Link Downloads** with progress, speed, Cancel, errors, Try Again, and Play. Completed videos join the library. Files are saved to the current download folder: `FLICK_DOWNLOAD_DIR`, otherwise `Downloads/Flick` in your home folder. Download only videos you have the right to save.
+- **[yt-dlp](https://github.com/yt-dlp/yt-dlp#installation)** to download from video pages. Keep it up to date; distribution packages are often too old.
+- **FFmpeg** so yt-dlp can merge the best video and audio streams.
+- **A free [OpenSubtitles](https://www.opensubtitles.com) API key** to search for subtitles, entered in Appearance.
 
-- **Video pages** such as YouTube or X posts need [yt-dlp](https://github.com/yt-dlp/yt-dlp#installation), an optional runtime dependency that Flick runs as a separate program. Keep it current; sites change often, and outdated releases fail. Flick uses `FLICK_YTDLP` if set to the program's full path, then `yt-dlp` (`yt-dlp.exe` on Windows) on `PATH`, then common install folders that apps opened from the desktop may not have on `PATH`: `/opt/homebrew/bin`, `/usr/local/bin`, and `/opt/local/bin` on macOS; `/usr/local/bin`, `/usr/bin`, `/snap/bin`, and `~/.local/bin` on Linux; and `%LOCALAPPDATA%\Microsoft\WinGet\Links` on Windows. Install with `brew install yt-dlp`, `winget install yt-dlp.yt-dlp`, `pipx install yt-dlp`, or the official standalone release. Distribution packages are often too old. A whole-playlist address downloads every entry.
-- **FFmpeg** is optional. Flick looks for it on `PATH`, beside yt-dlp, and in the same install folders, and passes its location to yt-dlp. With FFmpeg, yt-dlp merges the best video and audio; without it, Flick asks for the best single file that has both.
-- **Direct HTTPS video links**, whose address ends in a video file name, download without yt-dlp. If the address turns out to be a web page, yt-dlp handles it instead.
-- **Internet Archive** search results and `archive.org/details/…` links list the item's video files first, preselecting one copy of each video and preferring the uploaded original. Downloads go over HTTPS from archive.org into a folder named after the item, and are checked against the published size and SHA-1.
+The [user guide](docs/USER_GUIDE.md) covers every screen, the full keyboard shortcut list, and the environment variables Flick reads.
 
-Flick never overwrites an existing file: a different file with the same name gets a numbered name, and an identical Archive file is reused. Partial files use dot-prefixed names until a download finishes. Cancelling, a failure, or closing Flick removes them. An HTTPS download resumes after a dropped connection, and continues from a leftover partial file when the same download starts again.
+## Keyboard shortcuts
 
-## Keyboard controls
-
-Player keys can be changed on the **Keyboard Shortcuts** page, which also lists them. Press `?` to show them in the player or open the page from the library. Tab, Escape, Enter, number keys, and Ctrl or ⌘ with O, K, comma, L, or Q keep their fixed jobs and can't be assigned.
+<details>
+<summary>Player and library shortcuts</summary>
 
 | Key | Action |
 | --- | --- |
@@ -63,75 +97,20 @@ Player keys can be changed on the **Keyboard Shortcuts** page, which also lists 
 | B | Set the A–B loop start, then its end, then clear it |
 | [ / ] | Move audio 50 ms earlier or later |
 | Shift+N / Shift+P | Next or previous episode |
-| Escape | Exit fullscreen or close a menu |
-| Ctrl+O / Cmd+O | Add videos in the library or open a video in the player |
 | Ctrl+K / Cmd+K | Open the command center |
-| Ctrl+F / Cmd+F | Focus the library search field |
+| Ctrl+O / Cmd+O | Add videos in the library or open a video in the player |
 | Ctrl+, / Cmd+, | Open Appearance |
-| Ctrl+L / Cmd+L | Load a subtitle file |
-| Ctrl+Q / Cmd+Q | Quit Flick |
-| ? | Show keyboard shortcuts |
+| ? | Show all shortcuts |
 
-Tab and Shift+Tab move between controls, with a focus ring and the control's tooltip. Enter or Space activates the focused control. Arrow keys move between video cards and list rows, and Shift+F10 or the Menu key opens a video's menu: Play, Show in Folder, Mark as Watched or Unwatched, and Remove from Continue Watching. Right-click opens the same menu.
+Player keys can be changed on the Keyboard Shortcuts page. The [user guide](docs/USER_GUIDE.md#keyboard-and-mouse) has the complete list.
 
-Click or drag the timeline to seek or the volume slider to adjust sound. Hover the timeline to preview that moment. Double-click the video to toggle fullscreen. Chapters and an A–B loop are marked on the timeline.
-
-**Appearance** also sets text size, contrast, button labels, and subtitle size, color, background, and position. Auto contrast follows the system's increased-contrast setting on macOS, Windows, and GNOME. Colors meet WCAG AA contrast in every style, scheme, and accent.
-
-## Development checks
-
-```sh
-cargo fmt --all -- --check
-cargo check --locked --all-targets
-cargo clippy --locked --all-targets -- -D warnings
-cargo test --locked --all-targets
-```
-
-Generate a synthetic clip using FFmpeg and exercise the real playback boundary:
-
-```sh
-bash scripts/make-test-video.sh /tmp/flick-test.mp4 --with-subtitles
-FLICK_AUDIO=null cargo run --locked -- --smoke-test /tmp/flick-test.mp4
-FLICK_AUDIO=null FLICK_TEST_VIDEO=/tmp/flick-test.mp4 \
-  cargo test --locked playback::tests::real_playback -- --ignored --nocapture
-```
-
-Try link downloads without the desktop. `get` prints one JSON update per line, and Ctrl+C cancels:
-
-```sh
-cargo run --locked --no-default-features --bin flick-fetch -- tools
-cargo run --locked --no-default-features --bin flick-fetch -- archive Nabisco_2
-cargo run --locked --no-default-features --bin flick-fetch -- get "https://archive.org/details/Nabisco_2" --dest /tmp/flick-links
-```
-
-Automated link-download tests use a generated stand-in for yt-dlp and loopback servers, never the Internet. An opt-in test drives the installed yt-dlp against a loopback server only:
-
-```sh
-cargo test --locked --no-default-features --lib installed_ytdlp -- --ignored
-```
-
-`FLICK_AUDIO=null` is for automated tests without an audio device. Omit it for normal audible playback. The CLI smoke test does not open a desktop window. Its first-frame timing describes a software presentation submission, not a measured display scanout time.
-
-Run a sustained release benchmark with a generated local 4K/30 fps fixture (FFmpeg with libx264 required):
-
-```sh
-FLICK_AUDIO=null bash scripts/benchmark.sh                 # 300 seconds at 3840x2160
-FLICK_AUDIO=null bash scripts/benchmark.sh 60 --size 1920x1080
-FLICK_AUDIO=null FLICK_HWDEC=no cargo run --locked --release --bin flick -- \
-  --benchmark /path/to/local-video.mp4 --seconds 300 --size 3840x2160 --interval-ms 16
-```
-
-The script removes its temporary 12-second H.264 clip on exit. Stdout is one JSON report; diagnostics go to stderr. The CLI loops the file through the real software renderer without a GPUI window. It reports CPU, RSS, mpv drop counters, source/decoder metadata, and render-call percentiles after the first frame. Frame counts describe software submissions; GPUI upload, display timing, and audible playback are outside this measurement. See the [performance gate](docs/VALIDATION.md#performance-gate) for units, counter limitations, and recorded results.
-
-GPUI 0.2.2 is pinned. Its transitive `xattr` dependency still uses the `ENOATTR` alias removed in libc 0.2.190, so this application temporarily pins libc 0.2.189. Revisit this compatibility pin when updating GPUI.
+</details>
 
 ## Platform status
 
-Windows, macOS, and Linux have native CI jobs configured. Only results actually executed are recorded in [validation](docs/VALIDATION.md); configuration alone does not establish support. Windows and Linux installers remain release work.
+CI builds, lints, and tests Flick on Linux, Windows, and macOS for every push. On macOS it also packages an ad-hoc signed app and DMG and plays a test video with the bundled libmpv. Release downloads and Windows and Linux installers are still to come. [Validation](docs/VALIDATION.md) separates passing tests, desktop builds, and real interactive playback for each platform.
 
-## Packaging for macOS
-
-`scripts/package-macos.sh` builds a `Flick.app` that carries libmpv and its libraries, so it runs without Homebrew. It signs the app with the hardened runtime, can notarize it, and builds a DMG:
+To build a standalone macOS app that carries its own libmpv:
 
 ```sh
 brew install mpv
@@ -139,29 +118,30 @@ scripts/package-macos.sh            # ad-hoc signed, in target/macos/
 scripts/package-macos.sh --dry-run  # print the plan; works on any OS
 ```
 
-Set `FLICK_CODESIGN_IDENTITY` and notarization credentials for a distributable build. The bundled Homebrew libmpv and FFmpeg are GPL-licensed, which affects how Flick itself can be distributed. See [Packaging for macOS](docs/PACKAGING.md) for options, entitlements, licenses, and the CI job. The script has not yet run on a Mac.
+See [Packaging for macOS](docs/PACKAGING.md) for signing, notarization, and licensing.
 
-## Code organization
+## Documentation
 
-- `src/ui.rs`: GPUI window, video image lifecycle, controls, menus, and input.
-- `src/playback.rs`: dynamically loaded libmpv boundary and software presentation.
-- `src/store.rs`: local preferences, recent files, and resume positions.
-- `src/model.rs`: time and seek helpers.
-- `src/smoke.rs`: real media playback check without a desktop window.
-- `src/torrent.rs`: native transfer adapter, metadata, sharing, selected-file downloads, verification, and session persistence.
-- `src/bin/flick-transfer.rs`: development transfer diagnostic without GPUI or libmpv.
-- `src/presentation.rs`: physical display sizing without fixed resolution limits.
-- `src/library_ui.rs`: library, history, search results, torrent selection, and Downloads views.
-- `src/catalog.rs`: independent native discovery providers with progressive results.
-- `src/fetch.rs`: link downloads without GPUI, separate from the torrent session: yt-dlp processes, HTTPS files, and Internet Archive file lists.
-- `src/fetch_ui.rs`: Link Downloads on the Downloads page and the Internet Archive file chooser.
-- `src/palette_ui.rs`: the ⌘K / Ctrl+K command center.
-- `src/bin/flick-fetch.rs`: development diagnostic for link downloads.
-- `src/services.rs`: desktop background worker and transfer events.
-- `src/input.rs`: text fields with Unicode/IME and clipboard support, including selectable read-only values.
-- `src/shortcuts.rs`: rebindable player shortcuts.
-- `src/subtitles.rs`: OpenSubtitles search and download.
-- `src/thumbnails.rs`: poster frames, media details, and timeline previews from background players.
-- `src/theme.rs`: interface styles, WCAG contrast adjustment, and appearance settings.
+| Document | What's in it |
+| --- | --- |
+| [User guide](docs/USER_GUIDE.md) | Every screen, shortcut, and setting |
+| [Transfers](docs/TRANSFERS.md) | How torrent transfers work, and the command-line transfer diagnostic |
+| [Packaging for macOS](docs/PACKAGING.md) | Building, signing, and notarizing `Flick.app`, and what it bundles |
+| [Plan](docs/PLAN.md) | What's built and what's next |
+| [Playback and sharing design](docs/SHARING_PLAN.md) | Design and acceptance criteria for playback and sharing |
+| [Headless proposal](docs/HEADLESS_PLAN.md) | A deferred proposal for a headless agent interface |
+| [Validation](docs/VALIDATION.md) | Every check that has been run, by date and platform |
 
-Preferences are saved to `settings.json` in the operating system's per-user application configuration directory. Media files are read in place.
+## Contributing
+
+Issues and pull requests are welcome. [CONTRIBUTING.md](CONTRIBUTING.md) explains how to run the checks, the rules for transfer and download tests, and how the code is laid out.
+
+## Responsible use
+
+Like any BitTorrent client, Flick uploads pieces to other peers while a torrent downloads, and peers can see your IP address. Once a download completes, it keeps sharing only if you allowed that on first run; change it in Appearance → Transfers. Download and share only content you have the right to.
+
+## License
+
+Flick is released under the [MIT License](LICENSE). Third-party code and assets are listed in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) and [assets/README.md](assets/README.md).
+
+The packaged macOS app bundles Homebrew's libmpv and FFmpeg, which are GPL-licensed. Distributing that app means meeting the GPL's terms; [Packaging for macOS](docs/PACKAGING.md#licenses-and-what-the-bundle-ships) explains what's resolved and what isn't.
