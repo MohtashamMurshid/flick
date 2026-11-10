@@ -6,7 +6,7 @@
 pub fn token_matches(expected: &str, presented: &str) -> bool {
     let expected = expected.as_bytes();
     let presented = presented.as_bytes();
-    let mut diff = (expected.len() ^ presented.len()) as u8;
+    let mut diff = u8::from(expected.len() != presented.len());
     for i in 0..expected.len().max(presented.len()) {
         let a = expected.get(i).copied().unwrap_or(0);
         let b = presented.get(i).copied().unwrap_or(0);
@@ -111,6 +111,9 @@ mod tests {
         assert!(!token_matches("abc", "abcd"));
         assert!(!token_matches("", "a"));
         assert!(token_matches("", ""));
+        // Lengths that differ by a multiple of 256 still differ.
+        assert!(!token_matches("", &"\0".repeat(256)));
+        assert!(!token_matches("a", &format!("a{}", "\0".repeat(256))));
     }
 
     #[test]

@@ -59,8 +59,18 @@ const LOCK_WAIT: Duration = Duration::from_secs(2);
 const TRANSCODE_DIR: &str = "transcode";
 /// ffprobe runs at once while the library is being inspected.
 const INSPECT_CONCURRENCY: usize = 2;
+/// Embedded subtitle extractions (FFmpeg runs) at once.
+const EXTRACT_CONCURRENCY: usize = 2;
+/// Extracted WebVTT is kept here, inside the state folder.
+const SUBTITLE_CACHE_DIR: &str = "subtitles";
+/// Sidecar subtitle files larger than this are not sent. Text subtitles are
+/// far smaller; a VobSub `.sub` can be hundreds of megabytes.
+const MAX_SIDECAR_BYTES: u64 = 16 * 1024 * 1024;
+/// A progress `updated` time further ahead of the server's clock than this
+/// is taken as now plus this, so a client with a fast clock cannot pin it.
+const PROGRESS_CLOCK_SKEW: u64 = 60;
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct ServerConfig {
     /// Must satisfy [`crate::remote::bind::is_allowed`]; port 0 picks a free port.
     pub bind: SocketAddr,
@@ -77,6 +87,22 @@ pub struct ServerConfig {
     pub ffmpeg: Option<PathBuf>,
     /// Transcode jobs allowed at once; more get 503.
     pub max_transcodes: usize,
+}
+
+/// The token is left out, so a logged configuration never reveals it.
+impl std::fmt::Debug for ServerConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ServerConfig")
+            .field("bind", &self.bind)
+            .field("token", &"<redacted>")
+            .field("name", &self.name)
+            .field("sources", &self.sources)
+            .field("poster_cache", &self.poster_cache)
+            .field("state_dir", &self.state_dir)
+            .field("ffmpeg", &self.ffmpeg)
+            .field("max_transcodes", &self.max_transcodes)
+            .finish()
+    }
 }
 
 /// A running server. Dropping it does not stop it; call [`Server::shutdown`].
@@ -122,16 +148,19 @@ impl Server {
                     .by_id
                     .get(id)?
                     .clone();
-                if !entry.complete {
-                    return None;
-                }
-                // A known video stays resolvable without FFmpeg or when
-                // ffprobe fails; the transcoder then explains why it cannot
-                // proceed instead of answering as if the video did not exist.
-                let info = media.resolve_blocking(&entry.path).unwrap_or_default();
+                // A known video stays resolvable while it downloads, without
+                // FFmpeg, or when ffprobe fails; the transcoder then explains
+                // why it cannot proceed instead of answering as if the video
+                // did not exist. A download is not inspected.
+                let info = if entry.complete {
+                    media.resolve_blocking(&entry.path).unwrap_or_default()
+                } else {
+                    MediaInfo::default()
+                };
                 Some(ResolvedVideo {
                     path: entry.path.clone(),
                     info,
+                    complete: entry.complete,
                 })
             })
         };
@@ -151,6 +180,7 @@ impl Server {
             index,
             media,
             hls: hls.clone(),
+            extracting: tokio::sync::Semaphore::new(EXTRACT_CONCURRENCY),
             rebuild: tokio::sync::Mutex::new(()),
             progress: tokio::sync::Mutex::new(()),
             stopped,
@@ -249,6 +279,8 @@ struct AppState {
     /// What ffprobe knows about each file; fills the listing and the transcoder.
     media: Arc<MediaCache>,
     hls: Arc<HlsState>,
+    /// Bounds embedded subtitle extractions running at once.
+    extracting: tokio::sync::Semaphore,
     /// Serializes rebuilds so concurrent listings do not scan twice at once.
     rebuild: tokio::sync::Mutex<()>,
     /// Serializes progress file updates.
@@ -390,10 +422,7 @@ fn unknown_video() -> Response {
 }
 
 fn incomplete_video() -> Response {
-    error(
-        StatusCode::CONFLICT,
-        "This video is still downloading on the server and has not been verified yet.",
-    )
+    error(StatusCode::CONFLICT, crate::remote::hls::INCOMPLETE_MESSAGE)
 }
 
 async fn no_route() -> Response {
@@ -775,6 +804,11 @@ async fn subtitles(State(state): State<Arc<AppState>>, UrlPath(id): UrlPath<Stri
     }
 }
 
+/// A sidecar subtitle file, sent as is. Only a regular file of at most
+/// [`MAX_SIDECAR_BYTES`] is sent; a larger one answers 413 with a message.
+/// The listing already skips symbolic links; the file is opened without
+/// following one (on Unix) and checked again after opening, so a file
+/// swapped for a link after the listing is not followed.
 async fn subtitle(
     State(state): State<Arc<AppState>>,
     UrlPath((id, index)): UrlPath<(String, String)>,
@@ -792,8 +826,9 @@ async fn subtitle(
     let Some(sidecar) = sidecars.into_iter().nth(index) else {
         return error(StatusCode::NOT_FOUND, "No subtitle file with this index");
     };
-    match tokio::fs::read(&sidecar.path).await {
-        Ok(bytes) => (
+    let path = sidecar.path.clone();
+    match tokio::task::spawn_blocking(move || read_sidecar(&path)).await {
+        Ok(Ok(bytes)) => (
             [(
                 header::CONTENT_TYPE,
                 library::subtitle_mime(&sidecar.extension),
@@ -801,11 +836,61 @@ async fn subtitle(
             bytes,
         )
             .into_response(),
-        Err(_) => error(StatusCode::NOT_FOUND, "The subtitle file is gone"),
+        Ok(Err(SidecarError::TooLarge)) => error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!(
+                "This subtitle file is larger than {} MiB, so the server does not send it",
+                MAX_SIDECAR_BYTES / (1024 * 1024)
+            ),
+        ),
+        Ok(Err(SidecarError::Gone)) | Err(_) => {
+            error(StatusCode::NOT_FOUND, "The subtitle file is gone")
+        }
     }
 }
 
-/// A subtitle stream inside the file, extracted as WebVTT by FFmpeg.
+enum SidecarError {
+    TooLarge,
+    /// Missing, unreadable, or not a regular file.
+    Gone,
+}
+
+fn read_sidecar(path: &Path) -> Result<Vec<u8>, SidecarError> {
+    use std::io::Read;
+    let check = |metadata: &std::fs::Metadata| {
+        if !metadata.is_file() {
+            Err(SidecarError::Gone)
+        } else if metadata.len() > MAX_SIDECAR_BYTES {
+            Err(SidecarError::TooLarge)
+        } else {
+            Ok(())
+        }
+    };
+    check(&std::fs::symlink_metadata(path).map_err(|_| SidecarError::Gone)?)?;
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let file = options.open(path).map_err(|_| SidecarError::Gone)?;
+    check(&file.metadata().map_err(|_| SidecarError::Gone)?)?;
+    // The file may still grow after the check.
+    let mut bytes = Vec::new();
+    file.take(MAX_SIDECAR_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| SidecarError::Gone)?;
+    if bytes.len() as u64 > MAX_SIDECAR_BYTES {
+        return Err(SidecarError::TooLarge);
+    }
+    Ok(bytes)
+}
+
+/// A subtitle stream inside the file, extracted as WebVTT by FFmpeg. At most
+/// [`EXTRACT_CONCURRENCY`] extractions run at once, and each result is kept
+/// in the state folder, keyed by the file's path, size, modification time,
+/// and the track, so asking again does not run FFmpeg again.
 async fn embedded_subtitle(
     State(state): State<Arc<AppState>>,
     UrlPath((id, track)): UrlPath<(String, String)>,
@@ -845,10 +930,81 @@ async fn embedded_subtitle(
         }
         Some(_) => {}
     }
+    let Some(cached) = subtitle_cache_path(&state.state_dir, &entry.path, track) else {
+        return error(
+            StatusCode::NOT_FOUND,
+            "The video's file is no longer on the server",
+        );
+    };
+    if let Ok(bytes) = tokio::fs::read(&cached).await {
+        return webvtt(bytes);
+    }
+    let Ok(_permit) = state.extracting.acquire().await else {
+        return error(StatusCode::SERVICE_UNAVAILABLE, "The server is stopping");
+    };
+    // Another request may have extracted it while this one waited.
+    if let Ok(bytes) = tokio::fs::read(&cached).await {
+        return webvtt(bytes);
+    }
     match transcode::extract_webvtt(encoder, &entry.path, track).await {
-        Ok(bytes) => ([(header::CONTENT_TYPE, "text/vtt")], bytes).into_response(),
+        Ok(bytes) => {
+            if let Err(problem) = save_atomically(&cached, &bytes).await {
+                tracing::warn!(path = %cached.display(), "Could not keep the extracted subtitles: {problem:#}");
+            }
+            webvtt(bytes)
+        }
         Err(problem) => error(StatusCode::BAD_GATEWAY, format!("{problem:#}")),
     }
+}
+
+fn webvtt(bytes: Vec<u8>) -> Response {
+    ([(header::CONTENT_TYPE, "text/vtt")], bytes).into_response()
+}
+
+/// Where the WebVTT of `track` in `video` is kept: a hash of the path, size,
+/// modification time, and track, so a changed file is extracted again.
+/// None when the file cannot be read.
+fn subtitle_cache_path(state_dir: &Path, video: &Path, track: u32) -> Option<PathBuf> {
+    use sha1::{Digest, Sha1};
+    let metadata = std::fs::metadata(video).ok()?;
+    let modified = metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+        .map_or(0, |time| time.as_nanos());
+    let mut hasher = Sha1::new();
+    hasher.update(video.as_os_str().as_encoded_bytes());
+    hasher.update([0]);
+    hasher.update(metadata.len().to_le_bytes());
+    hasher.update(modified.to_le_bytes());
+    hasher.update(track.to_le_bytes());
+    let name = format!("{}.vtt", ids::encode_hex(&hasher.finalize()));
+    Some(state_dir.join(SUBTITLE_CACHE_DIR).join(name))
+}
+
+/// Writes through a uniquely named temporary file and renames it, so a
+/// reader never sees part of a file and two writers never share one.
+async fn save_atomically(path: &Path, bytes: &[u8]) -> Result<()> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let dir = path.parent().context("A cache file needs a folder")?;
+    tokio::fs::create_dir_all(dir)
+        .await
+        .with_context(|| format!("Create {}", dir.display()))?;
+    let temporary = dir.join(format!(
+        ".{}-{}.tmp",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    if let Err(problem) = tokio::fs::write(&temporary, bytes).await {
+        let _ = tokio::fs::remove_file(&temporary).await;
+        return Err(problem).with_context(|| format!("Write {}", temporary.display()));
+    }
+    if let Err(problem) = tokio::fs::rename(&temporary, path).await {
+        let _ = tokio::fs::remove_file(&temporary).await;
+        return Err(problem).with_context(|| format!("Save {}", path.display()));
+    }
+    Ok(())
 }
 
 /// `{"hash": "<16 hex>"}`, the OpenSubtitles movie hash.
@@ -897,7 +1053,9 @@ async fn get_progress(
 
 /// Saves progress and answers with what is now stored. A value older than
 /// the stored one by more than a minute is not applied, so a client that
-/// was offline does not rewind another client's newer position.
+/// was offline does not rewind another client's newer position. A time more
+/// than a minute ahead of the server's clock is lowered to that, so a
+/// client with a wrong clock cannot pin its value against every later one.
 async fn put_progress(
     State(state): State<Arc<AppState>>,
     UrlPath(id): UrlPath<String>,
@@ -925,11 +1083,15 @@ async fn put_progress(
             "Position and duration must be non-negative seconds",
         );
     }
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |time| time.as_secs());
     if progress.updated == 0 {
-        progress.updated = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_or(0, |time| time.as_secs());
+        progress.updated = now;
     }
+    progress.updated = progress
+        .updated
+        .min(now.saturating_add(PROGRESS_CLOCK_SKEW));
     let _guard = state.progress.lock().await;
     let path = progress_path(&state);
     let mut saved = read_progress(&path).await;

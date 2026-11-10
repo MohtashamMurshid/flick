@@ -22,13 +22,24 @@
 //! segments and at most one FFmpeg run at a time. A segment request serves
 //! the segment if it is there, waits if the run will reach it within
 //! [`HlsLimits::lookahead`] segments, and otherwise restarts the run at that
-//! segment. Runs write into their own folder; finished segments are moved
-//! into the job's folder, so segments from earlier runs stay available.
+//! segment. A request starts at most one run: if another request replaces
+//! its run, as when two viewers watch the same video at the same tier at
+//! different points, it answers 409 instead of taking the run back, so two
+//! requests never restart FFmpeg in turn. Runs write into their own folder;
+//! finished segments are moved into the job's folder, so segments from
+//! earlier runs stay available.
 //! A run that gets [`HlsLimits::max_ahead`] segments ahead of the last
 //! request stops, and a later request near the end of what was made starts
 //! the next run there. Segments behind the last request are removed once
 //! the job holds more than [`HlsLimits::max_job_bytes`]. A job without a
 //! request for [`HlsLimits::idle`] is stopped and its folder removed.
+//!
+//! At most `max_jobs` jobs exist. When a new one is needed at the cap, a job
+//! nobody is waiting on is closed to make room if it is another tier of the
+//! same video (the viewer switched tiers) or had no request for
+//! [`HlsLimits::reclaim_after`]; the least recently used such job goes.
+//! Otherwise the request gets 503, so viewers who are watching never take
+//! turns closing each other's transcodes.
 
 use super::protocol::{ErrorBody, HLS_SEGMENT_SECONDS, Quality};
 use super::transcode::{Encoder, MediaInfo, command, job_args, stderr_tail};
@@ -55,12 +66,20 @@ use tokio_util::sync::CancellationToken;
 
 /// Folder names this module creates under the temporary folder.
 const JOB_PREFIX: &str = "flick-hls-job-";
+/// A request whose FFmpeg run another request replaced.
+pub const CONFLICT_MESSAGE: &str = "Another viewer is watching this video at this quality at another point. Choose another quality or Original.";
+/// Any route for an unverified torrent download; the media route says the same.
+pub const INCOMPLETE_MESSAGE: &str =
+    "This video is still downloading on the server and has not been verified yet.";
 
-/// A source the server agrees to transcode.
+/// A source the server knows.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ResolvedVideo {
     pub path: PathBuf,
     pub info: MediaInfo,
+    /// False while the file is an unverified torrent download; every HLS
+    /// route then answers 409, as the media route does.
+    pub complete: bool,
 }
 
 /// Looks up a video id; None answers 404.
@@ -86,6 +105,9 @@ pub struct HlsLimits {
     pub resume_ahead: u32,
     /// How often a run checks its folder for finished segments.
     pub poll: Duration,
+    /// At the job cap, a job of another video with no request for this
+    /// long is closed to make room for a new one.
+    pub reclaim_after: Duration,
 }
 
 impl Default for HlsLimits {
@@ -98,6 +120,7 @@ impl Default for HlsLimits {
             max_ahead: 45,
             resume_ahead: 20,
             poll: Duration::from_millis(100),
+            reclaim_after: Duration::from_secs(10),
         }
     }
 }
@@ -112,13 +135,16 @@ pub struct HlsState {
     resolve: Resolver,
     limits: HlsLimits,
     jobs: Mutex<HashMap<JobKey, Arc<Job>>>,
+    /// Jobs closed to make room, still stopping FFmpeg and removing files.
+    closing: Mutex<Vec<JoinHandle<()>>>,
     next_job: AtomicU64,
     reaper: AtomicBool,
 }
 
 impl HlsState {
     /// `encoder` is None when FFmpeg was not found; every route then answers
-    /// 503. At most `max_jobs` (video, tier) jobs exist at once. Job folders
+    /// 503. At most `max_jobs` (video, tier) jobs exist at once; see the
+    /// module documentation for when one is closed to make room. Job folders
     /// are made inside `temp_dir`; leftovers from an earlier process that
     /// stopped without cleaning up are removed here.
     pub fn new(
@@ -141,6 +167,7 @@ impl HlsState {
             resolve,
             limits: HlsLimits::default(),
             jobs: Mutex::new(HashMap::new()),
+            closing: Mutex::new(Vec::new()),
             next_job: AtomicU64::new(0),
             reaper: AtomicBool::new(false),
         }
@@ -176,27 +203,42 @@ impl HlsState {
         for job in jobs {
             job.close().await;
         }
+        let closing = std::mem::take(&mut *lock(&self.closing));
+        for task in closing {
+            let _ = task.await;
+        }
     }
 
+    /// The job for (`id`, `quality`), made if needed, with the caller
+    /// counted as waiting on it. Counting happens under the jobs lock, so a
+    /// job being handed out is never chosen to make room for another.
     fn job(
         self: &Arc<Self>,
         id: &str,
         quality: Quality,
         video: ResolvedVideo,
-    ) -> Result<Arc<Job>, Refusal> {
+    ) -> Result<Waiting, Refusal> {
         let mut jobs = lock(&self.jobs);
         if let Some(job) = jobs.get(&(id.to_owned(), quality)) {
-            return Ok(job.clone());
+            return Ok(Waiting::new(job.clone()));
         }
         if jobs.len() >= self.max_jobs {
-            return Err(Refusal(
-                StatusCode::SERVICE_UNAVAILABLE,
-                format!(
-                    "This server is already making {} transcode{} at once. Stop another stream, wait a minute, or choose Original quality.",
-                    self.max_jobs,
-                    if self.max_jobs == 1 { "" } else { "s" }
-                ),
-            ));
+            let Some(victim) = self.reclaimable(&jobs, id) else {
+                return Err(Refusal(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    format!(
+                        "This server is already making {} transcode{} at once. Stop another stream, wait a few seconds, or choose Original quality.",
+                        self.max_jobs,
+                        if self.max_jobs == 1 { "" } else { "s" }
+                    ),
+                ));
+            };
+            let job = jobs.remove(&victim).expect("chosen from the map");
+            tracing::debug!(dir = %job.root.display(), "Closing an unused transcode to make room");
+            job.stop_runs();
+            let mut closing = lock(&self.closing);
+            closing.retain(|task| !task.is_finished());
+            closing.push(tokio::spawn(async move { job.close().await }));
         }
         let root = self.temp_dir.join(format!(
             "{JOB_PREFIX}{}-{}",
@@ -222,11 +264,27 @@ impl HlsState {
             state: Mutex::new(JobState::new()),
         });
         jobs.insert((id.to_owned(), quality), job.clone());
+        let waiting = Waiting::new(job);
         drop(jobs);
         if !self.reaper.swap(true, Ordering::AcqRel) {
             tokio::spawn(reap(Arc::downgrade(self), self.limits.idle));
         }
-        Ok(job)
+        Ok(waiting)
+    }
+
+    /// The job to close to make room for one of video `id`: nobody waiting
+    /// on it, and either another tier of `id` or unused for
+    /// [`HlsLimits::reclaim_after`]. The least recently used one wins.
+    fn reclaimable(&self, jobs: &HashMap<JobKey, Arc<Job>>, id: &str) -> Option<JobKey> {
+        jobs.iter()
+            .filter_map(|(key, job)| {
+                let state = lock(&job.state);
+                let unused = state.last_used.elapsed() >= self.limits.reclaim_after;
+                (state.waiters == 0 && (key.0 == id || unused))
+                    .then(|| (state.last_used, key.clone()))
+            })
+            .min_by_key(|(last_used, _)| *last_used)
+            .map(|(_, key)| key)
     }
 }
 
@@ -351,18 +409,18 @@ enum Outcome {
     Failed(String),
 }
 
-/// Counts a waiting request while it lives, even if its future is dropped
-/// because the client went away.
-struct Waiting<'a>(&'a Job);
+/// A job with one request counted as waiting on it while this lives, even
+/// if the request's future is dropped because the client went away.
+struct Waiting(Arc<Job>);
 
-impl<'a> Waiting<'a> {
-    fn new(job: &'a Job) -> Self {
+impl Waiting {
+    fn new(job: Arc<Job>) -> Self {
         lock(&job.state).waiters += 1;
         Self(job)
     }
 }
 
-impl Drop for Waiting<'_> {
+impl Drop for Waiting {
     fn drop(&mut self) {
         let mut state = lock(&self.0.state);
         state.waiters -= 1;
@@ -481,8 +539,27 @@ impl Job {
         Ok(())
     }
 
-    /// Decides what a request for segment `n` does now.
-    fn next_step(self: &Arc<Self>, n: u32, waited: &mut Option<u64>) -> Next {
+    /// Answer for a request whose run, `started`, is gone and which may not
+    /// start another: 409 when another request replaced it.
+    fn lost(state: &JobState, started: u64) -> Response {
+        if state.generation != started {
+            error(StatusCode::CONFLICT, CONFLICT_MESSAGE.into())
+        } else {
+            error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "The transcode stopped before reaching this point. Try again.".into(),
+            )
+        }
+    }
+
+    /// Decides what a request for segment `n` does now. `waited` is the run
+    /// the request last waited on, `started` the run it started, if any.
+    fn next_step(
+        self: &Arc<Self>,
+        n: u32,
+        waited: &mut Option<u64>,
+        started: &mut Option<u64>,
+    ) -> Next {
         let mut state = lock(&self.state);
         state.last_used = Instant::now();
         state.playhead = n;
@@ -505,8 +582,17 @@ impl Job {
         let covered = state.active_run().is_some_and(|run| {
             run.start <= n && run.next <= n && n <= run.next.saturating_add(self.limits.lookahead)
         });
-        if !covered && let Err(refusal) = self.start_run(&mut state, n) {
-            return Next::Fail(refusal.into_response());
+        if !covered {
+            // At most one run per request: a request whose run was replaced
+            // does not take it back, or two requests would restart FFmpeg
+            // in turn for as long as they wait.
+            if let Some(mine) = *started {
+                return Next::Fail(Self::lost(&state, mine));
+            }
+            if let Err(refusal) = self.start_run(&mut state, n) {
+                return Next::Fail(refusal.into_response());
+            }
+            *started = Some(state.generation);
         }
         *waited = state.run.as_ref().map(|run| run.generation);
         Next::Wait(self.changed.subscribe())
@@ -528,12 +614,13 @@ impl Job {
         }
     }
 
+    /// Answers a request for segment `n`. The caller holds a [`Waiting`].
     async fn segment(self: &Arc<Self>, n: u32) -> Response {
-        let _waiting = Waiting::new(self);
         let deadline = tokio::time::Instant::now() + self.limits.segment_wait;
         let mut waited = None;
+        let mut started = None;
         loop {
-            match self.next_step(n, &mut waited) {
+            match self.next_step(n, &mut waited, &mut started) {
                 Next::Serve(path) => match tokio::fs::read(&path).await {
                     Ok(bytes) => return file(bytes, "video/iso.segment"),
                     // Removed between the check and the read: decide again.
@@ -558,10 +645,12 @@ impl Job {
         }
     }
 
+    /// Answers a request for `init.mp4`, which any run makes. The caller
+    /// holds a [`Waiting`].
     async fn init(self: &Arc<Self>) -> Response {
-        let _waiting = Waiting::new(self);
         let deadline = tokio::time::Instant::now() + self.limits.segment_wait;
         let mut waited = None;
+        let mut started = None;
         loop {
             let changed = {
                 let mut state = lock(&self.state);
@@ -579,10 +668,15 @@ impl Job {
                         );
                     }
                     if state.active_run().is_none() {
+                        // Like a segment request, start at most one run.
+                        if let Some(mine) = started {
+                            return Self::lost(&state, mine);
+                        }
                         let start = state.playhead.min(self.count.saturating_sub(1));
                         if let Err(refusal) = self.start_run(&mut state, start) {
                             return refusal.into_response();
                         }
+                        started = Some(state.generation);
                     }
                     waited = state.run.as_ref().map(|run| run.generation);
                     Some(self.changed.subscribe())
@@ -822,6 +916,9 @@ async fn hls_file(
     let Some(video) = (state.resolve)(&id) else {
         return not_found();
     };
+    if !video.complete {
+        return error(StatusCode::CONFLICT, INCOMPLETE_MESSAGE.into());
+    }
     if state.encoder.is_none() {
         return error(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -845,11 +942,11 @@ async fn hls_file(
             .into_response(),
         Want::Segment(n) if n >= segment_count(video.info.duration) => not_found(),
         Want::Segment(n) => match state.job(&id, quality, video) {
-            Ok(job) => job.segment(n).await,
+            Ok(waiting) => waiting.0.segment(n).await,
             Err(refusal) => refusal.into_response(),
         },
         Want::Init => match state.job(&id, quality, video) {
-            Ok(job) => job.init().await,
+            Ok(waiting) => waiting.0.init().await,
             Err(refusal) => refusal.into_response(),
         },
     }

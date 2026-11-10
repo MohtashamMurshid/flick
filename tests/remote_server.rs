@@ -16,6 +16,13 @@ use tempfile::TempDir;
 use tokio::time::timeout;
 
 const DEADLINE: Duration = Duration::from_secs(30);
+
+fn now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+}
 const VIDEO_SIZE: usize = 4 * 1024 * 1024 + 123;
 
 /// Bytes that differ at every offset in a 251-byte cycle, so a misplaced
@@ -540,6 +547,20 @@ async fn unverified_torrent_files_answer_conflict() -> Result<()> {
         ensure!(error_message(response).await?.contains("downloading"));
         let response = running.get(&paths::hash(&partial.id)).send().await?;
         ensure!(response.status() == StatusCode::CONFLICT);
+        // Transcodes answer the same as the file, not as an unknown id.
+        for path in [
+            paths::hls_playlist(&partial.id, Quality::Low720),
+            paths::hls_init(&partial.id, Quality::Data480),
+            paths::hls_segment(&partial.id, Quality::High1080, 0),
+        ] {
+            let response = running.get(&path).send().await?;
+            ensure!(
+                response.status() == StatusCode::CONFLICT,
+                "{path}: {}",
+                response.status()
+            );
+            ensure!(error_message(response).await?.contains("downloading"), "{path}");
+        }
         let response = running.get(&paths::media(&film.id)).send().await?;
         ensure!(response.status() == StatusCode::OK);
         running.server.shutdown().await;
@@ -631,7 +652,7 @@ async fn progress_round_trips_and_survives_restarts() -> Result<()> {
             position: 42.5,
             duration: 100.0,
             finished: false,
-            updated: 1_800_000_000,
+            updated: now() - 600,
         };
         let response = running
             .request(reqwest::Method::PUT, &paths::progress(&id))
@@ -692,6 +713,64 @@ async fn progress_round_trips_and_survives_restarts() -> Result<()> {
             .await?;
         ensure!(got == close);
         again.server.shutdown().await;
+        Ok(())
+    })
+    .await?
+}
+
+/// A client whose clock runs years ahead cannot pin its progress against
+/// every later save: the time is lowered to a minute past the server's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn progress_from_a_future_clock_is_clamped() -> Result<()> {
+    timeout(DEADLINE, async {
+        let fixture = Fixture::new()?;
+        let running = fixture.start().await?;
+        let id = running.film_id().await?;
+        let before = now();
+        let future = Progress {
+            position: 99.0,
+            duration: 100.0,
+            finished: false,
+            updated: before + 10 * 365 * 24 * 3600,
+        };
+        let stored: Progress = running
+            .request(reqwest::Method::PUT, &paths::progress(&id))
+            .json(&future)
+            .send()
+            .await?
+            .json()
+            .await?;
+        ensure!(stored.position == 99.0);
+        ensure!(
+            stored.updated >= before && stored.updated <= now() + 60,
+            "{} is not clamped near {before}",
+            stored.updated
+        );
+        // A client with a correct clock saves over it.
+        let later = Progress {
+            position: 10.0,
+            duration: 100.0,
+            finished: false,
+            updated: now(),
+        };
+        let response = running
+            .request(reqwest::Method::PUT, &paths::progress(&id))
+            .json(&later)
+            .send()
+            .await?;
+        ensure!(response.json::<Progress>().await? == later);
+        // So does u64::MAX, clamped the same way without overflow.
+        let response = running
+            .request(reqwest::Method::PUT, &paths::progress(&id))
+            .json(&Progress {
+                updated: u64::MAX,
+                ..later.clone()
+            })
+            .send()
+            .await?;
+        ensure!(response.status() == StatusCode::OK);
+        ensure!(response.json::<Progress>().await?.updated <= now() + 60);
+        running.server.shutdown().await;
         Ok(())
     })
     .await?
@@ -769,6 +848,158 @@ async fn subtitles_posters_and_hash_are_served() -> Result<()> {
     .await?
 }
 
+/// A sidecar over 16 MiB (a VobSub `.sub`, say) answers 413 instead of
+/// being read into memory, and a symbolic link is never offered.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn large_sidecar_subtitles_are_refused() -> Result<()> {
+    timeout(DEADLINE, async {
+        let fixture = Fixture::new()?;
+        // Sparse, so the test writes nothing to disk.
+        std::fs::File::create(fixture.media.join("Film.zz.sub"))?.set_len(17 * 1024 * 1024)?;
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(
+            fixture.media.join("Film.srt"),
+            fixture.media.join("Film.aa.srt"),
+        )?;
+        let running = fixture.start().await?;
+        let id = running.film_id().await?;
+        let list: Vec<SubtitleFile> = running
+            .get(&paths::subtitles(&id))
+            .send()
+            .await?
+            .json()
+            .await?;
+        let names: Vec<_> = list.iter().map(|s| s.file_name.as_str()).collect();
+        ensure!(
+            names == ["Film.en.srt", "Film.srt", "Film.zz.sub"],
+            "{names:?}"
+        );
+        let response = running.get(&paths::subtitle(&id, 2)).send().await?;
+        ensure!(
+            response.status() == StatusCode::PAYLOAD_TOO_LARGE,
+            "{}",
+            response.status()
+        );
+        let message = error_message(response).await?;
+        ensure!(message.contains("16 MiB"), "{message}");
+        // A small one is still served.
+        let response = running.get(&paths::subtitle(&id, 0)).send().await?;
+        ensure!(response.status() == StatusCode::OK);
+        ensure!(response.text().await?.contains("Hi"));
+        running.server.shutdown().await;
+        Ok(())
+    })
+    .await?
+}
+
+/// Embedded subtitle extraction runs at most two FFmpeg processes at once,
+/// and a track extracted once is served from the state folder afterwards.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn embedded_subtitle_extraction_is_capped_and_cached() -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    timeout(DEADLINE, async {
+        let fixture = Fixture::new()?;
+        let bin = fixture.state.parent().unwrap().join("bin");
+        std::fs::create_dir_all(&bin)?;
+        let log = bin.join("extract.log");
+        let script = |name: &str, body: String| -> Result<()> {
+            let path = bin.join(name);
+            std::fs::write(&path, body)?;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))?;
+            Ok(())
+        };
+        script(
+            "ffmpeg",
+            format!(
+                r#"#!/bin/sh
+case "$*" in
+  *-encoders*) echo ' V....D libx264              libx264 H.264'; exit 0 ;;
+  *0:s:0*)
+    echo "start $$" >> '{log}'
+    sleep 1
+    echo "end $$" >> '{log}'
+    printf 'WEBVTT
+
+00:00:01.000 --> 00:00:02.000
+Hi
+'
+    exit 0 ;;
+esac
+exit 1
+"#,
+                log = log.display()
+            ),
+        )?;
+        script(
+            "ffprobe",
+            r#"#!/bin/sh
+echo '{"format":{"duration":"100"},"streams":[{"codec_type":"video","width":64,"height":64},{"codec_type":"subtitle","codec_name":"subrip"}]}'
+"#
+            .into(),
+        )?;
+        let mut config = fixture.config(Sources::Folders(vec![fixture.media.clone()]));
+        config.ffmpeg = Some(bin.join("ffmpeg"));
+        let server = Server::start(config).await?;
+        let running = std::sync::Arc::new(Running {
+            base: format!("http://{}", server.addr()),
+            token: fixture.token.clone(),
+            client: reqwest::Client::builder()
+                .no_proxy()
+                .timeout(Duration::from_secs(20))
+                .build()?,
+            server,
+        });
+        let id = running.film_id().await?;
+        let wave = |count: usize| {
+            let requests: Vec<_> = (0..count)
+                .map(|_| {
+                    let running = running.clone();
+                    let path = paths::embedded_subtitle(&id, 0);
+                    tokio::spawn(async move {
+                        let response = running.get(&path).send().await?;
+                        ensure!(response.status() == StatusCode::OK, "{}", response.status());
+                        Ok::<_, anyhow::Error>(response.text().await?)
+                    })
+                })
+                .collect();
+            async move {
+                for request in requests {
+                    let body = request.await??;
+                    ensure!(body.starts_with("WEBVTT") && body.contains("Hi"), "{body}");
+                }
+                Ok::<_, anyhow::Error>(())
+            }
+        };
+        wave(20).await?;
+        let lines = std::fs::read_to_string(&log)?;
+        let (mut running_now, mut most, mut starts) = (0i32, 0, 0);
+        for line in lines.lines() {
+            if line.starts_with("start") {
+                running_now += 1;
+                starts += 1;
+            } else {
+                running_now -= 1;
+            }
+            most = most.max(running_now);
+        }
+        ensure!(most <= 2, "{most} extractions at once:\n{lines}");
+        ensure!((1..=2).contains(&starts), "{starts} extractions:\n{lines}");
+        let cached = std::fs::read_dir(fixture.state.join("subtitles"))?.count();
+        ensure!(cached == 1, "{cached} files in the subtitle cache");
+
+        // The second wave is served from the cache without FFmpeg.
+        wave(5).await?;
+        ensure!(std::fs::read_to_string(&log)? == lines, "FFmpeg ran again");
+        let Ok(running) = std::sync::Arc::try_unwrap(running) else {
+            anyhow::bail!("a request still holds the server");
+        };
+        running.server.shutdown().await;
+        Ok(())
+    })
+    .await?
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn shutdown_ends_streams_in_progress() -> Result<()> {
     timeout(DEADLINE, async {
@@ -823,6 +1054,9 @@ fn flick_serve(state: &Path) -> tokio::process::Command {
     command
         .arg("--state-dir")
         .arg(state)
+        // A path that is not FFmpeg keeps the test off the real one.
+        .arg("--ffmpeg")
+        .arg(state.join("no-ffmpeg"))
         .env("RUST_LOG", "warn")
         .stdin(std::process::Stdio::null())
         .kill_on_drop(true);

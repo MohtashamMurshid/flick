@@ -144,9 +144,10 @@ exit 0
         std::fs::write(&source, b"not really a video").unwrap();
         Arc::new(move |id: &str| {
             let duration = match id {
-                "film" => 400.0, // 100 segments
-                "short" => 10.5, // 3 segments
-                "other" => 40.0, // 10 segments
+                "film" => 400.0,   // 100 segments
+                "short" => 10.5,   // 3 segments
+                "other" => 40.0,   // 10 segments
+                "partial" => 40.0, // still downloading
                 "unknown-length" => 0.0,
                 _ => return None,
             };
@@ -159,6 +160,7 @@ exit 0
                     frame_rate: 24.0,
                     ..Default::default()
                 },
+                complete: id != "partial",
             })
         })
     }
@@ -436,26 +438,235 @@ exit 0
         .await
     }
 
-    #[tokio::test]
-    async fn jobs_over_the_cap_get_503() -> Result<()> {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn jobs_with_waiters_are_never_closed_for_room() -> Result<()> {
         within(30, async {
-            let f = fixture(Script::default(), 1, limits()).await?;
-            f.segment("film", Quality::Low720, 0).await?;
-            for (id, quality) in [("film", Quality::Data480), ("other", Quality::Low720)] {
-                let response = f.get(&paths::hls_segment(id, quality, 0)).await?;
-                assert_eq!(response.status(), 503);
+            let f = fixture(
+                Script {
+                    delay: "1",
+                    ..Default::default()
+                },
+                1,
+                HlsLimits {
+                    // Any job nobody waits on may be closed for room.
+                    reclaim_after: Duration::ZERO,
+                    ..limits()
+                },
+            )
+            .await?;
+            let first_path = paths::hls_segment("film", Quality::Low720, 0);
+            let waiting = f.get(&first_path);
+            let refused = async {
+                until("the first run to start", || f.runs().len() == 1).await?;
+                let mut messages = Vec::new();
+                for (id, quality) in [("film", Quality::Data480), ("other", Quality::Low720)] {
+                    let response = f.get(&paths::hls_segment(id, quality, 0)).await?;
+                    assert_eq!(response.status(), 503, "{id} {quality:?}");
+                    messages.push(error_message(response).await?);
+                }
+                Ok::<_, anyhow::Error>(messages)
+            };
+            let (waiting, refused) = tokio::join!(waiting, refused);
+            assert_eq!(waiting?.text().await?, "segment 0 from 0\n");
+            for message in refused? {
                 assert!(
-                    error_message(response)
-                        .await?
-                        .contains("already making 1 transcode at once")
+                    message.contains("already making 1 transcode at once"),
+                    "{message}"
                 );
             }
-            // The running job itself is still served.
-            f.segment("film", Quality::Low720, 1).await?;
+            assert_eq!(f.runs().len(), 1, "a refused request starts nothing");
+            // Nobody waits on the job now, so it makes room.
+            let first = f.runs()[0].2;
+            assert_eq!(
+                f.segment("other", Quality::Low720, 0).await?,
+                "segment 0 from 0\n"
+            );
             assert_eq!(f.state.job_count(), 1);
-            f.state.shutdown().await;
+            until("the closed job's FFmpeg to exit", || !alive(first)).await?;
+            until("the closed job's folder to go", || {
+                f.job_folders().len() == 1
+            })
+            .await?;
+            f.shutdown().await;
+            Ok(())
+        })
+        .await
+    }
+
+    /// Switching tiers twice used to leave two abandoned jobs holding both
+    /// slots for a minute. The abandoned tier of the same video makes room;
+    /// another video's job that was just used does not.
+    #[tokio::test]
+    async fn switching_tiers_closes_the_abandoned_tier() -> Result<()> {
+        within(30, async {
+            let f = fixture(
+                Script::default(),
+                2,
+                HlsLimits {
+                    reclaim_after: Duration::from_secs(2),
+                    ..limits()
+                },
+            )
+            .await?;
+            f.segment("film", Quality::Low720, 0).await?;
+            let first = f.runs()[0].2;
+            f.segment("film", Quality::Data480, 0).await?;
+            assert_eq!(
+                f.segment("film", Quality::High1080, 0).await?,
+                "segment 0 from 0\n"
+            );
+            assert_eq!(f.state.job_count(), 2);
+            until("the 720p FFmpeg to exit", || !alive(first)).await?;
+            until("the 720p folder to go", || f.job_folders().len() == 2).await?;
+            // Both remaining jobs were just used, and are another video's.
+            let response = f
+                .get(&paths::hls_segment("other", Quality::Low720, 0))
+                .await?;
+            assert_eq!(response.status(), 503);
+            error_message(response).await?;
+            // Once one has gone unused for a while, it makes room.
+            tokio::time::sleep(Duration::from_millis(2500)).await;
+            assert_eq!(
+                f.segment("other", Quality::Low720, 0).await?,
+                "segment 0 from 0\n"
+            );
+            assert_eq!(f.state.job_count(), 2);
+            // The 1080p job was used last, so 480p was the one closed.
+            assert_eq!(
+                f.segment("film", Quality::High1080, 1).await?,
+                "segment 1 from 0\n"
+            );
+            f.shutdown().await;
+            Ok(())
+        })
+        .await
+    }
+
+    /// Two requests far apart in one (video, tier) job used to replace each
+    /// other's FFmpeg run thousands of times a second. Now the request whose
+    /// run was replaced answers 409 at once.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn far_apart_requests_do_not_restart_each_other() -> Result<()> {
+        within(30, async {
+            let q = Quality::Low720;
+            // FFmpeg that makes segments slowly: the later request wins.
+            let f = fixture(
+                Script {
+                    delay: "1",
+                    ..Default::default()
+                },
+                2,
+                limits(),
+            )
+            .await?;
+            let (near, far) = (
+                paths::hls_segment("film", q, 0),
+                paths::hls_segment("film", q, 50),
+            );
+            let started = std::time::Instant::now();
+            let (a, b) = tokio::join!(f.get(&near), f.get(&far));
+            let (a, b) = (a?, b?);
+            let elapsed = started.elapsed();
+            let runs = f.runs();
+            assert!(runs.len() <= 3, "{} runs: {runs:?}", runs.len());
+            let mut statuses = [a.status().as_u16(), b.status().as_u16()];
+            statuses.sort_unstable();
+            assert_eq!(statuses, [200, 409]);
+            let (served, conflict) = if a.status() == 409 { (b, a) } else { (a, b) };
+            assert!(served.text().await?.starts_with("segment "));
+            let message = error_message(conflict).await?;
+            assert!(message.contains("Another viewer"), "{message}");
+            assert!(elapsed < Duration::from_secs(5), "{elapsed:?}");
+            f.shutdown().await;
+
+            // FFmpeg that never makes a segment in time, as in the report.
+            let f = fixture(
+                Script {
+                    delay: "30",
+                    ..Default::default()
+                },
+                2,
+                HlsLimits {
+                    segment_wait: Duration::from_secs(2),
+                    ..limits()
+                },
+            )
+            .await?;
+            let started = std::time::Instant::now();
+            let (a, b) = tokio::join!(
+                async {
+                    let response = f.get(&paths::hls_segment("film", q, 0)).await?;
+                    Ok::<_, anyhow::Error>((response.status().as_u16(), started.elapsed()))
+                },
+                async {
+                    let response = f.get(&paths::hls_segment("film", q, 50)).await?;
+                    Ok::<_, anyhow::Error>((response.status().as_u16(), started.elapsed()))
+                }
+            );
+            let mut answers = [a?, b?];
+            answers.sort_unstable_by_key(|(status, _)| *status);
+            let runs = f.runs();
+            assert!(runs.len() <= 3, "{} runs: {runs:?}", runs.len());
+            assert_eq!(answers[0].0, 409);
+            assert!(answers[0].1 < Duration::from_secs(1), "{answers:?}");
+            assert_eq!(answers[1].0, 504);
+            assert!(answers[1].1 < Duration::from_secs(4), "{answers:?}");
+            f.shutdown().await;
+            Ok(())
+        })
+        .await
+    }
+
+    /// `init.mp4` is the same from any run, so it waits for whichever run
+    /// is going rather than starting its own again.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn init_waits_for_a_run_started_elsewhere() -> Result<()> {
+        within(30, async {
+            let f = fixture(
+                Script {
+                    delay: "0.3",
+                    ..Default::default()
+                },
+                2,
+                limits(),
+            )
+            .await?;
+            let q = Quality::Data480;
+            let (init_path, far) = (
+                paths::hls_init("film", q),
+                paths::hls_segment("film", q, 50),
+            );
+            let (init, segment) = tokio::join!(f.get(&init_path), f.get(&far));
+            let (init, segment) = (init?, segment?);
+            assert_eq!(init.status(), 200);
+            assert!(init.text().await?.starts_with("init from "));
+            assert_eq!(segment.text().await?, "segment 50 from 50\n");
+            let runs = f.runs();
+            assert!(runs.len() <= 2, "{runs:?}");
+            f.shutdown().await;
+            Ok(())
+        })
+        .await
+    }
+
+    #[tokio::test]
+    async fn downloads_in_progress_answer_conflict() -> Result<()> {
+        within(30, async {
+            let f = fixture(Script::default(), 2, limits()).await?;
+            for path in [
+                paths::hls_playlist("partial", Quality::Low720),
+                paths::hls_init("partial", Quality::Low720),
+                paths::hls_segment("partial", Quality::Low720, 0),
+            ] {
+                let response = f.get(&path).await?;
+                assert_eq!(response.status(), 409, "{path}");
+                assert_eq!(
+                    error_message(response).await?,
+                    flick::remote::hls::INCOMPLETE_MESSAGE
+                );
+            }
+            assert!(f.runs().is_empty());
             assert_eq!(f.state.job_count(), 0);
-            f.segment("other", Quality::Low720, 0).await?;
             f.shutdown().await;
             Ok(())
         })
@@ -738,6 +949,7 @@ async fn real_ffmpeg_makes_playable_segments() -> Result<()> {
         let resolved = ResolvedVideo {
             path: video.clone(),
             info: info.clone(),
+            complete: true,
         };
         let state = Arc::new(HlsState::new(
             Some(encoder.clone()),
