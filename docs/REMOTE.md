@@ -2,7 +2,7 @@
 
 `flick-serve` is a headless server for a machine that keeps the storage, such as a Mac mini. Another Flick on the same [Tailscale](https://tailscale.com) network can browse its library and stream the original files from it. Files are not copied. The design is in [the remote library plan](REMOTE_PLAN.md).
 
-**Status:** the server and this tool are implemented and covered by loopback tests. The desktop client (the Remote libraries page and playback in Flick) and the lower quality tiers are not built yet. Until they are, you can check the server with `curl` or stock `mpv`, as shown below.
+**Status:** the server and this tool are implemented, covered by loopback tests, and were checked on a real Tailscale address (see [validation](VALIDATION.md#remote-library-over-tailscale-on-2026-11-10)). In the desktop app, **Appearance → Remote Libraries** pairs with a server and shows whether it is online and how many videos it has. The library section that lists those videos and plays them, and the quality tiers below Original, are not finished yet. Until they are, you can check the server with `curl` or stock `mpv`, as shown below. Playback from a second machine has not been tested yet.
 
 ## What it does, and what it never does
 
@@ -41,12 +41,14 @@ flick-serve --folder /Volumes/Media/Films --folder /Volumes/Media/Shows
 
 `--library` reads the desktop app's `settings.json` read-only, so the desktop app can keep running. It finds the file the way the app does: `FLICK_SETTINGS_PATH` if set, else the app's configuration folder (`~/Library/Application Support/app.Flick.Flick/settings.json` on macOS). Posters come from the desktop's poster cache when it has one. Videos still downloading by torrent are listed but answer `409` until Flick has verified them.
 
-`--folder` scans each folder and its subfolders for video files. Symbolic links to folders are not followed.
+`--folder` scans each folder and its subfolders for video files. Symbolic links, to files or folders, are not followed. Videos from `--folder` have no duration or size in pixels in the listing; those come from the desktop library.
+
+One of `--library` or `--folder` is required.
 
 At startup it prints one line of JSON to stdout and keeps running until Ctrl+C (or SIGTERM):
 
 ```json
-{"pairing":"flick-remote://100.98.200.69:47117/#3f1c…","listen":"100.98.200.69:47117"}
+{"listen":"100.98.200.69:47117","pairing":"flick-remote://100.98.200.69:47117/#3f1c…"}
 ```
 
 Logs go to stderr. Set `RUST_LOG=flick=debug` for more detail. The token never appears in the logs.
@@ -60,10 +62,10 @@ Logs go to stderr. Set `RUST_LOG=flick=debug` for more detail. The token never a
 | `--bind IP:PORT` | Tailscale IPv4 address and `--port` | Listen here instead. Only Tailscale addresses (`100.64.0.0/10`, `fd7a:115c:a1e0::/48`) and loopback are accepted. |
 | `--port PORT` | `47117` | Port when `--bind` is not given. Keep it fixed so paired Flicks keep working across restarts. |
 | `--name NAME` | the computer's name (`scutil --get ComputerName`, else the host name) | The section title in the other Flick's library. |
-| `--state-dir DIR` | Flick's data folder, in `remote` (`FLICK_DATA_DIR/remote` if that variable is set) | Where the token, id salt, and progress are kept. |
-| `--print-pairing` | | Print the pairing line for the saved token (making one if needed) and exit. Needs a fixed port. |
+| `--state-dir DIR` | Flick's data folder, in `remote`: `~/Library/Application Support/app.Flick.Flick/remote` on macOS, or `FLICK_DATA_DIR/remote` if that variable is set | Where the token, id salt, and progress are kept. |
+| `--print-pairing` | | Print the pairing line for the saved token (making one if needed) and exit. Needs a fixed port, and Tailscale running unless `--bind` is given. |
 | `--new-token` | | Replace the saved token. Every paired Flick must pair again. |
-| `--ffmpeg PATH`, `--max-transcodes N` | | Reserved for the quality tiers below Original; not used yet. |
+| `--ffmpeg PATH`, `--max-transcodes N` | none, `2` | Reserved for the quality tiers below Original; accepted but not used yet. |
 
 The library is re-read on every listing request, so a video added on the desktop appears the next time the other Flick refreshes, without restarting the server.
 
@@ -75,7 +77,9 @@ The pairing string is `flick-remote://<address>:<port>/#<token>`. The token is i
 flick-serve --print-pairing
 ```
 
-prints it again at any time, including while the server is running. On the other Mac, Flick's **Appearance → Remote libraries → Add** will take this string once the desktop client ships.
+prints it again at any time, including while the server is running. Give it the same `--state-dir`, and the same `--port` or `--bind`, as the running server, or it prints a different address or makes a new token.
+
+On the other Mac, open Flick's **Appearance**, find **Remote Libraries**, choose **Add Server…**, paste the string, and choose **Add**. The row then shows the server's address and "Online · N videos", "Offline", or "Wrong token. Pair again". Pasting a string for an address that is already paired replaces its token.
 
 Treat the string like a password. To revoke every paired Flick, run `flick-serve --new-token --print-pairing` and restart the server.
 
@@ -128,7 +132,7 @@ tailscale ping mohtashams-mac-mini
 
 `pong from … via 192.168.1.20:41641` means a **direct** path: on the same LAN that comfortably carries the original file of a 4K remux. `via DERP(…)` means the traffic is **relayed** through a Tailscale server, which is slower and varies; expect it to struggle with high bit rate files. Away from home, the Mac mini's home upload speed is the ceiling either way.
 
-## Try it without the desktop client
+## Check it with curl or mpv
 
 With the pairing line's address and token:
 
@@ -155,10 +159,10 @@ All paths are under `/v1` and need the bearer token. Every error is JSON, `{"mes
 | `GET /v1/poster/{id}` | The poster PNG, or `404`. |
 | `GET /v1/subtitles/{id}` | Sidecar subtitle files: same name as the video, optionally with a language part (`Film.en.srt`), with extension `.srt`, `.ass`, `.ssa`, `.vtt`, or `.sub`. |
 | `GET /v1/subtitles/{id}/{n}` | Subtitle file `n` from that list. |
-| `GET /v1/hash/{id}` | `{"hash": "<16 hex digits>"}`, the OpenSubtitles movie hash. `422` for files under 64 KiB. |
-| `GET`/`PUT /v1/progress/{id}` | Playback position, `{"position", "duration", "finished", "updated"}`. `PUT` answers with what is stored: an `updated` more than a minute older than the stored value is not applied; within a minute, the newest `PUT` wins. `updated: 0` means now. |
+| `GET /v1/hash/{id}` | `{"hash": "<16 hex digits>"}`, the OpenSubtitles movie hash. `422` for files under 64 KiB, `409` while a torrent file is unverified. |
+| `GET`/`PUT /v1/progress/{id}` | Playback position, `{"position", "duration", "finished", "updated"}`. `GET` is `404` when nothing is saved. `PUT` answers with what is stored: an `updated` more than a minute older than the stored value is not applied; within a minute, the newest `PUT` wins. `updated: 0` means now. |
 
-An unknown id is `404`. Ids are SHA-1 of a random per-server salt and the file's canonical path, so they stay the same across restarts and never reveal a path.
+A request without the token is `401`, even for a path that does not exist. An unknown id or path is `404`. Ids are SHA-1 of a random per-server salt and the file's canonical path, so they stay the same across restarts and never reveal a path.
 
 ## Files it keeps
 
@@ -170,6 +174,8 @@ In the state folder (`--state-dir`):
 | `salt` | The id salt, mode 0600. Deleting it changes every id; paired Flicks then need a refresh and lose remote progress. |
 | `progress.json` | Saved positions by video id. |
 | `serve.lock` | Held while a server runs, so two servers cannot share the folder. |
+
+The desktop Flick keeps its cached listings of paired servers (`<server id>.json`) and downloaded subtitles (`subtitles/`) in the same default folder. On a machine that runs both, the two sets of files sit side by side; their names do not overlap.
 
 ## Troubleshooting
 

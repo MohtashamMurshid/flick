@@ -1,6 +1,6 @@
 # Remote library over Tailscale
 
-**Status: proposed on 2026-11-10; not implemented.** This plan adds a second machine to Flick: one Flick keeps the library and the files, another Flick on the same tailnet browses that library and plays from it at source quality. It does not change local playback, transfers, or link downloads.
+**Status: proposed on 2026-11-10; partly implemented.** The ticked items under [Delivery order](#delivery-order) are delivered at `c17bbd6`; see [validation](VALIDATION.md#remote-library-over-tailscale-on-2026-11-10). This plan adds a second machine to Flick: one Flick keeps the library and the files, another Flick on the same tailnet browses that library and plays from it at source quality. It does not change local playback, transfers, or link downloads.
 
 ## Outcome
 
@@ -105,18 +105,18 @@ flick-serve --bind 127.0.0.1:0 --folder /tmp/fixtures   # tests and local checks
 
 ### 1. Server core and headless binary
 
-- [ ] Add the HTTP server dependency and keep it out of the desktop feature gate check in CI. Candidate: `axum` 0.8 on the existing Tokio runtime; a hand-written range handler rather than another middleware crate.
-- [ ] `remote::ids`, `remote::auth`, `remote::bind` with unit tests: id stability, constant-time token compare, Tailscale range check that rejects `0.0.0.0`, LAN, and public addresses.
-- [ ] `remote::server` with the listing, media, poster, subtitle, and hash routes.
-- [ ] `flick-serve` with `--library`, `--folder`, `--bind`, `--port`, `--print-pairing`.
-- [ ] Integration tests on loopback with generated fixtures: 401 without token, 404 unknown id, 206 ranges including the last byte and an open-ended range, 416 for multi-range and out-of-bounds, `HEAD` lengths, `If-Range` with a stale ETag, 409 for an incomplete torrent file, and a concurrent-reader test that two clients reading different ranges get the right bytes.
+- [x] Add the HTTP server dependency and keep it out of the desktop feature gate check in CI. Candidate: `axum` 0.8 on the existing Tokio runtime; a hand-written range handler rather than another middleware crate.
+- [x] `remote::ids`, `remote::auth`, `remote::bind` with unit tests: id stability, constant-time token compare, Tailscale range check that rejects `0.0.0.0`, LAN, and public addresses.
+- [x] `remote::server` with the listing, media, poster, subtitle, and hash routes.
+- [x] `flick-serve` with `--library`, `--folder`, `--bind`, `--port`, `--print-pairing`.
+- [x] Integration tests on loopback with generated fixtures: 401 without token, 404 unknown id, 206 ranges including the last byte and an open-ended range, 416 for multi-range and out-of-bounds, `HEAD` lengths, `If-Range` with a stale ETag, 409 for an incomplete torrent file, and a concurrent-reader test that two clients reading different ranges get the right bytes.
 - [ ] `remote::transcode` and `remote::hls`: FFmpeg and encoder discovery, the tier ladder, playlist generation, the segment job manager, WebVTT extraction, and tests driven by a generated stand-in `ffmpeg` script, following the yt-dlp stand-in pattern. Real FFmpeg is exercised only by an ignored test.
 - [ ] Manual check from the MacBook with stock mpv: `mpv --http-header-fields='Authorization: Bearer …' http://mohtashams-mac-mini.taildcfc7a.ts.net:PORT/v1/media/<id>`. This proves the transport end to end before any desktop work and is recorded in validation as a real playback check with the observed bit rate and `tailscale ping` result.
 
 ### 2. Desktop client
 
-- [ ] `Source` enum through `open_prepared`, resume, history, and the title.
-- [ ] Remote libraries settings page and pairing string parsing, with tests for the parser.
+- [x] `Source` enum through `open_prepared`, resume, history, and the title.
+- [x] Remote libraries settings page and pairing string parsing, with tests for the parser.
 - [ ] Library section per server, posters over HTTP, offline row.
 - [ ] Playback with the bearer header set and cleared around load; cache tuning by measurement.
 - [ ] Sidecar subtitles, embedded WebVTT subtitles, and the OpenSubtitles hash over the wire.
