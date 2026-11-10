@@ -2656,6 +2656,13 @@ impl Flick {
                     self.error = Some(format!("{name}: {}", sentence(&message)));
                 }
             }
+            (Command::FetchStart { .. }, result) => match result {
+                Ok(Outcome::Queued { message }) => {
+                    self.show_status_for(message, std::time::Duration::from_secs(6));
+                }
+                Ok(_) => {}
+                Err(message) => self.error = Some(format!("{name}: {}", sentence(&message))),
+            },
             (Command::Browse { dir }, result) => {
                 let Some(sheet) = save_to.share.as_mut().filter(|sheet| {
                     sheet.machine.as_deref() == Some(server_id.as_str()) && sheet.dir == dir
