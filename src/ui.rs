@@ -332,6 +332,7 @@ impl Flick {
         }
         self.quitting = true;
         self.services.begin_shutdown();
+        self.remote.shutdown();
         self.up_next = None;
         self.pending_open = None;
         self.open_generation = self.open_generation.wrapping_add(1);
@@ -1317,6 +1318,12 @@ impl Flick {
             return Duration::from_millis(500);
         }
         self.poll_library_files(window, cx);
+        if self.remote.drain() {
+            cx.notify();
+        }
+        for image in self.remote.take_dropped_images() {
+            let _ = window.drop_image(image);
+        }
         let requested =
             std::mem::take(&mut *OPEN_REQUESTS.lock().unwrap_or_else(|e| e.into_inner()));
         let mut requested = requested.into_iter();
