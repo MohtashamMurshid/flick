@@ -17,6 +17,7 @@ use flick::remote::{
     server::{Server, ServerConfig, Sources},
 };
 use std::{
+    fmt,
     net::{IpAddr, SocketAddr},
     path::PathBuf,
     sync::mpsc,
@@ -30,8 +31,8 @@ pub const TAILSCALE_MISSING: &str = if cfg!(target_os = "macos") {
     "Tailscale is not running on this computer"
 };
 
-/// What the settings row shows.
-#[derive(Clone, Debug, Default, PartialEq)]
+/// What the settings row shows. `Debug` redacts the pairing token.
+#[derive(Clone, Default, PartialEq)]
 pub enum ServeStatus {
     #[default]
     Off,
@@ -42,6 +43,21 @@ pub enum ServeStatus {
         pairing: String,
     },
     Failed(String),
+}
+
+impl fmt::Debug for ServeStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ServeStatus::Off => f.write_str("Off"),
+            ServeStatus::Starting => f.write_str("Starting"),
+            ServeStatus::Running { listen, .. } => f
+                .debug_struct("Running")
+                .field("listen", listen)
+                .field("pairing", &"<redacted>")
+                .finish(),
+            ServeStatus::Failed(message) => f.debug_tuple("Failed").field(message).finish(),
+        }
+    }
 }
 
 /// Runs before the server reads its sources, on the server thread.
@@ -60,6 +76,10 @@ pub struct ServeOptions {
     /// None binds to this machine's Tailscale IPv4 address on
     /// [`protocol::DEFAULT_PORT`]. Tests pass loopback.
     pub bind: Option<SocketAddr>,
+    /// FFmpeg for the quality tiers. None searches `FLICK_FFMPEG`, `PATH`,
+    /// and the usual install folders. Tests pass a path that does not exist,
+    /// so they never run this machine's FFmpeg.
+    pub ffmpeg: Option<PathBuf>,
     /// For example, waiting for queued settings saves to reach the disk.
     pub before_start: Option<BeforeStart>,
 }
@@ -241,7 +261,7 @@ async fn serve(
         sources: Sources::SettingsFile(options.settings_path),
         poster_cache: options.poster_cache.filter(|dir| dir.is_dir()),
         state_dir: options.state_dir,
-        ffmpeg: None,
+        ffmpeg: options.ffmpeg,
         max_transcodes: 2,
     };
     let server = match Server::start(config).await {
@@ -332,6 +352,8 @@ mod tests {
             name: "Test Library".into(),
             new_token,
             bind: Some("127.0.0.1:0".parse().unwrap()),
+            // Not an executable: transcoding stays off without searching PATH.
+            ffmpeg: Some(dir.join("no-ffmpeg")),
             before_start: None,
         }
     }
@@ -363,7 +385,11 @@ mod tests {
             panic!("did not start: {:?}", serve.status());
         };
         ran.try_recv().expect("before_start runs before serving");
+        let debug = format!("{:?}", serve.status());
+        assert!(debug.contains("<redacted>"), "{debug}");
         let parsed = Pairing::parse(&pairing).unwrap();
+        assert!(!debug.contains(&parsed.token), "{debug}");
+        assert!(!debug.contains(&pairing), "{debug}");
         assert_eq!(
             (parsed.host.as_str(), parsed.port),
             ("127.0.0.1", listen.port())
@@ -372,6 +398,8 @@ mod tests {
         assert!(listing.starts_with("HTTP/1.1 200"), "{listing}");
         assert!(listing.contains("\"Test Library\""), "{listing}");
         assert!(listing.contains("\"Clip\""), "{listing}");
+        // The test's FFmpeg does not exist, so only Original is offered.
+        assert!(listing.contains(r#""qualities":["original"]"#), "{listing}");
         assert!(get(listen, "/v1/library", &"0".repeat(64)).starts_with("HTTP/1.1 401"));
 
         // A new token restarts the server and revokes the old one.

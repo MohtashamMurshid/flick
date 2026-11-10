@@ -1075,8 +1075,26 @@ impl TemporaryFile {
                 ".flick-settings-{}-{timestamp}-{sequence}.tmp",
                 std::process::id()
             ));
-            match OpenOptions::new().write(true).create_new(true).open(&path) {
-                Ok(file) => return Ok((Self { path }, file)),
+            let mut options = OpenOptions::new();
+            options.write(true).create_new(true);
+            // Settings hold remote pairing tokens: readable by this user only.
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            match options.open(&path) {
+                Ok(file) => {
+                    let temporary = Self { path };
+                    // The mode above is masked by the umask; set it exactly.
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        file.set_permissions(fs::Permissions::from_mode(0o600))
+                            .context("Cannot restrict temporary settings")?;
+                    }
+                    return Ok((temporary, file));
+                }
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
                 Err(error) => return Err(error).context("Cannot create temporary settings"),
             }
@@ -1922,5 +1940,26 @@ mod tests {
         assert!(store.save_to(&destination).is_err());
         assert_eq!(fs::read_to_string(marker).unwrap(), "prior data");
         assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn saved_settings_are_readable_by_this_user_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.json");
+        // A file left world-readable by an older Flick is replaced, not kept.
+        fs::write(&path, b"{}").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        let mut store = Store::load_from(&path);
+        store.data.remote.servers.push(remote::RemoteServer {
+            id: "id".into(),
+            token: "secret".into(),
+            ..Default::default()
+        });
+        store.save().unwrap();
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "{mode:o}");
+        assert!(fs::read_to_string(&path).unwrap().contains("secret"));
     }
 }

@@ -61,6 +61,23 @@ fn set_network_profile(player: &Player, remote: Option<&RemoteSource>) {
     }
 }
 
+/// Whether a player event means libmpv no longer needs the bearer header
+/// for the current remote load. `file_loaded` is whether the current load
+/// had loaded before this event.
+///
+/// A replacing load can deliver the previous file's end, tagged with the new
+/// request, before the new file opens its stream; clearing then could make
+/// that open fail with 401. So an end clears only once the current file has
+/// loaded. Every `player.load` sets or clears the header first, so a header
+/// left set after a stop is replaced before the next load.
+fn should_clear_header(event: &PlayerEvent, file_loaded: bool) -> bool {
+    match event {
+        PlayerEvent::FileLoaded | PlayerEvent::Error(_) => true,
+        PlayerEvent::EndFile => file_loaded,
+        PlayerEvent::OperationCompleted { .. } => false,
+    }
+}
+
 /// Removes the bearer header so no later request or load carries it.
 fn clear_http_headers(player: &Player) {
     if let Err(error) = player.set_property(crate::source::HTTP_HEADERS, "") {
@@ -982,7 +999,7 @@ impl Flick {
             .store
             .data
             .remote_resume_position(&remote.server_id, &remote.video_id);
-        self.load_remote(remote, resume, window, cx);
+        self.prepare_remote(remote, resume, window, cx);
     }
 
     /// Reloads the playing remote video at another tier, at the current
@@ -1009,7 +1026,39 @@ impl Flick {
         } else {
             self.pending_resume
         };
-        self.load_remote(remote, position, window, cx);
+        self.prepare_remote(remote, position, window, cx);
+    }
+
+    /// Loads Original at once. A transcode tier waits for the server to
+    /// confirm it will play it, because libmpv reports a refused HLS load
+    /// only as a generic failure; the server's reason is shown instead, and
+    /// whatever is playing keeps playing.
+    fn prepare_remote(
+        &mut self,
+        remote: RemoteSource,
+        resume: f64,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.remote_ui.checking = None;
+        if !remote.quality.is_transcode() {
+            self.load_remote(remote, resume, window, cx);
+            return;
+        }
+        // Any open or Back before the answer cancels this one.
+        self.open_generation = self.open_generation.wrapping_add(1);
+        self.pending_open = None;
+        let check = self
+            .remote
+            .check_playback(&remote.server_id, &remote.video_id, remote.quality);
+        self.show_status(format!("Preparing {}…", remote.quality.label()));
+        self.remote_ui.checking = Some(remote_library_ui::PendingPlayback {
+            check,
+            generation: self.open_generation,
+            remote,
+            resume,
+        });
+        cx.notify();
     }
 
     fn load_remote(
@@ -1022,6 +1071,7 @@ impl Flick {
         // A local open still resolving in the background must not replace this.
         self.open_generation = self.open_generation.wrapping_add(1);
         self.pending_open = None;
+        self.remote_ui.checking = None;
         self.persist();
         let Some(player) = &self.player else {
             cx.notify();
@@ -1337,7 +1387,7 @@ impl Flick {
         if self.remote.drain() {
             cx.notify();
         }
-        self.apply_remote_ready(cx);
+        self.apply_remote_ready(window, cx);
         for image in self.remote.take_dropped_images() {
             let _ = window.drop_image(image);
         }
@@ -1433,12 +1483,12 @@ impl Flick {
             return Duration::from_millis(500);
         };
         let mut changed = false;
-        // Only the current request's events arrive. Once a remote file has
-        // loaded or failed, libmpv no longer needs the token for new requests.
+        // Once a remote file has loaded or failed, libmpv no longer needs
+        // the token for new requests.
         let remote = self.source().is_some_and(Source::is_remote);
         for event in player.poll_events() {
             changed = true;
-            if remote && !matches!(event, PlayerEvent::OperationCompleted { .. }) {
+            if remote && should_clear_header(&event, self.file_loaded) {
                 clear_http_headers(player);
             }
             match event {
@@ -2431,6 +2481,27 @@ mod tests {
         );
         assert_eq!(url_path("https://example.com/a.mp4"), None);
         assert_eq!(url_path("file:///bad%2"), None);
+    }
+
+    #[test]
+    fn the_bearer_header_outlives_the_previous_files_end() {
+        // A replacing load: the old file's end arrives before the new file
+        // loads, and must not clear the header the new load needs.
+        assert!(!should_clear_header(&PlayerEvent::EndFile, false));
+        assert!(should_clear_header(&PlayerEvent::FileLoaded, false));
+        // The current file ending after it loaded, or failing, clears it.
+        assert!(should_clear_header(&PlayerEvent::EndFile, true));
+        assert!(should_clear_header(
+            &PlayerEvent::Error("401".into()),
+            false
+        ));
+        assert!(should_clear_header(&PlayerEvent::Error("eof".into()), true));
+        let completed = PlayerEvent::OperationCompleted {
+            id: 1,
+            result: crate::playback::OperationResult::Completed,
+        };
+        assert!(!should_clear_header(&completed, false));
+        assert!(!should_clear_header(&completed, true));
     }
 
     #[test]

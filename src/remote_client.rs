@@ -23,7 +23,7 @@
 use crate::store::{Settings, remote::RemoteServer};
 use flick::remote::protocol::{self, ErrorBody, Library, Pairing, Progress, Quality};
 use std::{
-    cell::{OnceCell, RefCell},
+    cell::{Cell, OnceCell, RefCell},
     collections::{HashMap, HashSet, VecDeque},
     fmt,
     path::{Path, PathBuf},
@@ -42,6 +42,8 @@ const SUBTITLE_TIMEOUT: Duration = Duration::from_secs(60);
 const MAX_LISTING_BYTES: usize = 64 * 1024 * 1024;
 const MAX_POSTER_BYTES: usize = 8 * 1024 * 1024;
 const MAX_SUBTITLE_BYTES: usize = 16 * 1024 * 1024;
+/// An HLS playlist: about 30 bytes per 4-second segment.
+const MAX_PLAYLIST_BYTES: usize = 4 * 1024 * 1024;
 /// Decoded posters kept in memory.
 const POSTER_CACHE_CAPACITY: usize = 128;
 /// Poster downloads in flight at once.
@@ -199,6 +201,16 @@ pub enum Ready {
         /// The OpenSubtitles movie hash, 16 hex digits.
         result: Result<String, String>,
     },
+    /// The answer to [`RemoteState::check_playback`].
+    Playback {
+        /// The number `check_playback` returned.
+        check: u64,
+        server_id: String,
+        video_id: String,
+        quality: Quality,
+        /// Why the server will not play it, in words for the user.
+        result: Result<(), String>,
+    },
 }
 
 /// Text fields of the Remote libraries settings rows. They are GPUI entities,
@@ -221,6 +233,10 @@ pub struct SettingsFields {
 pub struct RemoteState {
     pub fields: SettingsFields,
     worker: OnceCell<Worker>,
+    /// Set by [`Self::shutdown`]: no worker starts after it.
+    shut_down: Cell<bool>,
+    /// The last number [`Self::check_playback`] handed out.
+    checks: Cell<u64>,
     inner: RefCell<Inner>,
 }
 
@@ -368,7 +384,9 @@ impl RemoteState {
             return None;
         }
         inner.posters.enqueue(key, endpoint);
-        inner.posters.pump(self.worker());
+        if let Some(worker) = self.worker() {
+            inner.posters.pump(worker);
+        }
         None
     }
 
@@ -478,7 +496,42 @@ impl RemoteState {
         self.send(&mut self.inner.borrow_mut(), Some(request));
     }
 
-    /// Finished subtitle and hash requests since the last call.
+    /// Asks the server whether it will play a video at a tier, by fetching
+    /// what libmpv would load first: the HLS playlist for a transcode, or
+    /// the file's headers for Original. libmpv reports a refused HTTP load
+    /// only as a generic failure, so the server's reason (still downloading,
+    /// no FFmpeg, unknown length) is shown from this answer instead. The
+    /// answer arrives in [`Ready::Playback`] with the returned number.
+    pub fn check_playback(&mut self, server_id: &str, video_id: &str, quality: Quality) -> u64 {
+        let check = self.checks.get().wrapping_add(1);
+        self.checks.set(check);
+        let inner = self.inner.get_mut();
+        let Some(endpoint) = inner
+            .servers
+            .get(server_id)
+            .and_then(|remote| remote.endpoint.clone())
+        else {
+            inner.ready.push(Ready::Playback {
+                check,
+                server_id: server_id.to_owned(),
+                video_id: video_id.to_owned(),
+                quality,
+                result: Err("This server is not paired".into()),
+            });
+            return check;
+        };
+        let request = Request::Playback {
+            endpoint,
+            check,
+            server_id: server_id.to_owned(),
+            video_id: video_id.to_owned(),
+            quality,
+        };
+        self.send(&mut self.inner.borrow_mut(), Some(request));
+        check
+    }
+
+    /// Finished subtitle, hash, and playback checks since the last call.
     pub fn take_ready(&mut self) -> Vec<Ready> {
         std::mem::take(&mut self.inner.get_mut().ready)
     }
@@ -503,8 +556,10 @@ impl RemoteState {
     }
 
     /// Stops the worker without waiting for requests in flight and removes
-    /// temporary subtitle files. Also runs on drop.
+    /// temporary subtitle files. Also runs on drop. Requests made afterwards
+    /// fail at once instead of starting a new worker.
     pub fn shutdown(&mut self) {
+        self.shut_down.set(true);
         // Dropping the request sender ends the worker's loop.
         if self.worker.take().is_some() {
             let dir = subtitle_dir(self.inner.get_mut().data_dir());
@@ -516,16 +571,24 @@ impl RemoteState {
         }
     }
 
-    fn worker(&self) -> &Worker {
-        self.worker.get_or_init(Worker::start)
+    /// The worker, started on first use. None after [`Self::shutdown`].
+    fn worker(&self) -> Option<&Worker> {
+        if self.shut_down.get() {
+            return None;
+        }
+        Some(self.worker.get_or_init(Worker::start))
     }
 
     fn send(&self, inner: &mut Inner, request: Option<Request>) {
         let Some(request) = request else {
             return;
         };
-        if let Err(request) = self.worker().send(request) {
-            inner.apply((*request).unavailable());
+        let refused = match self.worker() {
+            Some(worker) => worker.send(request).err().map(|request| *request),
+            None => Some(request),
+        };
+        if let Some(request) = refused {
+            inner.apply(request.unavailable());
         }
     }
 }
@@ -855,6 +918,13 @@ enum Request {
         video_id: String,
         progress: Progress,
     },
+    Playback {
+        endpoint: Endpoint,
+        check: u64,
+        server_id: String,
+        video_id: String,
+        quality: Quality,
+    },
 }
 
 impl Request {
@@ -901,6 +971,19 @@ impl Request {
                 result: Err(error),
             }),
             Request::Progress { .. } => Reply::None,
+            Request::Playback {
+                check,
+                server_id,
+                video_id,
+                quality,
+                ..
+            } => Reply::Ready(Ready::Playback {
+                check,
+                server_id,
+                video_id,
+                quality,
+                result: Err(error),
+            }),
         }
     }
 }
@@ -1126,6 +1209,50 @@ async fn handle(http: &reqwest::Client, request: Request) -> Reply {
             }
             Reply::None
         }
+        Request::Playback {
+            endpoint,
+            check,
+            server_id,
+            video_id,
+            quality,
+        } => {
+            let path = protocol::paths::playback(&video_id, quality);
+            let result = if quality.is_transcode() {
+                get(http, &endpoint, &path, MAX_PLAYLIST_BYTES, REQUEST_TIMEOUT)
+                    .await
+                    .map(drop)
+            } else {
+                head(http, &endpoint, &path).await
+            };
+            Reply::Ready(Ready::Playback {
+                check,
+                server_id,
+                video_id,
+                quality,
+                result: result.map_err(|status| playback_error(&status)),
+            })
+        }
+    }
+}
+
+/// A HEAD with the bearer header; the file itself is never downloaded.
+async fn head(http: &reqwest::Client, endpoint: &Endpoint, path: &str) -> Result<(), Status> {
+    let response = http
+        .head(endpoint.url(path))
+        .header(
+            reqwest::header::AUTHORIZATION,
+            protocol::bearer(&endpoint.token),
+        )
+        .timeout(REQUEST_TIMEOUT)
+        .send()
+        .await
+        .map_err(|_| Status::Offline)?;
+    let code = response.status().as_u16();
+    if (200..300).contains(&code) {
+        Ok(())
+    } else {
+        // A HEAD answer has no body, so the generic message is used.
+        Err(status_for_http(code, &[]))
     }
 }
 
@@ -1174,26 +1301,35 @@ async fn get(
     Ok(body)
 }
 
-/// The status a non-success HTTP answer means. The server's message is used
-/// when it sent one.
+/// The status a non-success HTTP answer means. For any 4xx or 5xx other
+/// than 401, 403, and 404, the server's message is used when it sent one.
 pub fn status_for_http(code: u16, body: &[u8]) -> Status {
-    let message = serde_json::from_slice::<ErrorBody>(body)
-        .ok()
-        .map(|body| short(body.message.trim()))
-        .filter(|message| !message.is_empty());
+    let message = || {
+        serde_json::from_slice::<ErrorBody>(body)
+            .ok()
+            .map(|body| short(body.message.trim()))
+            .filter(|message| !message.is_empty())
+    };
     match code {
         200..=299 => Status::Online,
         401 | 403 => Status::WrongToken,
         404 => Status::NotFlick,
-        409 | 503 => Status::Failed(message.unwrap_or_else(|| {
-            if code == 409 {
-                "Still downloading on the server".into()
-            } else {
-                "The server is busy. Try again shortly".into()
-            }
+        400..=599 => Status::Failed(message().unwrap_or_else(|| match code {
+            409 => "Still downloading on the server".into(),
+            503 => "The server is busy. Try again shortly".into(),
+            500..=599 => format!("Server error ({code})"),
+            _ => format!("Unexpected reply ({code})"),
         })),
-        500..=599 => Status::Failed(message.unwrap_or_else(|| format!("Server error ({code})"))),
         _ => Status::Failed(format!("Unexpected reply ({code})")),
+    }
+}
+
+/// Why a video will not play, from a failed [`RemoteState::check_playback`].
+fn playback_error(status: &Status) -> String {
+    match status {
+        Status::Offline => "The server did not answer".into(),
+        Status::NotFlick => "The server no longer has this video".into(),
+        status => status.label(),
     }
 }
 
@@ -1601,6 +1737,30 @@ mod tests {
             status_for_http(418, b""),
             Status::Failed("Unexpected reply (418)".into())
         );
+        // Every 4xx and 5xx but 401, 403, and 404 carries the server's message.
+        for code in [400, 409, 415, 422, 418, 503, 504] {
+            assert_eq!(
+                status_for_http(code, br#"{"message":" Bitmap track "}"#),
+                Status::Failed("Bitmap track".into()),
+                "{code}"
+            );
+        }
+        assert_eq!(
+            status_for_http(415, b"<html>"),
+            Status::Failed("Unexpected reply (415)".into())
+        );
+        assert_eq!(
+            status_for_http(409, br#"{"message":""}"#),
+            Status::Failed("Still downloading on the server".into())
+        );
+        assert_eq!(
+            status_for_http(404, br#"{"message":"gone"}"#),
+            Status::NotFlick
+        );
+        assert_eq!(
+            status_for_http(302, br#"{"message":"elsewhere"}"#),
+            Status::Failed("Unexpected reply (302)".into())
+        );
         assert_eq!(
             Status::TooNew(2).label(),
             "Server is newer than this Flick (protocol 2)"
@@ -1702,8 +1862,28 @@ mod tests {
         assert_eq!(safe_name("a/b.c"), "a_b_c");
     }
 
+    type Answer = (u16, &'static str, Vec<u8>);
+
     /// A loopback stand-in for a Flick server: one request per connection.
     fn fake_server(listing: Library, poster: Vec<u8>) -> u16 {
+        loopback_server(move |_, path| {
+            if path == protocol::paths::library() {
+                (
+                    200,
+                    "application/json",
+                    serde_json::to_vec(&listing).unwrap(),
+                )
+            } else if path == protocol::paths::poster("v0") {
+                (200, "image/png", poster.clone())
+            } else {
+                (404, "application/json", br#"{"message":"gone"}"#.to_vec())
+            }
+        })
+    }
+
+    /// Answers 401 without the test token, else what `answer` gives for the
+    /// method and path. HEAD answers carry no body.
+    fn loopback_server(answer: impl Fn(&str, &str) -> Answer + Send + 'static) -> u16 {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         thread::spawn(move || {
@@ -1712,7 +1892,9 @@ mod tests {
                 let mut reader = BufReader::new(stream.try_clone().unwrap());
                 let mut line = String::new();
                 reader.read_line(&mut line).unwrap();
-                let path = line.split_whitespace().nth(1).unwrap_or("").to_owned();
+                let mut words = line.split_whitespace();
+                let method = words.next().unwrap_or("").to_owned();
+                let path = words.next().unwrap_or("").to_owned();
                 let mut authorized = false;
                 loop {
                     let mut header = String::new();
@@ -1728,23 +1910,17 @@ mod tests {
                 }
                 let (code, kind, body) = if !authorized {
                     (401, "application/json", br#"{"message":"no"}"#.to_vec())
-                } else if path == protocol::paths::library() {
-                    (
-                        200,
-                        "application/json",
-                        serde_json::to_vec(&listing).unwrap(),
-                    )
-                } else if path == protocol::paths::poster("v0") {
-                    (200, "image/png", poster.clone())
                 } else {
-                    (404, "application/json", br#"{"message":"gone"}"#.to_vec())
+                    answer(&method, &path)
                 };
                 let _ = write!(
                     stream,
                     "HTTP/1.1 {code} X\r\nContent-Type: {kind}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                     body.len()
                 );
-                let _ = stream.write_all(&body);
+                if method != "HEAD" {
+                    let _ = stream.write_all(&body);
+                }
             }
         });
         port
@@ -1851,5 +2027,153 @@ mod tests {
         wait_until(&mut state, |state| {
             state.servers(&settings)[0].status == Status::Offline
         });
+    }
+
+    fn wait_for_ready(state: &mut RemoteState) -> Ready {
+        let started = Instant::now();
+        loop {
+            state.drain();
+            if let Some(ready) = state.take_ready().pop() {
+                return ready;
+            }
+            assert!(started.elapsed() < Duration::from_secs(10), "timed out");
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn error_body(message: &str) -> Vec<u8> {
+        serde_json::to_vec(&ErrorBody {
+            message: message.into(),
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn server_messages_reach_subtitles_and_playback_checks() {
+        const BITMAP: &str = "Track 3 is a bitmap track, which cannot be converted to WebVTT";
+        const DOWNLOADING: &str = "This video is still downloading on the server";
+        const NO_LENGTH: &str = "The server could not read this video's length";
+        let port = loopback_server(|method, path| {
+            let json = "application/json";
+            if path == protocol::paths::library() {
+                (200, json, serde_json::to_vec(&library(3)).unwrap())
+            } else if path == protocol::paths::embedded_subtitle("v0", 3) {
+                (415, json, error_body(BITMAP))
+            } else if path == protocol::paths::hls_playlist("v0", Quality::Low720) {
+                (200, "application/vnd.apple.mpegurl", b"#EXTM3U\n".to_vec())
+            } else if path == protocol::paths::hls_playlist("v1", Quality::Low720) {
+                (409, json, error_body(DOWNLOADING))
+            } else if path == protocol::paths::hls_playlist("v2", Quality::Low720) {
+                (422, json, error_body(NO_LENGTH))
+            } else if path == protocol::paths::hls_playlist("v2", Quality::Data480) {
+                (503, "text/plain", b"busy".to_vec())
+            } else if method == "HEAD" && path == protocol::paths::media("v0") {
+                (200, "video/mp4", vec![0; 1024])
+            } else {
+                (404, json, error_body("gone"))
+            }
+        });
+        let data = tempfile::tempdir().unwrap();
+        let mut state = RemoteState::with_data_dir(data.path());
+        let mut settings = Settings::default();
+        let id = state
+            .add_pairing(
+                &mut settings,
+                &format!("flick-remote://127.0.0.1:{port}/#{TOKEN}"),
+            )
+            .unwrap();
+        wait_until(&mut state, |state| {
+            state.servers(&settings)[0].status == Status::Online
+        });
+
+        state.fetch_subtitle(&id, "v0", SubtitleRef::Embedded(3));
+        let Ready::Subtitle { result, .. } = wait_for_ready(&mut state) else {
+            panic!("expected a subtitle");
+        };
+        assert_eq!(result.unwrap_err(), BITMAP);
+
+        let mut check = |video: &str, quality: Quality| {
+            let number = state.check_playback(&id, video, quality);
+            let Ready::Playback {
+                check,
+                server_id,
+                video_id,
+                quality: answered,
+                result,
+            } = wait_for_ready(&mut state)
+            else {
+                panic!("expected a playback check");
+            };
+            assert_eq!(
+                (check, server_id.as_str(), video_id.as_str(), answered),
+                (number, id.as_str(), video, quality)
+            );
+            result
+        };
+        assert_eq!(check("v0", Quality::Low720), Ok(()));
+        assert_eq!(check("v0", Quality::Original), Ok(()));
+        assert_eq!(check("v1", Quality::Low720), Err(DOWNLOADING.into()));
+        assert_eq!(check("v2", Quality::Low720), Err(NO_LENGTH.into()));
+        assert_eq!(
+            check("v2", Quality::Data480),
+            Err("The server is busy. Try again shortly".into())
+        );
+        assert_eq!(
+            check("v1", Quality::Original),
+            Err("The server no longer has this video".into())
+        );
+        assert_eq!(
+            check("missing", Quality::Low720),
+            Err("The server no longer has this video".into())
+        );
+
+        let unpaired = state.check_playback("nobody", "v0", Quality::Low720);
+        let Ready::Playback { check, result, .. } = wait_for_ready(&mut state) else {
+            panic!("expected a playback check");
+        };
+        assert_eq!(check, unpaired);
+        assert_eq!(result, Err("This server is not paired".into()));
+    }
+
+    #[test]
+    fn no_worker_starts_after_shutdown() {
+        let port = fake_server(library(1), Vec::new());
+        let data = tempfile::tempdir().unwrap();
+        let mut state = RemoteState::with_data_dir(data.path());
+        let mut settings = Settings::default();
+        let id = state
+            .add_pairing(
+                &mut settings,
+                &format!("flick-remote://127.0.0.1:{port}/#{TOKEN}"),
+            )
+            .unwrap();
+        wait_until(&mut state, |state| {
+            state.servers(&settings)[0].status == Status::Online
+        });
+        state.shutdown();
+        assert!(state.worker.get().is_none());
+
+        // Every kind of request fails at once instead of restarting it.
+        state.fetch_hash(&id, "v0");
+        state.fetch_subtitle(&id, "v0", SubtitleRef::Sidecar(0));
+        state.check_playback(&id, "v0", Quality::Low720);
+        state.put_progress(&settings, &id, "v0", Progress::default());
+        state.refresh(&settings);
+        assert!(state.poster(&id, "v0").is_none());
+        assert!(state.worker.get().is_none());
+        let ready = state.take_ready();
+        assert_eq!(ready.len(), 3);
+        assert!(ready.iter().all(|ready| match ready {
+            Ready::Subtitle { result, .. } => result.is_err(),
+            Ready::Hash { result, .. } => result.is_err(),
+            Ready::Playback { result, .. } => result.is_err(),
+        }));
+        assert!(!state.servers(&settings)[0].status.is_online());
+
+        // A state shut down before any request never starts one.
+        let mut fresh = RemoteState::with_data_dir(data.path());
+        fresh.shutdown();
+        fresh.servers(&settings);
+        assert!(fresh.worker.get().is_none());
     }
 }

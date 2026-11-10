@@ -7,6 +7,7 @@
 
 use flick::remote::protocol::Quality;
 use serde::{Deserialize, Serialize};
+use std::fmt;
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(default)]
@@ -33,8 +34,9 @@ impl RemoteSettings {
 }
 
 /// A paired server. `id` is random and local; it keys progress entries so
-/// renaming or re-pairing a server keeps its positions.
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+/// renaming or re-pairing a server keeps its positions. `Debug` redacts the
+/// token.
+#[derive(Clone, Default, Deserialize, Serialize)]
 #[serde(default)]
 pub struct RemoteServer {
     pub id: String,
@@ -49,6 +51,27 @@ pub struct RemoteServer {
     pub quality: Quality,
 }
 
+/// Keeps the token out of logs, panic messages, and `Settings`' Debug.
+impl fmt::Debug for RemoteServer {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RemoteServer")
+            .field("id", &self.id)
+            .field("name", &self.name)
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field(
+                "token",
+                &if self.token.is_empty() {
+                    ""
+                } else {
+                    "<redacted>"
+                },
+            )
+            .field("quality", &self.quality)
+            .finish()
+    }
+}
+
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(default)]
 pub struct RemoteProgress {
@@ -60,4 +83,40 @@ pub struct RemoteProgress {
     pub finished: bool,
     /// Seconds since the Unix epoch.
     pub updated: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    #[test]
+    fn debug_output_redacts_the_token() {
+        let server = RemoteServer {
+            id: "id".into(),
+            name: "Mac mini".into(),
+            host: "100.98.200.69".into(),
+            port: 47117,
+            token: TOKEN.into(),
+            quality: Quality::Original,
+        };
+        let text = format!("{server:?}");
+        assert!(!text.contains(TOKEN), "{text}");
+        assert!(
+            text.contains("<redacted>") && text.contains("Mac mini"),
+            "{text}"
+        );
+        let settings = RemoteSettings {
+            servers: vec![server],
+            ..Default::default()
+        };
+        let text = format!("{settings:?} {settings:#?}");
+        assert!(!text.contains(TOKEN), "{text}");
+        let all = crate::store::Settings {
+            remote: settings,
+            ..Default::default()
+        };
+        assert!(!format!("{all:?}").contains(TOKEN));
+    }
 }

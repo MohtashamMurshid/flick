@@ -35,6 +35,18 @@ pub(super) struct RemoteUiState {
     awaiting_hash: Option<(String, String, u64)>,
     /// When the pairing string was last copied, for the button's label.
     pub(super) copied: Option<Instant>,
+    /// A transcode tier waiting for the server's answer before it loads.
+    pub(super) checking: Option<PendingPlayback>,
+}
+
+/// A remote load waiting for [`Ready::Playback`].
+pub(super) struct PendingPlayback {
+    /// From `RemoteState::check_playback`.
+    pub check: u64,
+    /// `open_generation` when it was asked; any later open cancels it.
+    pub generation: u64,
+    pub remote: RemoteSource,
+    pub resume: f64,
 }
 
 impl RemoteUiState {
@@ -171,6 +183,16 @@ pub(super) fn card_detail(
 /// Whether a server is known not to answer, so opening a video would fail.
 fn unreachable(status: &Status) -> bool {
     !status.is_online() && *status != Status::Connecting
+}
+
+/// A message that ends like a sentence, for joining after another one.
+fn sentence(message: &str) -> String {
+    let message = message.trim();
+    if message.ends_with(['.', '!', '?', '…']) {
+        message.to_owned()
+    } else {
+        format!("{message}.")
+    }
 }
 
 fn card_id(kind: &str, server: &str, video: &str) -> ElementId {
@@ -737,7 +759,7 @@ impl Flick {
     }
 
     /// Finished subtitle downloads and hash requests from the remote client.
-    pub(super) fn apply_remote_ready(&mut self, cx: &mut Context<Self>) {
+    pub(super) fn apply_remote_ready(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         for ready in self.remote.take_ready() {
             let current = self
                 .remote_source()
@@ -789,6 +811,37 @@ impl Flick {
                         self.send_subtitle_search(None, hash, cx);
                     }
                 }
+                Ready::Playback {
+                    check,
+                    server_id,
+                    video_id,
+                    quality,
+                    result,
+                } => {
+                    let Some(pending) = self.remote_ui.checking.take_if(|p| {
+                        p.check == check
+                            && p.remote.server_id == server_id
+                            && p.remote.video_id == video_id
+                            && p.remote.quality == quality
+                    }) else {
+                        continue;
+                    };
+                    if self.quitting || pending.generation != self.open_generation {
+                        continue;
+                    }
+                    match result {
+                        Ok(()) => self.load_remote(pending.remote, pending.resume, window, cx),
+                        Err(message) => {
+                            self.status = None;
+                            self.error = Some(format!(
+                                "Could not play this video at {}. {}",
+                                pending.remote.quality.label(),
+                                sentence(&message)
+                            ));
+                            cx.notify();
+                        }
+                    }
+                }
             }
         }
     }
@@ -830,6 +883,7 @@ impl Flick {
             name: self.store.data.remote.serve_name.clone(),
             new_token,
             bind: None,
+            ffmpeg: None,
             before_start: Some(Box::new(move || barrier.wait())),
         });
     }
@@ -936,6 +990,16 @@ impl Flick {
 mod tests {
     use super::*;
     use flick::remote::protocol::Episode;
+
+    #[test]
+    fn server_messages_end_as_sentences() {
+        assert_eq!(
+            sentence("Still downloading on the server"),
+            "Still downloading on the server."
+        );
+        assert_eq!(sentence(" Try again. "), "Try again.");
+        assert_eq!(sentence("Busy…"), "Busy…");
+    }
 
     fn video(id: &str, title: &str, episode: Option<(&str, u32, u32)>) -> Video {
         Video {
