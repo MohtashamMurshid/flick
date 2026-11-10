@@ -81,7 +81,7 @@ impl Default for SubtitleStyle {
     }
 }
 
-/// Subtitle colors offered in Appearance.
+/// Subtitle colors offered in Settings → Subtitles.
 pub const SUBTITLE_COLORS: [(&str, u32); 4] = [
     ("White", 0xffffff),
     ("Yellow", 0xffe14d),
@@ -325,7 +325,7 @@ fn system_high_contrast() -> bool {
     }
 }
 
-/// Accent colors offered in Appearance, in display order.
+/// Accent colors offered in Settings → Appearance, in display order.
 pub const ACCENTS: [(&str, u32); 8] = [
     ("Blue", 0x2f7cf6),
     ("Purple", 0x9a5cf0),

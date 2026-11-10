@@ -497,7 +497,7 @@ impl Flick {
             && let Some(path) = torrents.into_iter().next()
         {
             self.resolve(flick::torrent::TorrentInput::File(path), cx);
-            if self.resolving {
+            if self.resolving || self.remote_ui.save_to.remote_torrent.is_some() {
                 not_started -= 1;
             }
             // Resolve clears the previous error; preserve any new admission failure.
@@ -642,7 +642,24 @@ impl Flick {
         );
     }
 
+    /// Resolves a torrent on the Save to choice for torrents: this Mac or
+    /// a paired server.
     pub(super) fn resolve(&mut self, input: flick::torrent::TorrentInput, cx: &mut Context<Self>) {
+        if self.resolving {
+            return;
+        }
+        let machine = self
+            .remote
+            .destination(&self.store.data, crate::remote_client::Sheet::Torrent);
+        self.resolve_on(input, machine, cx);
+    }
+
+    /// Resolves a torrent with this Mac's transfer session.
+    pub(super) fn resolve_locally(
+        &mut self,
+        input: flick::torrent::TorrentInput,
+        cx: &mut Context<Self>,
+    ) {
         if self.resolving {
             return;
         }
@@ -703,6 +720,8 @@ impl Flick {
                     self.resolving = false;
                     self.pending_torrent = None;
                 }
+                // Save to moved this torrent to another machine meanwhile.
+                ServiceEvent::Resolved(_) if self.remote_ui.save_to.torrent_machine.is_some() => {}
                 ServiceEvent::Resolved(result) => {
                     self.resolving = false;
                     match result {
@@ -730,6 +749,7 @@ impl Flick {
                     self.checking_share = None;
                     match result {
                         Ok(shared) => {
+                            self.remote_ui.save_to.shared_on = None;
                             self.magnet_field
                                 .update(cx, |field, cx| field.set_value(shared.magnet.clone(), cx));
                             self.shared_magnet = Some(shared.magnet);
@@ -1025,7 +1045,7 @@ impl Flick {
                 ("magnet", "Paste Link", Control::PasteMagnet),
                 ("share-2", "Share Files…", Control::Share),
             ],
-            Page::History | Page::Appearance | Page::Shortcuts => &[],
+            Page::History | Page::Settings | Page::Shortcuts => &[],
         }
     }
 
@@ -1227,7 +1247,7 @@ impl Flick {
         let settings = v_flex()
             .gap_0p5()
             .child(item(Page::Shortcuts, "keyboard", None))
-            .child(item(Page::Appearance, "palette", None));
+            .child(item(Page::Settings, "palette", None));
         let heading = |text: &'static str| {
             div()
                 .px_2p5()
@@ -1516,6 +1536,9 @@ impl Flick {
                         |this, _, cx| this.send(ServiceCommand::CancelResolve, cx),
                     )),
             );
+            if let Some(picker) = self.torrent_save_to(cx) {
+                notices = notices.child(group(&t, vec![picker]).mb_4());
+            }
         }
         if matches!(
             self.transfer_availability,
@@ -1590,7 +1613,7 @@ impl Flick {
             Page::Shows => self.shows_page(width, cx),
             Page::History => self.history_page(cx),
             Page::Downloads => self.downloads_page(cx),
-            Page::Appearance => self.appearance_page(cx),
+            Page::Settings => self.settings_page(cx),
             Page::Shortcuts => self.shortcuts_page(cx),
         };
         body = body.child(page.when(!virtual_page, |d| d.flex_none()));
@@ -1723,7 +1746,7 @@ impl Flick {
                     .mt_2()
                     .text_size(t.font(12.))
                     .text_color(t.muted)
-                    .child(format!("{command}K to search or paste a link  ·  {command}, for Appearance")),
+                    .child(format!("{command}K to search or paste a link  ·  {command}, for Settings")),
             )
     }
 
@@ -3091,85 +3114,109 @@ impl Flick {
                 .child(self.torrent_sheet(torrent, cx))
                 .child(div().h(px(28.)));
         }
-        page = page.child(self.link_downloads(cx));
+        if let Some(sheet) = self.remote_torrent_sheet(cx) {
+            page = page.child(sheet).child(div().h(px(28.)));
+        }
+        page = page
+            .children(self.link_sheet(cx))
+            .children(self.share_sheet(cx))
+            .child(self.link_downloads(cx));
         if let Some(magnet) = &self.shared_magnet {
             let magnet = magnet.clone();
+            let ready = match &self.remote_ui.save_to.shared_on {
+                Some(name) => format!("Share link ready. {name} keeps sharing while it is on."),
+                None => "Share link ready. Keep Flick open while others download.".to_owned(),
+            };
             page = page.child(
                 v_flex()
                     .mb_6()
                     .gap_2()
-                    .child(
-                        notice(
-                            &t,
-                            false,
-                            "Share link ready. Keep Flick open while others download.",
-                        )
-                        .child(self.button(
-                            "copy-magnet",
-                            Some("copy"),
-                            "Copy Magnet Link",
-                            false,
-                            cx,
-                            move |_, _, cx| {
-                                cx.write_to_clipboard(ClipboardItem::new_string(magnet.clone()))
-                            },
-                        )),
-                    )
+                    .child(notice(&t, false, ready).child(self.button(
+                        "copy-magnet",
+                        Some("copy"),
+                        "Copy Magnet Link",
+                        false,
+                        cx,
+                        move |_, _, cx| {
+                            cx.write_to_clipboard(ClipboardItem::new_string(magnet.clone()))
+                        },
+                    )))
                     .child(self.text_field(&self.magnet_field, cx)),
             );
         }
-        if self.downloads.is_empty() && self.fetches.is_empty() {
+        let machines = self.remote.machine_transfers(&self.store.data);
+        let remote_transfers = machines.iter().any(|m| !m.transfers.is_empty());
+        if self.downloads.is_empty() && self.fetches.is_empty() && machines.is_empty() {
             page = page.child(empty_state(
                 &t,
                 "download",
                 "No transfers yet",
                 "Search for a video, paste a link, or share your own files.",
             ));
-        } else if !self.downloads.is_empty() {
-            let rows = self
-                .downloads
-                .iter()
-                .map(|download| self.transfer_row(download, cx))
-                .collect();
-            page = page
-                .child(
+        } else {
+            if !self.downloads.is_empty() || remote_transfers {
+                // Pause All and Resume All cover every machine.
+                let all_paused = self
+                    .downloads
+                    .iter()
+                    .all(|d| d.state == flick::torrent::TransferState::Paused)
+                    && machines.iter().all(|m| {
+                        m.transfers
+                            .iter()
+                            .all(|row| row.phase == flick::remote::protocol::TransferPhase::Paused)
+                    });
+                page = page.child(
                     h_flex()
                         .justify_between()
                         .mb_2()
                         .child(section_title(&t, "Transfers"))
-                        .child(
-                            self.button(
-                                "pause-all-transfers",
-                                None,
-                                if self
-                                    .downloads
-                                    .iter()
-                                    .all(|d| d.state == flick::torrent::TransferState::Paused)
-                                {
-                                    "Resume All"
-                                } else {
-                                    "Pause All"
-                                },
-                                false,
-                                cx,
-                                |this, _, cx| {
-                                    let paused = this
-                                        .downloads
-                                        .iter()
-                                        .all(|d| d.state == flick::torrent::TransferState::Paused);
+                        .child(self.button(
+                            "pause-all-transfers",
+                            None,
+                            if all_paused {
+                                "Resume All"
+                            } else {
+                                "Pause All"
+                            },
+                            false,
+                            cx,
+                            move |this, _, cx| {
+                                if !this.downloads.is_empty() {
                                     this.send(
-                                        if paused {
+                                        if all_paused {
                                             ServiceCommand::ResumeAll
                                         } else {
                                             ServiceCommand::PauseAll
                                         },
                                         cx,
                                     );
-                                },
-                            ),
-                        ),
-                )
-                .child(group(&t, rows));
+                                }
+                                this.pause_remote_machines(all_paused);
+                                cx.notify();
+                            },
+                        )),
+                );
+            }
+            if !machines.is_empty() {
+                page = page.child(section_title(&t, crate::remote_client::this_machine_name()));
+                if self.downloads.is_empty() {
+                    page = page.child(
+                        div()
+                            .text_size(t.font(12.))
+                            .text_color(t.muted)
+                            .child("No transfers on this computer."),
+                    );
+                }
+            }
+            if !self.downloads.is_empty() {
+                let rows = self
+                    .downloads
+                    .iter()
+                    .map(|download| self.transfer_row(download, cx))
+                    .collect();
+                page = page.child(group(&t, rows));
+            }
+            page = page.children(self.remote_download_sections(&machines, cx));
         }
         page.child(
             h_flex()
@@ -3188,28 +3235,8 @@ impl Flick {
         cx: &Context<Self>,
     ) -> AnyElement {
         use flick::torrent::TransferState;
-        let t = cx.theme().clone();
         let id = download.infohash.clone();
         let paused = matches!(download.state, TransferState::Paused | TransferState::Error);
-        let complete = download.verified_bytes == download.total_bytes && download.total_bytes > 0;
-        let (state, color) = match download.state {
-            TransferState::Checking => ("Checking files…", t.accent),
-            TransferState::Downloading => ("Downloading", t.accent),
-            TransferState::Paused if complete => ("Complete · sharing paused", t.muted),
-            TransferState::Paused => ("Paused", t.muted),
-            TransferState::Seeding => ("Sharing", rgb(0x30b158)),
-            TransferState::Error => ("Transfer failed", t.danger),
-        };
-        let (done, total) = if download.state == TransferState::Checking {
-            (download.checked_bytes, download.checking_total_bytes)
-        } else {
-            (download.verified_bytes, download.total_bytes)
-        };
-        let progress = if total > 0 {
-            (done as f64 / total as f64).clamp(0., 1.) as f32
-        } else {
-            0.
-        };
         let playable = download.files.iter().find(|file| {
             file.selected
                 && file.verified_bytes == file.length
@@ -3322,7 +3349,66 @@ impl Flick {
                     cx.notify();
                 },
             ));
-        let mut entry = v_flex()
+        let key = id.clone();
+        let confirmation = (self.delete_transfer.as_ref() == Some(&id)).then(|| {
+            self.delete_confirmation(
+                &key,
+                download
+                    .files
+                    .iter()
+                    .map(|file| file.path.display().to_string()),
+                None,
+                false,
+                cx,
+                |this, _, cx| {
+                    this.delete_transfer = None;
+                    cx.notify();
+                },
+                move |this, _, cx| {
+                    this.delete_transfer = None;
+                    this.send(
+                        ServiceCommand::Remove {
+                            id: id.clone(),
+                            delete_files: true,
+                        },
+                        cx,
+                    );
+                },
+            )
+        });
+        self.transfer_entry(&RowFigures::local(download), actions, confirmation, cx)
+    }
+
+    /// One Downloads row, local or on another machine: name, progress,
+    /// state, rates, error, actions, and a deletion confirmation.
+    pub(super) fn transfer_entry(
+        &self,
+        figures: &RowFigures,
+        actions: Div,
+        confirmation: Option<Div>,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let t = cx.theme().clone();
+        let complete = figures.verified == figures.total && figures.total > 0;
+        let (state, color) = match figures.state {
+            RowState::Checking => ("Checking files…", t.accent),
+            RowState::Downloading => ("Downloading", t.accent),
+            RowState::Paused if complete => ("Complete · sharing paused", t.muted),
+            RowState::Paused => ("Paused", t.muted),
+            RowState::Seeding => ("Sharing", rgb(0x30b158)),
+            RowState::Error => ("Transfer failed", t.danger),
+        };
+        let (done, total) = if figures.state == RowState::Checking {
+            (figures.checked, figures.checking_total)
+        } else {
+            (figures.verified, figures.total)
+        };
+        let progress = if total > 0 {
+            (done as f64 / total as f64).clamp(0., 1.) as f32
+        } else {
+            0.
+        };
+        v_flex()
             .gap_2()
             .px_3()
             .py_2p5()
@@ -3339,7 +3425,7 @@ impl Flick {
                             .font_weight(FontWeight::MEDIUM)
                             .overflow_hidden()
                             .whitespace_nowrap()
-                            .child(download.name.clone()),
+                            .child(figures.name.clone()),
                     ),
             )
             .child(
@@ -3373,13 +3459,13 @@ impl Flick {
                     .text_color(t.muted)
                     .child(format!(
                         "Download {}/s · Upload {}/s · {} uploaded · {} peers",
-                        format_bytes(download.download_bytes_per_second),
-                        format_bytes(download.upload_bytes_per_second),
-                        format_bytes(download.uploaded_bytes),
-                        download.peers
+                        format_bytes(figures.download_bps),
+                        format_bytes(figures.upload_bps),
+                        format_bytes(figures.uploaded),
+                        figures.peers
                     )),
             )
-            .when_some(download.error.clone(), |d, error| {
+            .when_some(figures.error.clone(), |d, error| {
                 d.child(
                     div()
                         .text_size(t.font(12.))
@@ -3387,89 +3473,97 @@ impl Flick {
                         .child(error),
                 )
             })
-            .child(actions);
-        if self.delete_transfer.as_ref() == Some(&id) {
-            let mut confirmation = v_flex()
-                .gap_2()
-                .p_3()
-                .rounded(px(t.radius))
-                .bg(t.control)
-                .child(
-                    div()
-                        .text_color(t.danger)
-                        .child("Permanently delete these torrent files? This cannot be undone."),
-                );
-            for file in &download.files {
-                confirmation = confirmation.child(
+            .child(actions)
+            .children(confirmation)
+            .into_any_element()
+    }
+
+    /// "Permanently delete these torrent files?" with the listed paths.
+    /// `key` keeps element ids apart between machines.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn delete_confirmation(
+        &self,
+        key: &str,
+        files: impl Iterator<Item = String>,
+        changed: Option<String>,
+        sending: bool,
+        cx: &Context<Self>,
+        on_cancel: impl Fn(&mut Self, &mut Window, &mut Context<Self>) + 'static,
+        on_confirm: impl Fn(&mut Self, &mut Window, &mut Context<Self>) + 'static,
+    ) -> Div {
+        let t = cx.theme().clone();
+        let mut confirmation = v_flex()
+            .gap_2()
+            .p_3()
+            .rounded(px(t.radius))
+            .bg(t.control)
+            .when_some(changed, |d, message| {
+                d.child(
                     div()
                         .text_size(t.font(12.))
-                        .child(file.path.display().to_string()),
-                );
-            }
-            confirmation = confirmation
-                .child(
-                    div()
-                        .text_size(t.font(12.))
-                        .text_color(t.muted)
-                        .child("Only listed files are deleted. Other files and folders are kept."),
+                        .child(format!("{message} The list below is the current one.")),
                 )
-                .child(
-                    h_flex()
-                        .gap_2()
-                        .child(self.button(
-                            SharedString::from(format!("cancel-delete-{id}")),
-                            None,
-                            "Cancel",
-                            false,
-                            cx,
-                            |this, _, cx| {
-                                this.delete_transfer = None;
-                                cx.notify();
-                            },
-                        ))
-                        .child(self.button(
-                            SharedString::from(format!("confirm-delete-{id}")),
-                            None,
-                            "Delete Listed Files",
-                            false,
-                            cx,
-                            move |this, _, cx| {
-                                this.delete_transfer = None;
-                                this.send(
-                                    ServiceCommand::Remove {
-                                        id: id.clone(),
-                                        delete_files: true,
-                                    },
-                                    cx,
-                                );
-                            },
-                        )),
-                );
-            entry = entry.child(confirmation);
+            })
+            .child(
+                div()
+                    .text_color(t.danger)
+                    .child("Permanently delete these torrent files? This cannot be undone."),
+            );
+        for file in files {
+            confirmation = confirmation.child(div().text_size(t.font(12.)).child(file));
         }
-        entry.into_any_element()
+        confirmation
+            .child(
+                div()
+                    .text_size(t.font(12.))
+                    .text_color(t.muted)
+                    .child("Only listed files are deleted. Other files and folders are kept."),
+            )
+            .child(
+                h_flex()
+                    .gap_2()
+                    .child(self.button(
+                        SharedString::from(format!("cancel-delete-{key}")),
+                        None,
+                        "Cancel",
+                        false,
+                        cx,
+                        on_cancel,
+                    ))
+                    .child(self.button(
+                        SharedString::from(format!("confirm-delete-{key}")),
+                        None,
+                        if sending {
+                            "Deleting…"
+                        } else {
+                            "Delete Listed Files"
+                        },
+                        false,
+                        cx,
+                        on_confirm,
+                    )),
+            )
     }
 
     fn torrent_sheet(&self, torrent: &flick::torrent::ResolvedTorrent, cx: &Context<Self>) -> Div {
         let t = cx.theme().clone();
         let total = torrent.files.iter().map(|file| file.length).sum::<u64>();
-        let mut rows = vec![
-            row(
-                &t,
-                Some("magnet"),
-                torrent.name.clone(),
-                Some(
-                    format!(
-                        "{} files · {} · choose what to download",
-                        torrent.files.len(),
-                        format_bytes(total)
-                    )
-                    .into(),
-                ),
-                div(),
-            )
-            .into_any_element(),
-        ];
+        let mut rows = self.torrent_save_to(cx).into_iter().collect::<Vec<_>>();
+        rows.extend([row(
+            &t,
+            Some("magnet"),
+            torrent.name.clone(),
+            Some(
+                format!(
+                    "{} files · {} · choose what to download",
+                    torrent.files.len(),
+                    format_bytes(total)
+                )
+                .into(),
+            ),
+            div(),
+        )
+        .into_any_element()]);
         for file in &torrent.files {
             let index = file.index;
             let id = ElementId::from(("torrent-file", index));
@@ -3508,7 +3602,11 @@ impl Flick {
                 .child(row(
                     &t,
                     Some("folder-open"),
-                    "Save to",
+                    if self.offers_save_to(crate::remote_client::Sheet::Torrent) {
+                        "Folder"
+                    } else {
+                        "Save to"
+                    },
                     None,
                     self.button(
                         "choose-destination",
@@ -3554,6 +3652,7 @@ impl Flick {
                                 return;
                             }
                             if let Some(torrent) = this.pending_torrent.take() {
+                                this.remote_ui.save_to.torrent_input = None;
                                 let mut files =
                                     this.selected_files.iter().copied().collect::<Vec<_>>();
                                 files.sort_unstable();
@@ -3738,6 +3837,80 @@ pub(super) fn checkbox(t: &Theme, checked: bool) -> Div {
         .when(checked, |d| d.bg(t.accent))
         .when(!checked, |d| d.border_1().border_color(t.muted))
         .when(checked, |d| d.child(icon("check", size - 4., t.on_accent)))
+}
+
+/// A Downloads row's state, for local and remote transfers alike.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum RowState {
+    Checking,
+    Downloading,
+    Paused,
+    Seeding,
+    Error,
+}
+
+/// What a Downloads row shows, from a local snapshot or a server's row.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct RowFigures {
+    pub(super) name: String,
+    pub(super) state: RowState,
+    pub(super) verified: u64,
+    pub(super) total: u64,
+    pub(super) checked: u64,
+    pub(super) checking_total: u64,
+    pub(super) uploaded: u64,
+    pub(super) peers: u32,
+    pub(super) download_bps: u64,
+    pub(super) upload_bps: u64,
+    pub(super) error: Option<String>,
+}
+
+impl RowFigures {
+    pub(super) fn local(download: &flick::torrent::TransferSnapshot) -> Self {
+        use flick::torrent::TransferState;
+        Self {
+            name: download.name.clone(),
+            state: match download.state {
+                TransferState::Checking => RowState::Checking,
+                TransferState::Downloading => RowState::Downloading,
+                TransferState::Paused => RowState::Paused,
+                TransferState::Seeding => RowState::Seeding,
+                TransferState::Error => RowState::Error,
+            },
+            verified: download.verified_bytes,
+            total: download.total_bytes,
+            checked: download.checked_bytes,
+            checking_total: download.checking_total_bytes,
+            uploaded: download.uploaded_bytes,
+            peers: download.peers,
+            download_bps: download.download_bytes_per_second,
+            upload_bps: download.upload_bytes_per_second,
+            error: download.error.clone(),
+        }
+    }
+
+    pub(super) fn remote(row: &flick::remote::protocol::TransferRow) -> Self {
+        use flick::remote::protocol::TransferPhase;
+        Self {
+            name: row.name.clone(),
+            state: match row.phase {
+                TransferPhase::Checking => RowState::Checking,
+                TransferPhase::Downloading => RowState::Downloading,
+                TransferPhase::Paused => RowState::Paused,
+                TransferPhase::Seeding => RowState::Seeding,
+                TransferPhase::Error => RowState::Error,
+            },
+            verified: row.verified_bytes,
+            total: row.total_bytes,
+            checked: row.checked_bytes,
+            checking_total: row.checking_total_bytes,
+            uploaded: row.uploaded_bytes,
+            peers: row.peers,
+            download_bps: row.download_bps,
+            upload_bps: row.upload_bps,
+            error: row.error.clone(),
+        }
+    }
 }
 
 #[cfg(test)]

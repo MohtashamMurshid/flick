@@ -1068,10 +1068,10 @@ impl Flick {
                     view = view.child(self.button(
                         "subtitle-settings",
                         Some("palette"),
-                        "Open Appearance",
+                        "Open Settings",
                         false,
                         cx,
-                        |this, w, cx| this.show_page(Page::Appearance, w, cx),
+                        |this, w, cx| this.show_page(Page::Settings, w, cx),
                     ));
                 }
             }

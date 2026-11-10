@@ -38,7 +38,7 @@ fn main() -> anyhow::Result<()> {
     let first = args.next();
     if first.as_deref().is_some_and(|s| s == "--help" || s == "-h") {
         println!(
-            "Flick — desktop video player\n\nUsage: flick [VIDEO]\n       flick --smoke-test VIDEO\n       flick --benchmark VIDEO [--seconds N] [--size WxH] [--interval-ms N]\n\nBenchmark defaults: 300 seconds, 3840x2160, 16 ms ticks; local video, no window.\n\nShortcuts: Space play/pause · arrows seek/volume · F fullscreen · M mute\n           Ctrl/Cmd+O open · Ctrl/Cmd+L subtitles · ? shortcuts\n\nRequires libmpv. See README.md for installation."
+            "Flick — desktop video player\n\nUsage: flick [VIDEO]\n       flick --smoke-test VIDEO\n       flick --benchmark VIDEO [--seconds N] [--size WxH] [--interval-ms N]\n\nBenchmark defaults: 300 seconds, 3840x2160, 16 ms ticks; local video, no window.\n\nShortcuts: Space play/pause · arrows seek/volume · F fullscreen · M mute\n           Ctrl/Cmd+O open · Ctrl/Cmd+L subtitles · Ctrl/Cmd+, settings · ? shortcuts\n\nRequires libmpv. See README.md for installation."
         );
         return Ok(());
     }

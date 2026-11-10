@@ -1,7 +1,7 @@
 //! OpenSubtitles search and download through its REST API (v1).
 //!
 //! The API needs a personal key from opensubtitles.com, which the user adds
-//! in Appearance or with `FLICK_OPENSUBTITLES_KEY`. Searches send the
+//! in Settings or with `FLICK_OPENSUBTITLES_KEY`. Searches send the
 //! video's title and its OpenSubtitles hash, which identifies exact
 //! releases. Nothing here touches playback; the desktop loads a saved file
 //! with mpv's `sub-add`.
@@ -57,7 +57,7 @@ impl Client {
         let key = key.trim();
         ensure!(
             !key.is_empty(),
-            "Add an OpenSubtitles API key in Appearance to search for subtitles"
+            "Add an OpenSubtitles API key in Settings to search for subtitles"
         );
         let mut base = reqwest::Url::parse(base).context("Invalid OpenSubtitles address")?;
         if !base.path().ends_with('/') {
@@ -202,7 +202,7 @@ async fn limited_body(response: reqwest::Response) -> Result<Vec<u8>> {
             .ok()
             .and_then(|v| v["message"].as_str().map(str::to_owned));
         bail!(match (status.as_u16(), message) {
-            (401 | 403, _) => "OpenSubtitles rejected the API key. Check it in Appearance.".into(),
+            (401 | 403, _) => "OpenSubtitles rejected the API key. Check it in Settings.".into(),
             (_, Some(message)) => format!("OpenSubtitles: {message}"),
             (code, None) => format!("OpenSubtitles answered with HTTP {code}"),
         });

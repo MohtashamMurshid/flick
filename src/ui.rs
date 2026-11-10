@@ -6,6 +6,8 @@ mod fetch_ui;
 mod library_files_ui;
 #[path = "library_ui.rs"]
 mod library_ui;
+#[path = "onboarding_ui.rs"]
+mod onboarding_ui;
 #[path = "palette_ui.rs"]
 mod palette_ui;
 #[path = "pip_ui.rs"]
@@ -98,6 +100,8 @@ const SHUTTLE_SPEEDS: [f64; 4] = [1., 1.5, 2., 4.];
 enum View {
     Library,
     Player,
+    /// First-launch setup; see `onboarding_ui.rs`.
+    Onboarding,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -107,7 +111,7 @@ enum Page {
     History,
     Shows,
     Downloads,
-    Appearance,
+    Settings,
     Shortcuts,
 }
 
@@ -119,7 +123,7 @@ impl Page {
             Self::History => "History",
             Self::Shows => "Shows",
             Self::Downloads => "Downloads",
-            Self::Appearance => "Appearance",
+            Self::Settings => "Settings",
             Self::Shortcuts => "Keyboard Shortcuts",
         }
     }
@@ -202,6 +206,8 @@ pub struct Flick {
     library_files_state: library_files_ui::LibraryFilesUiState,
     /// Remote libraries; everything for that feature lives inside it.
     remote: crate::remote_client::RemoteState,
+    /// First-launch setup state; everything for that flow lives inside it.
+    onboarding: onboarding_ui::OnboardingState,
     /// Remote library state of this view: cards, notices, player subtitles.
     remote_ui: remote_library_ui::RemoteUiState,
     /// "Share my library on Tailscale".
@@ -469,6 +475,7 @@ impl Flick {
         let video_frame = cx.new(|_| VideoFrameView::default());
         let focus = cx.focus_handle();
         focus.focus(window);
+        let needs_setup = onboarding_ui::needs_setup(&store.data);
         let mut this = Self {
             player,
             snapshot: PlaybackSnapshot::default(),
@@ -480,6 +487,7 @@ impl Flick {
             library_ui_state: library_ui::LibraryUiState::new(cx),
             library_files_state: library_files_ui::LibraryFilesUiState::default(),
             remote: Default::default(),
+            onboarding: Default::default(),
             remote_ui: Default::default(),
             serve: Default::default(),
             error,
@@ -495,7 +503,11 @@ impl Flick {
             opened_at: None,
             pending_resume: 0.,
             file_loaded: false,
-            view: View::Library,
+            view: if needs_setup {
+                View::Onboarding
+            } else {
+                View::Library
+            },
             page: Page::Home,
             video_filter: VideoFilter::All,
             search_open: false,
@@ -826,11 +838,19 @@ impl Flick {
     }
 
     /// Tiers the quality picker offers: those the playing video's server
-    /// lists, or every tier before its first listing.
+    /// lists. A video still downloading on the server, or one not known to
+    /// be finished because the server has not listed it yet (Watch Now from
+    /// Downloads before the first listing), plays only at Original.
     pub(crate) fn quality_choices(&self) -> Vec<Quality> {
-        self.remote_source()
-            .and_then(|remote| self.remote_server(&remote.server_id))
-            .map_or_else(|| Quality::ALL.to_vec(), |server| server.qualities())
+        let Some(remote) = self.remote_source() else {
+            return Quality::ALL.to_vec();
+        };
+        crate::remote_client::picker_qualities(
+            self.remote
+                .video_complete(&remote.server_id, &remote.video_id),
+            self.remote_server(&remote.server_id)
+                .map(|server| server.qualities()),
+        )
     }
 
     fn library_changed(&mut self, cx: &mut Context<Self>) {
@@ -1031,7 +1051,10 @@ impl Flick {
         cx: &mut Context<Self>,
     ) {
         self.remote_ui.checking = None;
-        if !remote.quality.is_transcode() {
+        let complete = self
+            .remote
+            .video_complete(&remote.server_id, &remote.video_id);
+        if !crate::remote_client::check_before_loading(remote.quality, complete) {
             self.load_remote(remote, resume, window, cx);
             return;
         }
@@ -1374,6 +1397,11 @@ impl Flick {
             return Duration::from_millis(500);
         }
         self.poll_library_files(window, cx);
+        self.remote.set_local_folder(&self.download_folder);
+        self.remote.poll_transfers(
+            &self.store.data,
+            self.view == View::Library && self.page == Page::Downloads,
+        );
         if self.remote.drain() {
             cx.notify();
         }
@@ -1719,7 +1747,7 @@ impl Flick {
             }
             Control::AddVideos => self.pick_library(false, false, window, cx),
             Control::AddFolder => self.pick_library(true, false, window, cx),
-            Control::Share => self.pick_library(true, true, window, cx),
+            Control::Share => self.open_share(window, cx),
             Control::PasteMagnet => self.paste_link(cx),
             Control::Open => self.pick(false, window, cx),
             Control::Subtitle => self.pick(true, window, cx),
@@ -1817,7 +1845,7 @@ impl Flick {
         let key = self.store.data.subtitle_key();
         if key.is_empty() {
             self.subtitle_search.results = Some(Err(
-                "Add an OpenSubtitles API key in Appearance › Subtitles to search.".into(),
+                "Add an OpenSubtitles API key in Settings › Subtitles to search.".into(),
             ));
             cx.notify();
             return;
@@ -2083,7 +2111,7 @@ impl Flick {
             return;
         }
         if command && key == "," {
-            self.show_page(Page::Appearance, window, cx);
+            self.show_page(Page::Settings, window, cx);
             cx.stop_propagation();
             return;
         }
@@ -2128,7 +2156,8 @@ impl Flick {
             return;
         }
         let shortcut = self.store.data.shortcuts.lookup(&binding);
-        if self.view == View::Library {
+        // Onboarding has text fields too; player shortcuts must not swallow their keys.
+        if matches!(self.view, View::Library | View::Onboarding) {
             if shortcut == Some(Shortcut::ShowShortcuts) {
                 cx.stop_propagation();
                 self.show_page(Page::Shortcuts, window, cx);
@@ -2342,6 +2371,7 @@ impl Render for Flick {
                 content
             }
             View::Player => self.player_frame(window, cx),
+            View::Onboarding => self.render_onboarding(window, cx),
         };
         let root = div()
             .id("flick")

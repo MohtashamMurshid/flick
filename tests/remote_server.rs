@@ -76,6 +76,7 @@ impl Fixture {
             // A path that is not FFmpeg keeps the test off the real one.
             ffmpeg: Some(self.state.join("no-ffmpeg")),
             max_transcodes: 2,
+            transfers: None,
         }
     }
 

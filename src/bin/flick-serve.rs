@@ -1,5 +1,6 @@
 //! Headless remote library server. See `docs/REMOTE.md` for running it on a
-//! Mac mini and `docs/REMOTE_PLAN.md` for the design.
+//! Mac mini, `docs/REMOTE_PLAN.md` for the design, and
+//! `docs/REMOTE_DOWNLOADS_PLAN.md` for accepting downloads from other Flicks.
 //!
 //! Stdout carries one JSON line, `{"pairing": "...", "listen": "..."}`,
 //! at startup or for `--print-pairing`. Logs go to stderr and never contain
@@ -7,15 +8,27 @@
 
 use anyhow::{Context, Result, bail};
 use clap::Parser;
-use flick::remote::{
-    auth, bind,
-    protocol::Pairing,
-    server::{Server, ServerConfig, Sources},
+use flick::{
+    remote::{
+        auth, bind,
+        ids::Salt,
+        protocol::Pairing,
+        server::{Server, ServerConfig, Sources},
+        transfers::{self, BackendOptions, TransferBackend},
+    },
+    torrent::{TransferConfig, TransferSession},
 };
 use std::{
     net::{IpAddr, SocketAddr},
+    num::NonZeroU32,
     path::PathBuf,
+    sync::Arc,
 };
+
+/// Inside the state folder: the transfer session's state.
+const TRANSFER_STATE_DIR: &str = "transfers";
+/// Inside the state folder: completed downloads served with `--library`.
+const DOWNLOADS_LIST: &str = "remote-downloads.json";
 
 #[derive(Parser)]
 #[command(
@@ -55,6 +68,42 @@ struct Args {
     /// Replace the saved token with a new one, revoking every paired Flick.
     #[arg(long)]
     new_token: bool,
+    /// Let paired Flicks start, pause, and remove torrents here, and play
+    /// them while they download. Off unless given.
+    #[arg(long)]
+    allow_downloads: bool,
+    /// Where downloads go. Defaults to `Downloads` in the Flick data directory.
+    #[arg(long, value_name = "DIR", requires = "allow_downloads")]
+    download_dir: Option<PathBuf>,
+    /// A folder paired Flicks may browse and share (seed) from; repeat for
+    /// several. Nothing outside these folders is shown.
+    #[arg(long = "share-root", value_name = "DIR", requires = "allow_downloads")]
+    share_roots: Vec<PathBuf>,
+    /// Let paired Flicks start link downloads (yt-dlp and HTTPS). Offered
+    /// only when yt-dlp is found.
+    #[arg(long, requires = "allow_downloads")]
+    links: bool,
+    /// Keep transfers off the Internet: no DHT, trackers, or port mapping;
+    /// listen on 127.0.0.1 only. For tests with explicit local peers.
+    #[arg(long, requires = "allow_downloads")]
+    local_transfers: bool,
+    /// An explicit peer for every torrent, for tests with --local-transfers.
+    #[arg(
+        long = "peer",
+        value_name = "IP:PORT",
+        requires = "allow_downloads",
+        hide = true
+    )]
+    peers: Vec<SocketAddr>,
+    /// Download speed limit in KiB/s for transfers started here.
+    #[arg(long, value_name = "KIB_PER_SECOND", requires = "allow_downloads")]
+    download_limit: Option<u32>,
+    /// Upload speed limit in KiB/s.
+    #[arg(long, value_name = "KIB_PER_SECOND", requires = "allow_downloads")]
+    upload_limit: Option<u32>,
+    /// Stop sharing a download once it completes, instead of seeding it.
+    #[arg(long, requires = "allow_downloads")]
+    no_seeding: bool,
 }
 
 #[tokio::main]
@@ -68,7 +117,7 @@ async fn main() -> Result<()> {
         )
         .init();
 
-    let state_dir = match args.state_dir {
+    let state_dir = match args.state_dir.clone() {
         Some(dir) => dir,
         None => default_state_dir()?,
     };
@@ -93,30 +142,137 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    let sources = if args.library {
-        Sources::SettingsFile(settings_path()?)
-    } else if !args.folders.is_empty() {
-        Sources::Folders(args.folders)
-    } else {
+    if !args.library && args.folders.is_empty() {
         bail!("Choose what to serve: --library, or one or more --folder PATH");
+    }
+    let downloads = if args.allow_downloads {
+        Some(start_downloads(&args, &state_dir).await?)
+    } else {
+        None
     };
-    let server = Server::start(ServerConfig {
+    let sources = match (&downloads, args.library) {
+        (None, true) => Sources::SettingsFile(settings_path()?),
+        (None, false) => Sources::Folders(args.folders.clone()),
+        // The desktop's settings file stays read-only; what this server
+        // downloads is listed beside it.
+        (Some(_), true) => Sources::Several(vec![
+            Sources::SettingsFile(settings_path()?),
+            Sources::PathList(state_dir.join(DOWNLOADS_LIST)),
+        ]),
+        (Some(downloads), false) => {
+            let mut folders = args.folders.clone();
+            folders.push(downloads.download_dir.clone());
+            Sources::Folders(folders)
+        }
+    };
+    let started = Server::start(ServerConfig {
         bind,
         token: token.clone(),
-        name: args.name.unwrap_or_else(computer_name),
+        name: args.name.clone().unwrap_or_else(computer_name),
         sources,
         poster_cache: poster_cache().filter(|dir| dir.is_dir()),
         state_dir,
-        ffmpeg: args.ffmpeg,
+        ffmpeg: args.ffmpeg.clone(),
         max_transcodes: args.max_transcodes,
+        transfers: downloads
+            .as_ref()
+            .map(|downloads| downloads.backend.clone()),
     })
-    .await?;
+    .await;
+    let server = match started {
+        Ok(server) => server,
+        Err(error) => {
+            if let Some(downloads) = downloads {
+                downloads.stop().await;
+            }
+            return Err(error);
+        }
+    };
     print_pairing(server.addr(), &token)?;
 
     wait_for_stop().await?;
     tracing::info!("Stopping the remote library server");
     server.shutdown().await;
+    if let Some(downloads) = downloads {
+        downloads.stop().await;
+    }
     Ok(())
+}
+
+/// The transfer session and its backend task for `--allow-downloads`.
+struct Downloads {
+    session: Arc<TransferSession>,
+    backend: TransferBackend,
+    download_dir: PathBuf,
+    stop: tokio_util::sync::CancellationToken,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Downloads {
+    /// Cancels link downloads, then stops the transfer session.
+    async fn stop(self) {
+        self.stop.cancel();
+        let _ = self.task.await;
+        self.session.shutdown().await;
+    }
+}
+
+async fn start_downloads(args: &Args, state_dir: &std::path::Path) -> Result<Downloads> {
+    let download_dir = match &args.download_dir {
+        Some(dir) => dir.clone(),
+        None => default_data_dir()?.join("Downloads"),
+    };
+    std::fs::create_dir_all(&download_dir)
+        .with_context(|| format!("Create {}", download_dir.display()))?;
+    let download_dir = download_dir
+        .canonicalize()
+        .with_context(|| format!("Find {}", download_dir.display()))?;
+    let local = args.local_transfers;
+    let kib = |limit: Option<u32>| limit.and_then(|kib| NonZeroU32::new(kib.saturating_mul(1024)));
+    let session = TransferSession::start(TransferConfig {
+        download_dir: download_dir.clone(),
+        state_dir: state_dir.join(TRANSFER_STATE_DIR),
+        listen_addr: (if local { [127, 0, 0, 1] } else { [0, 0, 0, 0] }, 0).into(),
+        // This is the owner's own machine, so it finds peers the way the
+        // desktop does unless told to stay local.
+        public_discovery: !local,
+        listener_mode: if local {
+            librqbit::ListenerMode::TcpOnly
+        } else {
+            librqbit::ListenerMode::TcpAndUtp
+        },
+        download_limit_bytes_per_second: kib(args.download_limit),
+        upload_limit_bytes_per_second: kib(args.upload_limit),
+        seed_completed_downloads: !args.no_seeding,
+    })
+    .await
+    .context("Start transfers")?;
+    let session = Arc::new(session);
+    let links = args.links
+        && match flick::fetch::ytdlp::Tools::discover() {
+            Ok(_) => true,
+            Err(error) => {
+                tracing::warn!("Link downloads are off: {error:#}");
+                false
+            }
+        };
+    let mut options = BackendOptions::new(download_dir.clone(), Salt::load_or_create(state_dir)?);
+    options.share_roots = args.share_roots.clone();
+    options.initial_peers = args.peers.clone();
+    options.links = links;
+    options.downloads_list = args.library.then(|| state_dir.join(DOWNLOADS_LIST));
+    let capabilities = options.capabilities();
+    tracing::info!(?capabilities, "Accepting downloads from paired Flicks");
+    let stop = options.stop.clone();
+    let (sender, receiver) = tokio::sync::mpsc::channel(64);
+    let task = tokio::spawn(transfers::serve_backend(session.clone(), options, receiver));
+    Ok(Downloads {
+        session,
+        backend: TransferBackend::new(capabilities, sender),
+        download_dir,
+        stop,
+        task,
+    })
 }
 
 fn print_pairing(listen: SocketAddr, token: &str) -> Result<()> {
@@ -157,13 +313,17 @@ fn project_dirs() -> Option<directories::ProjectDirs> {
     directories::ProjectDirs::from("app", "Flick", "Flick")
 }
 
-/// The Flick data directory, as the desktop's services use it, plus `remote`.
-fn default_state_dir() -> Result<PathBuf> {
+/// The Flick data directory, as the desktop's services use it.
+fn default_data_dir() -> Result<PathBuf> {
     std::env::var_os("FLICK_DATA_DIR")
         .map(PathBuf::from)
         .or_else(|| project_dirs().map(|dirs| dirs.data_local_dir().to_owned()))
-        .map(|base| base.join("remote"))
         .context("No data directory for Flick on this system; pass --state-dir")
+}
+
+/// The Flick data directory plus `remote`.
+fn default_state_dir() -> Result<PathBuf> {
+    default_data_dir().map(|base| base.join("remote"))
 }
 
 /// The desktop's settings file, found the way `Store::load` finds it.

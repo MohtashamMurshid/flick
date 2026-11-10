@@ -9,6 +9,7 @@ use super::{
 use flick::{
     fetch::{FetchProgress, FetchSource, FetchStage, FetchUpdate, WebLink, archive::ArchiveItem},
     library::format_bytes,
+    remote::protocol::{FetchPhase, FetchRow},
 };
 use gpui::{AnyElement, ElementId, FontWeight};
 
@@ -114,7 +115,17 @@ impl Flick {
         }
     }
 
+    /// A pasted link: the Save to sheet when another machine takes links,
+    /// else straight to this Mac.
     fn download_link(&mut self, link: WebLink, cx: &mut Context<Self>) {
+        if self.open_link_sheet(&link, cx) {
+            return;
+        }
+        self.download_link_here(link, cx);
+    }
+
+    /// Downloads a link on this Mac.
+    pub(super) fn download_link_here(&mut self, link: WebLink, cx: &mut Context<Self>) {
         let title = match &link {
             WebLink::Archive(identifier) => return self.list_archive(identifier.clone(), cx),
             WebLink::Page(url) => url.clone(),
@@ -427,6 +438,124 @@ impl Flick {
             .into_any_element()
     }
 
+    /// A link download on another machine, in that machine's section.
+    pub(super) fn remote_fetch_row(
+        &self,
+        machine: &crate::remote_client::MachineTransfers,
+        fetch: &FetchRow,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let t = cx.theme().clone();
+        let key = ElementId::from(SharedString::from(format!(
+            "remote-fetch-{}-{}",
+            gpui::hash(&machine.server_id),
+            fetch.id
+        )));
+        let running = matches!(
+            fetch.phase,
+            FetchPhase::Resolving | FetchPhase::Downloading | FetchPhase::Merging
+        );
+        let (color, fraction, detail) = remote_fetch_detail(fetch, &machine.name);
+        let color = match color {
+            FetchTone::Active => t.accent,
+            FetchTone::Done => rgb(0x30b158),
+            FetchTone::Failed => t.danger,
+            FetchTone::Quiet => t.muted,
+        };
+        let title = if fetch.title.trim().is_empty() {
+            fetch.url.clone()
+        } else {
+            fetch.title.clone()
+        };
+        let playable = (fetch.phase == FetchPhase::Done)
+            .then(|| fetch.saved.first().cloned())
+            .flatten();
+        let server = machine.server_id.clone();
+        let id = fetch.id;
+        h_flex()
+            .gap_3()
+            .px_3()
+            .py_2p5()
+            .child(
+                div()
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .size(px(40.))
+                    .rounded(px(t.radius + 2.))
+                    .bg(t.control)
+                    .child(icon("download", 18., color)),
+            )
+            .child(
+                v_flex()
+                    .flex_1()
+                    .min_w(px(0.))
+                    .gap_1()
+                    .child(
+                        div()
+                            .font_weight(FontWeight::MEDIUM)
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .child(title.clone()),
+                    )
+                    .child(
+                        div()
+                            .h(px(4.))
+                            .w_full()
+                            .rounded_full()
+                            .bg(t.control_hover)
+                            .child(
+                                div()
+                                    .h_full()
+                                    .w(relative(fraction))
+                                    .rounded_full()
+                                    .bg(color),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .text_size(t.font(12.))
+                            .text_color(t.muted)
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .child(detail),
+                    )
+                    .when_some(fetch.error.clone(), |d, error| {
+                        d.child(
+                            div()
+                                .text_size(t.font(12.))
+                                .text_color(t.danger)
+                                .child(error),
+                        )
+                    }),
+            )
+            .when_some(playable, |d, video| {
+                let server = server.clone();
+                d.child(self.button(
+                    ElementId::NamedChild(Box::new(key.clone()), "play".into()),
+                    Some("play"),
+                    "Play",
+                    false,
+                    cx,
+                    move |this, w, cx| this.watch_remote(&server, &video, &title, false, w, cx),
+                ))
+            })
+            .when(running, |d| {
+                d.child(self.icon_button(
+                    ElementId::NamedChild(Box::new(key.clone()), "cancel".into()),
+                    "x",
+                    "Cancel download",
+                    cx,
+                    move |this, _, cx| {
+                        this.remote.fetch_cancel(&this.store.data, &server, id);
+                        cx.notify();
+                    },
+                ))
+            })
+            .into_any_element()
+    }
+
     fn archive_sheet(&self, item: &ArchiveItem, cx: &Context<Self>) -> Div {
         let t = cx.theme().clone();
         let chosen_size = item
@@ -595,4 +724,89 @@ fn progress_detail(p: &FetchProgress, page: bool) -> String {
         }
     }
     parts.join(" · ")
+}
+
+/// How a remote link download's row is colored.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FetchTone {
+    Active,
+    Done,
+    Failed,
+    Quiet,
+}
+
+/// A remote link download's tone, bar fraction, and detail line.
+fn remote_fetch_detail(fetch: &FetchRow, machine: &str) -> (FetchTone, f32, String) {
+    match fetch.phase {
+        FetchPhase::Resolving => (FetchTone::Active, 0., "Starting…".into()),
+        FetchPhase::Merging => (FetchTone::Active, 1., "Processing…".into()),
+        FetchPhase::Downloading => {
+            let fraction = fetch
+                .total_bytes
+                .filter(|total| *total > 0)
+                .map_or(0., |total| {
+                    (fetch.downloaded_bytes as f64 / total as f64).clamp(0., 1.) as f32
+                });
+            let mut parts = vec![match fetch.total_bytes {
+                Some(total) => format!(
+                    "{} of {}",
+                    format_bytes(fetch.downloaded_bytes),
+                    format_bytes(total)
+                ),
+                None => format_bytes(fetch.downloaded_bytes),
+            }];
+            if let Some(speed) = fetch.bytes_per_second {
+                parts.push(format!("{}/s", format_bytes(speed)));
+            }
+            (FetchTone::Active, fraction, parts.join(" · "))
+        }
+        FetchPhase::Done => (
+            FetchTone::Done,
+            1.,
+            match fetch.saved.len() {
+                0 | 1 => format!("Saved on {machine}"),
+                count => format!("Saved {count} files on {machine}"),
+            },
+        ),
+        FetchPhase::Failed => (FetchTone::Failed, 0., "Download failed".into()),
+        FetchPhase::Cancelled => (FetchTone::Quiet, 0., "Cancelled".into()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn remote_fetch_rows_describe_each_phase() {
+        let mut fetch = FetchRow {
+            phase: FetchPhase::Downloading,
+            downloaded_bytes: 50,
+            total_bytes: Some(200),
+            bytes_per_second: Some(10),
+            ..Default::default()
+        };
+        let (tone, fraction, detail) = remote_fetch_detail(&fetch, "Mac mini");
+        assert_eq!(tone, FetchTone::Active);
+        assert!((fraction - 0.25).abs() < 1e-6);
+        assert_eq!(
+            detail,
+            format!(
+                "{} of {} · {}/s",
+                format_bytes(50),
+                format_bytes(200),
+                format_bytes(10)
+            )
+        );
+        fetch.phase = FetchPhase::Done;
+        fetch.saved = vec!["a".into(), "b".into()];
+        assert_eq!(
+            remote_fetch_detail(&fetch, "Mac mini"),
+            (FetchTone::Done, 1., "Saved 2 files on Mac mini".into())
+        );
+        fetch.phase = FetchPhase::Failed;
+        assert_eq!(remote_fetch_detail(&fetch, "Mac mini").0, FetchTone::Failed);
+        fetch.phase = FetchPhase::Resolving;
+        assert_eq!(remote_fetch_detail(&fetch, "Mac mini").2, "Starting…");
+    }
 }

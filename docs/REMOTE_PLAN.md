@@ -46,7 +46,7 @@ Three pieces, all in this repository:
 
 - **`remote` module** in the shared library (`src/lib.rs`), with no GPUI or libmpv dependency. It holds the wire types, the stable video identifiers, the token check, the Tailscale address check, and the HTTP server. It builds and tests with `--no-default-features`, like `torrent` and `fetch`.
 - **`flick-serve` binary** (`src/bin/flick-serve.rs`): a headless server for a Mac mini or a Linux box with no display. It serves the library saved by the desktop app, or folders given on the command line.
-- **Desktop changes**: a Remote libraries page in Appearance to add a server; the library shows the remote videos; the player loads them over HTTP. Later, a switch in Appearance runs the same server inside the desktop app so no separate process is needed.
+- **Desktop changes**: a Remote libraries group in Settings to add a server; the library shows the remote videos; the player loads them over HTTP. Later, a switch in Settings runs the same server inside the desktop app so no separate process is needed.
 
 ### Wire protocol
 
@@ -74,7 +74,7 @@ On the tailnet, traffic is already encrypted by WireGuard, so the server speaks 
 
 ### Pairing
 
-Turning the server on generates a random token and shows a pairing string, `flick-remote://mohtashams-mac-mini.taildcfc7a.ts.net:PORT/#<token>`, with a Copy button. On the client, Appearance → Remote libraries → Add pastes it. The token is stored in the client's `settings.json` beside the OpenSubtitles key and never logged. `FLICK_REMOTE_TOKEN` overrides it for development, the way `FLICK_OPENSUBTITLES_KEY` does.
+Turning the server on generates a random token and shows a pairing string, `flick-remote://mohtashams-mac-mini.taildcfc7a.ts.net:PORT/#<token>`, with a Copy button. On the client, Settings → Remote libraries → Add pastes it. The token is stored in the client's `settings.json` beside the OpenSubtitles key and never logged. `FLICK_REMOTE_TOKEN` overrides it for development, the way `FLICK_OPENSUBTITLES_KEY` does.
 
 A later step can replace the token with the caller's tailnet identity from Tailscale's local `whois` API, allowing only the same login. The token stays as the baseline because it is testable on loopback.
 
@@ -125,7 +125,7 @@ flick-serve --bind 127.0.0.1:0 --folder /tmp/fixtures   # tests and local checks
 
 ### 3. In-app server and extras
 
-- [x] "Share my library on Tailscale" in Appearance, running the server on the services runtime; the switch is off by default and the state survives restarts.
+- [x] "Share my library on Tailscale" in Settings, running the server on the services runtime; the switch is off by default and the state survives restarts.
 - [x] launchd agent for `flick-serve`. The plist and install script exist and were linted; they have not been installed on a machine yet.
 - [ ] Resume position sync: `PUT /v1/progress/{id}` so Continue Watching matches on both machines. Client wins on conflict within the same minute; otherwise the newer timestamp wins.
 - [ ] Watch while downloading over remote: serve incomplete torrent files through `TransferSession::open_stream` so verified pieces stream and unverified ones block, the same guarantee as local playback.

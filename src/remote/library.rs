@@ -1,5 +1,5 @@
-//! What the server serves: the desktop app's saved library, read-only, or
-//! folders scanned for videos.
+//! What the server serves: the desktop app's saved library, read-only,
+//! folders scanned for videos, or a list of files the server downloaded.
 //!
 //! The server rebuilds this list on every `GET /v1/library` (and when a
 //! request names an id it does not know yet, at most once a second). That is
@@ -21,6 +21,19 @@ pub enum Sources {
     SettingsFile(PathBuf),
     /// Folders scanned for video files.
     Folders(Vec<PathBuf>),
+    /// A JSON array of video paths, kept by the server itself (the headless
+    /// server's `remote-downloads.json`). A missing file is an empty list.
+    PathList(PathBuf),
+    /// Several sources, in order; a path listed twice is served once.
+    Several(Vec<Sources>),
+}
+
+/// The torrent file behind an entry, so an unfinished one can be streamed.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct TorrentFile {
+    /// 40 lowercase hex characters.
+    pub infohash: String,
+    pub index: usize,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -35,6 +48,38 @@ pub struct Entry {
     pub height: u32,
     /// False for a torrent file that has not been verified yet.
     pub complete: bool,
+    /// Verified fraction while incomplete; 1 when complete.
+    pub progress: f64,
+    /// The torrent file this entry is, when known.
+    pub torrent: Option<TorrentFile>,
+    /// The file's full size when the transfer knows it and the file may not
+    /// be on disk yet; otherwise the size is read from disk.
+    pub size: Option<u64>,
+}
+
+impl Entry {
+    /// A video that is a complete file on disk.
+    pub fn file(path: PathBuf, title: String) -> Self {
+        Self {
+            path,
+            title,
+            poster: None,
+            duration: 0.0,
+            width: 0,
+            height: 0,
+            complete: true,
+            progress: 1.0,
+            torrent: None,
+            size: None,
+        }
+    }
+
+    /// Whether the entry's path names a file the server may read: a complete
+    /// file, or a partial one on disk. An unfinished torrent file that only
+    /// the transfer knows has a relative, display-only path.
+    pub fn on_disk(&self) -> bool {
+        self.path.is_absolute()
+    }
 }
 
 /// The videos to serve, in a stable order, without duplicates or missing
@@ -49,10 +94,7 @@ pub async fn load(sources: &Sources, poster_cache: Option<&Path>) -> Result<Vec<
 }
 
 pub fn load_blocking(sources: &Sources, poster_cache: Option<&Path>) -> Result<Vec<Entry>> {
-    let mut entries = match sources {
-        Sources::SettingsFile(path) => from_settings(path)?,
-        Sources::Folders(folders) => from_folders(folders)?,
-    };
+    let mut entries = from_sources(sources)?;
     let mut seen = HashSet::new();
     entries.retain(|entry| seen.insert(entry.path.clone()));
     for entry in &mut entries {
@@ -67,6 +109,48 @@ pub fn load_blocking(sources: &Sources, poster_cache: Option<&Path>) -> Result<V
             });
     }
     Ok(entries)
+}
+
+fn from_sources(sources: &Sources) -> Result<Vec<Entry>> {
+    Ok(match sources {
+        Sources::SettingsFile(path) => from_settings(path)?,
+        Sources::Folders(folders) => from_folders(folders)?,
+        Sources::PathList(path) => from_path_list(path)?,
+        Sources::Several(sources) => {
+            let mut entries = Vec::new();
+            for source in sources {
+                entries.extend(from_sources(source)?);
+            }
+            entries
+        }
+    })
+}
+
+/// Reads a path list written by [`save_path_list`]. Files that are gone or
+/// are not videos are skipped.
+fn from_path_list(path: &Path) -> Result<Vec<Entry>> {
+    Ok(read_path_list(path)?
+        .into_iter()
+        .filter(|path| crate::library::is_video(path))
+        .filter_map(|path| path.canonicalize().ok().filter(|p| p.is_file()))
+        .map(|path| Entry::file(path.clone(), file_title(&path)))
+        .collect())
+}
+
+/// The paths in a path list file; a missing file is an empty list.
+pub fn read_path_list(path: &Path) -> Result<Vec<PathBuf>> {
+    match std::fs::read(path) {
+        Ok(bytes) => serde_json::from_slice(&bytes)
+            .with_context(|| format!("Parse the download list in {}", path.display())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(error) => Err(error).with_context(|| format!("Read {}", path.display())),
+    }
+}
+
+/// Replaces a path list file atomically.
+pub fn save_path_list(path: &Path, paths: &[PathBuf]) -> Result<()> {
+    let bytes = serde_json::to_vec_pretty(paths)?;
+    crate::remote::auth::write_private(path, &bytes)
 }
 
 /// The subset of the desktop's `settings.json` the server reads.
@@ -142,6 +226,17 @@ fn from_settings(path: &Path) -> Result<Vec<Entry>> {
                 width: video.width,
                 height: video.height,
                 complete: !unverified,
+                progress: if unverified { 0.0 } else { 1.0 },
+                torrent: video
+                    .torrent
+                    .filter(|torrent| {
+                        crate::remote::ids::is_valid_id(&torrent.infohash.to_ascii_lowercase())
+                    })
+                    .map(|torrent| TorrentFile {
+                        infohash: torrent.infohash.to_ascii_lowercase(),
+                        index: torrent.file_index,
+                    }),
+                size: None,
             })
         })
         .collect())
@@ -151,15 +246,7 @@ fn from_folders(folders: &[PathBuf]) -> Result<Vec<Entry>> {
     let mut entries = Vec::new();
     for folder in folders {
         for path in crate::library::scan_folder(folder)? {
-            entries.push(Entry {
-                title: file_title(&path),
-                path,
-                poster: None,
-                duration: 0.0,
-                width: 0,
-                height: 0,
-                complete: true,
-            });
+            entries.push(Entry::file(path.clone(), file_title(&path)));
         }
     }
     Ok(entries)
@@ -210,6 +297,11 @@ fn poster_path(cache: &Path, video: &Path) -> Option<PathBuf> {
 /// `.language` part, with a text subtitle extension. Sorted by file name;
 /// the index in this list is the index in URLs.
 pub fn sidecar_subtitles(video: &Path) -> Vec<Sidecar> {
+    // A relative path is a display name for a file not on disk yet; looking
+    // beside it would read the server's working folder.
+    if !video.is_absolute() {
+        return Vec::new();
+    }
     let (Some(dir), Some(stem)) = (video.parent(), video.file_stem().and_then(|s| s.to_str()))
     else {
         return Vec::new();

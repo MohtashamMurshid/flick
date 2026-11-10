@@ -1317,6 +1317,16 @@ impl TransferSession {
         })
     }
 
+    /// Whether this transfer seeds the owner's own files through
+    /// [`Self::share`]. Its output folder is the source's parent, so
+    /// deleting its files would delete the originals.
+    pub fn is_explicit_share(&self, infohash: &str) -> bool {
+        self.explicit_shares
+            .read()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .contains(infohash)
+    }
+
     fn set_explicit_share(&self, infohash: &str, explicit: bool) -> Result<()> {
         let mut shares = self
             .explicit_shares
