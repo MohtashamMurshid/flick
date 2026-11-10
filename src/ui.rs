@@ -208,6 +208,10 @@ pub struct Flick {
     remote: crate::remote_client::RemoteState,
     /// First-launch setup state; everything for that flow lives inside it.
     onboarding: onboarding_ui::OnboardingState,
+    /// Finding Flicks on the tailnet, pairing by code, waking machines.
+    discovery: crate::remote_discovery::DiscoveryState,
+    /// Remote videos being copied to this computer.
+    keep: crate::remote_keep::KeepState,
     /// Remote library state of this view: cards, notices, player subtitles.
     remote_ui: remote_library_ui::RemoteUiState,
     /// "Share my library on Tailscale".
@@ -352,6 +356,8 @@ impl Flick {
         self.quitting = true;
         self.services.begin_shutdown();
         self.remote.shutdown();
+        self.discovery.shutdown();
+        self.keep.shutdown();
         self.serve.shutdown();
         self.up_next = None;
         self.pending_open = None;
@@ -488,6 +494,8 @@ impl Flick {
             library_files_state: library_files_ui::LibraryFilesUiState::default(),
             remote: Default::default(),
             onboarding: Default::default(),
+            discovery: Default::default(),
+            keep: Default::default(),
             remote_ui: Default::default(),
             serve: Default::default(),
             error,
@@ -1403,6 +1411,11 @@ impl Flick {
             self.view == View::Library && self.page == Page::Downloads,
         );
         if self.remote.drain() {
+            cx.notify();
+        }
+        // The integration agents handle these events; draining keeps the
+        // workers from backing up meanwhile.
+        if !self.discovery.drain().is_empty() || !self.keep.drain().is_empty() {
             cx.notify();
         }
         self.apply_remote_ready(window, cx);

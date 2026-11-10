@@ -61,3 +61,50 @@ pub fn wake(mac: &[String], lan_ips: &[String]) -> Result<()> {
     let _ = (mac, lan_ips);
     anyhow::bail!("not implemented")
 }
+
+/// What the view learns from [`DiscoveryState::drain`].
+#[derive(Clone, Debug, PartialEq)]
+pub enum DiscoveryEvent {
+    /// A discovery pass finished; offline peers and non-Flicks are omitted.
+    Found(Vec<FoundFlick>),
+    /// A pairing code was accepted (`Ok`) or refused with the server's message.
+    Paired {
+        host: String,
+        port: u16,
+        result: Result<Pairing, String>,
+    },
+    /// A wake packet was sent, or could not be.
+    Woke {
+        server_id: String,
+        result: Result<(), String>,
+    },
+}
+
+/// Owns a worker thread for discovery, pairing by code, and waking; the
+/// view holds one and drains it on tick.
+#[derive(Default)]
+pub struct DiscoveryState {}
+
+impl DiscoveryState {
+    /// Starts a discovery pass; results arrive as [`DiscoveryEvent::Found`].
+    pub fn discover(&mut self) {}
+
+    /// Whether a pass is running, for a spinner.
+    pub fn discovering(&self) -> bool {
+        false
+    }
+
+    pub fn pair_by_code(&mut self, host: &str, port: u16, code: &str) {
+        let _ = (host, port, code);
+    }
+
+    pub fn wake(&mut self, server_id: &str, mac: Vec<String>, lan_ips: Vec<String>) {
+        let _ = (server_id, mac, lan_ips);
+    }
+
+    pub fn drain(&mut self) -> Vec<DiscoveryEvent> {
+        Vec::new()
+    }
+
+    pub fn shutdown(&mut self) {}
+}
