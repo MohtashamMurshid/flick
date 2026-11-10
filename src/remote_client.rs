@@ -5613,6 +5613,7 @@ mod tests {
                     duration: 600.,
                     finished: false,
                     updated: 4_000_000_000,
+                    revision: 0,
                 }),
                 ..Default::default()
             }],

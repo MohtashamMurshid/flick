@@ -2181,6 +2181,7 @@ impl Flick {
             duration: entry.duration,
             finished: entry.finished,
             updated: entry.updated,
+            revision: 0,
         };
         self.remote
             .put_progress(&self.store.data, server, video, progress);

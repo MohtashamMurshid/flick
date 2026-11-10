@@ -1890,6 +1890,9 @@ async fn put_progress(
     {
         return Json(existing.clone()).into_response();
     }
+    // A monotonic revision tells clients a new save apart from the same
+    // save seen again, since `updated` follows the saving client's clock.
+    progress.revision = saved.get(&id).map_or(0, |existing| existing.revision) + 1;
     saved.insert(id, progress.clone());
     let written = serde_json::to_vec_pretty(&saved)
         .map_err(anyhow::Error::from)

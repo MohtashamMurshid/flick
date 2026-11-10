@@ -269,6 +269,9 @@ pub struct Progress {
     pub finished: bool,
     /// Seconds since the Unix epoch when this was saved.
     pub updated: u64,
+    /// Set by the server: grows by one with each save it accepts for the
+    /// video, whatever the clocks say. Zero from clients and older servers.
+    pub revision: u64,
 }
 
 /// `POST /v1/transfers/resolve`. `input` is a magnet link, an HTTPS

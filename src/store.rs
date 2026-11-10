@@ -488,7 +488,7 @@ impl Settings {
         }
         let saved = self.remote_progress(server, video);
         let finished = saved.is_some_and(|p| p.finished);
-        let server_updated = saved.map_or(0, |p| p.server_updated);
+        let server_revision = saved.map_or(0, |p| p.server_revision);
         let duration = non_negative_finite(duration);
         let mut position = non_negative_finite(position);
         if duration > 0.0 {
@@ -502,7 +502,7 @@ impl Settings {
             duration,
             finished: finished || reached_end(position, duration),
             updated: unix_now(),
-            server_updated,
+            server_revision,
         });
     }
 
@@ -514,7 +514,7 @@ impl Settings {
         }
         let saved = self.remote_progress(server, video);
         let duration = saved.map_or(0.0, |p| p.duration);
-        let server_updated = saved.map_or(0, |p| p.server_updated);
+        let server_revision = saved.map_or(0, |p| p.server_revision);
         self.put_remote_progress(remote::RemoteProgress {
             server: server.to_owned(),
             video: video.to_owned(),
@@ -523,7 +523,7 @@ impl Settings {
             duration,
             finished: true,
             updated: unix_now(),
-            server_updated,
+            server_revision,
         });
     }
 
@@ -562,11 +562,14 @@ impl Settings {
             let updated = resume.updated.min(now.saturating_add(RESUME_CLOCK_SKEW));
             // A claim already merged is never applied again, so a server
             // clock far ahead cannot keep overwriting newer local progress;
-            // only a newer claim from that server competes, by capped time.
+            // a newer save on the server (a higher revision) competes by
+            // capped time. Older servers send no revision and compete by
+            // time alone.
             if self
                 .remote_progress(server, &video.id)
                 .is_some_and(|saved| {
-                    resume.updated <= saved.server_updated || updated <= saved.updated
+                    (resume.revision > 0 && resume.revision <= saved.server_revision)
+                        || updated <= saved.updated
                 })
             {
                 continue;
@@ -589,7 +592,7 @@ impl Settings {
                 duration,
                 finished: resume.finished,
                 updated,
-                server_updated: resume.updated,
+                server_revision: resume.revision,
             };
             self.remote
                 .progress
@@ -1943,6 +1946,7 @@ mod tests {
                 duration: 100.0,
                 finished: false,
                 updated,
+                revision: 0,
             })
         };
         let mut settings = Settings::default();
@@ -1991,7 +1995,7 @@ mod tests {
     #[test]
     fn a_server_clock_ahead_cannot_pin_its_position() {
         use flick::remote::protocol::{Progress, Video};
-        let listing = |position: f64, updated: u64| {
+        let listing = |position: f64, updated: u64, revision: u64| {
             [Video {
                 id: "abc".into(),
                 title: "Sintel".into(),
@@ -2000,6 +2004,7 @@ mod tests {
                     duration: 100.0,
                     finished: false,
                     updated,
+                    revision,
                 }),
                 ..Default::default()
             }]
@@ -2007,30 +2012,43 @@ mod tests {
         let now = 1_800_000_000;
         let mut settings = Settings::default();
         // A server a day ahead: its time is taken as now plus a minute.
-        assert!(settings.merge_remote_resume_at("mini", &listing(40.0, now + 86_400), now));
+        assert!(settings.merge_remote_resume_at("mini", &listing(40.0, now + 86_400, 1), now));
         let merged = settings.remote_progress("mini", "abc").unwrap();
         assert_eq!((merged.position, merged.updated), (40.0, now + 60));
         // The same claim at the same moment is not newer than the capped time.
         settings.remote.progress[0].position = 55.0;
-        assert!(!settings.merge_remote_resume_at("mini", &listing(40.0, now + 86_400), now));
+        assert!(!settings.merge_remote_resume_at("mini", &listing(40.0, now + 86_400, 1), now));
         assert_eq!(settings.remote_resume_position("mini", "abc"), 55.0);
-        // Watching on here later and seeing the same stale claim again: the
-        // recapped server time would be newer, but the claim was already merged.
+        // Watching on here later and seeing the same claim again: the
+        // recapped server time would be newer, but revision 1 was merged.
         settings.remember_remote("mini", "abc", "Sintel", 70.0, 100.0);
-        assert!(!settings.merge_remote_resume_at("mini", &listing(40.0, now + 86_400), now + 300));
-        assert_eq!(settings.remote_resume_position("mini", "abc"), 70.0);
-        // A real later save on the server, stamped by its own clock, wins.
-        let after = now + 600;
-        assert!(settings.merge_remote_resume_at("mini", &listing(80.0, after + 86_400), after));
-        assert_eq!(settings.remote_resume_position("mini", "abc"), 80.0);
-        // A claim older than one already merged from that server is ignored
-        // even if its capped time would be newer than the local entry.
         assert!(!settings.merge_remote_resume_at(
             "mini",
-            &listing(10.0, now + 86_400),
-            after + 900
+            &listing(40.0, now + 86_400, 1),
+            now + 300
         ));
+        assert_eq!(settings.remote_resume_position("mini", "abc"), 70.0);
+        // A later save the server accepted, even with a lower raw time from
+        // another client's clock, is a new revision and wins by capped time.
+        let after = now + 600;
+        assert!(settings.merge_remote_resume_at("mini", &listing(80.0, now + 86_000, 2), after));
         assert_eq!(settings.remote_resume_position("mini", "abc"), 80.0);
+        // An older server without revisions competes by time alone: a local
+        // save newer than the capped server time keeps winning until the
+        // capped time passes it.
+        settings.remote.progress[0].position = 85.0;
+        settings.remote.progress[0].updated = after + 100;
+        assert!(!settings.merge_remote_resume_at(
+            "mini",
+            &listing(50.0, now + 86_400, 0),
+            after + 1
+        ));
+        assert!(settings.merge_remote_resume_at(
+            "mini",
+            &listing(60.0, now + 86_400, 0),
+            after + 200
+        ));
+        assert_eq!(settings.remote_resume_position("mini", "abc"), 60.0);
     }
 
     #[test]

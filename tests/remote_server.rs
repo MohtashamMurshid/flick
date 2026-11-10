@@ -137,6 +137,14 @@ impl Running {
     }
 }
 
+/// Equal apart from the revision the server assigns on each accepted save.
+fn same_progress(got: &Progress, want: &Progress) -> bool {
+    got.position == want.position
+        && got.duration == want.duration
+        && got.finished == want.finished
+        && got.updated == want.updated
+}
+
 async fn error_message(response: reqwest::Response) -> Result<String> {
     let content_type = response
         .headers()
@@ -656,6 +664,7 @@ async fn progress_round_trips_and_survives_restarts() -> Result<()> {
             duration: 100.0,
             finished: false,
             updated: now() - 600,
+            revision: 0,
         };
         let response = running
             .request(reqwest::Method::PUT, &paths::progress(&id))
@@ -663,19 +672,20 @@ async fn progress_round_trips_and_survives_restarts() -> Result<()> {
             .send()
             .await?;
         ensure!(response.status() == StatusCode::OK, "{}", response.status());
-        ensure!(response.json::<Progress>().await? == saved);
+        ensure!(same_progress(&response.json::<Progress>().await?, &saved));
         let got: Progress = running
             .get(&paths::progress(&id))
             .send()
             .await?
             .json()
             .await?;
-        ensure!(got == saved);
+        ensure!(same_progress(&got, &saved));
 
         // Much older progress from an offline client does not rewind it.
         let older = Progress {
             position: 1.0,
             updated: saved.updated - 3600,
+            revision: 0,
             ..saved.clone()
         };
         let response = running
@@ -683,12 +693,13 @@ async fn progress_round_trips_and_survives_restarts() -> Result<()> {
             .json(&older)
             .send()
             .await?;
-        ensure!(response.json::<Progress>().await? == saved);
+        ensure!(same_progress(&response.json::<Progress>().await?, &saved));
 
         // Within the same minute, the client wins.
         let close = Progress {
             position: 40.0,
             updated: saved.updated - 30,
+            revision: 0,
             ..saved.clone()
         };
         let response = running
@@ -696,7 +707,7 @@ async fn progress_round_trips_and_survives_restarts() -> Result<()> {
             .json(&close)
             .send()
             .await?;
-        ensure!(response.json::<Progress>().await? == close);
+        ensure!(same_progress(&response.json::<Progress>().await?, &close));
 
         let response = running
             .request(reqwest::Method::PUT, &paths::progress(&id))
@@ -714,7 +725,7 @@ async fn progress_round_trips_and_survives_restarts() -> Result<()> {
             .await?
             .json()
             .await?;
-        ensure!(got == close);
+        ensure!(same_progress(&got, &close));
         again.server.shutdown().await;
         Ok(())
     })
@@ -735,6 +746,7 @@ async fn progress_from_a_future_clock_is_clamped() -> Result<()> {
             duration: 100.0,
             finished: false,
             updated: before + 10 * 365 * 24 * 3600,
+            revision: 0,
         };
         let stored: Progress = running
             .request(reqwest::Method::PUT, &paths::progress(&id))
@@ -755,18 +767,20 @@ async fn progress_from_a_future_clock_is_clamped() -> Result<()> {
             duration: 100.0,
             finished: false,
             updated: now(),
+            revision: 0,
         };
         let response = running
             .request(reqwest::Method::PUT, &paths::progress(&id))
             .json(&later)
             .send()
             .await?;
-        ensure!(response.json::<Progress>().await? == later);
+        ensure!(same_progress(&response.json::<Progress>().await?, &later));
         // So does u64::MAX, clamped the same way without overflow.
         let response = running
             .request(reqwest::Method::PUT, &paths::progress(&id))
             .json(&Progress {
                 updated: u64::MAX,
+                revision: 0,
                 ..later.clone()
             })
             .send()
@@ -1331,6 +1345,7 @@ async fn the_listing_carries_saved_progress() -> Result<()> {
             duration: 120.0,
             finished: false,
             updated: now() - 5,
+            revision: 0,
         };
         let response = running
             .request(reqwest::Method::PUT, &paths::progress(&id))
@@ -1341,7 +1356,14 @@ async fn the_listing_carries_saved_progress() -> Result<()> {
         let library = running.library().await?;
         for video in &library.videos {
             if video.id == id {
-                ensure!(video.resume.as_ref() == Some(&saved), "{:?}", video.resume);
+                ensure!(
+                    video
+                        .resume
+                        .as_ref()
+                        .is_some_and(|resume| same_progress(resume, &saved) && resume.revision == 1),
+                    "{:?}",
+                    video.resume
+                );
             } else {
                 ensure!(
                     video.resume.is_none(),
@@ -1361,7 +1383,11 @@ async fn the_listing_carries_saved_progress() -> Result<()> {
             .into_iter()
             .find(|video| video.id == id)
             .context("Film.mp4 is listed")?;
-        ensure!(film.resume == Some(saved));
+        ensure!(
+            film.resume
+                .as_ref()
+                .is_some_and(|resume| same_progress(resume, &saved) && resume.revision == 1)
+        );
         again.server.shutdown().await;
         Ok(())
     })
