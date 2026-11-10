@@ -6,6 +6,15 @@ The audit and implementation artifacts from 2026-10-25 (screenshots, measurement
 
 ## Evidence by revision
 
+### Remote downloads review fixes and the Settings rename on 2026-11-10
+
+Tested commit `5a98467`. An independent review of the "download to another machine" change set found one critical problem and fixed it with the rest: a paired Flick could delete the owner's original files through a share (both servers now answer 403 for Remove and Delete Files on a share, and on any transfer that no paired Flick started whose files are not under the server's download folder; the client hides the action for shares). Also fixed: the in-app listing froze and kept advertising capabilities after the owner turned downloads off (capabilities are now live, published empty while off); the deletion list differed between the client, the route, and the two backends (one shared rule, `will_delete` per file, echoed exactly); cancelling a resolve never reached the server (the client aborts the request and the server answers 204 on `DELETE /v1/transfers/resolve`); unfinished-file streams were unlimited (8 at once, then 503 with `Retry-After`); every 409 on a delete read as a changed list (only a real mismatch carries one); the in-app server advertised `shares` without roots and never re-checked `links`; fetch errors carried server paths; paired Flicks could fill the owner's command queue (own cap of 8); the two backends disagreed on status codes, limits, and helpers (aligned on the shared ones); and the long-standing intermittent `services` shutdown test (the worker no longer publishes after shutdown began; 25 of 25 isolated runs passed). The Appearance page was renamed Settings, with Appearance as its first group, at the owner's request.
+
+- `cargo fmt --all -- --check`, `cargo clippy --locked --no-default-features --all-targets -- -D warnings`, `cargo clippy --locked --features runtime-shaders --all-targets -- -D warnings`: passed.
+- `cargo test --locked --features runtime-shaders --all-targets`: 122 library unit tests (1 ignored), 217 desktop unit tests (12 ignored), 17 HLS, 18 server, 7 transfer-route, 9 transfer tests, all passed. The fix agents also ran the remote test files five times each and a full suite with logging `ffmpeg`, `ffprobe`, and `yt-dlp` shims first on `PATH`, which recorded no calls.
+- Interactive use from the MacBook of the Save to picker, Downloads by machine, Watch Now before completion, and the Settings page after the rename has not been performed at this commit; the public download started from the MacBook and run on the Mac mini is recorded below.
+
+
 | Platform | Native compilation and tests | Desktop playback | Native GPU video path |
 | --- | --- | --- | --- |
 | Linux | Native debug build, formatting, strict Clippy, 244 ordinary tests and expanded native backend tests pass on 2026-10-25 | Xvfb/Openbox session exercised for the review backlog and in all three interface styles; null audio | Deferred; hardware decoding unverified without a GPU |
