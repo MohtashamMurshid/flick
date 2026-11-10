@@ -62,6 +62,7 @@ impl Flick {
         }
         self.menu = None;
         self.card_menu = None;
+        self.remote_ui.menu = None;
         self.palette = Some(Palette {
             selected: 0,
             online: None,
