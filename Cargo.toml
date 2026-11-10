@@ -15,6 +15,8 @@ default-run = "flick"
 [features]
 default = ["desktop"]
 desktop = ["dep:gpui", "dep:image", "dep:notify", "dep:trash", "dep:windows", "dep:windows-core"]
+# Compile GPUI's Metal shaders at run time, for type-checking and tests on a Mac without full Xcode. Not for shipping builds.
+runtime-shaders = ["gpui/runtime_shaders"]
 
 [[bin]]
 name = "flick"
