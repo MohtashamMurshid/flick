@@ -134,7 +134,13 @@ Distribution:
 - [x] 36. Pasting a YouTube, X, other web, or magnet link into the command center or the search field offers its download straight away, naming the site.
 - [x] 37. Cards say Watched only for finished videos, using the same flag as Mark as Watched; older history that reached the end counts as finished.
 
-Watch folders, remote control, accounts, cloud storage, casting, and a general NDJSON agent interface are outside the first release. Search belongs in the library workflow.
+### 8. Remote library over Tailscale
+
+The design, delivery order, and checkboxes are in [the remote library plan](REMOTE_PLAN.md). One Flick, or the headless `flick-serve`, serves its library on its Tailscale address only, behind a pairing token; another Flick pairs with it and streams the original files.
+
+State on 2026-11-10 at `c17bbd6`: the server core and `flick-serve` are built, tested on loopback, and checked on a real Tailscale address. The desktop client has the `Source` type, the Remote Libraries settings page, and the player side of remote playback. The library section that lists remote videos, the quality tiers (transcodes and HLS), and playback from a second machine are not done. See [validation](VALIDATION.md#remote-library-over-tailscale-on-2026-11-10).
+
+Watch folders, remote control of the player, accounts, cloud storage, casting, and a general NDJSON agent interface are outside the first release. Search belongs in the library workflow.
 
 ## Existing prototype
 

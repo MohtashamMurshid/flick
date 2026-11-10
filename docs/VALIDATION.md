@@ -16,6 +16,53 @@ The earlier macOS build/playback entries later in this log describe pre-PR revis
 
 The presentation adapter transfers decoded BGRA frames through CPU memory into GPUI images. It sizes frames to physical video bounds without a fixed resolution, axis, or pixel-budget cap. Checked native dimensions and allocation failures produce explicit errors. GPU rendering of those images does not establish hardware video decoding or zero-copy presentation. Treat this as a functional prototype. Hardware decoding, efficient GPU surface sharing, HDR correctness, battery use, and claims of being faster than VLC remain unverified.
 
+### Remote library over Tailscale on 2026-11-10
+
+Tested commit `c17bbd6` on the `remote-library` work (server core, `flick-serve`, the desktop client, and its settings page). Machine: Mohtasham's Mac Mini, Apple Silicon macOS 27.2 (26B123), Rust 1.99.0 (`rustc 1.99.0 (b940084d7 2026-09-28)`, clippy 0.1.99, rustfmt 1.10.0), Tailscale 1.104.5, FFmpeg 7.0. No Xcode and no libmpv on this Mac.
+
+Not covered at this commit: the transcode and HLS modules (`src/remote/transcode.rs` and `src/remote/hls.rs` are placeholders, so the listing offers only `original`), embedded WebVTT subtitles, and the library section that lists remote videos and plays them (`open_remote` is not called from the library yet). Nothing below tests those.
+
+#### Backend tests (passing)
+
+- `cargo fmt --all -- --check` passed.
+- `cargo clippy --locked --no-default-features --all-targets -- -D warnings` passed.
+- CI's dependency-isolation check (`cargo tree --locked --no-default-features --edges normal`, no `gpui`, `blade-graphics`, `cocoa`, `metal`, or `winit`), run locally with the same Python, passed; `axum` is in that tree.
+- `cargo test --locked --no-default-features --all-targets` passed: 96 library unit tests (17 of them in `remote::`) with 1 ignored (`installed_ytdlp…`, opt-in), 14 `tests/remote_server.rs`, 9 `tests/transfers.rs`. The `flick-fetch`, `flick-serve`, and `flick-transfer` binaries have no tests. The remote-server tests run on loopback with generated fixtures: 401 without a token, 404 for unknown ids, single ranges, 416 for multi-range and out-of-bounds, `HEAD`, `If-Range` with a stale ETag, 409 for an unverified torrent file, concurrent readers, refused binds, progress across restarts, subtitles, posters, and hash, shutdown during a stream, and the `flick-serve` binary's pairing line.
+
+#### Desktop typecheck and unit tests under `runtime-shaders` (not a shipping build)
+
+The desktop target cannot build in its shipping configuration on this Mac, because GPUI's Metal shaders need full Xcode. The dev-only `runtime-shaders` feature type-checks and tests it instead. This is not a desktop build that could ship, and it is not playback.
+
+- `cargo clippy --locked --features runtime-shaders --all-targets -- -D warnings` passed, with Cargo's existing future-compatibility notice for `block` 0.1.6 and `proc-macro-error2` 2.0.1.
+- `cargo test --locked --features runtime-shaders --all-targets`: the first run failed one desktop unit test, `services::tests::begin_shutdown_is_nonblocking_and_finalization_cleans_http_and_session_lock` (`assertion failed: !services.drain().any(|e| matches!(e, Event::Error(_)))` at `src/services.rs:2460`), and stopped before the integration tests. The remote work does not touch that file. Run alone three times, the test passed each time. A full rerun with `--no-fail-fast` passed: 96 library unit tests (1 ignored), 167 desktop unit tests with 12 ignored opt-ins, 14 remote-server tests, and 9 transfer tests. Fifteen of the desktop unit tests cover the client: `remote_client` (10, including listing, caching, and posters from a loopback server) and `source` (5, including that the token never appears in the URL or `Debug` output). The intermittent `services` failure was not investigated further.
+
+#### `flick-serve` on the real Tailscale address (server only, no client)
+
+`bash scripts/make-test-video.sh /tmp/flick-remote-check/Check.S01E01.mp4 --with-subtitles` made a 4,900,410-byte MP4 and an SRT sidecar. `cargo build --locked --release --no-default-features --bin flick-serve` passed in 36.64 s. `target/release/flick-serve --folder /tmp/flick-remote-check --state-dir /tmp/flick-remote-state --name "Validation"` found the Tailscale address on its own, printed `{"listen":"100.98.200.69:47117","pairing":"flick-remote://100.98.200.69:47117/#<token>"}`, and logged `Remote library server listening addr=100.98.200.69:47117 videos=1`. It made `token` and `salt` with mode 0600, and `serve.lock`. Results with `curl` against `http://100.98.200.69:47117` (token redacted):
+
+- `GET /v1/library` without a token, and with the wrong token: 401, `www-authenticate: Bearer`, JSON message.
+- With the token: protocol 1, server name `Validation`, `qualities: ["original"]`, one video with a 40-hex id, size 4,900,410, MIME `video/mp4`, episode Check S01E01, `complete: true`, `poster: false`, one sidecar subtitle. Duration and size in pixels are 0 for `--folder` sources.
+- `HEAD /v1/media/{id}`: 200, `accept-ranges: bytes`, `etag: "4ac63a-18e69a331d98e79f"`, `content-type: video/mp4`, `content-length: 4900410`, no body.
+- `Range: bytes=-6`: 206, `content-range: bytes 4900404-4900409/4900410`, `content-length: 6`; the bytes (`f1f1 f1f1 f1c0`) matched `tail -c 6` of the file.
+- Full `GET` piped to `shasum -a 256`: `52c9cb04…2372f5d`, the same as the file.
+- `Range: bytes=0-1,5-6` and `Range: bytes=4900410-`: 416, `content-range: bytes */4900410`.
+- `GET /v1/hash/{id}`: `{"hash":"b5e2c92d7c3e8858"}`, the same as an independent Python computation of the OpenSubtitles hash.
+- `GET /v1/subtitles/{id}` listed `Check.S01E01.srt`; `GET /v1/subtitles/{id}/0` returned 200 `application/x-subrip`, byte-identical to the sidecar (`cmp`).
+- Unknown id: 404. Poster: 404 (no desktop poster cache for a folder source).
+- `curl http://127.0.0.1:47117/…` and `curl http://192.168.0.47:47117/…` (the LAN address on `en1`; `en0` has none): connection refused (curl exit 7). `lsof` showed the only listener on `100.98.200.69:47117`.
+- `--bind 0.0.0.0:47118`: exit 1, "Flick serves only on its Tailscale address, never on every interface…". `--bind 192.168.0.47:47118`: exit 1, "192.168.0.47 is not a Tailscale address…".
+- A second server with the same `--state-dir`: "Another Flick server is already using /tmp/flick-remote-state".
+- `flick-serve --state-dir … --print-pairing` while the server ran printed the same token.
+- `kill -TERM`: logged "Stopping the remote library server" and exited within a second; the port then refused connections. The token did not appear in stderr.
+
+`tailscale status` listed this Mac (`mohtashams-mac-mini`, 100.98.200.69), the MacBook Pro (`mohtashams-macbook-pro`, active, direct), a MacBook Air (offline), two Linux machines (one offline), an iPhone, and one macOS node owned by another login. `tailscale ping -c 5 mohtashams-macbook-pro` answered `pong … via 192.168.0.49:41641 in 5ms`: a direct LAN path, not relayed. No data was sent to the MacBook.
+
+The refused `--bind` runs had already written a `token` file into their new state folder before refusing. The temporary folders, the fixture, and the server's state were deleted afterward.
+
+#### Interactive playback from a second machine: not performed
+
+No video was played over the tailnet, by Flick or by stock mpv, and nothing was observed on the MacBook. Bit rate, seeking, resume, subtitles over HTTP, and the quality picker are unverified. The library section that would start remote playback is not wired at this commit. To record it: run Flick on the MacBook Pro (which needs a desktop build there), pair it in Appearance → Remote Libraries with the server's pairing string, play a video from the server, seek, switch quality once tiers exist, note the observed bit rate from libmpv, and record `tailscale ping` from the MacBook. Until the library section lands, `mpv --http-header-fields="Authorization: Bearer …" http://100.98.200.69:47117/v1/media/<id>` on the MacBook would check the transport alone.
+
 ### README screenshots with Blender open movies on 2026-11-01
 
 On Apple Silicon macOS 27.2, the debug build of `907e5ee` (`cargo build --locked --bin flick` reported it current; no Rust source changed) ran with an isolated profile: `FLICK_SETTINGS_PATH`, `FLICK_DATA_DIR`, and `FLICK_DOWNLOAD_DIR` pointed into a temporary folder, with `FLICK_AUDIO=null`. Six Blender open movies from the Internet Archive (five H.264 MP4 files and one MKV, 720p to 2048×872, 7:44 to 14:48 long) were listed in a seeded `settings.json`, with three saved positions and one film marked watched. Observed:
