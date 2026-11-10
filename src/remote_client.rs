@@ -29,7 +29,9 @@
 //!   [`RemoteState::machine_transfers`] returns the last rows of each.
 //! - [`RemoteState::command`] and its wrappers send resolve, start, pause,
 //!   remove, link, browse, and share commands; answers arrive in
-//!   [`Ready::Command`].
+//!   [`Ready::Command`]. A resolve can wait minutes for peers, so
+//!   [`RemoteState::cancel_resolve`] drops its request, which closes the
+//!   connection and ends the lookup on the server.
 
 use crate::store::{Settings, remote::RemoteServer};
 use flick::remote::protocol::{
@@ -362,6 +364,7 @@ impl RemoteState {
         let inner = self.inner.get_mut();
         inner.servers.remove(id);
         inner.machines.remove(id);
+        inner.resolves.remove(id);
         let dropped = inner.posters.remove_server(id);
         inner.dropped.extend(dropped);
         if let Some(fields) = &self.fields.renaming
@@ -668,6 +671,9 @@ struct Inner {
     /// Servers whose listing is asked for again on the next drain, because
     /// a download there finished.
     relist: HashSet<String>,
+    /// The resolve in flight on each server. Dropping its sender drops the
+    /// request, which closes the connection.
+    resolves: HashMap<String, tokio::sync::oneshot::Sender<()>>,
 }
 
 impl Inner {
@@ -1040,6 +1046,9 @@ enum Request {
         endpoint: Endpoint,
         server_id: String,
         command: Command,
+        /// Ends the request when it fires or its sender is dropped; the
+        /// answer is then discarded.
+        cancel: Option<tokio::sync::oneshot::Receiver<()>>,
     },
 }
 
@@ -1413,8 +1422,17 @@ async fn handle(http: &reqwest::Client, request: Request) -> Reply {
             endpoint,
             server_id,
             command,
+            cancel,
         } => {
-            let result = run_command(http, &endpoint, &command).await;
+            let run = run_command(http, &endpoint, &command);
+            let result = match cancel {
+                // Dropping `run` drops the request and closes its connection.
+                Some(cancel) => tokio::select! {
+                    result = run => result,
+                    _ = cancel => return Reply::None,
+                },
+                None => run.await,
+            };
             Reply::Command {
                 server_id,
                 command,
@@ -1490,6 +1508,9 @@ async fn get(
     Ok(body)
 }
 
+/// A 503 without a message: too many streams or transcodes are open.
+const BUSY: &str = "The server is busy; try again in a moment";
+
 /// The status a non-success HTTP answer means. For any 4xx or 5xx other
 /// than 401, 403, and 404, the server's message is used when it sent one.
 pub fn status_for_http(code: u16, body: &[u8]) -> Status {
@@ -1505,7 +1526,7 @@ pub fn status_for_http(code: u16, body: &[u8]) -> Status {
         404 => Status::NotFlick,
         400..=599 => Status::Failed(message().unwrap_or_else(|| match code {
             409 => "Still downloading on the server".into(),
-            503 => "The server is busy. Try again shortly".into(),
+            503 => BUSY.into(),
             500..=599 => format!("Server error ({code})"),
             _ => format!("Unexpected reply ({code})"),
         })),
@@ -2091,12 +2112,41 @@ pub fn poll_due(last: Option<Instant>, now: Instant, downloads_open: bool) -> bo
     last.is_none_or(|last| now.saturating_duration_since(last) >= interval)
 }
 
-/// Every selected file's path, in the server's order: what a deletion must
-/// echo in `RemoveTransfer::confirm`.
+/// Tiers the player's picker offers for a remote video: Original only
+/// unless the video is known to be finished (`complete` from
+/// [`RemoteState::video_complete`]), else the server's tiers, or every tier
+/// when it has none.
+pub fn picker_qualities(complete: Option<bool>, server: Option<Vec<Quality>>) -> Vec<Quality> {
+    if complete != Some(true) {
+        return vec![Quality::Original];
+    }
+    server.unwrap_or_else(|| Quality::ALL.to_vec())
+}
+
+/// Whether a remote open asks the server first ([`RemoteState::check_playback`])
+/// instead of loading at once: a transcode tier, or a file not known to be
+/// finished, so the server's reason (an unfinished file it cannot stream,
+/// or 503 when too many streams are open) is shown instead of libmpv's
+/// generic failure.
+pub fn check_before_loading(quality: Quality, complete: Option<bool>) -> bool {
+    quality.is_transcode() || complete != Some(true)
+}
+
+/// The paths "Remove and Delete Files" would delete, in the server's order:
+/// what the confirmation lists and a deletion echoes in
+/// `RemoveTransfer::confirm`. Those whose `will_delete` is set; a server
+/// that sets none (one older than `will_delete`) means the selected files.
 pub fn confirm_list(row: &TransferRow) -> Vec<String> {
+    let marked = row.files.iter().any(|file| file.will_delete);
     row.files
         .iter()
-        .filter(|file| file.selected)
+        .filter(|file| {
+            if marked {
+                file.will_delete
+            } else {
+                file.selected
+            }
+        })
         .map(|file| file.path.clone())
         .collect()
 }
@@ -2151,17 +2201,21 @@ pub fn command_error(code: u16, body: &[u8]) -> String {
     if code == 401 {
         return Status::WrongToken.label();
     }
-    let message = serde_json::from_slice::<ErrorBody>(body)
-        .ok()
-        .map(|body| short(body.message.trim()))
-        .filter(|message| !message.is_empty());
-    message.unwrap_or_else(|| match code {
+    server_message(body).unwrap_or_else(|| match code {
         403 => "This Flick's owner has not allowed that from other Flicks".into(),
         404 => "The server no longer has this. Refresh and try again".into(),
         409 => "The server already has this".into(),
         504 => "The server took too long to answer. Try again".into(),
         _ => status_for_http(code, body).label(),
     })
+}
+
+/// The `message` of an error body, when it has one.
+fn server_message(body: &[u8]) -> Option<String> {
+    serde_json::from_slice::<ErrorBody>(body)
+        .ok()
+        .map(|body| short(body.message.trim()))
+        .filter(|message| !message.is_empty())
 }
 
 /// What a server is sent for a torrent: a magnet link or URL as it is, a
@@ -2232,7 +2286,10 @@ fn parse_fetch_id(body: &[u8]) -> Option<u64> {
 }
 
 /// The file list a 409 to a deletion carries, under `confirm`, `files`,
-/// `current`, or `paths`, as strings or objects with a `path`.
+/// `current`, or `paths`, as strings or objects with a `path`. Objects
+/// count when `will_delete` is true, or, without it, unless `selected` is
+/// false. None when the answer has no list: not a changed list, so the
+/// user is not asked again.
 pub fn parse_current_list(body: &[u8]) -> Option<Vec<String>> {
     let value: serde_json::Value = serde_json::from_slice(body).ok()?;
     let object = value.as_object()?;
@@ -2243,7 +2300,8 @@ pub fn parse_current_list(body: &[u8]) -> Option<Vec<String>> {
         .map(|entry| match entry {
             serde_json::Value::String(path) => Some(path.clone()),
             serde_json::Value::Object(file) => {
-                if file.get("selected").and_then(serde_json::Value::as_bool) == Some(false) {
+                let flag = |key| file.get(key).and_then(serde_json::Value::as_bool);
+                if flag("will_delete").or(flag("selected")) == Some(false) {
                     return Some(String::new());
                 }
                 file.get("path")?.as_str().map(str::to_owned)
@@ -2478,39 +2536,42 @@ async fn run_command(
     match (command, answer) {
         (
             Command::Remove {
-                id,
                 delete_files: true,
                 ..
             },
             Err(Failure::Http { code: 409, body }),
-        ) => {
-            let message = command_error(409, &body);
-            let current = match parse_current_list(&body) {
-                Some(current) => current,
-                // Without a list in the answer, the current snapshot has it.
-                None => call(
-                    http,
-                    endpoint,
-                    Call::get(paths::transfers(), MAX_TRANSFERS_BYTES),
-                )
-                .await
-                .ok()
-                .and_then(|body| parse_rows::<TransferRow>(&body).ok())
-                .and_then(|rows| rows.into_iter().find(|row| &row.id == id))
-                .map(|row| confirm_list(&row))
-                .unwrap_or_default(),
-            };
-            Ok(Outcome::ListChanged { message, current })
-        }
+        ) => match parse_current_list(&body) {
+            // The list changed: ask again with the server's.
+            Some(current) => Ok(Outcome::ListChanged {
+                message: command_error(409, &body),
+                current,
+            }),
+            // Any other refusal is said once and not asked again.
+            None => Err(server_message(&body)
+                .unwrap_or_else(|| "The server deleted nothing. Refresh and try again".into())),
+        },
+        // Keep Files on a transfer that is already gone did what was asked.
+        (
+            Command::Remove {
+                delete_files: false,
+                ..
+            },
+            Err(Failure::Http { code: 404, .. }),
+        ) => Ok(Outcome::Done),
         (_, Err(failure)) => Err(failure.message()),
         (Command::Resolve { .. }, Ok(body)) => serde_json::from_slice(&body)
             .map(Outcome::Resolved)
             .map_err(|_| unreadable("file list")),
-        (Command::Start { .. }, Ok(body)) => Ok(Outcome::Started {
-            id: serde_json::from_slice::<protocol::Started>(&body)
-                .map(|started| started.id)
-                .unwrap_or_default(),
-        }),
+        // It may have started: say so rather than offering to start it again.
+        (Command::Start { .. }, Ok(body)) => serde_json::from_slice::<protocol::Started>(&body)
+            .ok()
+            .map(|started| started.id.trim().to_owned())
+            .filter(|id| !id.is_empty())
+            .map(|id| Outcome::Started { id })
+            .ok_or_else(|| {
+                "The server sent an unreadable answer. Check its downloads before starting this again"
+                    .to_owned()
+            }),
         (Command::FetchStart { .. }, Ok(body)) => parse_fetch_id(&body)
             .map(|id| Outcome::FetchStarted { id })
             .ok_or_else(|| unreadable("answer")),
@@ -2737,16 +2798,6 @@ impl RemoteState {
         Some(listing.video(video_id).is_some_and(|video| video.complete))
     }
 
-    /// Whether a server's last listing advertises a capability.
-    pub fn server_allows(&self, server_id: &str, capability: Capability) -> bool {
-        self.inner
-            .borrow()
-            .servers
-            .get(server_id)
-            .and_then(|remote| remote.listing.as_ref())
-            .is_some_and(|listing| listing.library.capabilities.contains(&capability))
-    }
-
     /// Sends a command to a paired server; the answer arrives in
     /// [`Ready::Command`] after a [`Self::drain`]. Rows are asked for again
     /// after every answer.
@@ -2759,19 +2810,41 @@ impl RemoteState {
             });
             return;
         };
+        let mut inner = self.inner.borrow_mut();
+        let cancel = match &command {
+            // A newer resolve on the same server replaces, and so cancels,
+            // the older one.
+            Command::Resolve { .. } => {
+                let (sender, receiver) = tokio::sync::oneshot::channel();
+                inner.resolves.insert(server_id.to_owned(), sender);
+                Some(receiver)
+            }
+            Command::CancelResolve => {
+                inner.resolves.remove(server_id);
+                None
+            }
+            _ => None,
+        };
         let request = Request::Command {
             endpoint: Endpoint::of(server),
             server_id: server_id.to_owned(),
             command,
+            cancel,
         };
-        self.send(&mut self.inner.borrow_mut(), Some(request));
+        self.send(&mut inner, Some(request));
     }
 
     /// Asks a server for a torrent's file list. `input` is from [`wire_input`].
+    /// A later resolve on the same server cancels this one.
     pub fn resolve(&mut self, settings: &Settings, server_id: &str, input: String) {
         self.command(settings, server_id, Command::Resolve { input });
     }
 
+    /// Ends the resolve in flight on a server: its request is dropped,
+    /// which closes the connection and so ends the lookup on the server,
+    /// and its answer is discarded. `DELETE /v1/transfers/resolve` is also
+    /// sent for servers that track lookups apart from the connection; the
+    /// cancellation does not depend on it.
     pub fn cancel_resolve(&mut self, settings: &Settings, server_id: &str) {
         self.command(settings, server_id, Command::CancelResolve);
     }
@@ -2956,10 +3029,7 @@ mod tests {
             status_for_http(502, b"<html>"),
             Status::Failed("Server error (502)".into())
         );
-        assert_eq!(
-            status_for_http(503, b""),
-            Status::Failed("The server is busy. Try again shortly".into())
-        );
+        assert_eq!(status_for_http(503, b""), Status::Failed(BUSY.into()));
         assert_eq!(
             status_for_http(418, b""),
             Status::Failed("Unexpected reply (418)".into())
@@ -3296,6 +3366,9 @@ mod tests {
                 (503, "text/plain", b"busy".to_vec())
             } else if method == "HEAD" && path == protocol::paths::media("v0") {
                 (200, "video/mp4", vec![0; 1024])
+            } else if method == "HEAD" && path == protocol::paths::media("v2") {
+                // Too many unfinished-file streams open: Watch Now is refused.
+                (503, json, error_body("Too many streams are open"))
             } else {
                 (404, json, error_body("gone"))
             }
@@ -3341,9 +3414,11 @@ mod tests {
         assert_eq!(check("v0", Quality::Original), Ok(()));
         assert_eq!(check("v1", Quality::Low720), Err(DOWNLOADING.into()));
         assert_eq!(check("v2", Quality::Low720), Err(NO_LENGTH.into()));
+        assert_eq!(check("v2", Quality::Data480), Err(BUSY.into()));
+        // A HEAD answer has no body, so a busy stream limit says BUSY.
         assert_eq!(
-            check("v2", Quality::Data480),
-            Err("The server is busy. Try again shortly".into())
+            check("v2", Quality::Original),
+            Err("The server is busy; try again in a moment".into())
         );
         assert_eq!(
             check("v1", Quality::Original),
@@ -3581,12 +3656,22 @@ mod tests {
     }
 
     #[test]
-    fn deletion_confirms_exactly_the_selected_paths() {
+    fn deletion_confirms_exactly_the_files_the_server_will_delete() {
         assert_eq!(
             confirm_list(&transfer("a", TransferPhase::Downloading, 0)),
             ["Show/E01.mkv", "Show/E02.mkv"]
         );
         assert!(confirm_list(&TransferRow::default()).is_empty());
+        // An unselected file with data on disk is deleted too, and listed.
+        let mut row = transfer("a", TransferPhase::Paused, 0);
+        row.files[1].will_delete = true;
+        row.files[2].will_delete = false;
+        assert_eq!(confirm_list(&row), ["Show/E01.mkv", "Show/notes.txt"]);
+        // A server older than `will_delete` sets none: the selected files.
+        for file in &mut row.files {
+            file.will_delete = false;
+        }
+        assert_eq!(confirm_list(&row), ["Show/E01.mkv", "Show/E02.mkv"]);
         assert_eq!(
             parse_current_list(br#"{"message":"changed","files":["a","b"]}"#),
             Some(vec!["a".into(), "b".into()])
@@ -3594,6 +3679,12 @@ mod tests {
         assert_eq!(
             parse_current_list(
                 br#"{"message":"x","current":[{"path":"a","selected":true},{"path":"b","selected":false}]}"#
+            ),
+            Some(vec!["a".into()])
+        );
+        assert_eq!(
+            parse_current_list(
+                br#"{"files":[{"path":"a","selected":false,"will_delete":true},{"path":"b","selected":true,"will_delete":false}]}"#
             ),
             Some(vec!["a".into()])
         );
@@ -3623,10 +3714,7 @@ mod tests {
             "The server no longer has this. Refresh and try again"
         );
         assert_eq!(command_error(409, b""), "The server already has this");
-        assert_eq!(
-            command_error(503, b""),
-            "The server is busy. Try again shortly"
-        );
+        assert_eq!(command_error(503, b""), BUSY);
         assert_eq!(
             command_error(504, b""),
             "The server took too long to answer. Try again"
@@ -3712,6 +3800,26 @@ mod tests {
         assert!(poll_due(Some(earlier), now, true));
         assert!(!poll_due(Some(earlier), now, false));
         assert!(poll_due(Some(now - POLL_IDLE), now, false));
+    }
+
+    #[test]
+    fn videos_not_known_to_be_finished_offer_original_and_are_checked_first() {
+        let server = Some(vec![Quality::Original, Quality::Low720]);
+        assert_eq!(
+            picker_qualities(Some(true), server.clone()),
+            [Quality::Original, Quality::Low720]
+        );
+        assert_eq!(picker_qualities(Some(true), None), Quality::ALL);
+        // Still downloading, or not listed yet (Watch Now before the listing).
+        for complete in [Some(false), None] {
+            assert_eq!(
+                picker_qualities(complete, server.clone()),
+                [Quality::Original]
+            );
+            assert!(check_before_loading(Quality::Original, complete));
+        }
+        assert!(!check_before_loading(Quality::Original, Some(true)));
+        assert!(check_before_loading(Quality::Low720, Some(true)));
     }
 
     #[test]
@@ -3901,7 +4009,7 @@ mod tests {
                 fake.removed.lock().unwrap().push(remove.clone());
                 let current = confirm_list(&transfer(&id, TransferPhase::Seeding, 200));
                 if remove.delete_files && remove.confirm.is_empty() {
-                    // No list in the answer: the client reads the snapshot.
+                    // A refusal that is not a changed list carries no list.
                     (409, error_body("Confirm the files to delete"))
                 } else if remove.delete_files && remove.confirm != current {
                     let reply = serde_json::json!({
@@ -4081,13 +4189,11 @@ mod tests {
         };
         assert_eq!(message, "The files changed since you looked");
         assert_eq!(current, ["Show/E01.mkv", "Show/E02.mkv"]);
+        // A 409 without a list is said once, not asked again.
         state.remove(&settings, &mini, &id, true, Vec::new());
         assert_eq!(
             command_answer(&mut state).2,
-            Ok(Outcome::ListChanged {
-                message: "Confirm the files to delete".into(),
-                current: current.clone(),
-            })
+            Err("Confirm the files to delete".into())
         );
         state.remove(&settings, &mini, &id, true, current.clone());
         assert_eq!(command_answer(&mut state).2, Ok(Outcome::Done));
@@ -4151,5 +4257,166 @@ mod tests {
 
         state.remove_server(&mut settings, &mini);
         assert!(state.machine_transfers(&settings).is_empty());
+    }
+
+    #[test]
+    fn refusals_end_without_asking_again_and_unreadable_starts_are_errors() {
+        const SHARED: &str = "This is a share of the owner's files; remove it with Keep Files";
+        let port = loopback_server(|method, path| {
+            let json = "application/json";
+            match (method, path) {
+                ("POST", "/v1/transfers") => (201, json, b"<html>".to_vec()),
+                ("DELETE", "/v1/transfers/gone") => (404, json, error_body("gone")),
+                ("DELETE", "/v1/transfers/share") => (403, json, error_body(SHARED)),
+                ("DELETE", "/v1/transfers/held") => (409, json, b"{}".to_vec()),
+                _ => (404, json, error_body("gone")),
+            }
+        });
+        let data = tempfile::tempdir().unwrap();
+        let mut state = RemoteState::with_data_dir(data.path());
+        let mut settings = Settings::default();
+        let id = state
+            .add_pairing(
+                &mut settings,
+                &format!("flick-remote://127.0.0.1:{port}/#{TOKEN}"),
+            )
+            .unwrap();
+        let answer = |state: &mut RemoteState, command: Command| {
+            state.command(&settings, &id, command.clone());
+            loop {
+                let (_, answered, result) = command_answer(state);
+                if answered == command {
+                    return result;
+                }
+            }
+        };
+        let start = Command::Start {
+            input: "magnet:?xt=urn:btih:abc".into(),
+            files: vec![0],
+        };
+        let Err(message) = answer(&mut state, start) else {
+            panic!("an unreadable start answer is an error");
+        };
+        assert!(message.starts_with("The server sent an unreadable answer"));
+        let remove = |id: &str, delete_files: bool| Command::Remove {
+            id: id.into(),
+            delete_files,
+            confirm: vec!["a".into()],
+        };
+        // Keep Files on a transfer that is already gone is done.
+        assert_eq!(answer(&mut state, remove("gone", false)), Ok(Outcome::Done));
+        assert_eq!(answer(&mut state, remove("gone", true)), Err("gone".into()));
+        assert_eq!(
+            answer(&mut state, remove("share", true)),
+            Err(SHARED.into())
+        );
+        assert_eq!(
+            answer(&mut state, remove("held", true)),
+            Err("The server deleted nothing. Refresh and try again".into())
+        );
+    }
+
+    /// Reads one request's head and body; None when the client left first.
+    fn read_request(reader: &mut BufReader<std::net::TcpStream>) -> Option<(String, String)> {
+        let mut line = String::new();
+        reader.read_line(&mut line).ok()?;
+        let mut words = line.split_whitespace();
+        let method = words.next()?.to_owned();
+        let path = words.next()?.to_owned();
+        let mut length = 0;
+        loop {
+            let mut header = String::new();
+            reader.read_line(&mut header).ok()?;
+            if header.trim().is_empty() {
+                break;
+            }
+            if let Some((name, value)) = header.split_once(':')
+                && name.eq_ignore_ascii_case("content-length")
+            {
+                length = value.trim().parse().ok()?;
+            }
+        }
+        let mut body = vec![0; length];
+        reader.read_exact(&mut body).ok()?;
+        Some((method, path))
+    }
+
+    #[test]
+    fn cancelling_a_resolve_closes_its_connection() {
+        let (events, seen) = mpsc::channel::<String>();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let events = events.clone();
+                thread::spawn(move || {
+                    let mut reader = BufReader::new(stream.try_clone().unwrap());
+                    let Some((method, path)) = read_request(&mut reader) else {
+                        return;
+                    };
+                    if (method.as_str(), path.as_str()) == ("POST", "/v1/transfers/resolve") {
+                        // Hold the lookup open, as a server finding peers does,
+                        // until the client closes the connection.
+                        let _ = events.send("resolving".into());
+                        let mut rest = Vec::new();
+                        let _ = reader.read_to_end(&mut rest);
+                        let _ = events.send("closed".into());
+                        return;
+                    }
+                    let code = if method == "DELETE" { 204 } else { 404 };
+                    let _ = events.send(format!("{method} {path}"));
+                    let _ = write!(
+                        stream,
+                        "HTTP/1.1 {code} X\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    );
+                });
+            }
+        });
+        let next = |want: &str| loop {
+            let event = seen.recv_timeout(Duration::from_secs(10)).expect(want);
+            if event == want {
+                return;
+            }
+        };
+        let data = tempfile::tempdir().unwrap();
+        let mut state = RemoteState::with_data_dir(data.path());
+        let mut settings = Settings::default();
+        let id = state
+            .add_pairing(
+                &mut settings,
+                &format!("flick-remote://127.0.0.1:{port}/#{TOKEN}"),
+            )
+            .unwrap();
+        state.resolve(&settings, &id, "magnet:?xt=urn:btih:abc".into());
+        next("resolving");
+        state.cancel_resolve(&settings, &id);
+        next("closed");
+        next("DELETE /v1/transfers/resolve");
+        assert_eq!(
+            command_answer(&mut state).1,
+            Command::CancelResolve,
+            "only the cancel is answered"
+        );
+
+        // A newer resolve on the same server cancels the older one, and
+        // removing the server cancels its resolve.
+        state.resolve(&settings, &id, "magnet:?xt=urn:btih:abc".into());
+        next("resolving");
+        state.resolve(&settings, &id, "magnet:?xt=urn:btih:def".into());
+        // The old connection closes and the new one opens, in either order.
+        let mut pending = vec!["closed", "resolving"];
+        while !pending.is_empty() {
+            let event = seen.recv_timeout(Duration::from_secs(10)).expect("both");
+            pending.retain(|want| *want != event);
+        }
+        state.remove_server(&mut settings, &id);
+        next("closed");
+        thread::sleep(Duration::from_millis(100));
+        state.drain();
+        assert!(
+            state.take_ready().is_empty(),
+            "cancelled resolves are not answered"
+        );
     }
 }

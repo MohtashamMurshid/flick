@@ -838,21 +838,19 @@ impl Flick {
     }
 
     /// Tiers the quality picker offers: those the playing video's server
-    /// lists, or every tier before its first listing. A video still
-    /// downloading on the server plays only at Original.
+    /// lists. A video still downloading on the server, or one not known to
+    /// be finished because the server has not listed it yet (Watch Now from
+    /// Downloads before the first listing), plays only at Original.
     pub(crate) fn quality_choices(&self) -> Vec<Quality> {
         let Some(remote) = self.remote_source() else {
             return Quality::ALL.to_vec();
         };
-        if self
-            .remote
-            .video_complete(&remote.server_id, &remote.video_id)
-            == Some(false)
-        {
-            return vec![Quality::Original];
-        }
-        self.remote_server(&remote.server_id)
-            .map_or_else(|| Quality::ALL.to_vec(), |server| server.qualities())
+        crate::remote_client::picker_qualities(
+            self.remote
+                .video_complete(&remote.server_id, &remote.video_id),
+            self.remote_server(&remote.server_id)
+                .map(|server| server.qualities()),
+        )
     }
 
     fn library_changed(&mut self, cx: &mut Context<Self>) {
@@ -1053,17 +1051,10 @@ impl Flick {
         cx: &mut Context<Self>,
     ) {
         self.remote_ui.checking = None;
-        // An unfinished file on a server that cannot stream one is checked
-        // first, so its reason is shown instead of a generic failure.
-        let unplayable = self
+        let complete = self
             .remote
-            .video_complete(&remote.server_id, &remote.video_id)
-            == Some(false)
-            && !self.remote.server_allows(
-                &remote.server_id,
-                flick::remote::protocol::Capability::StreamIncomplete,
-            );
-        if !remote.quality.is_transcode() && !unplayable {
+            .video_complete(&remote.server_id, &remote.video_id);
+        if !crate::remote_client::check_before_loading(remote.quality, complete) {
             self.load_remote(remote, resume, window, cx);
             return;
         }

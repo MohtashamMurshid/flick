@@ -63,6 +63,10 @@ pub(super) struct SaveToUi {
     pub(super) delete: Option<RemoteDelete>,
     /// The machine whose share link is shown, when it is not this Mac.
     pub(super) shared_on: Option<String>,
+    /// Remote rows with a Pause, Resume, or Remove · Keep Files in flight,
+    /// by (server id, transfer id), with what the button says meanwhile. A
+    /// second click waits for the answer.
+    pub(super) busy: HashMap<(String, String), &'static str>,
 }
 
 /// A torrent resolved on another machine.
@@ -107,6 +111,57 @@ pub(super) struct RemoteDelete {
     pub(super) changed: Option<String>,
     /// Sent and not answered yet.
     pub(super) sending: bool,
+}
+
+/// What Remove · Keep Files says while the server answers.
+const REMOVING: &str = "Removing…";
+
+/// Marks a remote row's Pause, Resume, or Remove as in flight. False when
+/// one already is, so the click does nothing.
+pub(super) fn start_row_command(
+    busy: &mut HashMap<(String, String), &'static str>,
+    server_id: &str,
+    id: &str,
+    label: &'static str,
+) -> bool {
+    use std::collections::hash_map::Entry;
+    match busy.entry((server_id.to_owned(), id.to_owned())) {
+        Entry::Occupied(_) => false,
+        Entry::Vacant(entry) => {
+            entry.insert(label);
+            true
+        }
+    }
+}
+
+/// Whether a remote row offers "Remove and Delete Files…". A share is the
+/// owner's own files, which the server never deletes: Keep Files only.
+pub(super) fn offers_delete(row: &TransferRow) -> bool {
+    !row.share
+}
+
+/// What a deletion's answer leaves: the confirmation to show again, only
+/// when the server's list changed, and a refusal to show once. Any other
+/// answer closes the confirmation, so a refusal is never asked again.
+pub(super) fn delete_answered(
+    server_id: String,
+    id: String,
+    result: Result<Outcome, String>,
+) -> (Option<RemoteDelete>, Option<String>) {
+    match result {
+        Ok(Outcome::ListChanged { message, current }) => (
+            Some(RemoteDelete {
+                server_id,
+                id,
+                confirm: current,
+                changed: Some(sentence(&message)),
+                sending: false,
+            }),
+            None,
+        ),
+        Ok(_) => (None, None),
+        Err(message) => (None, Some(message)),
+    }
 }
 
 /// `TorrentInput` is not `Clone`; the torrent sheet keeps a copy to resolve
@@ -1428,33 +1483,34 @@ impl Flick {
                     }
                 }
             }
-            (Command::Remove { id, .. }, result) => {
+            (
+                Command::Remove {
+                    id,
+                    delete_files: true,
+                    ..
+                },
+                result,
+            ) => {
                 let pending = save_to
                     .delete
                     .as_ref()
                     .is_some_and(|delete| delete.server_id == server_id && delete.id == id);
-                match result {
-                    Ok(Outcome::ListChanged { message, current }) if pending => {
-                        // Ask again with the list the server has now.
-                        save_to.delete = Some(RemoteDelete {
-                            server_id,
-                            id,
-                            confirm: current,
-                            changed: Some(sentence(&message)),
-                            sending: false,
-                        });
-                    }
-                    Ok(_) => {
-                        if pending {
-                            save_to.delete = None;
-                        }
-                    }
-                    Err(message) => {
-                        if pending && let Some(delete) = save_to.delete.as_mut() {
-                            delete.sending = false;
-                        }
-                        self.error = Some(format!("{name}: {}", sentence(&message)));
-                    }
+                // A share's 403, or a 409 without a list, is said once.
+                let (again, refused) = delete_answered(server_id, id, result);
+                if pending {
+                    save_to.delete = again;
+                }
+                if let Some(message) = refused {
+                    self.error = Some(format!("{name}: {}", sentence(&message)));
+                }
+            }
+            (
+                Command::Pause { id } | Command::Resume { id } | Command::Remove { id, .. },
+                result,
+            ) => {
+                save_to.busy.remove(&(server_id, id));
+                if let Err(message) = result {
+                    self.error = Some(format!("{name}: {}", sentence(&message)));
                 }
             }
             (Command::Browse { dir }, result) => {
@@ -2117,21 +2173,32 @@ impl Flick {
                 },
             ));
         }
+        let busy = self
+            .remote_ui
+            .save_to
+            .busy
+            .get(&(server.clone(), id.clone()))
+            .copied();
+        let removing = busy == Some(REMOVING);
         let (toggle_server, toggle_id) = (server.clone(), id.clone());
         let (remove_server, remove_id) = (server.clone(), id.clone());
-        let (delete_server, delete_id, delete_list) = (
-            server.clone(),
-            id.clone(),
-            crate::remote_client::confirm_list(transfer),
-        );
         actions = actions
             .child(self.button(
                 SharedString::from(format!("remote-pause-{key}")),
                 Some(if paused { "play" } else { "pause" }),
-                if paused { "Resume" } else { "Pause" },
+                match busy {
+                    Some(label) if !removing => label,
+                    _ if paused => "Resume",
+                    _ => "Pause",
+                },
                 false,
                 cx,
                 move |this, _, cx| {
+                    let label = if paused { "Resuming…" } else { "Pausing…" };
+                    let busy = &mut this.remote_ui.save_to.busy;
+                    if !start_row_command(busy, &toggle_server, &toggle_id, label) {
+                        return;
+                    }
                     if paused {
                         this.remote
                             .resume(&this.store.data, &toggle_server, &toggle_id);
@@ -2145,10 +2212,18 @@ impl Flick {
             .child(self.button(
                 SharedString::from(format!("remote-remove-{key}")),
                 None,
-                "Remove · Keep Files",
+                if removing {
+                    REMOVING
+                } else {
+                    "Remove · Keep Files"
+                },
                 false,
                 cx,
                 move |this, _, cx| {
+                    let busy = &mut this.remote_ui.save_to.busy;
+                    if !start_row_command(busy, &remove_server, &remove_id, REMOVING) {
+                        return;
+                    }
                     this.remote.remove(
                         &this.store.data,
                         &remove_server,
@@ -2158,8 +2233,14 @@ impl Flick {
                     );
                     cx.notify();
                 },
-            ))
-            .child(self.button(
+            ));
+        if offers_delete(transfer) {
+            let (delete_server, delete_id, delete_list) = (
+                server.clone(),
+                id.clone(),
+                crate::remote_client::confirm_list(transfer),
+            );
+            actions = actions.child(self.button(
                 SharedString::from(format!("remote-delete-{key}")),
                 None,
                 "Remove and Delete Files…",
@@ -2176,6 +2257,7 @@ impl Flick {
                     cx.notify();
                 },
             ));
+        }
         let confirmation = self
             .remote_ui
             .save_to
@@ -2388,6 +2470,50 @@ mod tests {
             copy_input(&magnet),
             flick::torrent::TorrentInput::Magnet(text) if text == "magnet:?x"
         ));
+    }
+
+    #[test]
+    fn shares_offer_keep_files_only() {
+        let row = TransferRow::default();
+        assert!(offers_delete(&row));
+        assert!(!offers_delete(&TransferRow { share: true, ..row }));
+    }
+
+    #[test]
+    fn row_commands_wait_for_their_answer() {
+        let mut busy = HashMap::new();
+        assert!(start_row_command(&mut busy, "mini", "a", REMOVING));
+        assert!(!start_row_command(&mut busy, "mini", "a", "Pausing…"));
+        assert_eq!(busy[&("mini".to_owned(), "a".to_owned())], REMOVING);
+        // Other rows and other servers are independent.
+        assert!(start_row_command(&mut busy, "mini", "b", "Pausing…"));
+        assert!(start_row_command(&mut busy, "book", "a", "Pausing…"));
+    }
+
+    #[test]
+    fn deletions_ask_again_only_for_a_changed_list() {
+        let changed = Ok(Outcome::ListChanged {
+            message: "The files changed since you looked".into(),
+            current: vec!["Show/E01.mkv".into(), "Show/notes.txt".into()],
+        });
+        let (again, refused) = delete_answered("mini".into(), "a".into(), changed);
+        let again = again.expect("asked again");
+        assert_eq!(again.confirm, ["Show/E01.mkv", "Show/notes.txt"]);
+        assert_eq!(
+            again.changed.as_deref(),
+            Some("The files changed since you looked.")
+        );
+        assert!(!again.sending && refused.is_none());
+        let (again, refused) = delete_answered("mini".into(), "a".into(), Ok(Outcome::Done));
+        assert!(again.is_none() && refused.is_none());
+        // A share's 403 or a 409 without a list closes it and is said once.
+        let shared = Err("This is a share; remove it with Keep Files".to_owned());
+        let (again, refused) = delete_answered("mini".into(), "a".into(), shared);
+        assert!(again.is_none());
+        assert_eq!(
+            refused.as_deref(),
+            Some("This is a share; remove it with Keep Files")
+        );
     }
 
     #[test]
