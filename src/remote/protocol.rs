@@ -31,7 +31,57 @@ pub struct Library {
     pub capabilities: Vec<Capability>,
     /// The download destination this server offers, when it accepts downloads.
     pub storage: Option<Storage>,
+    /// How to wake this machine from the same LAN; None when unknown.
+    pub hardware: Option<Hardware>,
     pub videos: Vec<Video>,
+}
+
+/// Addresses a client needs to send a Wake-on-LAN packet. Only the server's
+/// own interfaces; nothing about other machines.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default)]
+pub struct Hardware {
+    /// MAC addresses as `aa:bb:cc:dd:ee:ff`.
+    pub mac: Vec<String>,
+    /// IPv4 addresses on the LAN (not the Tailscale address).
+    pub lan_ips: Vec<String>,
+}
+
+/// `GET /v1/hello`, the only route that needs no token: enough to recognise
+/// a Flick on the tailnet and offer to pair with it. Never lists videos.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default)]
+pub struct Hello {
+    pub protocol: u32,
+    pub server_name: String,
+    /// A pairing code is currently valid on the server's screen or log.
+    pub pairing_open: bool,
+}
+
+/// `POST /v1/pair`, no token: a six-digit code the owner showed. The server
+/// allows five wrong attempts per code, a code lives ten minutes, and the
+/// route is rate-limited; the reply is the full pairing string.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default)]
+pub struct PairRequest {
+    pub code: String,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default)]
+pub struct PairReply {
+    pub pairing: String,
+}
+
+/// An audio stream inside the file, selectable for transcode tiers with
+/// `?audio=<track>` on the HLS playlist.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default)]
+pub struct AudioTrack {
+    pub track: u32,
+    pub language: Option<String>,
+    pub title: Option<String>,
+    pub channels: u32,
 }
 
 /// What a server lets paired Flicks do, beyond browsing and playing.
@@ -81,6 +131,11 @@ pub struct Video {
     pub subtitles: Vec<SubtitleFile>,
     /// Subtitle streams inside the file, extracted as WebVTT on demand.
     pub embedded_subtitles: Vec<EmbeddedSubtitle>,
+    /// Audio streams inside the file; transcode tiers can pick one.
+    pub audio_tracks: Vec<AudioTrack>,
+    /// The position the server last saved for this video, from any client,
+    /// so Continue Watching follows the person between machines.
+    pub resume: Option<Progress>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
@@ -523,6 +578,20 @@ pub mod paths {
 
     pub fn hls_playlist(id: &str, quality: Quality) -> String {
         format!("/v1/hls/{id}/{quality}/index.m3u8")
+    }
+
+    /// A transcode tier with a chosen audio stream; `track` indexes
+    /// `Video::audio_tracks`.
+    pub fn hls_playlist_audio(id: &str, quality: Quality, track: u32) -> String {
+        format!("/v1/hls/{id}/{quality}/index.m3u8?audio={track}")
+    }
+
+    pub fn hello() -> String {
+        "/v1/hello".into()
+    }
+
+    pub fn pair() -> String {
+        "/v1/pair".into()
     }
 
     pub fn hls_init(id: &str, quality: Quality) -> String {

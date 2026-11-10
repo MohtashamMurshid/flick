@@ -1628,6 +1628,8 @@ pub fn server_from_pairing(pairing: &Pairing, id: String) -> RemoteServer {
         port: pairing.port,
         token: pairing.token.clone(),
         quality: Quality::default(),
+        auto_quality: true,
+        wake: None,
     }
 }
 
@@ -2952,6 +2954,7 @@ mod tests {
             qualities: vec![Quality::Original, Quality::Low720],
             capabilities: Vec::new(),
             storage: None,
+            hardware: None,
             videos: (0..videos)
                 .map(|index| Video {
                     id: format!("v{index}"),

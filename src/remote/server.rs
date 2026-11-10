@@ -613,6 +613,8 @@ async fn listing(State(state): State<Arc<AppState>>) -> Response {
         Ok(videos) => Json(Library {
             protocol: protocol::VERSION,
             server_name: state.name.clone(),
+            // ORCHESTRATOR SEAM: the server agent fills this from the interfaces.
+            hardware: None,
             qualities: state.hls.qualities(),
             capabilities: state
                 .transfers
@@ -680,6 +682,9 @@ fn describe(id: &str, entry: &Entry, media: &MediaCache) -> Video {
         poster: entry.poster.is_some(),
         subtitles: subtitle_files(&entry.path),
         embedded_subtitles: info.map(|info| info.subtitles).unwrap_or_default(),
+        // ORCHESTRATOR SEAM: audio tracks from ffprobe, resume from the progress file.
+        audio_tracks: Vec::new(),
+        resume: None,
     }
 }
 
