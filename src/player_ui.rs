@@ -1241,6 +1241,31 @@ impl Flick {
             );
         match menu {
             Menu::Tracks => {
+                // Remote videos only, first so it is never below the fold:
+                // switching reloads at the current position.
+                if let Some(current) = self.remote_quality() {
+                    panel = panel.child(
+                        div()
+                            .px_2()
+                            .pt_2()
+                            .pb_1()
+                            .text_size(t.font(11.))
+                            .text_color(t.muted)
+                            .child("Quality"),
+                    );
+                    for quality in self.quality_choices() {
+                        panel = panel.child(
+                            option(
+                                format!("quality-{quality}").into(),
+                                quality.label().into(),
+                                quality == current,
+                            )
+                            .on_click(cx.listener(
+                                move |this, _, window, cx| this.switch_quality(quality, window, cx),
+                            )),
+                        );
+                    }
+                }
                 for (kind, title) in [("audio", "Audio"), ("sub", "Subtitles")] {
                     panel = panel.child(
                         div()
@@ -1311,30 +1336,6 @@ impl Flick {
                         panel = panel.child(option("subs-off".into(), "Off".into(), off).on_click(
                             cx.listener(|this, _, _, cx| this.property("sid", "no", cx)),
                         ));
-                    }
-                }
-                // Remote videos only: switching reloads at the current position.
-                if let Some(current) = self.remote_quality() {
-                    panel = panel.child(
-                        div()
-                            .px_2()
-                            .pt_2()
-                            .pb_1()
-                            .text_size(t.font(11.))
-                            .text_color(t.muted)
-                            .child("Quality"),
-                    );
-                    for quality in self.quality_choices() {
-                        panel = panel.child(
-                            option(
-                                format!("quality-{quality}").into(),
-                                quality.label().into(),
-                                quality == current,
-                            )
-                            .on_click(cx.listener(
-                                move |this, _, window, cx| this.switch_quality(quality, window, cx),
-                            )),
-                        );
                     }
                 }
                 panel = panel.child(
