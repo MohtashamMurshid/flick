@@ -1285,6 +1285,13 @@ async fn hardware_is_listed_only_when_advertised() -> Result<()> {
                 let ip: std::net::Ipv4Addr = ip.parse()?;
                 ensure!(ip.is_private(), "{ip} is not a LAN address");
             }
+            ensure!(hardware.mac.len() <= 8 && hardware.lan_ips.len() <= 8);
+            for mac in &hardware.mac {
+                ensure!(
+                    mac != "02:00:00:00:00:00" && mac != "00:00:00:00:00:00",
+                    "{mac} wakes nothing"
+                );
+            }
         } else {
             eprintln!("this machine reports no LAN interface; only absence is checked");
         }
