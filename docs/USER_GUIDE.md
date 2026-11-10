@@ -6,8 +6,8 @@ This guide covers everything Flick does, screen by screen. For installation, see
 
 A new Flick, with an empty library and no paired server, opens to setup: four screens, each with Back, Skip, and Next. Skip leaves that screen's settings as they were when you reached it. Each choice is saved as you make it, through the same controls as Settings.
 
-1. **Where are your videos?** *On this Mac* (*On this computer* on Windows and Linux), or *On another machine on my Tailscale network*. For another machine, paste the pairing string that Flick shows in **Settings → Remote Libraries** there, or that `flick-serve --print-pairing` prints, and choose **Test Connection**. Next is enabled once that server answers. Going on with *On this Mac* unpairs a server that was only tested here.
-2. **Share this library?** The **Share my library on Tailscale** switch, off by default, with the pairing string, Copy, and New Token once sharing starts. See [Remote libraries](#remote-libraries).
+1. **Where are your videos?** *On this Mac* (*On this computer* on Windows and Linux), or *On another machine on my Tailscale network*. Choosing another machine starts a search of your tailnet and lists the Flicks that answer, by name; choose **Pair** beside one and type the six-digit code it shows (see [Finding Flicks and pairing by code](#finding-flicks-and-pairing-by-code)). Or paste the pairing string that Flick shows in **Settings → Remote Libraries** there, or that `flick-serve --print-pairing` prints, and choose **Test Connection**. Next is enabled once that server answers. Going on with *On this Mac* unpairs a server that was only tested here.
+2. **Share this library?** The **Share my library on Tailscale** switch, off by default, with the pairing string, Copy, New Token, and **Show Pairing Code** once sharing starts. See [Remote libraries](#remote-libraries).
 3. **Where should downloads go?** This Mac and every paired machine. A machine that is offline, or does not accept downloads, cannot be chosen; the others show their download folder and free space. Below it, **Keep sharing completed downloads?** asks the seeding question with *Keep sharing completed downloads* or *Stop sharing*. Next needs both answers.
 4. **You're set.** One line each for Videos, Share this library, Downloads go to, and After downloading, with **Change** to go back to that screen. **Open Library** finishes setup and shows Home.
 
@@ -68,17 +68,67 @@ A remote library lets one computer keep the videos and another watch them. A Mac
 
 Each paired server has its own section in the library, and its videos play like local ones, with Continue Watching. It has been played from a MacBook at Original and through a transcode tier; see [validation](VALIDATION.md#remote-playback-from-the-macbook-pro-on-2026-11-10).
 
-To pair, run `flick-serve --print-pairing` on the server and copy the `flick-remote://…` string. In Flick, open **Settings**, find **Remote Libraries**, choose **Add Server…**, paste the string, and choose **Add**. Each paired server has a row with its address and status: Online with its number of videos, Offline, or Wrong token. The row can rename the server, refresh it, change its default quality, and remove it. The token is saved in `settings.json`; treat the pairing string like a password.
+To pair by pasting, run `flick-serve --print-pairing` on the server and copy the `flick-remote://…` string. In Flick, open **Settings**, find **Remote Libraries**, choose **Add Server…**, paste the string, and choose **Add**. Each paired server has a row with its address and status: Online with its number of videos, Offline, or Wrong token. The row can rename the server, refresh it, change its default quality, turn [automatic quality](#automatic-quality) off, and remove it. The token is saved in `settings.json`; treat the pairing string like a password.
 
-**Quality.** Original sends the file as it is: every audio and subtitle track, HDR, and the full bit rate. Use it at home, or on any direct path with room to spare. The lower tiers are live H.264 transcodes made on the server: 1080p High (12 Mbit/s) for fast fibre upload, 1080p (6 Mbit/s) for ordinary home upload, 720p (3 Mbit/s) for hotel Wi-Fi and relayed paths, and 480p (1.5 Mbit/s) for cellular. A server offers them only when it has FFmpeg. **Quality**, at the top of the player's Audio & subtitles menu, switches tiers for a remote video and reloads at the current position.
+The features below (finding Flicks, pairing codes, automatic quality, Continue Watching across machines, Keep on this Mac, Wake, audio tracks in transcodes, queued downloads, and notifications) are covered by unit and loopback tests, and the server side was checked with `curl` on a real Tailscale address. None of them has been used from the app's own screens or from a second machine yet; see [validation](VALIDATION.md#remote-library-polish-on-2026-11-11).
+
+### Finding Flicks and pairing by code
+
+**Add Server…** and the first setup screen search your tailnet for Flicks. They ask Tailscale for the machines on it and list each one that answers on Flick's port, by its name, with its Tailscale name and address. A Flick already paired says **Paired**; one whose owner has a code open says "showing a pairing code". **Search Again** repeats the search. If nothing answers, the list says that Tailscale must be running on this computer and the other Flick must be sharing its library on Tailscale.
+
+Choose **Pair** beside a Flick, type the six-digit code shown on it, and choose **Pair** again. Spaces and dashes in the code are ignored. On success the server is added like a pasted pairing string. A wrong code shows the server's answer, with how many attempts are left; after five wrong codes, or ten minutes, the code closes and the owner must show a new one.
+
+To show a code on the machine that shares, turn on **Share my library on Tailscale** in **Settings → Remote Libraries** and choose **Show Pairing Code**. The code appears in large digits with its time left, **Copy**, and **New Code**, which replaces it. With `flick-serve`, run `flick-serve pair-code` while it runs, or start it with `--pair-code`; see [pairing](REMOTE.md#pairing).
+
+Pasting the full pairing string still works, and is the way to pair a server on another port or one that discovery does not find.
+
+### Quality
+
+Original sends the file as it is: every audio and subtitle track, HDR, and the full bit rate. Use it at home, or on any direct path with room to spare. The lower tiers are live H.264 transcodes made on the server: 1080p High (12 Mbit/s) for fast fibre upload, 1080p (6 Mbit/s) for ordinary home upload, 720p (3 Mbit/s) for hotel Wi-Fi and relayed paths, and 480p (1.5 Mbit/s) for cellular. A server offers them only when it has FFmpeg. **Quality**, at the top of the player's Audio & subtitles menu, switches tiers for a remote video and reloads at the current position.
 
 Before relying on it:
 
 - **Home upload speed is the limit away from home.** A 4K remux at original quality needs more than most home connections upload.
 - **Direct or relayed.** `tailscale ping <server>` shows `via <address>` for a direct path and `via DERP(…)` for a relay. Relayed paths are slower and vary; expect 720p there.
 - **FFmpeg on the server** is needed for any tier but Original.
-- **Transcodes are lossy.** They tone-map HDR to SDR, carry only the default audio track, and cannot show bitmap subtitles such as PGS. Original keeps all of these.
-- **Keep the server awake.** The Mac mini must stay awake, logged in, and connected to Tailscale. The launchd agent from `scripts/install-flick-serve.sh` runs the server inside `caffeinate`; see [keeping the Mac mini awake](REMOTE.md#keep-the-mac-mini-awake-and-reachable).
+- **Transcodes are lossy.** They tone-map HDR to SDR, carry one audio track at a time, and cannot show bitmap subtitles such as PGS. Original keeps all of these.
+- **Keep the server awake.** The Mac mini must stay awake, logged in, and connected to Tailscale. The launchd agent from `scripts/install-flick-serve.sh` runs the server inside `caffeinate`, and the desktop app's own server does the same while **Keep this Mac awake while sharing** is on; see [Wake](#wake) and [keeping the Mac mini awake](REMOTE.md#keep-the-mac-mini-awake-and-reachable).
+
+#### Automatic quality
+
+While a remote video plays on a server that offers transcode tiers, Flick watches for buffering. Two stalls within the first minute on a tier, or one stall longer than five seconds at any time, drop it one tier and reload at the current position, with a message on the video such as "Dropped to 720p after buffering twice." A short stall right after a seek is not counted. It never drops below the lowest tier the server offers, and never raises the tier again.
+
+Choosing a tier yourself in **Quality** turns automatic quality off until that video is closed. To turn it off for a server for good, switch off **Automatic quality** under that server in **Settings → Remote Libraries**. It is on by default, and does nothing for a server without FFmpeg or for a download that has not finished, since those play only at Original.
+
+#### Audio tracks in transcodes
+
+A transcode carries one audio track. When the server has read the file, the player's audio menu lists the file's audio tracks by language, title, and channels (for example "eng · 5.1"), and choosing one reloads the tier at the current position with that track. Without a choice, a transcode uses the file's first audio track. At Original, the menu lists the file's own tracks, as for a local video.
+
+### Continue Watching across machines
+
+Each Flick saves its position in a remote video to the server as it plays, and the server's listing carries the last position any Flick saved there. When a listing arrives, Flick keeps whichever position is newer, its own or the server's. Stop watching on one Mac, and any other Flick paired with the same server resumes from there. A video finished on one machine counts as finished on the others.
+
+### Keep on this Mac
+
+A remote video's menu (right-click its card, or Shift+F10) has **Keep on this Mac** (**Keep on this PC** on Windows, **Keep on this computer** on Linux). It copies the original file to this computer, for watching without the server, such as when travelling. It is offered only while the server answers and the video has finished downloading there.
+
+- The copy goes into Flick's download folder, in a folder named `From <server name>`. Downloads shows it under **Copies to this Mac**, with its progress, speed, and **Cancel**. A copy that fails stays there with its reason, **Retry**, and **Dismiss**; Retry continues from the bytes already copied.
+- When the copy finishes, it joins the library as a local video marked "Kept from Mac mini", and the server's card is marked **On this Mac**. It plays from this computer.
+- While copying, the server card's menu has **Cancel Copy**. Once kept, it has **Show Local Copy in Folder** and **Remove Local Copy…**, which asks before moving the copy to the Trash, like Delete File. The file on the server is never touched.
+
+### Wake
+
+A server that told this Flick its hardware addresses while it was online, and has stopped answering, gets a **Wake** button: on its row in **Settings → Remote Libraries**, beside its section title in the library, and in its Downloads section. Wake sends a Wake-on-LAN packet and says "Wake packet sent; give it a minute." Then the row updates when the server answers again.
+
+- It works only from the same local network as the sleeping machine. Over Tailscale from elsewhere, the packet cannot reach it.
+- The machine must allow waking for network access, and a Mac on Wi-Fi may not wake from a packet. Ethernet is the reliable case.
+- A server started with `flick-serve --no-wake-info` does not share its addresses, so no Wake button appears for it.
+
+To avoid needing Wake, keep the sharing machine awake. In the desktop app, **Keep this Mac awake while sharing** in **Settings → Remote Libraries** (macOS only, on by default) stops idle sleep while the server runs; the display can still sleep. The launchd agent for `flick-serve` does the same with `caffeinate`.
+
+### Notifications
+
+Flick shows a system notification when a torrent or link download it is following on another machine finishes ("Sintel finished downloading on Mac mini"), when a kept copy finishes ("… is now on this Mac"), and when queued downloads are sent to a machine that woke up. Flick must be running to notice. Notifications use the system's own tool, `osascript` on macOS and `notify-send` on Linux; Windows shows none yet. They never include paths or tokens.
 
 ## Downloading to another machine
 
@@ -103,10 +153,12 @@ The command center lists **Download to Mac mini…** for each machine that accep
 
 **Seed from.** Choosing another machine in the Share sheet browses only the folders its owner allowed. **Share This Folder** seeds from there; the magnet link is the server's, and sharing keeps going after this Mac closes.
 
+**Queued for a sleeping machine.** If a torrent or link download sent to another machine gets no answer, because it went to sleep or lost its connection in the meantime, Flick keeps it and says "Mac mini is not answering; queued until it does." Downloads shows it in that machine's section as "Download · Waiting for Mac mini to answer", with **Cancel**. The queue is saved, so it survives quitting Flick. When the machine answers again, Flick sends its queued downloads in order and shows one notification for the batch. A download the machine refuses then is dropped from the queue. Pause, Resume, Remove, and the other commands on existing transfers are never queued.
+
 Limits:
 
 - Only paired machines on your tailnet, with the same pairing token as the library. Nothing is reachable from the Internet or the LAN.
-- A download cannot move between machines once started, and nothing waits in a queue for a machine that is asleep: an offline machine cannot be chosen.
+- A download cannot move between machines once started. A machine already shown as offline cannot be chosen under Save to; only a download it did not answer is queued.
 - A server looks up at most three torrents and runs at most three link downloads at once; more are refused until one finishes. A lookup waits at most five minutes for peers.
 - Unfinished downloads play at Original only; the transcode tiers need the finished file.
 
