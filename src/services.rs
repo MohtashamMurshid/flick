@@ -91,6 +91,9 @@ pub enum Command {
     /// Explicit retry after a terminal startup failure. Load only asks for readiness.
     RetryTransfers,
     CancelSearch,
+    /// A question from the in-app remote server, answered on its own
+    /// channel instead of as an [`Event`]. Built by [`QueryHandle::query`].
+    Query(Query),
     Shutdown,
 }
 pub enum Event {
@@ -353,10 +356,30 @@ impl Services {
             .split(',')
             .filter_map(|v| v.parse().ok())
             .collect::<Vec<std::net::SocketAddr>>();
-        Self::start_config(config, peers)
+        let services = Self::start_config(config, peers);
+        // The in-app remote server finds the window's worker here.
+        *QUERY_HOST.lock().unwrap_or_else(|e| e.into_inner()) = Some(services.query_handle());
+        services
     }
 
-    fn start_config(config: TransferConfig, peers: Vec<std::net::SocketAddr>) -> Self {
+    /// A handle the in-app remote server uses to ask this worker questions
+    /// from its own threads. See [`QueryHandle::query`].
+    pub fn query_handle(&self) -> QueryHandle {
+        QueryHandle {
+            sender: self.sender.clone(),
+            shutdown: self.shutdown.clone(),
+            download_dir: self.download_dir.clone(),
+        }
+    }
+
+    /// Asks the worker and returns the answer on its own channel, without
+    /// going through the view's events.
+    #[allow(dead_code)]
+    pub fn query(&self, request: QueryRequest) -> oneshot::Receiver<QueryResult> {
+        self.query_handle().query(request)
+    }
+
+    pub(crate) fn start_config(config: TransferConfig, peers: Vec<std::net::SocketAddr>) -> Self {
         let download_dir = config.download_dir.clone();
         let (sender, receiver) = channel::unbounded_channel();
         let (events_tx, events) = mpsc::channel();
@@ -604,6 +627,7 @@ async fn run_loop(
     let mut dirty = false;
     let mut configure = false;
     let mut fetches = Fetches::default();
+    let mut remote = RemoteQueries::default();
     loop {
         if shutdown.is_cancelled() {
             break;
@@ -632,6 +656,18 @@ async fn run_loop(
                     let _ = events.send(Event::Resolved(result));
                 }));
             }
+            // Paired Flicks' reads never wait behind a transfer change.
+            let mut index = 0;
+            while index < pending.len() {
+                if matches!(&pending[index], Command::Query(query) if !query.is_mutation()) {
+                    let Some(Command::Query(query)) = pending.remove(index) else {
+                        unreachable!()
+                    };
+                    remote.spawn(query, ready.clone(), initial_peers.clone());
+                } else {
+                    index += 1;
+                }
+            }
             if configure {
                 ready.set_limits(
                     config.download_limit_bytes_per_second,
@@ -644,13 +680,23 @@ async fn run_loop(
             if transfer_job.is_none() {
                 let command = pending.pop_front();
                 if let Some(command) = command {
-                    transfer_job = Some(tokio::spawn(transfer_command(
-                        command,
-                        ready.clone(),
-                        initial_peers.clone(),
-                        events.clone(),
-                        changed.clone(),
-                    )));
+                    transfer_job = Some(match command {
+                        Command::Query(query) => tokio::spawn(run_mutation(
+                            query,
+                            ready.clone(),
+                            initial_peers.clone(),
+                            events.clone(),
+                            changed.clone(),
+                            remote.paths.clone(),
+                        )),
+                        command => tokio::spawn(transfer_command(
+                            command,
+                            ready.clone(),
+                            initial_peers.clone(),
+                            events.clone(),
+                            changed.clone(),
+                        )),
+                    });
                     dirty = true;
                 }
             }
@@ -729,6 +775,17 @@ async fn run_loop(
                         let _ = events.send(Event::TransferAvailability(TransferAvailability::Ready));
                         progress.empty(&events);
                         pending.retain(|command| !matches!(command, Command::Load));
+                        // Paired Flicks' reads of an empty state must not
+                        // start an engine; their changes still do.
+                        pending = std::mem::take(&mut pending)
+                            .into_iter()
+                            .filter_map(|command| match command {
+                                Command::Query(query) => {
+                                    query.answer_without_session().map(Command::Query)
+                                }
+                                command => Some(command),
+                            })
+                            .collect();
                     }
                     Err(error) => {
                         let _ = events.send(error.event());
@@ -756,6 +813,14 @@ async fn run_loop(
                 dirty = true;
             }
             _ = changed.notified() => { dirty = true; }
+            Some(query) = remote.admit.recv() => {
+                if pending.len() >= MAX_PENDING_TRANSFERS {
+                    query.fail(QueryError::Busy("Too many pending transfer commands. Try again shortly.".into()));
+                } else {
+                    pending.push_back(Command::Query(query));
+                }
+            }
+            _ = remote.tasks.join_next(), if !remote.tasks.is_empty() => {}
             _ = tokio::time::sleep_until(next_poll.unwrap_or_else(Instant::now)), if next_poll.is_some() => {
                 next_poll = None;
                 dirty = true;
@@ -798,6 +863,26 @@ async fn run_loop(
                     }
                     continue;
                 }
+                let command = match command {
+                    Command::Query(query) => {
+                        if let Some(error) = &startup_error {
+                            query.fail(QueryError::Unavailable(error.clone()));
+                            continue;
+                        }
+                        match &session {
+                            Some(ready) if !query.is_mutation() => {
+                                remote.spawn(query, ready.clone(), initial_peers.clone());
+                                continue;
+                            }
+                            None if startup.is_none() => match query.answer_without_session() {
+                                Some(query) => Command::Query(query),
+                                None => continue,
+                            },
+                            _ => Command::Query(query),
+                        }
+                    }
+                    command => command,
+                };
                 if let Some(error) = &startup_error {
                     // Readiness was already reported as Unavailable. A page
                     // visit must not replace its actionable Retry message.
@@ -864,6 +949,7 @@ async fn run_loop(
     }
     tasks.abort_all();
     while tasks.join_next().await.is_some() {}
+    remote.shutdown().await;
     fetches.shutdown(&events).await;
     streams
         .session
@@ -878,6 +964,7 @@ async fn run_loop(
 fn reject_transfer(command: Command, error: &str, events: &mpsc::Sender<Event>) {
     match command {
         Command::ReleaseForDeletion { reply, .. } => reply.finish(Err(error.into())),
+        Command::Query(query) => query.fail(QueryError::Unavailable(error.into())),
         Command::Resolve(_) => {
             let _ = events.send(Event::Resolved(Err(error.into())));
         }
@@ -1165,6 +1252,9 @@ fn subtitles(command: Command, events: &mpsc::Sender<Event>) -> Option<Command> 
 struct Fetches {
     jobs: HashMap<u64, (CancellationToken, tokio::task::JoinHandle<()>)>,
     retiring: Vec<tokio::task::JoinHandle<()>>,
+    /// Paired Flicks' link downloads, newest first, with their last update.
+    remote: VecDeque<Arc<Mutex<FetchListing>>>,
+    next_remote: u64,
 }
 
 impl Fetches {
@@ -1181,6 +1271,7 @@ impl Fetches {
                     folder,
                     cancel.clone(),
                     events.clone(),
+                    None,
                 ));
                 if let Some((previous, job)) = self.jobs.insert(id, (cancel, job)) {
                     previous.cancel();
@@ -1203,9 +1294,112 @@ impl Fetches {
                     let _ = events.send(Event::ArchiveResolved { identifier, result });
                 });
             }
+            Command::Query(query) => return self.query(query, events).map(Command::Query),
             command => return Some(command),
         }
         None
+    }
+
+    /// Link download questions from paired Flicks. Returns other questions.
+    fn query(&mut self, mut query: Query, events: &mpsc::Sender<Event>) -> Option<Query> {
+        let QueryKind::Request(request) = &query.kind else {
+            return Some(query);
+        };
+        let answer = match request {
+            QueryRequest::FetchStart { url, folder } => self.start_remote(url, folder, events),
+            QueryRequest::FetchList => Ok(QueryReply::Fetches(
+                self.remote
+                    .iter()
+                    .map(|record| record.lock().unwrap_or_else(|e| e.into_inner()).clone())
+                    .collect(),
+            )),
+            QueryRequest::FetchCancel(id) => {
+                let known = self
+                    .remote
+                    .iter()
+                    .any(|record| record.lock().unwrap_or_else(|e| e.into_inner()).id == *id);
+                match self.jobs.get(id) {
+                    Some((cancel, _)) if known => {
+                        cancel.cancel();
+                        Ok(QueryReply::Done)
+                    }
+                    // Already finished: nothing left to cancel.
+                    _ if known => Ok(QueryReply::Done),
+                    _ => Err(QueryError::NotFound(
+                        "No link download with that id on this Flick.".into(),
+                    )),
+                }
+            }
+            _ => return Some(query),
+        };
+        if let Some(reply) = query.reply.take() {
+            let _ = reply.send(answer);
+        }
+        None
+    }
+
+    fn start_remote(
+        &mut self,
+        url: &str,
+        folder: &std::path::Path,
+        events: &mpsc::Sender<Event>,
+    ) -> QueryResult {
+        let url = match fetch::web_link(url) {
+            Some(Ok(link)) => match link {
+                fetch::WebLink::Page(url) => url,
+                // yt-dlp lists and downloads an item page on its own.
+                fetch::WebLink::Archive(_) => url.trim().to_owned(),
+            },
+            Some(Err(error)) => return Err(QueryError::Invalid(format!("{error:#}"))),
+            None => {
+                return Err(QueryError::Invalid(
+                    "Enter a full web address, starting with https://".into(),
+                ));
+            }
+        };
+        let running = self
+            .remote
+            .iter()
+            .filter(|record| {
+                record.lock().unwrap_or_else(|e| e.into_inner()).state == FetchState::Running
+            })
+            .count();
+        if running >= MAX_REMOTE_FETCHES {
+            return Err(QueryError::Busy(
+                "This Flick is already downloading several links. Try again when one finishes."
+                    .into(),
+            ));
+        }
+        self.next_remote += 1;
+        let id = REMOTE_FETCH_BASE + self.next_remote;
+        let record = Arc::new(Mutex::new(FetchListing {
+            id,
+            url: url.clone(),
+            title: String::new(),
+            state: FetchState::Running,
+            progress: Default::default(),
+            saved: Vec::new(),
+        }));
+        let cancel = CancellationToken::new();
+        let job = tokio::spawn(fetch_job(
+            id,
+            FetchSource::Page(url),
+            folder.to_owned(),
+            cancel.clone(),
+            events.clone(),
+            Some(record.clone()),
+        ));
+        self.jobs.insert(id, (cancel, job));
+        self.remote.push_front(record);
+        // Keep running jobs and the most recent finished ones.
+        let mut finished = 0;
+        self.remote.retain(|record| {
+            record.lock().unwrap_or_else(|e| e.into_inner()).state == FetchState::Running || {
+                finished += 1;
+                finished <= KEPT_REMOTE_FETCHES
+            }
+        });
+        Ok(QueryReply::FetchStarted(id))
     }
 
     /// Cancels running downloads and waits briefly for their cleanup.
@@ -1241,14 +1435,27 @@ async fn fetch_job(
     folder: PathBuf,
     cancel: CancellationToken,
     events: mpsc::Sender<Event>,
+    record: Option<Arc<Mutex<FetchListing>>>,
 ) {
+    // A paired Flick's link download reports to its record instead of the
+    // view, which lists only its own jobs. Saved videos still reach the
+    // library through `Completed`, like the view's own.
+    let report = |update: FetchUpdate| match &record {
+        Some(record) => record
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .apply(update),
+        None => {
+            let _ = events.send(Event::Fetch { id, update });
+        }
+    };
     let result = fetch::fetch(source, &folder, &cancel, |update| {
         if let FetchUpdate::Saved(path) = &update
             && flick::library::is_video(path)
         {
             let _ = events.send(Event::Completed(path.clone()));
         }
-        let _ = events.send(Event::Fetch { id, update });
+        report(update);
     })
     .await;
     let update = match result {
@@ -1256,7 +1463,695 @@ async fn fetch_job(
         Err(_) if cancel.is_cancelled() => FetchUpdate::Cancelled,
         Err(error) => FetchUpdate::Failed(format!("{error:#}")),
     };
-    let _ = events.send(Event::Fetch { id, update });
+    report(update);
+}
+
+// Questions from the in-app remote server. Design and statuses:
+// `docs/REMOTE_DOWNLOADS_PLAN.md`; the HTTP side is `crate::remote_serve`.
+
+/// The worker of the window that started first, for the in-app server.
+static QUERY_HOST: Mutex<Option<QueryHandle>> = Mutex::new(None);
+
+/// The running window's worker, if downloads were started.
+pub fn query_host() -> Option<QueryHandle> {
+    QUERY_HOST.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+/// Resolutions for paired Flicks running at once; more answer Busy.
+const MAX_REMOTE_RESOLVES: usize = 2;
+/// Link downloads for paired Flicks running at once; more answer Busy.
+const MAX_REMOTE_FETCHES: usize = 3;
+/// Finished link downloads kept for listing.
+const KEPT_REMOTE_FETCHES: usize = 20;
+/// How long a resolution is remembered for the Start that follows it.
+const RESOLVED_TTL: Duration = Duration::from_secs(30 * 60);
+const RESOLVED_KEPT: usize = 16;
+/// Link download ids for paired Flicks; the view counts up from 1.
+const REMOTE_FETCH_BASE: u64 = 1 << 48;
+
+/// What a paired Flick asks this worker.
+pub enum QueryRequest {
+    /// Torrent metadata, with the same five-minute peer wait as the view.
+    /// `key` identifies the input so a following `Start` can reuse it.
+    Resolve {
+        input: TorrentInput,
+        key: String,
+    },
+    /// Downloads into `folder`. Reuses a recent resolution of `key`, or
+    /// resolves `input` again. Empty `files` selects every file.
+    Start {
+        input: TorrentInput,
+        key: String,
+        files: Vec<usize>,
+        folder: PathBuf,
+    },
+    List,
+    Pause(String),
+    Resume(String),
+    PauseAll,
+    ResumeAll,
+    /// With `delete_files`, `confirm` must equal [`deletion_list`] exactly.
+    Remove {
+        id: String,
+        delete_files: bool,
+        confirm: Vec<String>,
+    },
+    /// Seeds an existing file or folder.
+    Share(PathBuf),
+    OpenStream {
+        id: String,
+        file_index: usize,
+    },
+    FetchStart {
+        url: String,
+        folder: PathBuf,
+    },
+    /// The paired Flicks' link downloads, not the view's.
+    FetchList,
+    FetchCancel(u64),
+}
+
+pub enum QueryReply {
+    Resolved(ResolvedTorrent),
+    Started(String),
+    Transfers(Vec<TransferListing>),
+    Done,
+    Shared(SharedTorrent),
+    Stream(flick::torrent::VerifiedStream),
+    FetchStarted(u64),
+    Fetches(Vec<FetchListing>),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum QueryError {
+    NotFound(String),
+    /// The state does not allow it now. `files` is the current deletion
+    /// list when a confirmation did not match it.
+    Conflict {
+        message: String,
+        files: Vec<String>,
+    },
+    Invalid(String),
+    /// Too many of these at once.
+    Busy(String),
+    TimedOut(String),
+    /// Downloads are not running.
+    Unavailable(String),
+    Failed(String),
+}
+
+impl QueryError {
+    fn conflict(message: impl Into<String>) -> Self {
+        Self::Conflict {
+            message: message.into(),
+            files: Vec::new(),
+        }
+    }
+}
+
+pub type QueryResult = Result<QueryReply, QueryError>;
+
+/// A snapshot with each file's path inside the torrent, `/`-separated, by
+/// file index; the snapshot's own paths are where files are on disk.
+#[derive(Clone, Debug)]
+pub struct TransferListing {
+    pub snapshot: TransferSnapshot,
+    pub paths: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum FetchState {
+    Running,
+    Done,
+    Failed(String),
+    Cancelled,
+}
+
+/// A paired Flick's link download and its last update.
+#[derive(Clone, Debug)]
+pub struct FetchListing {
+    pub id: u64,
+    pub url: String,
+    pub title: String,
+    pub state: FetchState,
+    pub progress: fetch::FetchProgress,
+    pub saved: Vec<PathBuf>,
+}
+
+impl FetchListing {
+    fn apply(&mut self, update: FetchUpdate) {
+        match update {
+            FetchUpdate::Title(title) => self.title = title,
+            FetchUpdate::Progress(progress) => self.progress = progress,
+            FetchUpdate::Saved(path) => self.saved.push(path),
+            FetchUpdate::Done => self.state = FetchState::Done,
+            FetchUpdate::Failed(error) => self.state = FetchState::Failed(error),
+            FetchUpdate::Cancelled => self.state = FetchState::Cancelled,
+        }
+    }
+}
+
+/// A question and where its answer goes. Dropping it answers Unavailable.
+pub struct Query {
+    kind: QueryKind,
+    reply: Option<oneshot::Sender<QueryResult>>,
+}
+
+enum QueryKind {
+    Request(QueryRequest),
+    /// The second half of `Start`, after resolution, in the ordered queue.
+    Admit {
+        torrent: ResolvedTorrent,
+        files: Vec<usize>,
+        folder: PathBuf,
+    },
+}
+
+impl Query {
+    fn finish(mut self, result: QueryResult) {
+        if let Some(reply) = self.reply.take() {
+            let _ = reply.send(result);
+        }
+    }
+
+    fn fail(self, error: QueryError) {
+        self.finish(Err(error));
+    }
+
+    /// Changes transfers, so it runs in order with the view's own changes.
+    fn is_mutation(&self) -> bool {
+        matches!(
+            self.kind,
+            QueryKind::Admit { .. }
+                | QueryKind::Request(
+                    QueryRequest::Pause(_)
+                        | QueryRequest::Resume(_)
+                        | QueryRequest::PauseAll
+                        | QueryRequest::ResumeAll
+                        | QueryRequest::Remove { .. }
+                        | QueryRequest::Share(_)
+                )
+        )
+    }
+
+    /// Answers when no engine is running and the saved state is known to
+    /// be empty, so that listing never starts one. Returns questions that
+    /// need an engine.
+    fn answer_without_session(self) -> Option<Query> {
+        let answer = match &self.kind {
+            QueryKind::Request(QueryRequest::List) => Ok(QueryReply::Transfers(Vec::new())),
+            QueryKind::Request(QueryRequest::PauseAll | QueryRequest::ResumeAll) => {
+                Ok(QueryReply::Done)
+            }
+            QueryKind::Request(
+                QueryRequest::Pause(_)
+                | QueryRequest::Resume(_)
+                | QueryRequest::Remove { .. }
+                | QueryRequest::OpenStream { .. },
+            ) => Err(unknown_transfer()),
+            _ => return Some(self),
+        };
+        self.finish(answer);
+        None
+    }
+}
+
+impl Drop for Query {
+    fn drop(&mut self) {
+        if let Some(reply) = self.reply.take() {
+            let _ = reply.send(Err(QueryError::Unavailable(
+                "Downloads stopped before answering.".into(),
+            )));
+        }
+    }
+}
+
+/// Sends questions to a [`Services`] worker from any thread. Cheap to clone.
+#[derive(Clone)]
+pub struct QueryHandle {
+    sender: channel::UnboundedSender<Command>,
+    shutdown: CancellationToken,
+    /// The app's download folder, used when the owner chose none for
+    /// paired Flicks.
+    pub download_dir: PathBuf,
+}
+
+impl QueryHandle {
+    pub fn query(&self, request: QueryRequest) -> oneshot::Receiver<QueryResult> {
+        let (reply, answer) = oneshot::channel();
+        let query = Query {
+            kind: QueryKind::Request(request),
+            reply: Some(reply),
+        };
+        if self.shutdown.is_cancelled() {
+            query.fail(QueryError::Unavailable(
+                "Downloads are shutting down.".into(),
+            ));
+        } else if let Err(channel::error::SendError(Command::Query(query))) =
+            self.sender.send(Command::Query(query))
+        {
+            query.fail(QueryError::Unavailable("Downloads are not running.".into()));
+        }
+        answer
+    }
+}
+
+fn unknown_transfer() -> QueryError {
+    QueryError::NotFound("No transfer with that id on this Flick.".into())
+}
+
+/// The answer to a deletion confirmation: Ok when `confirm` lists exactly
+/// the files that would be deleted, in any order.
+pub fn check_confirmation(required: &[String], confirm: &[String]) -> Result<(), QueryError> {
+    let mut want = required.to_vec();
+    want.sort();
+    want.dedup();
+    let mut got = confirm.to_vec();
+    got.sort();
+    got.dedup();
+    if want == got && got.len() == confirm.len() {
+        return Ok(());
+    }
+    Err(QueryError::Conflict {
+        message: "The files to delete changed on this Flick; nothing was deleted. Confirm the current list."
+            .into(),
+        files: want,
+    })
+}
+
+/// The files that Remove and Delete would delete: every selected file and
+/// any unselected file that has data on disk, since the engine deletes
+/// every file the torrent lists. Paths inside the torrent.
+pub fn deletion_list(listing: &TransferListing) -> Vec<String> {
+    listing
+        .snapshot
+        .files
+        .iter()
+        .filter(|file| file.selected || std::fs::symlink_metadata(&file.path).is_ok())
+        .filter_map(|file| listing.paths.get(file.index).cloned())
+        .collect()
+}
+
+/// Remote-only state of the worker: bounded resolution, remembered
+/// resolutions for Start, in-torrent paths, and link downloads.
+struct RemoteQueries {
+    resolves: Arc<tokio::sync::Semaphore>,
+    resolved: Arc<Mutex<VecDeque<(String, Instant, ResolvedTorrent)>>>,
+    paths: Arc<Mutex<HashMap<String, Arc<Vec<String>>>>>,
+    /// Starts whose resolution finished, back into the ordered queue.
+    admit_tx: channel::UnboundedSender<Query>,
+    admit: channel::UnboundedReceiver<Query>,
+    tasks: JoinSet<()>,
+}
+
+impl Default for RemoteQueries {
+    fn default() -> Self {
+        let (admit_tx, admit) = channel::unbounded_channel();
+        Self {
+            resolves: Arc::new(tokio::sync::Semaphore::new(MAX_REMOTE_RESOLVES)),
+            resolved: Default::default(),
+            paths: Default::default(),
+            admit_tx,
+            admit,
+            tasks: JoinSet::new(),
+        }
+    }
+}
+
+impl RemoteQueries {
+    /// Runs a question that only reads, or Start's resolution, now.
+    fn spawn(
+        &mut self,
+        mut query: Query,
+        session: Arc<TransferSession>,
+        peers: Vec<std::net::SocketAddr>,
+    ) {
+        let Some(mut reply) = query.reply.take() else {
+            return;
+        };
+        let QueryKind::Request(request) =
+            std::mem::replace(&mut query.kind, QueryKind::Request(QueryRequest::List))
+        else {
+            return;
+        };
+        let resolves = self.resolves.clone();
+        let resolved = self.resolved.clone();
+        let paths = self.paths.clone();
+        let admit = self.admit_tx.clone();
+        self.tasks.spawn(async move {
+            let work = async {
+                match request {
+                    QueryRequest::Resolve { input, key } => Outcome::Answer(
+                        resolve_remote(&session, input, key, peers, &resolves, &resolved)
+                            .await
+                            .map(QueryReply::Resolved),
+                    ),
+                    QueryRequest::Start {
+                        input,
+                        key,
+                        files,
+                        folder,
+                    } => {
+                        let torrent = match remembered(&resolved, &key) {
+                            Some(torrent) => Ok(torrent),
+                            None => {
+                                resolve_remote(&session, input, key, peers, &resolves, &resolved)
+                                    .await
+                            }
+                        };
+                        match torrent {
+                            Ok(torrent) => Outcome::Admit(QueryKind::Admit {
+                                torrent,
+                                files,
+                                folder,
+                            }),
+                            Err(error) => Outcome::Answer(Err(error)),
+                        }
+                    }
+                    QueryRequest::List => {
+                        Outcome::Answer(list_transfers(&session, &paths).map(QueryReply::Transfers))
+                    }
+                    QueryRequest::OpenStream { id, file_index } => {
+                        Outcome::Answer(open_remote_stream(&session, &id, file_index).await)
+                    }
+                    _ => {
+                        Outcome::Answer(Err(QueryError::Failed("Not a read-only question.".into())))
+                    }
+                }
+            };
+            // A client that went away stops its resolution too.
+            let outcome = tokio::select! {
+                outcome = work => outcome,
+                () = reply.closed() => return,
+            };
+            match outcome {
+                Outcome::Answer(result) => {
+                    let _ = reply.send(result);
+                }
+                Outcome::Admit(kind) => {
+                    // A closed channel drops the query, which answers.
+                    let _ = admit.send(Query {
+                        kind,
+                        reply: Some(reply),
+                    });
+                }
+            }
+        });
+    }
+
+    async fn shutdown(&mut self) {
+        self.tasks.abort_all();
+        while self.tasks.join_next().await.is_some() {}
+    }
+}
+
+enum Outcome {
+    Answer(QueryResult),
+    Admit(QueryKind),
+}
+
+async fn open_remote_stream(session: &TransferSession, id: &str, file_index: usize) -> QueryResult {
+    let snapshot = session.snapshot(id).map_err(|_| unknown_transfer())?;
+    let file = snapshot
+        .files
+        .get(file_index)
+        .ok_or_else(|| QueryError::NotFound("No file with that index in this transfer.".into()))?;
+    if !file.selected {
+        return Err(QueryError::NotFound(
+            "That file was not chosen for download.".into(),
+        ));
+    }
+    session
+        .open_stream(id, file_index)
+        .await
+        .map(QueryReply::Stream)
+        .map_err(|e| QueryError::Unavailable(format!("Could not open the download: {e:#}")))
+}
+
+fn remembered(
+    resolved: &Mutex<VecDeque<(String, Instant, ResolvedTorrent)>>,
+    key: &str,
+) -> Option<ResolvedTorrent> {
+    let mut resolved = resolved.lock().unwrap_or_else(|e| e.into_inner());
+    resolved.retain(|(_, at, _)| at.elapsed() < RESOLVED_TTL);
+    resolved
+        .iter()
+        .find(|(known, _, torrent)| known == key || torrent.infohash == key)
+        .map(|(_, _, torrent)| torrent.clone())
+}
+
+async fn resolve_remote(
+    session: &TransferSession,
+    input: TorrentInput,
+    key: String,
+    peers: Vec<std::net::SocketAddr>,
+    resolves: &Arc<tokio::sync::Semaphore>,
+    resolved: &Mutex<VecDeque<(String, Instant, ResolvedTorrent)>>,
+) -> Result<ResolvedTorrent, QueryError> {
+    let _permit = resolves.clone().try_acquire_owned().map_err(|_| {
+        QueryError::Busy("This Flick is already reading other torrents. Try again shortly.".into())
+    })?;
+    let torrent = session
+        .resolve(input, peers, Duration::from_secs(300))
+        .await
+        .map_err(|error| {
+            let message = format!("Could not read torrent files: {error:#}");
+            if error
+                .chain()
+                .any(|cause| cause.is::<tokio::time::error::Elapsed>())
+            {
+                QueryError::TimedOut(message)
+            } else {
+                QueryError::Invalid(message)
+            }
+        })?;
+    let mut remembered = resolved.lock().unwrap_or_else(|e| e.into_inner());
+    remembered.retain(|(known, _, _)| known != &key);
+    remembered.push_front((key, Instant::now(), torrent.clone()));
+    remembered.truncate(RESOLVED_KEPT);
+    Ok(torrent)
+}
+
+/// Every transfer, with paths inside each torrent read once per infohash.
+fn list_transfers(
+    session: &TransferSession,
+    cache: &Mutex<HashMap<String, Arc<Vec<String>>>>,
+) -> Result<Vec<TransferListing>, QueryError> {
+    let snapshots = session
+        .snapshots()
+        .map_err(|e| QueryError::Unavailable(format!("Could not read downloads: {e:#}")))?;
+    let mut cache = cache.lock().unwrap_or_else(|e| e.into_inner());
+    cache.retain(|infohash, _| snapshots.iter().any(|s| &s.infohash == infohash));
+    Ok(snapshots
+        .into_iter()
+        .map(|snapshot| {
+            let paths = match cache.get(&snapshot.infohash) {
+                Some(paths) => paths.clone(),
+                None => {
+                    let paths = Arc::new(torrent_paths(session, &snapshot.infohash));
+                    if paths.len() == snapshot.files.len() {
+                        cache.insert(snapshot.infohash.clone(), paths.clone());
+                    }
+                    paths
+                }
+            };
+            let paths = if paths.len() == snapshot.files.len() {
+                paths.as_ref().clone()
+            } else {
+                // Metadata not readable yet: the file names alone.
+                snapshot
+                    .files
+                    .iter()
+                    .map(|file| {
+                        file.path
+                            .file_name()
+                            .map(|name| name.to_string_lossy().into_owned())
+                            .unwrap_or_default()
+                    })
+                    .collect()
+            };
+            TransferListing { snapshot, paths }
+        })
+        .collect())
+}
+
+/// Paths inside the torrent from its metadata, `/`-separated, by index.
+fn torrent_paths(session: &TransferSession, infohash: &str) -> Vec<String> {
+    let Ok(bytes) = session.torrent_bytes(infohash) else {
+        return Vec::new();
+    };
+    let Ok(parsed) = librqbit::torrent_from_bytes(&bytes) else {
+        return Vec::new();
+    };
+    let Ok(info) = parsed.info.data.validate() else {
+        return Vec::new();
+    };
+    info.iter_file_details()
+        .map(|file| file.filename.to_vec().join("/"))
+        .collect()
+}
+
+/// A change from a paired Flick, run in order with the view's commands.
+/// Returns an admission for the progress publisher, like Download.
+async fn run_mutation(
+    mut query: Query,
+    session: Arc<TransferSession>,
+    peers: Vec<std::net::SocketAddr>,
+    events: mpsc::Sender<Event>,
+    changed: Arc<tokio::sync::Notify>,
+    paths: Arc<Mutex<HashMap<String, Arc<Vec<String>>>>>,
+) -> Option<DownloadAcceptance> {
+    let kind = std::mem::replace(&mut query.kind, QueryKind::Request(QueryRequest::List));
+    let exists = |id: &str| session.snapshot(id).map_err(|_| unknown_transfer());
+    let failed = |error: anyhow::Error| QueryError::Failed(format!("{error:#}"));
+    let result = match kind {
+        QueryKind::Admit {
+            torrent,
+            files,
+            folder,
+        } => {
+            if session.snapshot(&torrent.infohash).is_ok() {
+                query.fail(QueryError::conflict(
+                    "This torrent is already on this Flick.",
+                ));
+                return None;
+            }
+            let count = torrent.files.len();
+            let selection = if files.is_empty() {
+                (0..count).collect()
+            } else {
+                files
+            };
+            let mut seen = HashSet::new();
+            if !selection.iter().all(|i| *i < count && seen.insert(*i)) {
+                query.fail(QueryError::Invalid(
+                    "Choose files by their index in the torrent, each once.".into(),
+                ));
+                return None;
+            }
+            let id = match session
+                .download_to(&torrent, Some(selection), &folder)
+                .await
+            {
+                Ok(id) => id,
+                Err(error) => {
+                    query.fail(QueryError::Failed(format!(
+                        "Could not start the download: {error:#}"
+                    )));
+                    return None;
+                }
+            };
+            // The same admission the view's Download makes, so the library
+            // and Downloads treat it like a local download.
+            let accepted = match session.selected_file_paths(&id) {
+                Ok(files) => {
+                    let admission = DownloadAcceptance {
+                        infohash: id.clone(),
+                        selected: files
+                            .into_iter()
+                            .filter(|(path, _)| flick::library::is_video(path))
+                            .collect(),
+                    };
+                    let _ = events.send(Event::DownloadAccepted {
+                        infohash: admission.infohash.clone(),
+                        selected: admission.selected.clone(),
+                    });
+                    Some(admission)
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "Could not identify a remote download's files");
+                    None
+                }
+            };
+            query.finish(Ok(QueryReply::Started(id.clone())));
+            changed.notify_one();
+            if let Err(error) = session.resume(&id, peers).await {
+                tracing::warn!("A download started from another Flick did not resume: {error:#}");
+            }
+            return accepted;
+        }
+        QueryKind::Request(QueryRequest::Pause(id)) => match exists(&id) {
+            Ok(_) => session
+                .pause(&id)
+                .await
+                .map(|()| QueryReply::Done)
+                .map_err(failed),
+            Err(error) => Err(error),
+        },
+        QueryKind::Request(QueryRequest::Resume(id)) => match exists(&id) {
+            Ok(_) => session
+                .resume(&id, peers)
+                .await
+                .map(|()| QueryReply::Done)
+                .map_err(failed),
+            Err(error) => Err(error),
+        },
+        QueryKind::Request(QueryRequest::PauseAll) => session
+            .pause_all()
+            .await
+            .map(|()| QueryReply::Done)
+            .map_err(failed),
+        QueryKind::Request(QueryRequest::ResumeAll) => session
+            .resume_all(peers)
+            .await
+            .map(|()| QueryReply::Done)
+            .map_err(failed),
+        QueryKind::Request(QueryRequest::Remove {
+            id,
+            delete_files,
+            confirm,
+        }) => remove_remote(&session, &paths, &id, delete_files, &confirm).await,
+        QueryKind::Request(QueryRequest::Share(path)) => session
+            .share(&path, vec![])
+            .await
+            .map(QueryReply::Shared)
+            .map_err(|error| {
+                let message = format!("Could not share these files: {error:#}");
+                if message.contains("already managed") {
+                    QueryError::conflict(message)
+                } else {
+                    QueryError::Failed(message)
+                }
+            }),
+        QueryKind::Request(_) => Err(QueryError::Failed("Not a change.".into())),
+    };
+    changed.notify_one();
+    query.finish(result);
+    None
+}
+
+async fn remove_remote(
+    session: &TransferSession,
+    paths: &Mutex<HashMap<String, Arc<Vec<String>>>>,
+    id: &str,
+    delete_files: bool,
+    confirm: &[String],
+) -> QueryResult {
+    let listing = list_transfers(session, paths)?
+        .into_iter()
+        .find(|listing| listing.snapshot.infohash == id)
+        .ok_or_else(unknown_transfer)?;
+    match listing.snapshot.state {
+        TransferState::Checking => {
+            return Err(QueryError::conflict(
+                "Files are still being checked. Try again when checking finishes.",
+            ));
+        }
+        TransferState::Error if !delete_files => {
+            return Err(QueryError::conflict(
+                "Resume this transfer so its files can be checked, then remove it. Its files and transfer were kept.",
+            ));
+        }
+        _ => {}
+    }
+    if delete_files {
+        check_confirmation(&deletion_list(&listing), confirm)?;
+    }
+    session
+        .remove(id, delete_files)
+        .await
+        .map(|()| QueryReply::Done)
+        .map_err(|e| QueryError::Failed(format!("{e:#}")))
 }
 
 #[cfg(test)]
@@ -2379,6 +3274,62 @@ mod tests {
         tokio::task::spawn_blocking(finish_shutdown).await?;
         seed.stop().await;
         outcome??;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn queries_answer_on_their_own_channel_and_fail_after_shutdown() -> anyhow::Result<()> {
+        let root = tempfile::tempdir()?;
+        let config =
+            TransferConfig::local(root.path().join("downloads"), root.path().join("state"));
+        let mut services = Services::start_config(config, vec![]);
+        let handle = services.query_handle();
+        let answer = |request| {
+            let receiver = handle.query(request);
+            async move {
+                tokio::time::timeout(Duration::from_secs(20), receiver)
+                    .await
+                    .map_err(|_| anyhow::anyhow!("no answer"))?
+                    .map_err(|_| anyhow::anyhow!("answer dropped"))
+            }
+        };
+        // Nothing saved: listing answers without starting an engine.
+        assert!(matches!(
+            answer(QueryRequest::List).await?,
+            Ok(QueryReply::Transfers(rows)) if rows.is_empty()
+        ));
+        assert!(matches!(
+            answer(QueryRequest::Pause("a".repeat(40))).await?,
+            Err(QueryError::NotFound(_))
+        ));
+        assert!(matches!(
+            answer(QueryRequest::FetchCancel(3)).await?,
+            Err(QueryError::NotFound(_))
+        ));
+        assert!(matches!(
+            answer(QueryRequest::FetchStart {
+                url: "ftp://example.com/a.mp4".into(),
+                folder: root.path().join("links"),
+            })
+            .await?,
+            Err(QueryError::Invalid(_))
+        ));
+        assert!(matches!(
+            answer(QueryRequest::FetchList).await?,
+            Ok(QueryReply::Fetches(rows)) if rows.is_empty()
+        ));
+        // Answers never reach the view's events.
+        assert!(
+            services
+                .drain()
+                .all(|event| !matches!(event, Event::Error(_) | Event::Fetch { .. }))
+        );
+        services.begin_shutdown();
+        assert!(matches!(
+            answer(QueryRequest::List).await?,
+            Err(QueryError::Unavailable(_))
+        ));
+        tokio::task::spawn_blocking(finish_shutdown).await?;
         Ok(())
     }
 
