@@ -1397,7 +1397,9 @@ pub fn default_data_dir() -> PathBuf {
 }
 
 pub fn cache_dir(data_dir: &Path) -> PathBuf {
-    data_dir.join("remote")
+    // Not `remote`: that folder is the in-app server's state, with its
+    // token, salt, and progress file.
+    data_dir.join("remote-listings")
 }
 
 fn subtitle_dir(data_dir: &Path) -> PathBuf {
