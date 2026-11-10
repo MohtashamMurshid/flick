@@ -486,9 +486,9 @@ impl Settings {
         if server.is_empty() || video.is_empty() {
             return;
         }
-        let finished = self
-            .remote_progress(server, video)
-            .is_some_and(|p| p.finished);
+        let saved = self.remote_progress(server, video);
+        let finished = saved.is_some_and(|p| p.finished);
+        let server_updated = saved.map_or(0, |p| p.server_updated);
         let duration = non_negative_finite(duration);
         let mut position = non_negative_finite(position);
         if duration > 0.0 {
@@ -502,6 +502,7 @@ impl Settings {
             duration,
             finished: finished || reached_end(position, duration),
             updated: unix_now(),
+            server_updated,
         });
     }
 
@@ -511,9 +512,9 @@ impl Settings {
         if server.is_empty() || video.is_empty() {
             return;
         }
-        let duration = self
-            .remote_progress(server, video)
-            .map_or(0.0, |p| p.duration);
+        let saved = self.remote_progress(server, video);
+        let duration = saved.map_or(0.0, |p| p.duration);
+        let server_updated = saved.map_or(0, |p| p.server_updated);
         self.put_remote_progress(remote::RemoteProgress {
             server: server.to_owned(),
             video: video.to_owned(),
@@ -522,6 +523,7 @@ impl Settings {
             duration,
             finished: true,
             updated: unix_now(),
+            server_updated,
         });
     }
 
@@ -558,9 +560,14 @@ impl Settings {
                 continue;
             }
             let updated = resume.updated.min(now.saturating_add(RESUME_CLOCK_SKEW));
+            // A claim already merged is never applied again, so a server
+            // clock far ahead cannot keep overwriting newer local progress;
+            // only a newer claim from that server competes, by capped time.
             if self
                 .remote_progress(server, &video.id)
-                .is_some_and(|saved| updated <= saved.updated)
+                .is_some_and(|saved| {
+                    resume.updated <= saved.server_updated || updated <= saved.updated
+                })
             {
                 continue;
             }
@@ -582,6 +589,7 @@ impl Settings {
                 duration,
                 finished: resume.finished,
                 updated,
+                server_updated: resume.updated,
             };
             self.remote
                 .progress
@@ -2006,9 +2014,22 @@ mod tests {
         settings.remote.progress[0].position = 55.0;
         assert!(!settings.merge_remote_resume_at("mini", &listing(40.0, now + 86_400), now));
         assert_eq!(settings.remote_resume_position("mini", "abc"), 55.0);
-        // A real later position from the server wins.
+        // Watching on here later and seeing the same stale claim again: the
+        // recapped server time would be newer, but the claim was already merged.
+        settings.remember_remote("mini", "abc", "Sintel", 70.0, 100.0);
+        assert!(!settings.merge_remote_resume_at("mini", &listing(40.0, now + 86_400), now + 300));
+        assert_eq!(settings.remote_resume_position("mini", "abc"), 70.0);
+        // A real later save on the server, stamped by its own clock, wins.
         let after = now + 600;
-        assert!(settings.merge_remote_resume_at("mini", &listing(80.0, after), after));
+        assert!(settings.merge_remote_resume_at("mini", &listing(80.0, after + 86_400), after));
+        assert_eq!(settings.remote_resume_position("mini", "abc"), 80.0);
+        // A claim older than one already merged from that server is ignored
+        // even if its capped time would be newer than the local entry.
+        assert!(!settings.merge_remote_resume_at(
+            "mini",
+            &listing(10.0, now + 86_400),
+            after + 900
+        ));
         assert_eq!(settings.remote_resume_position("mini", "abc"), 80.0);
     }
 

@@ -184,6 +184,14 @@ pub struct RemoteProgress {
     pub finished: bool,
     /// Seconds since the Unix epoch.
     pub updated: u64,
+    /// The server's own timestamp of the last claim merged from its listing,
+    /// so the same claim is never applied twice however its clock runs.
+    #[serde(skip_serializing_if = "is_zero_u64")]
+    pub server_updated: u64,
+}
+
+fn is_zero_u64(value: &u64) -> bool {
+    *value == 0
 }
 
 #[cfg(test)]
