@@ -130,6 +130,7 @@ See [Packaging for macOS](docs/PACKAGING.md) for signing, notarization, and lice
 | [Packaging for macOS](docs/PACKAGING.md) | Building, signing, and notarizing `Flick.app`, and what it bundles |
 | [Plan](docs/PLAN.md) | What's built and what's next |
 | [Playback and sharing design](docs/SHARING_PLAN.md) | Design and acceptance criteria for playback and sharing |
+| [Download to another machine](docs/REMOTE_DOWNLOADS_PLAN.md) | Proposed design for starting downloads and shares on a paired machine, and first-launch onboarding |
 | [Remote library over Tailscale](docs/REMOTE_PLAN.md) | Design for watching one Flick's library from another machine on a tailnet, and its delivery state |
 | [Serving a Flick library](docs/REMOTE.md) | Running `flick-serve` on a Mac mini: build, pairing, launchd, and the HTTP interface |
 | [Headless proposal](docs/HEADLESS_PLAN.md) | A deferred proposal for a headless agent interface |
