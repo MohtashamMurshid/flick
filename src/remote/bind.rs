@@ -42,10 +42,66 @@ pub fn refusal(ip: IpAddr) -> Option<String> {
     })
 }
 
-// TODO(server agent): `pub async fn tailscale_ipv4() -> anyhow::Result<Ipv4Addr>`
-// that runs `tailscale ip -4` from PATH, then
-// `/Applications/Tailscale.app/Contents/MacOS/Tailscale`, then
-// `/usr/local/bin/tailscale`, and validates the result with `is_tailscale_v4`.
+/// Where the Tailscale command line is looked for, in order.
+const TAILSCALE_COMMANDS: [&str; 3] = [
+    "tailscale",
+    "/Applications/Tailscale.app/Contents/MacOS/Tailscale",
+    "/usr/local/bin/tailscale",
+];
+
+/// This machine's Tailscale IPv4 address, from `tailscale ip -4`: the
+/// command on `PATH`, then the Mac app's bundled CLI, then
+/// `/usr/local/bin/tailscale`. The answer must lie in `100.64.0.0/10`.
+pub async fn tailscale_ipv4() -> anyhow::Result<Ipv4Addr> {
+    let mut problems = Vec::new();
+    for command in TAILSCALE_COMMANDS {
+        let output = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            tokio::process::Command::new(command)
+                .args(["ip", "-4"])
+                .stdin(std::process::Stdio::null())
+                .kill_on_drop(true)
+                .output(),
+        )
+        .await;
+        let output = match output {
+            Ok(Ok(output)) => output,
+            Ok(Err(error)) => {
+                problems.push(format!("{command}: {error}"));
+                continue;
+            }
+            Err(_) => {
+                problems.push(format!("{command}: timed out"));
+                continue;
+            }
+        };
+        if !output.status.success() {
+            problems.push(format!(
+                "{command}: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+            continue;
+        }
+        match parse_tailscale_ipv4(&String::from_utf8_lossy(&output.stdout)) {
+            Some(ip) => return Ok(ip),
+            None => problems.push(format!(
+                "{command}: no Tailscale IPv4 address in its output"
+            )),
+        }
+    }
+    anyhow::bail!(
+        "Could not find this machine's Tailscale address. Start Tailscale, or pass --bind with the address. ({})",
+        problems.join("; ")
+    )
+}
+
+/// The first line of `tailscale ip -4` output that is a Tailscale address.
+fn parse_tailscale_ipv4(output: &str) -> Option<Ipv4Addr> {
+    output
+        .lines()
+        .filter_map(|line| line.trim().parse::<Ipv4Addr>().ok())
+        .find(|ip| is_tailscale_v4(*ip))
+}
 
 #[cfg(test)]
 mod tests {
@@ -81,5 +137,16 @@ mod tests {
                 .unwrap()
                 .contains("every interface")
         );
+    }
+
+    #[test]
+    fn tailscale_output_is_validated() {
+        assert_eq!(
+            parse_tailscale_ipv4("100.98.200.69\n"),
+            Some(Ipv4Addr::new(100, 98, 200, 69))
+        );
+        assert_eq!(parse_tailscale_ipv4("192.168.1.2\n"), None);
+        assert_eq!(parse_tailscale_ipv4("no address\n"), None);
+        assert_eq!(parse_tailscale_ipv4(""), None);
     }
 }
