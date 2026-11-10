@@ -7,6 +7,7 @@ use super::{
     library_ui::{is_torrent_link, result_detail},
     *,
 };
+use crate::remote_client::Sheet;
 use gpui::{AnyElement, FontWeight, ScrollHandle, deferred};
 
 /// Library videos listed for typed text, before the online and command rows.
@@ -29,6 +30,10 @@ enum Action {
     Play(PathBuf),
     Player,
     Link,
+    /// The typed link, on this paired server.
+    LinkTo(String),
+    /// Paste a link to download on this paired server.
+    DownloadTo(String),
     SearchOnline,
     Result(usize),
     Page(Page),
@@ -110,9 +115,11 @@ impl Flick {
                 verb: "Download",
                 action: Action::Link,
             });
+            items.extend(self.download_to_items(Sheet::Torrent));
             return items;
         }
         if let Some(link) = flick::fetch::web_link(&query) {
+            let page = matches!(link, Ok(flick::fetch::WebLink::Page(_)));
             let (title, detail) = match link {
                 Ok(link @ flick::fetch::WebLink::Archive(_)) => (
                     format!("Download from {}", link.site()),
@@ -133,6 +140,9 @@ impl Flick {
                 verb: "Download",
                 action: Action::Link,
             });
+            if page {
+                items.extend(self.download_to_items(Sheet::Link));
+            }
             return items;
         }
         let words = query
@@ -223,6 +233,28 @@ impl Flick {
         items
     }
 
+    /// "Download to Mac mini" for each paired server that takes this kind
+    /// of download now.
+    fn download_to_items(&self, sheet: Sheet) -> Vec<Item> {
+        self.remote
+            .destinations(&self.store.data)
+            .into_iter()
+            .filter(|destination| destination.selectable(sheet))
+            .filter_map(|destination| {
+                Some(Item {
+                    section: "Download",
+                    icon: "download",
+                    title: format!("Download to {}", destination.name).into(),
+                    detail: Some(destination.detail(sheet).into())
+                        .filter(|d: &SharedString| !d.is_empty()),
+                    keys: None,
+                    verb: "Download",
+                    action: Action::LinkTo(destination.id?),
+                })
+            })
+            .collect()
+    }
+
     fn palette_commands(&self) -> Vec<Item> {
         let command = |icon, title: &'static str, keys: Option<String>, action| Item {
             section: "Commands",
@@ -295,6 +327,26 @@ impl Flick {
                 None,
                 Action::Control(Control::Share),
             ),
+        ]);
+        // Paste a link straight to another machine.
+        items.extend(
+            self.remote
+                .destinations(&self.store.data)
+                .into_iter()
+                .filter(|d| d.selectable(Sheet::Torrent) || d.selectable(Sheet::Link))
+                .filter_map(|destination| {
+                    Some(Item {
+                        section: "Commands",
+                        icon: "download",
+                        title: format!("Download to {}…", destination.name).into(),
+                        detail: Some("Paste a magnet or video link".into()),
+                        keys: None,
+                        verb: "Run",
+                        action: Action::DownloadTo(destination.id?),
+                    })
+                }),
+        );
+        items.extend([
             command("house", "Go to Home", None, Action::Page(Page::Home)),
             command("film", "Go to All Videos", None, Action::Page(Page::Videos)),
             command("library", "Go to Shows", None, Action::Page(Page::Shows)),
@@ -357,6 +409,26 @@ impl Flick {
             }
             Action::Link => {
                 self.search_link(&query, cx);
+            }
+            Action::LinkTo(server) => {
+                // The sheet opens with this machine chosen.
+                let sheet = if is_torrent_link(&query) {
+                    Sheet::Torrent
+                } else {
+                    Sheet::Link
+                };
+                self.remote.remember_destination(sheet, Some(server));
+                if sheet == Sheet::Torrent {
+                    self.resolve(flick::torrent::TorrentInput::Magnet(query), cx)
+                } else {
+                    self.search_link(&query, cx);
+                }
+            }
+            Action::DownloadTo(server) => {
+                self.remote
+                    .remember_destination(Sheet::Torrent, Some(server.clone()));
+                self.remote.remember_destination(Sheet::Link, Some(server));
+                self.paste_link(cx);
             }
             Action::Result(index) => {
                 if let Some(result) = self
