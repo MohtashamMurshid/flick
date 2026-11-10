@@ -536,6 +536,12 @@ impl Flick {
                     }
                 },
             ));
+            let saved = self.saved_server(&server.id);
+            if let Some(wake) = saved.and_then(|saved| {
+                self.wake_button(("remote-wake", index), saved, &server.status, cx)
+            }) {
+                trailing = trailing.child(wake);
+            }
             let id = server.id.clone();
             trailing = trailing.child(self.icon_button(
                 ("remote-refresh", index),
@@ -562,13 +568,53 @@ impl Flick {
                     cx.notify();
                 },
             ));
+            let mut detail = format!("{} · {}", server.address, server.summary());
+            if let Some(woke) = self.wake_line(&server.id, &server.status) {
+                detail = format!("{detail} · {woke}");
+            }
             rows.push(
                 row(
                     &t,
                     Some("library"),
                     server.name.clone(),
-                    Some(format!("{} · {}", server.address, server.summary()).into()),
+                    Some(detail.into()),
                     trailing,
+                )
+                .into_any_element(),
+            );
+            let auto = saved.is_none_or(|saved| saved.auto_quality);
+            let id = server.id.clone();
+            rows.push(
+                row(
+                    &t,
+                    None,
+                    "Automatic quality",
+                    Some(
+                        format!(
+                            "Drops one tier when {} buffers early in a video",
+                            server.name
+                        )
+                        .into(),
+                    ),
+                    self.keyed_switch(
+                        ("remote-auto-quality", index),
+                        auto,
+                        cx,
+                        move |this, _, cx| {
+                            if let Some(server) = this
+                                .store
+                                .data
+                                .remote
+                                .servers
+                                .iter_mut()
+                                .find(|server| server.id == id)
+                            {
+                                server.auto_quality = !server.auto_quality;
+                                this.persist();
+                            }
+                            cx.notify();
+                        },
+                    ),
                 )
                 .into_any_element(),
             );
@@ -589,6 +635,7 @@ impl Flick {
                     self.icon_button("remote-add-cancel", "x", "Cancel", cx, |this, _, cx| {
                         this.remote.fields.pairing = None;
                         this.remote.fields.pairing_error = None;
+                        this.remote_ui.discovery.code = None;
                         cx.notify();
                     }),
                 ),
@@ -601,16 +648,33 @@ impl Flick {
                 |this, window, cx| this.open_pairing_field(window, cx),
             )),
         };
+        let adding = fields.pairing.is_some();
         rows.push(
             row(
                 &t,
                 Some("plus"),
                 "Add a remote library",
-                Some("Paste the pairing string shown by Flick on the other machine".into()),
+                Some(
+                    if adding {
+                        "Paste the pairing string shown by Flick on the other machine"
+                    } else {
+                        "Find a Flick on your Tailscale network, or paste its pairing string"
+                    }
+                    .into(),
+                ),
                 add,
             )
             .into_any_element(),
         );
+        if adding {
+            rows.push(
+                div()
+                    .px_3()
+                    .py_2()
+                    .child(self.discovery_list(cx))
+                    .into_any_element(),
+            );
+        }
         let (serve_rows, serve_error) = self.serve_rows(cx);
         rows.extend(serve_rows);
         v_flex()
@@ -834,6 +898,7 @@ impl Flick {
         field.focus_handle(cx).focus(window);
         self.remote.fields.pairing = Some(field);
         self.remote.fields.pairing_error = None;
+        self.start_discovery(cx);
         cx.notify();
     }
 
@@ -848,11 +913,74 @@ impl Flick {
                 // Closing the field drops the pasted token from the UI.
                 self.remote.fields.pairing = None;
                 self.remote.fields.pairing_error = None;
+                self.remote_ui.discovery.code = None;
                 self.persist();
             }
             Err(error) => self.remote.fields.pairing_error = Some(error),
         }
         cx.notify();
+    }
+
+    /// `chrome_ui`'s switch takes a `&'static str` id, so one per server
+    /// needs this copy keyed by any id. Same look and behaviour.
+    fn keyed_switch(
+        &self,
+        id: impl Into<ElementId>,
+        on: bool,
+        cx: &Context<Self>,
+        on_toggle: impl Fn(&mut Self, &mut Window, &mut Context<Self>) + 'static,
+    ) -> Stateful<Div> {
+        let t = cx.theme();
+        let (width, height, knob) = match t.style {
+            Style::Mac => (34., 20., 16.),
+            Style::Windows => (40., 20., 12.),
+            Style::Gnome => (46., 26., 22.),
+        };
+        let inset = (height - knob) / 2.;
+        let id = id.into();
+        let (track, knob_color) = match (t.style, on) {
+            (_, true) => (
+                t.accent,
+                if t.style == Style::Windows {
+                    t.on_accent
+                } else {
+                    rgb(0xffffff)
+                },
+            ),
+            (Style::Windows, false) => (rgba(0x00000000), t.muted),
+            (_, false) => (t.control_hover, rgb(0xffffff)),
+        };
+        let el = div()
+            .id(id.clone())
+            .relative()
+            .flex_none()
+            .flex()
+            .items_center()
+            .w(px(width))
+            .h(px(height))
+            .rounded_full()
+            .bg(track)
+            .when(t.style == Style::Windows && !on, |d| {
+                d.border_1().border_color(t.muted)
+            })
+            .cursor_pointer()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, _| this.control_pressed = true),
+            )
+            .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                cx.stop_propagation();
+                on_toggle(this, window, cx);
+            }))
+            .child(
+                div()
+                    .ml(px(if on { width - knob - inset } else { inset }))
+                    .size(px(knob))
+                    .rounded_full()
+                    .bg(knob_color)
+                    .when(t.style != Style::Windows, |d| d.shadow_sm()),
+            );
+        self.focusable(el, &id, None, height / 2., (0., 0.), cx)
     }
 
     /// Edits a server's name in place; every change is saved.

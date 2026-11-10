@@ -8,8 +8,6 @@
 //! completion the integration agent adds the path to the library and records
 //! a `store::remote::KeptCopy`.
 
-#![allow(dead_code)]
-
 use std::{
     collections::{HashMap, VecDeque},
     path::{Path, PathBuf},

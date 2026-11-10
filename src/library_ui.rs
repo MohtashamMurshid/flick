@@ -1918,6 +1918,7 @@ impl Flick {
             .data
             .continue_watching()
             .any(|file| file.path == path);
+        self.remote_ui.menu = None;
         self.card_menu = Some(CardMenu {
             path,
             position,
@@ -1959,8 +1960,10 @@ impl Flick {
     }
 
     pub(super) fn card_menu_panel(&self, cx: &Context<Self>) -> Option<AnyElement> {
-        let menu = self.card_menu.as_ref()?;
-        let t = cx.theme().clone();
+        let Some(menu) = self.card_menu.as_ref() else {
+            let (position, items) = self.remote_card_menu_items()?;
+            return Some(self.context_menu(position, items, cx));
+        };
         let path = menu.path.clone();
         let watched = self.store.data.watched(&path);
         let mut items: Vec<(&'static str, &'static str, Rc<MenuAction>)> = Vec::new();
@@ -2009,6 +2012,22 @@ impl Flick {
             "Delete File…",
             Rc::new(move |this, w, cx| this.request_delete_video(path.clone(), w, cx)),
         ));
+        let items = items
+            .into_iter()
+            .map(|(name, label, action)| (name, SharedString::from(label), action))
+            .collect();
+        Some(self.context_menu(menu.position, items, cx))
+    }
+
+    /// A card's context menu at a window position, local or remote. Choosing
+    /// an item closes it, runs the action, and saves.
+    fn context_menu(
+        &self,
+        position: gpui::Point<Pixels>,
+        items: Vec<MenuItem>,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let t = cx.theme().clone();
         let mut panel = v_flex()
             .id("card-menu-panel")
             .occlude()
@@ -2021,7 +2040,15 @@ impl Flick {
             .shadow_lg()
             .text_color(t.text)
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-            .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation());
+            .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation())
+            // The remote menu is not `card_menu`, which the window's Escape closes.
+            .on_key_down(cx.listener(|this, e: &KeyDownEvent, window, cx| {
+                if e.keystroke.key == "escape" && this.remote_ui.menu.take().is_some() {
+                    cx.stop_propagation();
+                    this.focus.focus(window);
+                    cx.notify();
+                }
+            }));
         for (index, (name, label, action)) in items.into_iter().enumerate() {
             let id = ElementId::from(("card-menu", index));
             let item = h_flex()
@@ -2035,6 +2062,7 @@ impl Flick {
                 .hover(|s| s.bg(t.selection))
                 .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
                     this.card_menu = None;
+                    this.remote_ui.menu = None;
                     this.focus.focus(window);
                     action(this, window, cx);
                     this.persist();
@@ -2044,36 +2072,36 @@ impl Flick {
                 .child(label);
             panel = panel.child(self.focusable(item, &id, None, t.radius, (-2., -2.), cx));
         }
-        Some(
-            deferred(
-                div()
-                    .id("card-menu-backdrop")
-                    .absolute()
-                    .inset_0()
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(|this, _, _, cx| {
-                            this.card_menu = None;
-                            cx.notify();
-                        }),
-                    )
-                    .on_mouse_down(
-                        MouseButton::Right,
-                        cx.listener(|this, _, _, cx| {
-                            this.card_menu = None;
-                            cx.notify();
-                        }),
-                    )
-                    .child(
-                        anchored()
-                            .position(menu.position)
-                            .snap_to_window_with_margin(px(8.))
-                            .child(panel),
-                    ),
-            )
-            .with_priority(3)
-            .into_any_element(),
+        deferred(
+            div()
+                .id("card-menu-backdrop")
+                .absolute()
+                .inset_0()
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _, _, cx| {
+                        this.card_menu = None;
+                        this.remote_ui.menu = None;
+                        cx.notify();
+                    }),
+                )
+                .on_mouse_down(
+                    MouseButton::Right,
+                    cx.listener(|this, _, _, cx| {
+                        this.card_menu = None;
+                        this.remote_ui.menu = None;
+                        cx.notify();
+                    }),
+                )
+                .child(
+                    anchored()
+                        .position(position)
+                        .snap_to_window_with_margin(px(8.))
+                        .child(panel),
+                ),
         )
+        .with_priority(3)
+        .into_any_element()
     }
 
     fn video_has_focus(
@@ -2148,6 +2176,11 @@ impl Flick {
         let focused_card = self
             .video_has_focus(section, &path, cx)
             .then(|| self.focused_card.clone());
+        let kept = super::remote_library_ui::kept_from(
+            &self.store.data.remote.kept,
+            &self.store.data.remote.servers,
+            &path,
+        );
         let el = v_flex()
             .id(id.clone())
             .group(group_name.clone())
@@ -2163,6 +2196,9 @@ impl Flick {
                     .relative()
                     .border_1()
                     .border_color(t.border)
+                    .when_some(kept.filter(|_| width >= 120.), |d, kept| {
+                        d.child(super::remote_library_ui::corner_badge(t, kept).left(px(6.)))
+                    })
                     .child(
                         div()
                             .absolute()
@@ -3146,7 +3182,14 @@ impl Flick {
         }
         let machines = self.remote.machine_transfers(&self.store.data);
         let remote_transfers = machines.iter().any(|m| !m.transfers.is_empty());
-        if self.downloads.is_empty() && self.fetches.is_empty() && machines.is_empty() {
+        let kept = self.kept_rows(cx);
+        let queued = !self.store.data.remote.queued.is_empty();
+        if self.downloads.is_empty()
+            && self.fetches.is_empty()
+            && machines.is_empty()
+            && kept.is_none()
+            && !queued
+        {
             page = page.child(empty_state(
                 &t,
                 "download",
@@ -3199,7 +3242,7 @@ impl Flick {
             }
             if !machines.is_empty() {
                 page = page.child(section_title(&t, crate::remote_client::this_machine_name()));
-                if self.downloads.is_empty() {
+                if self.downloads.is_empty() && kept.is_none() {
                     page = page.child(
                         div()
                             .text_size(t.font(12.))
@@ -3216,7 +3259,9 @@ impl Flick {
                     .collect();
                 page = page.child(group(&t, rows));
             }
-            page = page.children(self.remote_download_sections(&machines, cx));
+            page = page
+                .children(kept)
+                .children(self.remote_download_sections(&machines, cx));
         }
         page.child(
             h_flex()
@@ -3672,7 +3717,9 @@ impl Flick {
 }
 
 /// A context-menu item's action.
-type MenuAction = dyn Fn(&mut Flick, &mut Window, &mut Context<Flick>);
+pub(super) type MenuAction = dyn Fn(&mut Flick, &mut Window, &mut Context<Flick>);
+/// A context menu item: its icon, label, and action.
+pub(super) type MenuItem = (&'static str, SharedString, Rc<MenuAction>);
 
 /// Rows inside grouped lists draw their focus ring inside the group.
 pub(super) const RING_INSET: f32 = 4.;

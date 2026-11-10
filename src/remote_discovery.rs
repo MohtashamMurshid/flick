@@ -6,8 +6,6 @@
 //! peers, `GET /v1/hello` to recognise a Flick, `POST /v1/pair` to turn a
 //! code into a pairing string, and a UDP magic packet to wake a machine.
 
-#![allow(dead_code)]
-
 use anyhow::{Context, Result, bail};
 use flick::remote::protocol::{self, ErrorBody, Hello, PairReply, PairRequest, Pairing};
 use serde::Deserialize;
