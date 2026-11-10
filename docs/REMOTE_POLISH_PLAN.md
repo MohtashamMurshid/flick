@@ -1,6 +1,6 @@
 # Remote library polish
 
-**Status: implemented on 2026-11-11 and tested on loopback, with the server checked with `curl` on a real Tailscale address at `981d26a` ([validation](VALIDATION.md#remote-library-polish-on-2026-11-11)). Review fixes are in flight. Nothing has been used from a second machine or in the app's own screens yet.** A set of smaller improvements on top of the [remote library](REMOTE_PLAN.md) and [downloads to another machine](REMOTE_DOWNLOADS_PLAN.md), chosen for how much they change daily use. Each is independent; together they remove the last awkward steps from setting up and living with a second machine.
+**Status: implemented on 2026-11-11 and tested on loopback, with the server checked with `curl` on a real Tailscale address at `981d26a` ([validation](VALIDATION.md#remote-library-polish-on-2026-11-11)). Review fixes landed at `eeb7237`. Nothing has been used from a second machine or in the app's own screens yet.** A set of smaller improvements on top of the [remote library](REMOTE_PLAN.md) and [downloads to another machine](REMOTE_DOWNLOADS_PLAN.md), chosen for how much they change daily use. Each is independent; together they remove the last awkward steps from setting up and living with a second machine.
 
 ## What changes
 
@@ -33,4 +33,4 @@ A menu bar app for the headless server (GPUI has no status item support; `flick-
 - [x] In-app server: show a pairing code, keep awake while serving; launchd agent installed and verified.
 - [x] Views: discovery in onboarding and Add Server, pairing by code, Wake on offline rows, Keep on this Mac in card menus and Downloads, queued rows, the auto-quality switch, audio tracks in the player menu.
 - [x] Player and client glue: auto quality on tick with its message, Continue Watching merge, queue replay, notifications on completion.
-- [ ] Review, fixes, docs, validation. Review done; docs and validation recorded at `981d26a`; the client and server fixes land after it.
+- [x] Review, fixes, docs, validation. Two reviews (Claude, then a four-round GPT Sol loop ending in approve); every finding fixed with a test; recorded at `eeb7237`.
