@@ -17,8 +17,11 @@
 //! ```
 //!
 //! Routes: `GET /v1/hls/{id}/{quality}/index.m3u8`, `/init.mp4`, `/{n}.m4s`.
+//! Each takes an optional `?audio=<track>`, an index into the video's audio
+//! streams; the playlist then names its init file and segments with the
+//! same query, so the player keeps the choice without knowing about it.
 //!
-//! One job exists per (video, tier). A job owns a folder of finished
+//! One job exists per (video, tier, audio track). A job owns a folder of finished
 //! segments and at most one FFmpeg run at a time. A segment request serves
 //! the segment if it is there, waits if the run will reach it within
 //! [`HlsLimits::lookahead`] segments, and otherwise restarts the run at that
@@ -45,7 +48,7 @@ use super::protocol::{ErrorBody, HLS_SEGMENT_SECONDS, Quality};
 use super::transcode::{Encoder, MediaInfo, command, job_args, stderr_tail};
 use axum::{
     Json, Router,
-    extract::{Path as UrlPath, State},
+    extract::{Path as UrlPath, Query, State},
     http::{StatusCode, header},
     response::{IntoResponse, Response},
     routing::get,
@@ -125,7 +128,10 @@ impl Default for HlsLimits {
     }
 }
 
-type JobKey = (String, Quality);
+/// (video, tier, audio track). None is the first audio track, mapped as
+/// optional so a file without audio still transcodes; `?audio=0` is the
+/// same job.
+type JobKey = (String, Quality, Option<u32>);
 
 /// The transcode side of the server. Share it as `Arc<HlsState>`.
 pub struct HlsState {
@@ -191,7 +197,7 @@ impl HlsState {
         }
     }
 
-    /// Number of (video, tier) jobs that exist now.
+    /// Number of (video, tier, audio) jobs that exist now.
     pub fn job_count(&self) -> usize {
         lock(&self.jobs).len()
     }
@@ -209,17 +215,20 @@ impl HlsState {
         }
     }
 
-    /// The job for (`id`, `quality`), made if needed, with the caller
-    /// counted as waiting on it. Counting happens under the jobs lock, so a
-    /// job being handed out is never chosen to make room for another.
+    /// The job for (`id`, `quality`, `audio`), made if needed, with the
+    /// caller counted as waiting on it. Counting happens under the jobs
+    /// lock, so a job being handed out is never chosen to make room for
+    /// another.
     fn job(
         self: &Arc<Self>,
         id: &str,
         quality: Quality,
+        audio: Option<u32>,
         video: ResolvedVideo,
     ) -> Result<Waiting, Refusal> {
+        let key: JobKey = (id.to_owned(), quality, audio);
         let mut jobs = lock(&self.jobs);
-        if let Some(job) = jobs.get(&(id.to_owned(), quality)) {
+        if let Some(job) = jobs.get(&key) {
             return Ok(Waiting::new(job.clone()));
         }
         if jobs.len() >= self.max_jobs {
@@ -255,6 +264,7 @@ impl HlsState {
         let (changed, _) = watch::channel(0);
         let job = Arc::new(Job {
             quality,
+            audio,
             count: segment_count(video.info.duration),
             video,
             root,
@@ -263,7 +273,7 @@ impl HlsState {
             changed,
             state: Mutex::new(JobState::new()),
         });
-        jobs.insert((id.to_owned(), quality), job.clone());
+        jobs.insert(key, job.clone());
         let waiting = Waiting::new(job);
         drop(jobs);
         if !self.reaper.swap(true, Ordering::AcqRel) {
@@ -273,7 +283,7 @@ impl HlsState {
     }
 
     /// The job to close to make room for one of video `id`: nobody waiting
-    /// on it, and either another tier of `id` or unused for
+    /// on it, and either another tier or audio track of `id` or unused for
     /// [`HlsLimits::reclaim_after`]. The least recently used one wins.
     fn reclaimable(&self, jobs: &HashMap<JobKey, Arc<Job>>, id: &str) -> Option<JobKey> {
         jobs.iter()
@@ -337,6 +347,8 @@ async fn reap(state: Weak<HlsState>, idle: Duration) {
 
 struct Job {
     quality: Quality,
+    /// The audio track mapped, by its index among the audio streams.
+    audio: Option<u32>,
     video: ResolvedVideo,
     /// Segments in the playlist.
     count: u32,
@@ -499,6 +511,7 @@ impl Job {
                         &self.video.path,
                         &self.video.info,
                         self.quality,
+                        self.audio,
                         start,
                         &dir,
                     ))
@@ -865,11 +878,18 @@ pub fn segment_count(duration: f64) -> u32 {
 /// A complete VOD playlist of `HLS_SEGMENT_SECONDS` segments, the last one
 /// shorter, with relative segment URIs.
 pub fn playlist(duration: f64, quality: Quality) -> String {
+    playlist_with_audio(duration, quality, None)
+}
+
+/// [`playlist`] for a chosen audio track: the init file and every segment
+/// carry `?audio=<track>`, since a relative URI drops the playlist's query.
+pub fn playlist_with_audio(duration: f64, quality: Quality, audio: Option<u32>) -> String {
     let _ = quality; // Every tier uses the same segment timeline.
+    let query = audio.map_or(String::new(), |track| format!("?audio={track}"));
     let segment = f64::from(HLS_SEGMENT_SECONDS);
     let count = segment_count(duration);
     let mut text = format!(
-        "#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-TARGETDURATION:{HLS_SEGMENT_SECONDS}\n#EXT-X-MEDIA-SEQUENCE:0\n#EXT-X-PLAYLIST-TYPE:VOD\n#EXT-X-INDEPENDENT-SEGMENTS\n#EXT-X-MAP:URI=\"init.mp4\"\n"
+        "#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-TARGETDURATION:{HLS_SEGMENT_SECONDS}\n#EXT-X-MEDIA-SEQUENCE:0\n#EXT-X-PLAYLIST-TYPE:VOD\n#EXT-X-INDEPENDENT-SEGMENTS\n#EXT-X-MAP:URI=\"init.mp4{query}\"\n"
     );
     for n in 0..count {
         let length = if n + 1 == count {
@@ -877,7 +897,7 @@ pub fn playlist(duration: f64, quality: Quality) -> String {
         } else {
             segment
         };
-        let _ = write!(text, "#EXTINF:{length:.6},\n{n}.m4s\n");
+        let _ = write!(text, "#EXTINF:{length:.6},\n{n}.m4s{query}\n");
     }
     text.push_str("#EXT-X-ENDLIST\n");
     text
@@ -890,12 +910,36 @@ pub fn router(state: Arc<HlsState>) -> Router {
         .with_state(state)
 }
 
+/// The query of every `/v1/hls` route.
+#[derive(Debug, Default, serde::Deserialize)]
+struct HlsQuery {
+    audio: Option<String>,
+}
+
 async fn hls_file(
     State(state): State<Arc<HlsState>>,
     UrlPath((id, quality, file_name)): UrlPath<(String, String, String)>,
+    query: Result<Query<HlsQuery>, axum::extract::rejection::QueryRejection>,
 ) -> Response {
     let Some(quality) = Quality::parse(&quality).filter(|q| q.is_transcode()) else {
         return not_found();
+    };
+    let bad_audio = || {
+        error(
+            StatusCode::BAD_REQUEST,
+            "The audio track must be a number from the listing's audio_tracks.".into(),
+        )
+    };
+    let Ok(Query(query)) = query else {
+        return bad_audio();
+    };
+    // Digits only, without leading zeros, so one track has one URL.
+    let audio = match query.audio {
+        None => None,
+        Some(text) => match text.parse::<u32>() {
+            Ok(track) if track.to_string() == text => Some(track),
+            _ => return bad_audio(),
+        },
     };
     enum Want {
         Playlist,
@@ -931,21 +975,32 @@ async fn hls_file(
             "The server could not read this video's length, so it cannot transcode it. Choose Original quality.".into(),
         );
     }
+    if let Some(track) = audio
+        && !video.info.audio.iter().any(|known| known.track == track)
+    {
+        return error(
+            StatusCode::NOT_FOUND,
+            "This video has no audio track with this index. Refresh the library.".into(),
+        );
+    }
+    // The first track is the default job; its playlist keeps the query so
+    // the URLs a client asked for stay the ones it follows.
+    let job_audio = audio.filter(|&track| track != 0);
     match want {
         Want::Playlist => (
             [
                 (header::CONTENT_TYPE, "application/vnd.apple.mpegurl"),
                 (header::CACHE_CONTROL, "no-cache"),
             ],
-            playlist(video.info.duration, quality),
+            playlist_with_audio(video.info.duration, quality, audio),
         )
             .into_response(),
         Want::Segment(n) if n >= segment_count(video.info.duration) => not_found(),
-        Want::Segment(n) => match state.job(&id, quality, video) {
+        Want::Segment(n) => match state.job(&id, quality, job_audio, video) {
             Ok(waiting) => waiting.0.segment(n).await,
             Err(refusal) => refusal.into_response(),
         },
-        Want::Init => match state.job(&id, quality, video) {
+        Want::Init => match state.job(&id, quality, job_audio, video) {
             Ok(waiting) => waiting.0.init().await,
             Err(refusal) => refusal.into_response(),
         },
@@ -1007,6 +1062,26 @@ mod tests {
             text,
             "#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-TARGETDURATION:4\n#EXT-X-MEDIA-SEQUENCE:0\n#EXT-X-PLAYLIST-TYPE:VOD\n#EXT-X-INDEPENDENT-SEGMENTS\n#EXT-X-MAP:URI=\"init.mp4\"\n\
              #EXTINF:4.000000,\n0.m4s\n#EXTINF:4.000000,\n1.m4s\n#EXTINF:2.500000,\n2.m4s\n#EXT-X-ENDLIST\n"
+        );
+    }
+
+    #[test]
+    fn audio_playlists_keep_the_query_on_every_uri() {
+        let text = playlist_with_audio(10.5, Quality::Low720, Some(1));
+        assert!(
+            text.contains("#EXT-X-MAP:URI=\"init.mp4?audio=1\"\n"),
+            "{text}"
+        );
+        assert_eq!(
+            segments(&text)
+                .into_iter()
+                .map(|(_, uri)| uri)
+                .collect::<Vec<_>>(),
+            ["0.m4s?audio=1", "1.m4s?audio=1", "2.m4s?audio=1"]
+        );
+        assert_eq!(
+            playlist_with_audio(10.5, Quality::Low720, None),
+            playlist(10.5, Quality::Low720)
         );
     }
 

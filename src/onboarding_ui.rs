@@ -116,6 +116,7 @@ impl Nav {
 struct Snapshot {
     servers: Vec<String>,
     serve: bool,
+    keep_awake: bool,
     default_destination: String,
     seed_completed: Option<bool>,
 }
@@ -130,6 +131,7 @@ impl Snapshot {
                 .map(|server| server.id.clone())
                 .collect(),
             serve: settings.remote.serve,
+            keep_awake: settings.remote.keep_awake,
             default_destination: settings.remote.default_destination.clone(),
             seed_completed: settings.transfers.seed_completed,
         }
@@ -197,11 +199,12 @@ impl Flick {
         self.store.data.remote.setup_done = true;
         self.persist();
         let focus = self.onboarding.focus.take();
-        // Drops the pasted token from the UI.
+        // Drops the pasted token and any typed code from the UI.
         self.onboarding = OnboardingState {
             focus,
             ..Default::default()
         };
+        self.remote_ui.discovery.code = None;
         self.view = View::Library;
         cx.notify();
     }
@@ -245,6 +248,11 @@ impl Flick {
                 self.onboarding.pairing_error = None;
             }
             Step::Share => {
+                if self.store.data.remote.keep_awake != snapshot.keep_awake {
+                    self.store.data.remote.keep_awake = snapshot.keep_awake;
+                    self.serve.set_keep_awake(snapshot.keep_awake);
+                    self.persist();
+                }
                 if self.store.data.remote.serve != snapshot.serve {
                     self.set_serving(snapshot.serve, cx);
                 }
@@ -320,6 +328,16 @@ impl Flick {
         cx.notify();
     }
 
+    /// A found Flick accepted its pairing code: step one now tests that
+    /// server, as Test Connection does for a pasted string.
+    pub(crate) fn onboarding_paired(&mut self, id: String) {
+        if self.onboarding.tested.as_ref() != Some(&id) {
+            self.forget_tested_server();
+        }
+        self.onboarding.tested = Some(id);
+        self.onboarding.pairing_error = None;
+    }
+
     fn pairing_field(&mut self, cx: &mut Context<Self>) -> Entity<TextInput> {
         if let Some(field) = &self.onboarding.pairing {
             return field.clone();
@@ -352,11 +370,21 @@ impl Flick {
         let on_control = window
             .focused(cx)
             .is_some_and(|focused| self.is_control_handle(&focused));
-        let in_field = self
+        // The pairing string field, or a found Flick's code field.
+        let focused_field = self
             .onboarding
             .pairing
-            .as_ref()
-            .is_some_and(|field| field.read(cx).focused(window));
+            .iter()
+            .chain(
+                self.remote_ui
+                    .discovery
+                    .code
+                    .iter()
+                    .map(|entry| &entry.field),
+            )
+            .find(|field| field.read(cx).focused(window))
+            .cloned();
+        let in_field = focused_field.is_some();
         match keystroke.key.as_str() {
             "enter" if !on_control && !in_field => {
                 cx.stop_propagation();
@@ -371,7 +399,7 @@ impl Flick {
                 // The window's key handler would read a player shortcut
                 // here, such as F for full screen or a digit for a seek, and
                 // a handled key never reaches the text field. Keep those keys
-                // from it, typing them into the pairing field ourselves.
+                // from it, typing them into the focused field ourselves.
                 let binding = crate::shortcuts::normalize(keystroke);
                 let shortcut = crate::shortcuts::percent_key(&binding).is_some()
                     || self.store.data.shortcuts.lookup(&binding).is_some();
@@ -379,9 +407,8 @@ impl Flick {
                     return;
                 }
                 cx.stop_propagation();
-                if in_field
-                    && let Some(text) = keystroke.key_char.clone()
-                    && let Some(field) = self.onboarding.pairing.clone()
+                if let Some(text) = keystroke.key_char.clone()
+                    && let Some(field) = focused_field
                 {
                     field.update(cx, |field, cx| {
                         gpui::EntityInputHandler::replace_text_in_range(
@@ -642,17 +669,30 @@ impl Flick {
                 "onboarding-source-remote",
                 "library",
                 "On another machine on my Tailscale network",
-                "Paste the pairing string shown in that Flick's Settings → Remote Libraries.",
+                "Pair with a code from that Flick, or paste its pairing string.",
                 remote,
                 cx,
                 |this, window, cx| {
+                    let first = this.onboarding.source != Source::Remote;
                     this.onboarding.source = Source::Remote;
+                    if first && this.remote_ui.discovery.found.is_none() {
+                        this.start_discovery(cx);
+                    }
                     let field = this.pairing_field(cx);
                     field.focus_handle(cx).focus(window);
                     cx.notify();
                 },
             ));
         if let Some(field) = field {
+            body = body
+                .child(div().mt_2().child(self.discovery_list(cx)))
+                .child(
+                    div()
+                        .mt_2()
+                        .text_size(t.font(t.text_size - 1.))
+                        .text_color(t.muted)
+                        .child("Or paste the pairing string shown in that Flick's Settings → Remote Libraries:"),
+                );
             body = body.child(
                 h_flex()
                     .mt_2()
@@ -700,11 +740,12 @@ impl Flick {
 
     fn share_step(&self, cx: &Context<Self>) -> Div {
         let t = cx.theme().clone();
-        let (rows, error) = self.serve_rows(cx);
+        let (mut rows, error) = self.serve_rows(cx);
+        rows.extend(self.serve_extra_rows(cx));
         v_flex()
             .gap_2()
             .child(div().text_color(t.muted).child(
-                "Let your other Flicks play this library over Tailscale. They pair with the string shown here once sharing starts.",
+                "Let your other Flicks play this library over Tailscale. Once sharing starts, they find this one by name and type the pairing code shown here, or paste the pairing string.",
             ))
             .child(group(&t, rows))
             .when_some(error, |d, error| d.child(notice(&t, true, error)))
@@ -918,8 +959,9 @@ fn step_dots(t: &Theme, step: Step) -> Div {
     dots
 }
 
-/// Next while its step is not answered yet: dimmed and not focusable.
-fn disabled_button(t: &Theme, label: &'static str) -> Div {
+/// Next while its step is not answered yet, or any button that cannot be
+/// used yet: dimmed and not focusable.
+pub(super) fn disabled_button(t: &Theme, label: &'static str) -> Div {
     let height = match t.style {
         Style::Mac => 26.,
         Style::Windows => 32.,
@@ -1301,12 +1343,14 @@ mod tests {
             });
         settings.remote.serve = true;
         settings.remote.default_destination = "a".into();
+        settings.remote.keep_awake = false;
         settings.transfers.seed_completed = Some(true);
         assert_eq!(
             Snapshot::of(&settings),
             Snapshot {
                 servers: vec!["a".into()],
                 serve: true,
+                keep_awake: false,
                 default_destination: "a".into(),
                 seed_completed: Some(true),
             }

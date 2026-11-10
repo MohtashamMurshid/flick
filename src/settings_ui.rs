@@ -12,7 +12,7 @@ use crate::{
         SUBTITLE_SCALE, SchemeChoice, StyleChoice, SubtitleBackground, TEXT_SCALE,
     },
 };
-use gpui::{FontWeight, hsla, linear_color_stop, linear_gradient};
+use gpui::{AnyElement, FontWeight, hsla, linear_color_stop, linear_gradient};
 
 impl Flick {
     pub(super) fn settings_page(&self, cx: &Context<Self>) -> Div {
@@ -536,6 +536,12 @@ impl Flick {
                     }
                 },
             ));
+            let saved = self.saved_server(&server.id);
+            if let Some(wake) = saved.and_then(|saved| {
+                self.wake_button(("remote-wake", index), saved, &server.status, cx)
+            }) {
+                trailing = trailing.child(wake);
+            }
             let id = server.id.clone();
             trailing = trailing.child(self.icon_button(
                 ("remote-refresh", index),
@@ -562,13 +568,53 @@ impl Flick {
                     cx.notify();
                 },
             ));
+            let mut detail = format!("{} · {}", server.address, server.summary());
+            if let Some(woke) = self.wake_line(&server.id, &server.status) {
+                detail = format!("{detail} · {woke}");
+            }
             rows.push(
                 row(
                     &t,
                     Some("library"),
                     server.name.clone(),
-                    Some(format!("{} · {}", server.address, server.summary()).into()),
+                    Some(detail.into()),
                     trailing,
+                )
+                .into_any_element(),
+            );
+            let auto = saved.is_none_or(|saved| saved.auto_quality);
+            let id = server.id.clone();
+            rows.push(
+                row(
+                    &t,
+                    None,
+                    "Automatic quality",
+                    Some(
+                        format!(
+                            "Drops one tier when {} buffers early in a video",
+                            server.name
+                        )
+                        .into(),
+                    ),
+                    self.keyed_switch(
+                        ("remote-auto-quality", index),
+                        auto,
+                        cx,
+                        move |this, _, cx| {
+                            if let Some(server) = this
+                                .store
+                                .data
+                                .remote
+                                .servers
+                                .iter_mut()
+                                .find(|server| server.id == id)
+                            {
+                                server.auto_quality = !server.auto_quality;
+                                this.persist();
+                            }
+                            cx.notify();
+                        },
+                    ),
                 )
                 .into_any_element(),
             );
@@ -589,6 +635,7 @@ impl Flick {
                     self.icon_button("remote-add-cancel", "x", "Cancel", cx, |this, _, cx| {
                         this.remote.fields.pairing = None;
                         this.remote.fields.pairing_error = None;
+                        this.remote_ui.discovery.code = None;
                         cx.notify();
                     }),
                 ),
@@ -601,18 +648,36 @@ impl Flick {
                 |this, window, cx| this.open_pairing_field(window, cx),
             )),
         };
+        let adding = fields.pairing.is_some();
         rows.push(
             row(
                 &t,
                 Some("plus"),
                 "Add a remote library",
-                Some("Paste the pairing string shown by Flick on the other machine".into()),
+                Some(
+                    if adding {
+                        "Paste the pairing string shown by Flick on the other machine"
+                    } else {
+                        "Find a Flick on your Tailscale network, or paste its pairing string"
+                    }
+                    .into(),
+                ),
                 add,
             )
             .into_any_element(),
         );
+        if adding {
+            rows.push(
+                div()
+                    .px_3()
+                    .py_2()
+                    .child(self.discovery_list(cx))
+                    .into_any_element(),
+            );
+        }
         let (serve_rows, serve_error) = self.serve_rows(cx);
         rows.extend(serve_rows);
+        rows.extend(self.serve_extra_rows(cx));
         v_flex()
             .child(section_title(&t, "Remote Libraries"))
             .child(
@@ -774,6 +839,165 @@ impl Flick {
             )
     }
 
+    /// The in-app server's rows after its switch and pairing string: the
+    /// pairing code while it runs, and "Keep this Mac awake while sharing"
+    /// on macOS. Onboarding's sharing step shows them too.
+    pub(super) fn serve_extra_rows(&self, cx: &Context<Self>) -> Vec<AnyElement> {
+        let t = cx.theme().clone();
+        let mut rows = Vec::new();
+        if matches!(
+            self.serve.status(),
+            crate::remote_serve::ServeStatus::Running { .. }
+        ) {
+            rows.push(self.pairing_code_row(cx).into_any_element());
+        }
+        if cfg!(target_os = "macos") {
+            let on = self.store.data.remote.keep_awake;
+            let detail = if on && self.serve.keeping_awake().is_some() {
+                "On now. The Mac does not idle-sleep while sharing; the display still can"
+            } else {
+                "The Mac does not idle-sleep while sharing; the display still can"
+            };
+            rows.push(
+                row(
+                    &t,
+                    Some("sun"),
+                    "Keep this Mac awake while sharing",
+                    Some(detail.into()),
+                    self.switch("remote-serve-keep-awake", on, cx, move |this, _, cx| {
+                        this.store.data.remote.keep_awake = !on;
+                        this.serve.set_keep_awake(!on);
+                        this.persist();
+                        cx.notify();
+                    }),
+                )
+                .into_any_element(),
+            );
+        }
+        rows
+    }
+
+    /// "Show Pairing Code", or the open code in large digits with how long
+    /// it lasts, Copy, and New Code.
+    fn pairing_code_row(&self, cx: &Context<Self>) -> Div {
+        let t = cx.theme().clone();
+        let name = self.serve.server_name().unwrap_or_else(|| {
+            if cfg!(target_os = "macos") {
+                "this Mac".to_owned()
+            } else {
+                "this computer".to_owned()
+            }
+        });
+        let Some((code, left)) = self.serve.pairing_code() else {
+            return row(
+                &t,
+                None,
+                "Pairing code",
+                Some(
+                    format!(
+                        "Other Flicks find {name} by name and type a code shown here. A code lasts ten minutes"
+                    )
+                    .into(),
+                ),
+                self.button(
+                    "remote-serve-pair-code",
+                    None,
+                    "Show Pairing Code",
+                    false,
+                    cx,
+                    |this, _, cx| this.show_pairing_code(cx),
+                ),
+            );
+        };
+        let minutes = left.as_secs().div_ceil(60);
+        let spaced = match code.split_at_checked(3) {
+            Some((first, second)) => format!("{first} {second}"),
+            None => code.clone(),
+        };
+        let copied = self.serve.code_copied();
+        let trailing = h_flex()
+            .gap_3()
+            .child(
+                div()
+                    .text_size(t.font(t.text_size + 12.))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(t.text)
+                    .child(spaced),
+            )
+            .child(self.button(
+                "remote-serve-pair-code-copy",
+                Some("copy"),
+                if copied { "Copied" } else { "Copy" },
+                true,
+                cx,
+                move |this, _, cx| {
+                    cx.write_to_clipboard(ClipboardItem::new_string(code.clone()));
+                    this.serve.mark_code_copied();
+                    cx.notify();
+                },
+            ))
+            .child(self.button(
+                "remote-serve-pair-code-new",
+                Some("rotate-ccw"),
+                "New Code",
+                false,
+                cx,
+                |this, _, cx| this.show_pairing_code(cx),
+            ));
+        row(
+            &t,
+            None,
+            "Pairing code",
+            Some(
+                format!(
+                    "On the other Flick, choose {name} and type this code. Expires in {minutes} min"
+                )
+                .into(),
+            ),
+            trailing,
+        )
+    }
+
+    /// Opens a code, replacing any open one, and redraws while it counts
+    /// down, until it is used, expires, is replaced, or the server stops.
+    pub(super) fn show_pairing_code(&mut self, cx: &mut Context<Self>) {
+        let opened = match self.serve.open_pairing_code() {
+            Ok(code) => code,
+            Err(error) => {
+                tracing::warn!(%error, "Could not open a pairing code");
+                cx.notify();
+                return;
+            }
+        };
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let mut last = None;
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_millis(500))
+                    .await;
+                let going = this.update(cx, |this, cx| {
+                    let code = this.serve.pairing_code();
+                    let now = (
+                        code.as_ref().map(|(_, left)| left.as_secs().div_ceil(60)),
+                        this.serve.code_copied(),
+                    );
+                    let ours = code.is_some_and(|(code, _)| code == opened);
+                    if last != Some(now) {
+                        last = Some(now);
+                        cx.notify();
+                    }
+                    // A newer code has its own loop.
+                    ours
+                });
+                if !matches!(going, Ok(true)) {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
     /// Saves the owner's download settings and applies them to the
     /// running server from its next request.
     fn remote_downloads_changed(&mut self, cx: &mut Context<Self>) {
@@ -834,6 +1058,7 @@ impl Flick {
         field.focus_handle(cx).focus(window);
         self.remote.fields.pairing = Some(field);
         self.remote.fields.pairing_error = None;
+        self.start_discovery(cx);
         cx.notify();
     }
 
@@ -848,11 +1073,74 @@ impl Flick {
                 // Closing the field drops the pasted token from the UI.
                 self.remote.fields.pairing = None;
                 self.remote.fields.pairing_error = None;
+                self.remote_ui.discovery.code = None;
                 self.persist();
             }
             Err(error) => self.remote.fields.pairing_error = Some(error),
         }
         cx.notify();
+    }
+
+    /// `chrome_ui`'s switch takes a `&'static str` id, so one per server
+    /// needs this copy keyed by any id. Same look and behaviour.
+    fn keyed_switch(
+        &self,
+        id: impl Into<ElementId>,
+        on: bool,
+        cx: &Context<Self>,
+        on_toggle: impl Fn(&mut Self, &mut Window, &mut Context<Self>) + 'static,
+    ) -> Stateful<Div> {
+        let t = cx.theme();
+        let (width, height, knob) = match t.style {
+            Style::Mac => (34., 20., 16.),
+            Style::Windows => (40., 20., 12.),
+            Style::Gnome => (46., 26., 22.),
+        };
+        let inset = (height - knob) / 2.;
+        let id = id.into();
+        let (track, knob_color) = match (t.style, on) {
+            (_, true) => (
+                t.accent,
+                if t.style == Style::Windows {
+                    t.on_accent
+                } else {
+                    rgb(0xffffff)
+                },
+            ),
+            (Style::Windows, false) => (rgba(0x00000000), t.muted),
+            (_, false) => (t.control_hover, rgb(0xffffff)),
+        };
+        let el = div()
+            .id(id.clone())
+            .relative()
+            .flex_none()
+            .flex()
+            .items_center()
+            .w(px(width))
+            .h(px(height))
+            .rounded_full()
+            .bg(track)
+            .when(t.style == Style::Windows && !on, |d| {
+                d.border_1().border_color(t.muted)
+            })
+            .cursor_pointer()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, _| this.control_pressed = true),
+            )
+            .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                cx.stop_propagation();
+                on_toggle(this, window, cx);
+            }))
+            .child(
+                div()
+                    .ml(px(if on { width - knob - inset } else { inset }))
+                    .size(px(knob))
+                    .rounded_full()
+                    .bg(knob_color)
+                    .when(t.style != Style::Windows, |d| d.shadow_sm()),
+            );
+        self.focusable(el, &id, None, height / 2., (0., 0.), cx)
     }
 
     /// Edits a server's name in place; every change is saved.

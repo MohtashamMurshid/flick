@@ -33,10 +33,13 @@
 //!   [`RemoteState::cancel_resolve`] drops its request, which closes the
 //!   connection and ends the lookup on the server.
 
-use crate::store::{Settings, remote::RemoteServer};
+use crate::store::{
+    Settings,
+    remote::{QueuedCommand, RemoteServer, WakeTarget},
+};
 use flick::remote::protocol::{
-    self, BrowseListing, Capability, ErrorBody, FetchPhase, FetchRow, Library, Pairing, Progress,
-    Quality, ShareResult, TorrentInfo, TransferPhase, TransferRow,
+    self, BrowseListing, Capability, ErrorBody, FetchPhase, FetchRow, Hardware, Library, Pairing,
+    Progress, Quality, ShareResult, TorrentInfo, TransferPhase, TransferRow,
 };
 use std::{
     cell::{Cell, OnceCell, RefCell},
@@ -357,14 +360,35 @@ impl RemoteState {
         Ok(id)
     }
 
-    /// Forgets a server, its listing, its cache file, and its progress.
+    /// Adds the server a pairing code returned. Unlike a pasted string, a
+    /// code never replaces the token of a server already paired at that
+    /// address: that is refused with its name, and the existing entry kept.
+    pub fn add_code_pairing(
+        &mut self,
+        settings: &mut Settings,
+        pairing: &Pairing,
+    ) -> Result<String, String> {
+        if let Some(server) = paired_server(&settings.remote.servers, pairing) {
+            return Err(already_paired(&server.name));
+        }
+        let id = upsert_pairing(&mut settings.remote.servers, pairing, new_server_id);
+        self.refresh_server(settings, &id);
+        Ok(id)
+    }
+
+    /// Forgets a server, its listing, its cache file, its progress, and its
+    /// queued commands.
     pub fn remove_server(&mut self, settings: &mut Settings, id: &str) {
         settings.remote.servers.retain(|server| server.id != id);
         settings.remote.progress.retain(|entry| entry.server != id);
+        settings.remote.queued.retain(|entry| entry.server != id);
         let inner = self.inner.get_mut();
         inner.servers.remove(id);
         inner.machines.remove(id);
         inner.resolves.remove(id);
+        inner.replays.remove(id);
+        inner.to_queue.retain(|entry| entry.server != id);
+        inner.arrived.retain(|(server, _)| server != id);
         let dropped = inner.posters.remove_server(id);
         inner.dropped.extend(dropped);
         if let Some(fields) = &self.fields.renaming
@@ -674,6 +698,36 @@ struct Inner {
     /// The resolve in flight on each server. Dropping its sender drops the
     /// request, which closes the connection.
     resolves: HashMap<String, tokio::sync::oneshot::Sender<()>>,
+    /// Listings that arrived from the server since the last
+    /// [`RemoteState::sync_settings`], for progress and wake targets.
+    arrived: Vec<(String, Arc<Library>)>,
+    /// Starts and links the server did not answer, to add to
+    /// `RemoteSettings::queued`.
+    to_queue: Vec<QueuedCommand>,
+    /// Answers to replayed queue entries.
+    replayed: Vec<ReplayAnswer>,
+    /// Servers whose queue is being sent, one entry at a time.
+    replays: HashMap<String, ReplayBatch>,
+    /// System notifications to show, as (title, body).
+    notifications: Vec<(String, String)>,
+    /// Transfers and link downloads already announced, so each finish is
+    /// announced once: (server id, "t:" infohash or "f:" fetch id).
+    announced: HashSet<(String, String)>,
+}
+
+/// The answer to one replayed queue entry.
+struct ReplayAnswer {
+    server_id: String,
+    entry: QueuedCommand,
+    answered: bool,
+    accepted: bool,
+}
+
+/// One server's queue being sent; it exists while an entry is in flight.
+#[derive(Default)]
+struct ReplayBatch {
+    sent: usize,
+    refused: usize,
 }
 
 impl Inner {
@@ -697,6 +751,9 @@ impl Inner {
     /// The runtime state for a saved server, with its address and token current.
     fn sync(&mut self, server: &RemoteServer) -> &mut Remote {
         let remote = self.servers.entry(server.id.clone()).or_default();
+        if remote.name != server.name {
+            remote.name.clone_from(&server.name);
+        }
         let endpoint = Endpoint::of(server);
         if remote.endpoint.as_ref() != Some(&endpoint) {
             remote.endpoint = Some(endpoint);
@@ -721,7 +778,10 @@ impl Inner {
                 match result {
                     Ok(library) => {
                         remote.status = Status::Online;
-                        remote.listing = Some(Listing::new(library));
+                        let listing = Listing::new(library);
+                        self.arrived
+                            .push((server_id.clone(), listing.library.clone()));
+                        remote.listing = Some(listing);
                     }
                     Err(status) => remote.status = status,
                 }
@@ -758,7 +818,25 @@ impl Inner {
                 machine.polling_transfers = false;
                 match result {
                     Ok(rows) => {
-                        if machine.transfers_loaded && transfers_finished(&machine.transfers, &rows)
+                        let name = self
+                            .servers
+                            .get(&server_id)
+                            .map_or_else(String::new, |remote| remote.name.clone());
+                        if machine.transfers_loaded {
+                            for (id, title) in newly_seeding(&machine.transfers, &rows) {
+                                if self
+                                    .announced
+                                    .insert((server_id.clone(), format!("t:{id}")))
+                                {
+                                    self.notifications
+                                        .push(finished_notification(&title, &name));
+                                }
+                            }
+                        }
+                        // Answering again after failing: its queue may be sent.
+                        if (machine.transfers_loaded
+                            && transfers_finished(&machine.transfers, &rows))
+                            || machine.transfers_problem.is_some()
                         {
                             self.relist.insert(server_id);
                         }
@@ -774,7 +852,24 @@ impl Inner {
                 machine.polling_fetches = false;
                 match result {
                     Ok(rows) => {
-                        if machine.fetches_loaded && fetches_finished(&machine.fetches, &rows) {
+                        let name = self
+                            .servers
+                            .get(&server_id)
+                            .map_or_else(String::new, |remote| remote.name.clone());
+                        if machine.fetches_loaded {
+                            for (id, title) in newly_done(&machine.fetches, &rows) {
+                                if self
+                                    .announced
+                                    .insert((server_id.clone(), format!("f:{id}")))
+                                {
+                                    self.notifications
+                                        .push(finished_notification(&title, &name));
+                                }
+                            }
+                        }
+                        if (machine.fetches_loaded && fetches_finished(&machine.fetches, &rows))
+                            || machine.fetches_problem.is_some()
+                        {
                             self.relist.insert(server_id);
                         }
                         machine.fetches = rows;
@@ -787,13 +882,52 @@ impl Inner {
             Reply::Command {
                 server_id,
                 command,
-                result,
+                mut result,
+                delivery,
+                replay,
             } => {
                 // Whatever the answer, the rows may have changed.
                 if !matches!(command, Command::Browse { .. } | Command::Resolve { .. }) {
                     let machine = self.machines.entry(server_id.clone()).or_default();
                     machine.last_transfers = None;
                     machine.last_fetches = None;
+                }
+                // A replay's answer goes to the queue, not to the views.
+                // A replay whose answer was lost after it was sent counts as
+                // sent and leaves the queue: sending it again could start
+                // the same download twice.
+                if let Some(entry) = replay {
+                    self.replayed.push(ReplayAnswer {
+                        server_id,
+                        accepted: result.is_ok() || delivery == Delivery::Unknown,
+                        entry,
+                        answered: delivery != Delivery::Offline,
+                    });
+                    return;
+                }
+                let name = self
+                    .servers
+                    .get(&server_id)
+                    .map_or("", |remote| remote.name.as_str());
+                match delivery {
+                    Delivery::Offline => {
+                        if let Some(entry) = queue_entry(&server_id, &command, unix_now()) {
+                            result = Ok(Outcome::Queued {
+                                message: queued_message(name),
+                            });
+                            self.to_queue.push(entry);
+                        } else if matches!(command, Command::Resolve { .. }) {
+                            result = Ok(Outcome::Unanswered {
+                                question: unanswered_resolve_question(name),
+                            });
+                        }
+                    }
+                    // Sent, but no answer: not queued, so it is never
+                    // started twice.
+                    Delivery::Unknown if queue_entry(&server_id, &command, 0).is_some() => {
+                        result = Err(maybe_taken_message(name));
+                    }
+                    _ => {}
                 }
                 self.ready.push(Ready::Command {
                     server_id,
@@ -809,6 +943,8 @@ impl Inner {
 /// Runtime state of one paired server.
 #[derive(Default)]
 struct Remote {
+    /// The server's name in settings, for messages written off the settings.
+    name: String,
     endpoint: Option<Endpoint>,
     listing: Option<Listing>,
     status: Status,
@@ -1049,6 +1185,8 @@ enum Request {
         /// Ends the request when it fires or its sender is dropped; the
         /// answer is then discarded.
         cancel: Option<tokio::sync::oneshot::Receiver<()>>,
+        /// The queued entry this command replays, if it is one.
+        replay: Option<QueuedCommand>,
     },
 }
 
@@ -1126,11 +1264,17 @@ impl Request {
                 result: Err(error),
             },
             Request::Command {
-                server_id, command, ..
+                server_id,
+                command,
+                replay,
+                ..
             } => Reply::Command {
                 server_id,
                 command,
                 result: Err(error),
+                // The worker is gone, not the server: nothing to queue.
+                delivery: Delivery::Answered,
+                replay,
             },
         }
     }
@@ -1161,8 +1305,25 @@ enum Reply {
         server_id: String,
         command: Command,
         result: Result<Outcome, String>,
+        /// Whether the server answered, could not be reached, or was sent
+        /// the request and then went silent.
+        delivery: Delivery,
+        replay: Option<QueuedCommand>,
     },
     None,
+}
+
+/// How far a command got.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Delivery {
+    /// The server answered, with success or an error.
+    Answered,
+    /// Nothing was sent: the connection was refused, timed out, or the
+    /// name did not resolve. Safe to send again later.
+    Offline,
+    /// The request was sent and the answer was lost (a timeout or reset
+    /// after it was written): the server may have acted on it.
+    Unknown,
 }
 
 /// The request thread: its own Tokio runtime, started on first use.
@@ -1423,9 +1584,10 @@ async fn handle(http: &reqwest::Client, request: Request) -> Reply {
             server_id,
             command,
             cancel,
+            replay,
         } => {
             let run = run_command(http, &endpoint, &command);
-            let result = match cancel {
+            let (result, delivery) = match cancel {
                 // Dropping `run` drops the request and closes its connection.
                 Some(cancel) => tokio::select! {
                     result = run => result,
@@ -1437,6 +1599,8 @@ async fn handle(http: &reqwest::Client, request: Request) -> Reply {
                 server_id,
                 command,
                 result,
+                delivery,
+                replay,
             }
         }
     }
@@ -1600,8 +1764,28 @@ fn decode_poster(bytes: &[u8]) -> Result<image::RgbaImage, String> {
     Ok(image)
 }
 
+/// The server already paired at a pairing's host and port.
+pub fn paired_server<'a>(
+    servers: &'a [RemoteServer],
+    pairing: &Pairing,
+) -> Option<&'a RemoteServer> {
+    servers
+        .iter()
+        .find(|s| s.port == pairing.port && s.host.eq_ignore_ascii_case(&pairing.host))
+}
+
+/// Why a code pairing was not used for a server already paired.
+pub fn already_paired(name: &str) -> String {
+    format!(
+        "Already paired with {}. To pair it again, paste its pairing string",
+        display_name(name)
+    )
+}
+
 /// Adds a paired server or, when one already uses the same host and port,
-/// replaces its token. Returns the server's id.
+/// replaces its token. Returns the server's id. Only a pasted pairing
+/// string replaces a token; a code goes through
+/// [`RemoteState::add_code_pairing`].
 pub fn upsert_pairing(
     servers: &mut Vec<RemoteServer>,
     pairing: &Pairing,
@@ -1628,6 +1812,8 @@ pub fn server_from_pairing(pairing: &Pairing, id: String) -> RemoteServer {
         port: pairing.port,
         token: pairing.token.clone(),
         quality: Quality::default(),
+        auto_quality: true,
+        wake: None,
     }
 }
 
@@ -1895,13 +2081,27 @@ impl Destination {
         }
     }
 
-    /// Whether the picker lets this be chosen for `sheet`.
+    /// Whether the picker lets this be chosen for `sheet`. An offline
+    /// server whose last listing allowed a download or link stays
+    /// selectable: what is started there waits in the queue.
     pub fn selectable(&self, sheet: Sheet) -> bool {
-        self.online && self.allows(sheet)
+        self.allows(sheet) && (self.online || self.queues(sheet))
+    }
+
+    /// Offline, with a last listing that allows `sheet`'s download or link:
+    /// a start there is queued until it answers.
+    fn queues(&self, sheet: Sheet) -> bool {
+        !self.online
+            && self.status == Status::Offline
+            && sheet != Sheet::Share
+            && self.allows(sheet)
     }
 
     /// The line under its segment: free space, or why it cannot be chosen.
     pub fn detail(&self, sheet: Sheet) -> String {
+        if self.queues(sheet) {
+            return "Asleep · will queue".into();
+        }
         if !self.online {
             return match &self.status {
                 Status::Connecting => "Connecting…".into(),
@@ -2072,6 +2272,18 @@ pub enum Outcome {
     },
     Browsed(BrowseListing),
     Shared(ShareResult),
+    /// A start or link the server did not answer: kept in
+    /// `RemoteSettings::queued` and sent when the server answers again.
+    /// `message` is the sentence to show.
+    Queued {
+        message: String,
+    },
+    /// A resolve the server did not answer: nothing was sent.
+    /// `question` offers to queue the download with every file
+    /// ([`RemoteState::queue_download`]).
+    Unanswered {
+        question: String,
+    },
 }
 
 /// One server's section in Downloads.
@@ -2180,6 +2392,37 @@ pub fn transfers_finished(old: &[TransferRow], new: &[TransferRow]) -> bool {
             });
         file_done || seeding
     })
+}
+
+/// Downloads (not shares) that moved from downloading or checking to
+/// seeding since the previous poll, including one that started and
+/// finished between two polls, as (id, name). The caller skips the first
+/// poll for a server, so transfers present then never count.
+pub fn newly_seeding(old: &[TransferRow], new: &[TransferRow]) -> Vec<(String, String)> {
+    new.iter()
+        .filter(|row| !row.share && row.phase == TransferPhase::Seeding)
+        .filter(|row| match old.iter().find(|before| before.id == row.id) {
+            Some(before) => matches!(
+                before.phase,
+                TransferPhase::Downloading | TransferPhase::Checking
+            ),
+            None => true,
+        })
+        .map(|row| (row.id.clone(), row.name.clone()))
+        .collect()
+}
+
+/// Link downloads that reached Done since the previous poll, including one
+/// that started and finished between two polls, as (id, title).
+pub fn newly_done(old: &[FetchRow], new: &[FetchRow]) -> Vec<(u64, String)> {
+    new.iter()
+        .filter(|row| row.phase == FetchPhase::Done)
+        .filter(|row| {
+            !old.iter()
+                .any(|before| before.id == row.id && before.phase == FetchPhase::Done)
+        })
+        .map(|row| (row.id, row.title.clone()))
+        .collect()
 }
 
 /// Whether a link download finished or saved another file since the
@@ -2312,17 +2555,34 @@ pub fn parse_current_list(body: &[u8]) -> Option<Vec<String>> {
         .map(|paths| paths.into_iter().filter(|p| !p.is_empty()).collect())
 }
 
-/// A failed request: no answer, too large, or an HTTP error with its body.
+/// A failed request: never sent, sent without an answer, too large, or an
+/// HTTP error with its body.
 enum Failure {
+    /// Not connected: refused, unreachable, connect timeout, or DNS.
     Offline,
+    /// Connected and sent, then a timeout or reset before the answer.
+    Unknown,
     TooLarge,
-    Http { code: u16, body: Vec<u8> },
+    Http {
+        code: u16,
+        body: Vec<u8>,
+    },
 }
 
 impl Failure {
+    /// Only a failure to connect (which covers a name that does not
+    /// resolve) means the request never reached the server.
+    fn of_send(error: &reqwest::Error) -> Self {
+        if error.is_connect() {
+            Failure::Offline
+        } else {
+            Failure::Unknown
+        }
+    }
+
     fn message(&self) -> String {
         match self {
-            Failure::Offline => "The server did not answer".into(),
+            Failure::Offline | Failure::Unknown => "The server did not answer".into(),
             Failure::TooLarge => "The server's reply is too large".into(),
             Failure::Http { code, body } => command_error(*code, body),
         }
@@ -2379,7 +2639,10 @@ async fn call(
     if let Some(body) = body {
         request = request.json(&body);
     }
-    let mut response = request.send().await.map_err(|_| Failure::Offline)?;
+    let mut response = request
+        .send()
+        .await
+        .map_err(|error| Failure::of_send(&error))?;
     let code = response.status().as_u16();
     let success = (200..300).contains(&code);
     if response
@@ -2396,7 +2659,8 @@ async fn call(
         });
     }
     let mut bytes = Vec::new();
-    while let Some(chunk) = response.chunk().await.map_err(|_| Failure::Offline)? {
+    // The server answered; only its body was lost.
+    while let Some(chunk) = response.chunk().await.map_err(|_| Failure::Unknown)? {
         if bytes.len() + chunk.len() > limit {
             return Err(Failure::TooLarge);
         }
@@ -2409,11 +2673,12 @@ async fn call(
     }
 }
 
+/// The command's answer, and how far it got.
 async fn run_command(
     http: &reqwest::Client,
     endpoint: &Endpoint,
     command: &Command,
-) -> Result<Outcome, String> {
+) -> (Result<Outcome, String>, Delivery) {
     use protocol::paths;
     use reqwest::Method;
     let json = |value: &dyn erased::Json| Some(value.json());
@@ -2532,6 +2797,16 @@ async fn run_command(
         },
     )
     .await;
+    let delivery = match answer {
+        Err(Failure::Offline) => Delivery::Offline,
+        Err(Failure::Unknown) => Delivery::Unknown,
+        _ => Delivery::Answered,
+    };
+    (outcome(command, answer), delivery)
+}
+
+/// What a command's reply means.
+fn outcome(command: &Command, answer: Result<Vec<u8>, Failure>) -> Result<Outcome, String> {
     let unreadable = |what: &str| format!("The server sent an unreadable {what}");
     match (command, answer) {
         (
@@ -2789,6 +3064,18 @@ impl RemoteState {
         })
     }
 
+    /// The audio streams inside a remote video, from its listing; empty
+    /// when the listing has none or does not have the video.
+    pub fn audio_tracks(&self, server_id: &str, video_id: &str) -> Vec<protocol::AudioTrack> {
+        let inner = self.inner.borrow();
+        inner
+            .servers
+            .get(server_id)
+            .and_then(|remote| remote.listing.as_ref()?.video(video_id))
+            .map(|video| video.audio_tracks.clone())
+            .unwrap_or_default()
+    }
+
     /// Whether a remote video has finished downloading: None before the
     /// server's first listing, false while it downloads or when the
     /// listing does not have it yet (a download started from Downloads).
@@ -2825,11 +3112,14 @@ impl RemoteState {
             }
             _ => None,
         };
+        // Keeps the name current for the queued message.
+        inner.sync(server);
         let request = Request::Command {
             endpoint: Endpoint::of(server),
             server_id: server_id.to_owned(),
             command,
             cancel,
+            replay: None,
         };
         self.send(&mut inner, Some(request));
     }
@@ -2838,6 +3128,26 @@ impl RemoteState {
     /// A later resolve on the same server cancels this one.
     pub fn resolve(&mut self, settings: &Settings, server_id: &str, input: String) {
         self.command(settings, server_id, Command::Resolve { input });
+    }
+
+    /// Queues a torrent with every file for a server that did not answer
+    /// its resolve ([`Outcome::Unanswered`]); it is sent when the server
+    /// answers again, once however often it is asked for. Returns the
+    /// sentence to show.
+    pub fn queue_download(&mut self, server_id: &str, input: String) -> String {
+        let inner = self.inner.get_mut();
+        let command = Command::Start {
+            input,
+            files: Vec::new(),
+        };
+        inner
+            .to_queue
+            .extend(queue_entry(server_id, &command, unix_now()));
+        let name = inner
+            .servers
+            .get(server_id)
+            .map_or("", |remote| remote.name.as_str());
+        queued_message(name)
     }
 
     /// Ends the resolve in flight on a server: its request is dropped,
@@ -2922,6 +3232,292 @@ impl RemoteState {
     pub fn share(&mut self, settings: &Settings, server_id: &str, dir: &str) {
         self.command(settings, server_id, Command::Share { dir: dir.into() });
     }
+
+    /// Carries what the last [`Self::drain`]s learned into settings. Call
+    /// it on the tick right after `drain`, and save settings when
+    /// [`SettingsSync::changed`] is set.
+    ///
+    /// - A listing from the server merges its videos' `resume` positions
+    ///   into `RemoteSettings::progress` (the newer wins) and stores its
+    ///   `hardware` as the server's `wake` target, or clears it.
+    /// - A start or link the server did not answer joins
+    ///   `RemoteSettings::queued`; the view already got
+    ///   [`Outcome::Queued`].
+    /// - A listing from a server with queued entries sends them, in order,
+    ///   one at a time. Each one the server answers is removed, accepted or
+    ///   refused; one it does not answer stays, and the rest wait for the
+    ///   next listing. One notification sums up each batch.
+    pub fn sync_settings(&mut self, settings: &mut Settings) -> SettingsSync {
+        let mut sync = SettingsSync::default();
+        let mut inner = self.inner.borrow_mut();
+        let paired = |settings: &Settings, id: &str| {
+            settings.remote.servers.iter().any(|server| server.id == id)
+        };
+        for entry in std::mem::take(&mut inner.to_queue) {
+            // The same download asked for twice while asleep is sent once.
+            let queued = settings
+                .remote
+                .queued
+                .iter()
+                .any(|other| same_queued(other, &entry));
+            if paired(settings, &entry.server) && !queued {
+                settings.remote.queued.push(entry);
+                sync.changed = true;
+            }
+        }
+        let mut next = Vec::new();
+        for (id, library) in std::mem::take(&mut inner.arrived) {
+            let Some(server) = find_mut(settings, &id) else {
+                continue;
+            };
+            let wake = wake_target(library.hardware.as_ref());
+            if server.wake != wake {
+                server.wake = wake;
+                sync.changed = true;
+            }
+            sync.changed |= settings.merge_remote_resume(&id, &library.videos);
+            if !inner.replays.contains_key(&id)
+                && settings
+                    .remote
+                    .queued
+                    .iter()
+                    .any(|entry| entry.server == id)
+            {
+                inner.replays.insert(id.clone(), ReplayBatch::default());
+                next.push(id);
+            }
+        }
+        for answer in std::mem::take(&mut inner.replayed) {
+            let Some(batch) = inner.replays.get_mut(&answer.server_id) else {
+                continue;
+            };
+            if !answer.answered {
+                // Asleep again: the rest wait for the next listing.
+                let batch = inner.replays.remove(&answer.server_id);
+                if let Some(batch) = batch
+                    && let Some(note) = replay_notification(
+                        &server_name(settings, &answer.server_id),
+                        batch.sent,
+                        batch.refused,
+                    )
+                {
+                    sync.notifications.push(note);
+                }
+                continue;
+            }
+            if answer.accepted {
+                batch.sent += 1;
+            } else {
+                tracing::debug!("A queued download was refused by its server");
+                batch.refused += 1;
+            }
+            if let Some(at) = settings
+                .remote
+                .queued
+                .iter()
+                .position(|entry| *entry == answer.entry)
+            {
+                settings.remote.queued.remove(at);
+                sync.changed = true;
+            }
+            next.push(answer.server_id);
+        }
+        for id in next {
+            let entry = settings
+                .remote
+                .queued
+                .iter()
+                .find(|entry| entry.server == id)
+                .cloned();
+            let server = settings.remote.servers.iter().find(|s| s.id == id);
+            match (entry, server) {
+                (Some(entry), Some(server)) => {
+                    let request = Request::Command {
+                        endpoint: Endpoint::of(server),
+                        server_id: id,
+                        command: replay_command(&entry),
+                        cancel: None,
+                        replay: Some(entry),
+                    };
+                    self.send(&mut inner, Some(request));
+                }
+                _ => {
+                    if let Some(batch) = inner.replays.remove(&id)
+                        && let Some(note) = replay_notification(
+                            &server_name(settings, &id),
+                            batch.sent,
+                            batch.refused,
+                        )
+                    {
+                        sync.notifications.push(note);
+                    }
+                }
+            }
+        }
+        sync.notifications
+            .extend(std::mem::take(&mut inner.notifications));
+        sync
+    }
+}
+
+/// What [`RemoteState::sync_settings`] did.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct SettingsSync {
+    /// Settings changed and should be saved.
+    pub changed: bool,
+    /// System notifications to show, as (title, body). Plain text: names
+    /// and titles only, never paths, URLs, or tokens.
+    pub notifications: Vec<(String, String)>,
+}
+
+fn server_name(settings: &Settings, id: &str) -> String {
+    settings
+        .remote
+        .servers
+        .iter()
+        .find(|server| server.id == id)
+        .map_or_else(String::new, |server| server.name.clone())
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs())
+}
+
+/// A name for messages; "The server" when it has none.
+fn display_name(name: &str) -> &str {
+    if name.trim().is_empty() {
+        "The server"
+    } else {
+        name
+    }
+}
+
+/// The queue entry for a command the server did not answer: starts and
+/// links only. Everything else acts on the server's current state and is
+/// not worth sending later.
+pub fn queue_entry(server_id: &str, command: &Command, created: u64) -> Option<QueuedCommand> {
+    let (input, files, link) = match command {
+        Command::Start { input, files } => (input.clone(), files.clone(), false),
+        Command::FetchStart { url } => (url.clone(), Vec::new(), true),
+        _ => return None,
+    };
+    Some(QueuedCommand {
+        server: server_id.to_owned(),
+        input,
+        files,
+        link,
+        created,
+    })
+}
+
+/// Whether two queue entries ask for the same thing, whenever they were
+/// made.
+pub fn same_queued(a: &QueuedCommand, b: &QueuedCommand) -> bool {
+    a.server == b.server && a.input == b.input && a.files == b.files && a.link == b.link
+}
+
+/// What a start or link says when it was sent and its answer was lost.
+pub fn maybe_taken_message(name: &str) -> String {
+    if name.trim().is_empty() {
+        "The server may have taken it; check its Downloads.".into()
+    } else {
+        format!("The server may have taken it; check Downloads on {name}.")
+    }
+}
+
+/// The command that sends a queue entry.
+pub fn replay_command(entry: &QueuedCommand) -> Command {
+    if entry.link {
+        Command::FetchStart {
+            url: entry.input.clone(),
+        }
+    } else {
+        Command::Start {
+            input: entry.input.clone(),
+            files: entry.files.clone(),
+        }
+    }
+}
+
+/// What [`Outcome::Queued`] says.
+pub fn queued_message(name: &str) -> String {
+    format!(
+        "{} is not answering; queued until it does.",
+        display_name(name)
+    )
+}
+
+/// What [`Outcome::Unanswered`] asks.
+pub fn unanswered_resolve_question(name: &str) -> String {
+    format!(
+        "{} is not answering. Queue this download with every file and start it when it answers?",
+        display_name(name)
+    )
+}
+
+/// The one notification for a sent queue, if anything was answered.
+pub fn replay_notification(name: &str, sent: usize, refused: usize) -> Option<(String, String)> {
+    let name = display_name(name);
+    let plural = |count: usize| if count == 1 { "download" } else { "downloads" };
+    let body = match (sent, refused) {
+        (0, 0) => return None,
+        (sent, 0) => format!("Sent {sent} queued {} to {name}", plural(sent)),
+        (0, refused) => format!("{name} refused {refused} queued {}", plural(refused)),
+        (sent, refused) => format!(
+            "Sent {sent} queued {} to {name}; it refused {refused}",
+            plural(sent)
+        ),
+    };
+    Some(("Queued downloads".into(), body))
+}
+
+/// The notification for a download that finished on a server.
+pub fn finished_notification(title: &str, server: &str) -> (String, String) {
+    let title = if title.trim().is_empty() {
+        "A download"
+    } else {
+        title.trim()
+    };
+    (
+        "Download finished".into(),
+        format!("{title} finished downloading on {}", display_name(server)),
+    )
+}
+
+/// The notification for a copy kept on this computer that finished.
+pub fn kept_notification(title: &str, server: &str) -> (String, String) {
+    let title = if title.trim().is_empty() {
+        "A video"
+    } else {
+        title.trim()
+    };
+    let here = this_machine_name().replacen("This", "this", 1);
+    (
+        "Copy finished".into(),
+        format!("{title} from {} is now on {here}", display_name(server)),
+    )
+}
+
+/// Where a Wake-on-LAN packet for this server goes: the listing's
+/// well-formed hardware addresses and private LAN IPv4 addresses, at most
+/// eight of each, or None when it has no usable hardware address. The
+/// server's list is not trusted: a public, broadcast, or multicast address
+/// it names is dropped here and again when the packet is sent.
+pub fn wake_target(hardware: Option<&Hardware>) -> Option<WakeTarget> {
+    let hardware = hardware?;
+    let mac = crate::remote_discovery::wake_macs(&hardware.mac);
+    if mac.is_empty() {
+        return None;
+    }
+    Some(WakeTarget {
+        mac,
+        lan_ips: crate::remote_discovery::wake_ips(&hardware.lan_ips)
+            .into_iter()
+            .map(|ip| ip.to_string())
+            .collect(),
+    })
 }
 
 #[cfg(test)]
@@ -2952,6 +3548,7 @@ mod tests {
             qualities: vec![Quality::Original, Quality::Low720],
             capabilities: Vec::new(),
             storage: None,
+            hardware: None,
             videos: (0..videos)
                 .map(|index| Video {
                     id: format!("v{index}"),
@@ -3551,10 +4148,26 @@ mod tests {
         assert!(!read_only.selectable(Sheet::Torrent) && read_only.online);
         assert_eq!(read_only.detail(Sheet::Torrent), "Not accepting downloads");
         assert_eq!(read_only.detail(Sheet::Share), "Not sharing folders");
-        // Offline keeps its last known capabilities but cannot be chosen.
+        // Offline keeps its last known capabilities: downloads and links
+        // there are queued, but nothing is shared from it.
         let asleep = &destinations[3];
-        assert!(asleep.allows_downloads && !asleep.selectable(Sheet::Torrent));
-        assert_eq!(asleep.detail(Sheet::Torrent), "Offline");
+        assert!(!asleep.online && asleep.allows_downloads);
+        assert!(asleep.selectable(Sheet::Torrent) && asleep.selectable(Sheet::Link));
+        assert!(!asleep.selectable(Sheet::Share));
+        assert_eq!(asleep.detail(Sheet::Torrent), "Asleep · will queue");
+        assert_eq!(asleep.detail(Sheet::Link), "Asleep · will queue");
+        assert_eq!(asleep.detail(Sheet::Share), "Offline");
+        // Offline without those capabilities, or never listed: not chosen.
+        let none = library(1);
+        let bare = destinations_from(
+            None,
+            &[
+                facts("ro", Some(&none), &offline),
+                facts("never", None, &offline),
+            ],
+        );
+        assert!(!bare[1].selectable(Sheet::Torrent) && !bare[2].selectable(Sheet::Link));
+        assert_eq!(bare[1].detail(Sheet::Torrent), "Offline");
         assert_eq!(destinations[4].detail(Sheet::Link), "Connecting…");
         assert!(!destinations[4].allows_links);
 
@@ -3587,11 +4200,12 @@ mod tests {
             choose_destination(&destinations, Sheet::Torrent, None, ""),
             None
         );
-        // A default that is offline, unknown, or not allowed falls back.
+        // An asleep default that took downloads is kept: they queue there.
         assert_eq!(
             choose_destination(&destinations, Sheet::Torrent, None, "asleep"),
-            None
+            Some("asleep".to_owned())
         );
+        // A default that is unknown or not allowed falls back.
         assert_eq!(
             choose_destination(&destinations, Sheet::Torrent, None, "gone"),
             None
@@ -3609,7 +4223,8 @@ mod tests {
             choose_destination(&destinations, Sheet::Torrent, Some(&mini), ""),
             mini
         );
-        // A remembered machine that went offline gives way to the default.
+        // A remembered machine that went to sleep stays chosen; one that
+        // can no longer be chosen gives way to the default.
         assert_eq!(
             choose_destination(
                 &destinations,
@@ -3617,7 +4232,11 @@ mod tests {
                 Some(&Some("asleep".into())),
                 "mini"
             ),
-            mini
+            Some("asleep".to_owned())
+        );
+        assert_eq!(
+            choose_destination(&destinations, Sheet::Link, Some(&Some("asleep".into())), ""),
+            None
         );
     }
 
@@ -4418,5 +5037,640 @@ mod tests {
             state.take_ready().is_empty(),
             "cancelled resolves are not answered"
         );
+    }
+
+    #[test]
+    fn only_starts_and_links_are_queued_and_replayed_as_they_were() {
+        let start = Command::Start {
+            input: "magnet:?xt=urn:btih:abc".into(),
+            files: vec![0, 2],
+        };
+        let link = Command::FetchStart {
+            url: "https://example.com/watch".into(),
+        };
+        let queued = queue_entry("mini", &start, 7).unwrap();
+        assert_eq!(
+            queued,
+            QueuedCommand {
+                server: "mini".into(),
+                input: "magnet:?xt=urn:btih:abc".into(),
+                files: vec![0, 2],
+                link: false,
+                created: 7,
+            }
+        );
+        assert_eq!(replay_command(&queued), start);
+        let queued = queue_entry("mini", &link, 8).unwrap();
+        assert!(queued.link && queued.files.is_empty());
+        assert_eq!(replay_command(&queued), link);
+        for other in [
+            Command::Resolve { input: "x".into() },
+            Command::Pause { id: "x".into() },
+            Command::PauseAll,
+            Command::FetchCancel { id: 1 },
+            Command::Browse { dir: String::new() },
+            Command::Share {
+                dir: "Films".into(),
+            },
+        ] {
+            assert_eq!(queue_entry("mini", &other, 1), None, "{other:?}");
+        }
+    }
+
+    #[test]
+    fn queue_and_finish_messages_name_the_machine_only() {
+        assert_eq!(
+            queued_message("Mac mini"),
+            "Mac mini is not answering; queued until it does."
+        );
+        assert_eq!(
+            queued_message(" "),
+            "The server is not answering; queued until it does."
+        );
+        assert_eq!(replay_notification("Mac mini", 0, 0), None);
+        let body = |sent, refused| replay_notification("Mac mini", sent, refused).unwrap().1;
+        assert_eq!(body(2, 0), "Sent 2 queued downloads to Mac mini");
+        assert_eq!(body(1, 0), "Sent 1 queued download to Mac mini");
+        assert_eq!(body(0, 1), "Mac mini refused 1 queued download");
+        assert_eq!(
+            body(2, 1),
+            "Sent 2 queued downloads to Mac mini; it refused 1"
+        );
+        assert_eq!(
+            finished_notification("Sintel", "Mac mini").1,
+            "Sintel finished downloading on Mac mini"
+        );
+        assert_eq!(
+            finished_notification("", "Mac mini").1,
+            "A download finished downloading on Mac mini"
+        );
+        let (title, body) = kept_notification("Sintel", "Mac mini");
+        assert_eq!(title, "Copy finished");
+        assert!(
+            body.starts_with("Sintel from Mac mini is now on this "),
+            "{body}"
+        );
+    }
+
+    #[test]
+    fn wake_targets_come_from_the_listing_hardware() {
+        assert_eq!(wake_target(None), None);
+        assert_eq!(wake_target(Some(&Hardware::default())), None);
+        let hardware = Hardware {
+            mac: vec!["aa:bb:cc:dd:ee:ff".into()],
+            lan_ips: vec!["192.168.1.20".into()],
+        };
+        assert_eq!(
+            wake_target(Some(&hardware)),
+            Some(WakeTarget {
+                mac: hardware.mac.clone(),
+                lan_ips: hardware.lan_ips.clone(),
+            })
+        );
+        // A server cannot aim wake packets anywhere it likes.
+        let mut hostile = Hardware {
+            mac: vec!["not a mac".into(), "ff:ff:ff:ff:ff:ff".into()],
+            lan_ips: vec!["192.168.1.20".into()],
+        };
+        assert_eq!(wake_target(Some(&hostile)), None);
+        hostile.mac = (0..20).map(|n| format!("02:00:00:00:00:{n:02x}")).collect();
+        hostile.lan_ips = vec![
+            "8.8.8.8".into(),
+            "255.255.255.255".into(),
+            "192.168.1.255".into(),
+            "224.0.0.251".into(),
+            "100.98.200.69".into(),
+            "10.1.2.3".into(),
+        ];
+        hostile
+            .lan_ips
+            .extend((1..=20).map(|n| format!("192.168.7.{n}")));
+        let target = wake_target(Some(&hostile)).unwrap();
+        assert_eq!(target.mac.len(), 8);
+        assert_eq!(target.lan_ips.len(), 8);
+        assert_eq!(target.lan_ips[0], "10.1.2.3");
+        assert!(
+            target.lan_ips[1..]
+                .iter()
+                .all(|ip| ip.starts_with("192.168.7."))
+        );
+    }
+
+    #[test]
+    fn a_code_never_replaces_the_token_of_a_paired_server() {
+        let data = tempfile::tempdir().unwrap();
+        let mut state = RemoteState::with_data_dir(data.path());
+        let mut settings = Settings::default();
+        let port = TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let id = state
+            .add_pairing(
+                &mut settings,
+                &format!("flick-remote://127.0.0.1:{port}/#{TOKEN}"),
+            )
+            .unwrap();
+        settings.remote.servers[0].name = "Mac mini".into();
+        let error = state
+            .add_code_pairing(&mut settings, &pairing("127.0.0.1", port, OTHER))
+            .unwrap_err();
+        assert_eq!(
+            error,
+            "Already paired with Mac mini. To pair it again, paste its pairing string"
+        );
+        assert_eq!(settings.remote.servers.len(), 1);
+        assert_eq!(settings.remote.servers[0].id, id);
+        assert_eq!(settings.remote.servers[0].token, TOKEN);
+        // Another port is another server, and is added.
+        let other = state
+            .add_code_pairing(
+                &mut settings,
+                &pairing("127.0.0.1", port.wrapping_add(1), OTHER),
+            )
+            .unwrap();
+        assert_ne!(other, id);
+        assert_eq!(settings.remote.servers.len(), 2);
+        assert_eq!(settings.remote.servers[0].token, TOKEN);
+        // Pasting the string is still the way to replace a token.
+        state
+            .add_pairing(
+                &mut settings,
+                &format!("flick-remote://127.0.0.1:{port}/#{OTHER}"),
+            )
+            .unwrap();
+        assert_eq!(settings.remote.servers[0].token, OTHER);
+    }
+
+    #[test]
+    fn finishes_are_seen_once_between_polls() {
+        let id = "c".repeat(40);
+        let downloading = transfer(&id, TransferPhase::Downloading, 40);
+        let seeding = transfer(&id, TransferPhase::Seeding, 200);
+        assert_eq!(
+            newly_seeding(
+                std::slice::from_ref(&downloading),
+                std::slice::from_ref(&seeding)
+            ),
+            vec![(id.clone(), "Show".to_owned())]
+        );
+        // Already seeding at the previous poll, or a share: no news.
+        let seen = std::slice::from_ref(&seeding);
+        assert!(newly_seeding(seen, seen).is_empty());
+        let share = TransferRow {
+            share: true,
+            ..seeding.clone()
+        };
+        assert!(newly_seeding(std::slice::from_ref(&downloading), &[share]).is_empty());
+        // Started and finished between two polls: first seen seeding.
+        let other = transfer(&"d".repeat(40), TransferPhase::Seeding, 200);
+        assert_eq!(
+            newly_seeding(seen, &[seeding.clone(), other.clone()]),
+            vec![("d".repeat(40), "Show".to_owned())]
+        );
+        let shared_new = TransferRow {
+            share: true,
+            ..other.clone()
+        };
+        assert!(newly_seeding(seen, &[shared_new]).is_empty());
+
+        let fetch = |id: u64, phase: FetchPhase| FetchRow {
+            id,
+            title: format!("Clip {id}"),
+            phase,
+            ..Default::default()
+        };
+        assert_eq!(
+            newly_done(
+                &[
+                    fetch(1, FetchPhase::Downloading),
+                    fetch(2, FetchPhase::Done)
+                ],
+                &[
+                    fetch(1, FetchPhase::Done),
+                    fetch(2, FetchPhase::Done),
+                    fetch(3, FetchPhase::Done),
+                    fetch(4, FetchPhase::Failed),
+                ]
+            ),
+            vec![(1, "Clip 1".to_owned()), (3, "Clip 3".to_owned())]
+        );
+    }
+
+    /// Drains and syncs until `done` holds and no queue is being sent,
+    /// returning every notification.
+    fn sync_until(
+        state: &mut RemoteState,
+        settings: &mut Settings,
+        mut done: impl FnMut(&RemoteState, &Settings) -> bool,
+    ) -> Vec<(String, String)> {
+        let started = Instant::now();
+        let mut notifications = Vec::new();
+        loop {
+            state.drain();
+            notifications.extend(state.sync_settings(settings).notifications);
+            if done(state, settings) && state.inner.borrow().replays.is_empty() {
+                return notifications;
+            }
+            assert!(started.elapsed() < Duration::from_secs(15), "timed out");
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn starts_for_a_sleeping_machine_wait_and_are_sent_in_order_when_it_answers() {
+        let asleep = TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let fake = Arc::new(Fake::default());
+        let port = transfers_server(fake.clone(), true);
+        let data = tempfile::tempdir().unwrap();
+        let mut state = RemoteState::with_data_dir(data.path());
+        let mut settings = Settings::default();
+        let mini = state
+            .add_pairing(
+                &mut settings,
+                &format!("flick-remote://127.0.0.1:{asleep}/#{TOKEN}"),
+            )
+            .unwrap();
+        settings.remote.servers[0].name = "Mac mini".into();
+        wait_until(&mut state, |state| {
+            state.servers(&settings)[0].status == Status::Offline
+        });
+
+        // Nothing answers: each start and link is queued, and said so.
+        let magnet = "magnet:?xt=urn:btih:abc".to_owned();
+        state.start(&settings, &mini, magnet.clone(), vec![0]);
+        let (_, command, result) = command_answer(&mut state);
+        assert!(matches!(command, Command::Start { .. }));
+        assert_eq!(
+            result,
+            Ok(Outcome::Queued {
+                message: "Mac mini is not answering; queued until it does.".into()
+            })
+        );
+        // The same start again is said to be queued but kept once.
+        state.start(&settings, &mini, magnet.clone(), vec![0]);
+        assert!(matches!(
+            command_answer(&mut state).2,
+            Ok(Outcome::Queued { .. })
+        ));
+        // Another start, which the server will refuse as one it already has.
+        let known = "magnet:?xt=urn:btih:def".to_owned();
+        fake.started.lock().unwrap().push(protocol::StartTransfer {
+            input: known.clone(),
+            files: Vec::new(),
+        });
+        state.start(&settings, &mini, known.clone(), Vec::new());
+        assert!(matches!(
+            command_answer(&mut state).2,
+            Ok(Outcome::Queued { .. })
+        ));
+        state.fetch_start(&settings, &mini, "https://example.com/watch");
+        assert!(matches!(
+            command_answer(&mut state).2,
+            Ok(Outcome::Queued { .. })
+        ));
+        // Commands that act on the server's state are not queued.
+        state.pause(&settings, &mini, "x");
+        assert_eq!(
+            command_answer(&mut state).2,
+            Err("The server did not answer".into())
+        );
+        let synced = state.sync_settings(&mut settings);
+        assert!(synced.changed);
+        let queued = &settings.remote.queued;
+        assert_eq!(queued.len(), 3);
+        assert!(queued.iter().all(|entry| entry.server == mini));
+        assert_eq!(
+            queued
+                .iter()
+                .map(|entry| entry.input.as_str())
+                .collect::<Vec<_>>(),
+            [magnet.as_str(), known.as_str(), "https://example.com/watch"]
+        );
+        assert_eq!((queued[0].link, queued[2].link), (false, true));
+
+        // Its listing answers, then it is asleep again before the queue is
+        // sent: the first entry stays, and the rest keep their place.
+        settings.remote.servers[0].port = port;
+        state.refresh_server(&settings, &mini);
+        let started = Instant::now();
+        while state.inner.borrow().arrived.is_empty() {
+            assert!(started.elapsed() < Duration::from_secs(10), "timed out");
+            state.drain();
+            thread::sleep(Duration::from_millis(10));
+        }
+        settings.remote.servers[0].port = asleep;
+        let mut batch_seen = false;
+        let notifications = sync_until(&mut state, &mut settings, |state, _| {
+            batch_seen |= !state.inner.borrow().replays.is_empty();
+            batch_seen
+        });
+        assert!(notifications.is_empty(), "{notifications:?}");
+        assert_eq!(settings.remote.queued.len(), 3);
+        assert_eq!(fake.started.lock().unwrap().len(), 1);
+
+        // Answering now: sent in order, the refused one is dropped too, and
+        // one notification sums it up.
+        settings.remote.servers[0].port = port;
+        state.refresh_server(&settings, &mini);
+        let notifications = sync_until(&mut state, &mut settings, |_, settings| {
+            settings.remote.queued.is_empty()
+        });
+        assert_eq!(
+            notifications,
+            vec![(
+                "Queued downloads".to_owned(),
+                "Sent 2 queued downloads to Mac mini; it refused 1".to_owned()
+            )]
+        );
+        let started = fake.started.lock().unwrap().clone();
+        let start = |input: &str, files: Vec<usize>| protocol::StartTransfer {
+            input: input.to_owned(),
+            files,
+        };
+        assert_eq!(
+            started,
+            vec![
+                start(&known, Vec::new()),
+                start(&magnet, vec![0]),
+                start(&known, Vec::new()),
+            ]
+        );
+        // Replays are answered to the queue, not to the views.
+        assert!(state.take_ready().is_empty());
+        // A later listing with an empty queue sends nothing.
+        let listings = fake.listings.load(Ordering::SeqCst);
+        state.refresh_server(&settings, &mini);
+        let notifications = sync_until(&mut state, &mut settings, |state, settings| {
+            fake.listings.load(Ordering::SeqCst) > listings
+                && state.servers(settings)[0].status == Status::Online
+        });
+        assert!(notifications.is_empty());
+        assert_eq!(fake.started.lock().unwrap().len(), 3);
+
+        // Removing the server drops whatever it still had queued.
+        settings.remote.queued.push(QueuedCommand {
+            server: mini.clone(),
+            input: "https://example.com/later".into(),
+            link: true,
+            ..Default::default()
+        });
+        state.remove_server(&mut settings, &mini);
+        assert!(settings.remote.queued.is_empty());
+    }
+
+    #[test]
+    fn a_resolve_on_a_sleeping_machine_offers_to_queue_every_file() {
+        let asleep = TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let data = tempfile::tempdir().unwrap();
+        let mut state = RemoteState::with_data_dir(data.path());
+        let mut settings = Settings::default();
+        let mini = state
+            .add_pairing(
+                &mut settings,
+                &format!("flick-remote://127.0.0.1:{asleep}/#{TOKEN}"),
+            )
+            .unwrap();
+        settings.remote.servers[0].name = "Mac mini".into();
+        wait_until(&mut state, |state| {
+            state.servers(&settings)[0].status == Status::Offline
+        });
+
+        // The resolve reaches nothing: the sheet is asked whether to queue.
+        let magnet = "magnet:?xt=urn:btih:abc".to_owned();
+        state.resolve(&settings, &mini, magnet.clone());
+        let (_, command, result) = command_answer(&mut state);
+        assert!(matches!(command, Command::Resolve { .. }));
+        assert_eq!(
+            result,
+            Ok(Outcome::Unanswered {
+                question: "Mac mini is not answering. Queue this download with every file and start it when it answers?".into()
+            })
+        );
+        state.sync_settings(&mut settings);
+        assert!(settings.remote.queued.is_empty());
+
+        // Queue: every file, kept once however often it is pressed.
+        let message = state.queue_download(&mini, magnet.clone());
+        assert_eq!(message, "Mac mini is not answering; queued until it does.");
+        state.queue_download(&mini, magnet.clone());
+        assert!(state.sync_settings(&mut settings).changed);
+        assert_eq!(
+            settings
+                .remote
+                .queued
+                .iter()
+                .map(|entry| (
+                    entry.server.as_str(),
+                    entry.input.as_str(),
+                    entry.files.clone(),
+                    entry.link
+                ))
+                .collect::<Vec<_>>(),
+            [(mini.as_str(), magnet.as_str(), Vec::new(), false)]
+        );
+    }
+
+    #[test]
+    fn a_start_whose_answer_is_lost_is_not_queued_or_sent_twice() {
+        let fake = Arc::new(Fake::default());
+        let port = transfers_server(fake.clone(), true);
+        let data = tempfile::tempdir().unwrap();
+        let mut state = RemoteState::with_data_dir(data.path());
+        let mut settings = Settings::default();
+        let mini = state
+            .add_pairing(
+                &mut settings,
+                &format!("flick-remote://127.0.0.1:{port}/#{TOKEN}"),
+            )
+            .unwrap();
+        settings.remote.servers[0].name = "Mac mini".into();
+        wait_until(&mut state, |state| {
+            state.servers(&settings)[0].status == Status::Online
+        });
+
+        // The server reads the start, then closes without answering.
+        fake.down.store(true, Ordering::SeqCst);
+        state.start(&settings, &mini, "magnet:?xt=urn:btih:abc".into(), vec![0]);
+        assert_eq!(
+            command_answer(&mut state).2,
+            Err("The server may have taken it; check Downloads on Mac mini.".into())
+        );
+        state.sync_settings(&mut settings);
+        assert!(settings.remote.queued.is_empty());
+
+        // A queued entry whose replay is lost the same way leaves the queue
+        // rather than being sent again.
+        settings.remote.queued.push(QueuedCommand {
+            server: mini.clone(),
+            input: "magnet:?xt=urn:btih:def".into(),
+            created: 1,
+            ..Default::default()
+        });
+        state.refresh_server(&settings, &mini);
+        let notifications = sync_until(&mut state, &mut settings, |_, settings| {
+            settings.remote.queued.is_empty()
+        });
+        assert_eq!(
+            notifications,
+            vec![(
+                "Queued downloads".to_owned(),
+                "Sent 1 queued download to Mac mini".to_owned()
+            )]
+        );
+    }
+
+    #[test]
+    fn only_a_failure_to_connect_counts_as_offline() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let http = http_client().unwrap();
+        let endpoint = |port: u16| Endpoint {
+            base: format!("http://127.0.0.1:{port}"),
+            token: TOKEN.into(),
+        };
+        let start = Command::FetchStart {
+            url: "https://example.com/watch".into(),
+        };
+        // Nothing listening: never sent.
+        let closed = TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let (_, delivery) = rt.block_on(run_command(&http, &endpoint(closed), &start));
+        assert_eq!(delivery, Delivery::Offline);
+        // A name that does not resolve: never sent.
+        let unresolved = Endpoint {
+            base: "http://no-such-host.invalid:1".into(),
+            token: TOKEN.into(),
+        };
+        let (_, delivery) = rt.block_on(run_command(&http, &unresolved, &start));
+        assert_eq!(delivery, Delivery::Offline);
+        // Accepted, read, and closed without an answer: unknown.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let silent = listener.local_addr().unwrap().port();
+        thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(stream) = stream else { continue };
+                let mut reader = BufReader::new(stream);
+                let mut line = String::new();
+                while reader.read_line(&mut line).is_ok_and(|n| n > 2) {
+                    line.clear();
+                }
+            }
+        });
+        let (result, delivery) = rt.block_on(run_command(&http, &endpoint(silent), &start));
+        assert_eq!(delivery, Delivery::Unknown);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn the_same_queued_download_is_kept_once() {
+        let entry = |input: &str, created| QueuedCommand {
+            server: "mini".into(),
+            input: input.into(),
+            files: vec![1],
+            link: false,
+            created,
+        };
+        assert!(same_queued(&entry("a", 1), &entry("a", 2)));
+        assert!(!same_queued(&entry("a", 1), &entry("b", 1)));
+        let mut link = entry("a", 1);
+        link.link = true;
+        assert!(!same_queued(&entry("a", 1), &link));
+        assert_eq!(
+            maybe_taken_message(" "),
+            "The server may have taken it; check its Downloads."
+        );
+    }
+
+    #[test]
+    fn listings_bring_wake_targets_and_newer_positions_into_settings() {
+        let listing = Arc::new(std::sync::Mutex::new(Library {
+            hardware: Some(Hardware {
+                mac: vec!["aa:bb:cc:dd:ee:ff".into()],
+                lan_ips: vec!["192.168.1.20".into()],
+            }),
+            videos: vec![Video {
+                id: "v0".into(),
+                title: "Sintel".into(),
+                duration: 600.,
+                complete: true,
+                resume: Some(Progress {
+                    position: 120.,
+                    duration: 600.,
+                    finished: false,
+                    updated: 4_000_000_000,
+                    revision: 0,
+                }),
+                ..Default::default()
+            }],
+            ..library(0)
+        }));
+        let served = listing.clone();
+        let port = loopback_server(move |_, path| {
+            if path == protocol::paths::library() {
+                let body = serde_json::to_vec(&*served.lock().unwrap()).unwrap();
+                (200, "application/json", body)
+            } else {
+                (404, "application/json", error_body("gone"))
+            }
+        });
+        let data = tempfile::tempdir().unwrap();
+        let mut state = RemoteState::with_data_dir(data.path());
+        let mut settings = Settings::default();
+        let id = state
+            .add_pairing(
+                &mut settings,
+                &format!("flick-remote://127.0.0.1:{port}/#{TOKEN}"),
+            )
+            .unwrap();
+        settings.remember_remote(&id, "v0", "Old", 30., 600.);
+        // Saved here ten minutes ago; the server's far-future time counts
+        // as a minute from now, which is newer by more than the window.
+        settings.remote.progress[0].updated -= 600;
+        let mut changed = false;
+        sync_until(&mut state, &mut settings, |state, settings| {
+            changed |= state.inner.borrow().arrived.is_empty()
+                && settings.remote.servers[0].wake.is_some();
+            changed
+        });
+        assert_eq!(
+            settings.remote.servers[0].wake,
+            Some(WakeTarget {
+                mac: vec!["aa:bb:cc:dd:ee:ff".into()],
+                lan_ips: vec!["192.168.1.20".into()],
+            })
+        );
+        // The server's position is newer than the one saved here.
+        assert_eq!(settings.remote_resume_position(&id, "v0"), 120.);
+        assert_eq!(settings.remote_progress(&id, "v0").unwrap().title, "Sintel");
+
+        // A listing without hardware clears the target; an older position
+        // leaves the newer one saved here.
+        {
+            let mut listing = listing.lock().unwrap();
+            listing.hardware = None;
+            listing.videos[0].resume.as_mut().unwrap().updated = 1;
+            listing.videos[0].resume.as_mut().unwrap().position = 500.;
+        }
+        settings.remember_remote(&id, "v0", "Sintel", 200., 600.);
+        state.refresh_server(&settings, &id);
+        sync_until(&mut state, &mut settings, |_, settings| {
+            settings.remote.servers[0].wake.is_none()
+        });
+        assert_eq!(settings.remote_resume_position(&id, "v0"), 200.);
     }
 }

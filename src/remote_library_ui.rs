@@ -13,6 +13,9 @@ use super::{
 use crate::remote_client::{
     Command, MachineTransfers, Outcome, Ready, ServerView, Sheet, Status, SubtitleRef,
 };
+use crate::remote_discovery::{DiscoveryEvent, FoundFlick};
+use crate::remote_keep::{KeepEvent, KeepProgress, KeepRequest};
+use crate::store::remote::{KeptCopy, QueuedCommand, RemoteServer, WakeTarget};
 use flick::library::format_bytes;
 use flick::remote::protocol::{Library, Progress, TransferPhase, TransferRow, Video};
 use gpui::{AnyElement, FontWeight};
@@ -43,6 +46,12 @@ pub(super) struct RemoteUiState {
     pub(super) checking: Option<PendingPlayback>,
     /// Save to pickers, sheets for other machines, and remote deletions.
     pub(super) save_to: SaveToUi,
+    /// Finding Flicks, pairing by code, and Wake results.
+    pub(super) discovery: DiscoveryUi,
+    /// A remote card's open context menu.
+    pub(super) menu: Option<RemoteCardMenu>,
+    /// Copies to this computer that failed, until dismissed or retried.
+    pub(super) keep_failed: Vec<KeepFailure>,
 }
 
 /// Downloads to another machine: the sheets' state while they are open.
@@ -79,6 +88,16 @@ pub(super) struct RemoteTorrent {
     pub(super) selected: HashSet<usize>,
     /// Download Selected was pressed and the server has not answered.
     pub(super) starting: bool,
+    /// The server did not answer the resolve: the question offering to
+    /// queue the download with every file.
+    pub(super) asleep: Option<String>,
+}
+
+impl RemoteTorrent {
+    /// Its resolve is still on the server.
+    fn resolving(&self) -> bool {
+        self.info.is_none() && self.asleep.is_none()
+    }
 }
 
 /// A pasted video page link waiting for Save to.
@@ -381,6 +400,1037 @@ struct Card<'a> {
     badge: Option<&'static str>,
 }
 
+/// Shown under Add Server and on onboarding step one while a code is typed.
+pub(super) const CODE_HINT: &str = "Ask the owner for a code: open one from its Settings → Remote Libraries, or run flick-serve pair-code on that machine.";
+
+/// The discovery list after a pass that found nothing.
+pub(super) const NO_FLICKS: &str = "No Flicks found. Tailscale must be running on this computer, and the other Flick must be sharing its library on Tailscale.";
+
+/// Wake's tooltip and the note beside its result.
+const WAKE_NOTE: &str = "Wake works only from the same network as the sleeping machine.";
+
+/// Finding Flicks and pairing by code, for Add Server and onboarding step
+/// one. Only one of them is on screen at a time, so they share this.
+#[derive(Default)]
+pub(super) struct DiscoveryUi {
+    /// The last pass's answer; None before the first one ends.
+    pub(super) found: Option<Vec<FoundFlick>>,
+    /// The found Flick whose code is being typed.
+    pub(super) code: Option<CodeEntry>,
+    /// The last wake result per server id.
+    pub(super) woke: HashMap<String, Result<(), String>>,
+}
+
+/// The six-digit code field for one found Flick.
+pub(super) struct CodeEntry {
+    /// The address discovery reached it on.
+    pub(super) host: String,
+    pub(super) port: u16,
+    pub(super) name: String,
+    pub(super) field: Entity<TextInput>,
+    /// Sent and not answered yet.
+    pub(super) sending: bool,
+    /// The server's message when it refused the code.
+    pub(super) error: Option<String>,
+}
+
+/// A found Flick as the list shows it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct FoundRow {
+    pub(super) name: String,
+    /// The MagicDNS host, shown under the name.
+    pub(super) host: String,
+    /// The address pairing goes to.
+    pub(super) address: String,
+    pub(super) port: u16,
+    /// Already paired at this address; no Pair button.
+    pub(super) paired: bool,
+    /// The server has a code on screen now.
+    pub(super) code_open: bool,
+}
+
+/// The rows of the discovery list: each answering Flick with its name, and
+/// whether it is already paired (by address or MagicDNS name).
+pub(super) fn found_rows(found: &[FoundFlick], servers: &[RemoteServer]) -> Vec<FoundRow> {
+    let port = flick::remote::protocol::DEFAULT_PORT;
+    found
+        .iter()
+        .map(|flick| {
+            let address = flick.peer.ip.to_string();
+            let paired = servers.iter().any(|server| {
+                server.port == port
+                    && (server.host.eq_ignore_ascii_case(&address)
+                        || server.host.eq_ignore_ascii_case(&flick.peer.host)
+                        || server
+                            .host
+                            .split('.')
+                            .next()
+                            .is_some_and(|label| label.eq_ignore_ascii_case(&flick.peer.host)))
+            });
+            let name = flick.hello.server_name.trim();
+            FoundRow {
+                name: if name.is_empty() {
+                    flick.peer.host.clone()
+                } else {
+                    name.to_owned()
+                },
+                host: flick.peer.host.clone(),
+                address,
+                port,
+                paired,
+                code_open: flick.hello.pairing_open,
+            }
+        })
+        .collect()
+}
+
+/// What the discovery list says above its rows, if anything.
+pub(super) fn discovery_note(
+    discovering: bool,
+    found: Option<&[FoundFlick]>,
+) -> Option<&'static str> {
+    match (discovering, found) {
+        (true, _) => Some("Looking for Flicks on your Tailscale network…"),
+        (false, Some([])) => Some(NO_FLICKS),
+        _ => None,
+    }
+}
+
+/// Six digits, ignoring the spaces and dashes a person may type.
+pub(super) fn code_ready(text: &str) -> bool {
+    let digits = text
+        .chars()
+        .filter(|c| !c.is_whitespace() && *c != '-')
+        .collect::<Vec<_>>();
+    digits.len() == 6 && digits.iter().all(char::is_ascii_digit)
+}
+
+/// Where Wake sends its packet: only for a server that does not answer and
+/// told us its hardware addresses while it was online.
+pub(super) fn wake_target<'a>(server: &'a RemoteServer, status: &Status) -> Option<&'a WakeTarget> {
+    server
+        .wake
+        .as_ref()
+        .filter(|wake| *status == Status::Offline && !wake.mac.is_empty())
+}
+
+/// The line under an offline server after Wake was pressed.
+pub(super) fn wake_message(result: &Result<(), String>) -> String {
+    match result {
+        Ok(()) => "Wake packet sent; give it a minute.".to_owned(),
+        Err(message) => format!("Could not wake it: {} {WAKE_NOTE}", sentence(message)),
+    }
+}
+
+/// "Keep on this Mac", named like the Save to picker names this machine.
+pub(super) fn keep_label() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "Keep on this Mac"
+    } else if cfg!(windows) {
+        "Keep on this PC"
+    } else {
+        "Keep on this computer"
+    }
+}
+
+/// The Downloads section of copies kept here.
+pub(super) fn kept_section_title() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "Copies to this Mac"
+    } else if cfg!(windows) {
+        "Copies to this PC"
+    } else {
+        "Copies to this computer"
+    }
+}
+
+/// The mark on a remote card whose video is kept here.
+pub(super) fn kept_here_badge() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "On this Mac"
+    } else if cfg!(windows) {
+        "On this PC"
+    } else {
+        "On this computer"
+    }
+}
+
+/// The copy of this remote video kept here, if any.
+pub(super) fn kept_copy<'a>(
+    kept: &'a [KeptCopy],
+    server: &str,
+    video: &str,
+) -> Option<&'a KeptCopy> {
+    kept.iter()
+        .find(|copy| copy.server == server && copy.video == video)
+}
+
+/// The mark on a local card that is a kept copy: "Kept from Mac mini".
+pub(super) fn kept_from(
+    kept: &[KeptCopy],
+    servers: &[RemoteServer],
+    path: &Path,
+) -> Option<String> {
+    let copy = kept.iter().find(|copy| copy.path == path)?;
+    let name = servers
+        .iter()
+        .find(|server| server.id == copy.server)
+        .map_or("another Flick", |server| server.name.as_str());
+    Some(format!("Kept from {name}"))
+}
+
+/// Drops kept copies whose file has left the library, by Delete File… or
+/// Remove from Library. True when one was dropped.
+pub(super) fn prune_kept(kept: &mut Vec<KeptCopy>, in_library: impl Fn(&Path) -> bool) -> bool {
+    let before = kept.len();
+    kept.retain(|copy| in_library(&copy.path));
+    kept.len() != before
+}
+
+/// Where a remote video stands with this computer.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum KeepStatus {
+    NotKept,
+    Copying,
+    Kept(PathBuf),
+}
+
+/// One item of a remote card's menu.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum RemoteMenuItem {
+    Play,
+    Keep,
+    CancelCopy,
+    ShowCopy(PathBuf),
+    RemoveCopy(PathBuf),
+}
+
+impl RemoteMenuItem {
+    pub(super) fn icon(&self) -> &'static str {
+        match self {
+            Self::Play => "play",
+            Self::Keep => "download",
+            Self::CancelCopy | Self::RemoveCopy(_) => "x",
+            Self::ShowCopy(_) => "folder-open",
+        }
+    }
+
+    pub(super) fn label(&self) -> &'static str {
+        match self {
+            Self::Play => "Play",
+            Self::Keep => keep_label(),
+            Self::CancelCopy => "Cancel Copy",
+            Self::ShowCopy(_) => "Show Local Copy in Folder",
+            Self::RemoveCopy(_) => "Remove Local Copy…",
+        }
+    }
+}
+
+/// A remote card's menu. Keep needs the server to answer and the whole
+/// file on it; a kept video offers its copy instead.
+pub(super) fn remote_menu_items(status: &KeepStatus, can_copy: bool) -> Vec<RemoteMenuItem> {
+    let mut items = vec![RemoteMenuItem::Play];
+    match status {
+        KeepStatus::NotKept if can_copy => items.push(RemoteMenuItem::Keep),
+        KeepStatus::NotKept => {}
+        KeepStatus::Copying => items.push(RemoteMenuItem::CancelCopy),
+        KeepStatus::Kept(path) => {
+            items.push(RemoteMenuItem::ShowCopy(path.clone()));
+            items.push(RemoteMenuItem::RemoveCopy(path.clone()));
+        }
+    }
+    items
+}
+
+/// What "Keep on this Mac" fetches: the original file with the bearer
+/// header, into the app's download folder.
+pub(super) fn keep_request(
+    playback: &crate::remote_client::RemotePlayback,
+    file_name: &str,
+    download_dir: &Path,
+) -> KeepRequest {
+    KeepRequest {
+        server_id: playback.server_id.clone(),
+        server_name: playback.server_name.clone(),
+        video_id: playback.video_id.clone(),
+        file_name: file_name.to_owned(),
+        url: format!(
+            "{}{}",
+            playback.base_url,
+            flick::remote::protocol::paths::media(&playback.video_id)
+        ),
+        authorization: flick::remote::protocol::bearer(&playback.token),
+        download_dir: download_dir.to_owned(),
+    }
+}
+
+/// A copy row's detail: bytes so far, size, and speed.
+pub(super) fn keep_detail(progress: &KeepProgress, server_name: &str) -> String {
+    if progress.downloaded == 0 && progress.bytes_per_second == 0 {
+        return format!("From {server_name} · waiting to start");
+    }
+    let mut text = format!("From {server_name} · {}", format_bytes(progress.downloaded));
+    if let Some(total) = progress.total.filter(|total| *total > 0) {
+        let percent = (progress.downloaded as f64 / total as f64 * 100.).clamp(0., 100.);
+        text = format!(
+            "From {server_name} · {} of {} ({percent:.0}%)",
+            format_bytes(progress.downloaded),
+            format_bytes(total)
+        );
+    }
+    if progress.bytes_per_second > 0 {
+        text.push_str(&format!(" · {}/s", format_bytes(progress.bytes_per_second)));
+    }
+    text
+}
+
+/// A queued command's title: the link, or the torrent's name when a magnet
+/// carries one.
+pub(super) fn queued_title(command: &QueuedCommand) -> String {
+    let input = command.input.trim();
+    if !command.link
+        && let Some(query) = input.strip_prefix("magnet:?")
+    {
+        let name = query
+            .split('&')
+            .find_map(|pair| pair.strip_prefix("dn="))
+            .map(|name| percent_decode(&name.replace('+', " ")))
+            .filter(|name| !name.trim().is_empty());
+        return name.unwrap_or_else(|| "Magnet link".to_owned());
+    }
+    input.to_owned()
+}
+
+/// A queued command's detail line under its server.
+pub(super) fn queued_detail(command: &QueuedCommand, server_name: &str) -> String {
+    let what = if command.link {
+        "Link download".to_owned()
+    } else if command.files.is_empty() {
+        "Download".to_owned()
+    } else if command.files.len() == 1 {
+        "Download · 1 file".to_owned()
+    } else {
+        format!("Download · {} files", command.files.len())
+    };
+    format!("{what} · Waiting for {server_name} to answer")
+}
+
+/// The queued commands for one server, in the order they were made.
+pub(super) fn queued_for<'a>(queued: &'a [QueuedCommand], server: &str) -> Vec<&'a QueuedCommand> {
+    queued
+        .iter()
+        .filter(|command| command.server == server)
+        .collect()
+}
+
+/// Removes the first queued command equal to `command`. True when found.
+pub(super) fn cancel_queued(queued: &mut Vec<QueuedCommand>, command: &QueuedCommand) -> bool {
+    match queued.iter().position(|entry| entry == command) {
+        Some(index) => {
+            queued.remove(index);
+            true
+        }
+        None => false,
+    }
+}
+
+fn percent_decode(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%'
+            && let Some(byte) = text
+                .get(index + 1..index + 3)
+                .and_then(|hex| u8::from_str_radix(hex, 16).ok())
+        {
+            out.push(byte);
+            index += 3;
+        } else {
+            out.push(bytes[index]);
+            index += 1;
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// A remote card's open context menu.
+pub(super) struct RemoteCardMenu {
+    pub(super) server: String,
+    pub(super) video: String,
+    pub(super) position: gpui::Point<Pixels>,
+}
+
+/// A copy that failed, kept in Downloads with its message until dismissed.
+#[derive(Clone, Debug, PartialEq)]
+pub(super) struct KeepFailure {
+    pub(super) server: String,
+    pub(super) video: String,
+    pub(super) message: String,
+}
+
+impl Flick {
+    /// Discovery, pairing-by-code, and wake results, drained on tick.
+    pub(crate) fn handle_discovery_events(
+        &mut self,
+        events: Vec<DiscoveryEvent>,
+        cx: &mut Context<Self>,
+    ) {
+        if events.is_empty() {
+            return;
+        }
+        for event in events {
+            match event {
+                DiscoveryEvent::Found(found) => self.remote_ui.discovery.found = Some(found),
+                DiscoveryEvent::Paired { host, port, result } => {
+                    // An answer after the field was closed pairs nothing.
+                    let waiting = self.remote_ui.discovery.code.as_ref().is_some_and(|entry| {
+                        entry.sending && entry.host == host && entry.port == port
+                    });
+                    if !waiting {
+                        continue;
+                    }
+                    // The pairing was checked to name `host:port`; a code
+                    // never replaces the token of a server already paired.
+                    let added = result.and_then(|pairing| {
+                        self.remote.add_code_pairing(&mut self.store.data, &pairing)
+                    });
+                    match added {
+                        Ok(id) => {
+                            // Closing the fields drops the code from the UI.
+                            self.remote_ui.discovery.code = None;
+                            self.remote.fields.pairing = None;
+                            self.remote.fields.pairing_error = None;
+                            if self.view == View::Onboarding {
+                                self.onboarding_paired(id);
+                            }
+                            self.persist();
+                        }
+                        Err(message) => {
+                            if let Some(entry) = self.remote_ui.discovery.code.as_mut() {
+                                entry.sending = false;
+                                entry.error = Some(sentence(&message));
+                            }
+                        }
+                    }
+                }
+                DiscoveryEvent::Woke { server_id, result } => {
+                    self.remote_ui.discovery.woke.insert(server_id, result);
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    /// Progress and completion of copies kept on this computer, drained on
+    /// tick. Also drops kept copies whose file has left the library.
+    pub(crate) fn handle_keep_events(&mut self, events: Vec<KeepEvent>, cx: &mut Context<Self>) {
+        let data = &mut self.store.data;
+        if !data.remote.kept.is_empty() {
+            let mut kept = std::mem::take(&mut data.remote.kept);
+            let pruned = prune_kept(&mut kept, |path| data.video(path).is_some());
+            data.remote.kept = kept;
+            if pruned {
+                self.persist();
+                cx.notify();
+            }
+        }
+        if events.is_empty() {
+            return;
+        }
+        for event in events {
+            match event {
+                KeepEvent::Progress(_) => {}
+                KeepEvent::Done {
+                    server_id,
+                    video_id,
+                    path,
+                } => self.kept_copy_done(server_id, video_id, path, cx),
+                KeepEvent::Failed {
+                    server_id,
+                    video_id,
+                    message,
+                } => {
+                    let failures = &mut self.remote_ui.keep_failed;
+                    failures.retain(|f| !(f.server == server_id && f.video == video_id));
+                    failures.push(KeepFailure {
+                        server: server_id,
+                        video: video_id,
+                        message: sentence(&message),
+                    });
+                }
+                KeepEvent::Cancelled {
+                    server_id,
+                    video_id,
+                } => self
+                    .remote_ui
+                    .keep_failed
+                    .retain(|f| !(f.server == server_id && f.video == video_id)),
+            }
+        }
+        cx.notify();
+    }
+
+    /// A finished copy joins the library like an imported file and is
+    /// recorded as kept from its server.
+    fn kept_copy_done(
+        &mut self,
+        server: String,
+        video: String,
+        path: PathBuf,
+        cx: &mut Context<Self>,
+    ) {
+        let path = flick::library::canonical_video(&path).unwrap_or(path);
+        self.remote_ui
+            .keep_failed
+            .retain(|f| !(f.server == server && f.video == video));
+        self.library_files_restored([&path]);
+        self.store.data.restore_videos([path.clone()]);
+        let kept = &mut self.store.data.remote.kept;
+        kept.retain(|copy| !(copy.server == server && copy.video == video));
+        kept.push(KeptCopy {
+            server,
+            video,
+            path,
+        });
+        self.library_changed(cx);
+        self.persist();
+    }
+
+    /// Where this remote video stands with this computer.
+    pub(super) fn keep_status(&self, server: &str, video: &str) -> KeepStatus {
+        if let Some(copy) = kept_copy(&self.store.data.remote.kept, server, video) {
+            return KeepStatus::Kept(copy.path.clone());
+        }
+        if self
+            .keep
+            .in_progress()
+            .iter()
+            .any(|p| p.server_id == server && p.video_id == video)
+        {
+            return KeepStatus::Copying;
+        }
+        KeepStatus::NotKept
+    }
+
+    /// "Keep on this Mac": copies the original file into the download folder.
+    pub(super) fn keep_remote_video(&mut self, server: &str, video: &str, cx: &mut Context<Self>) {
+        let Some(playback) = self.remote.playback(&self.store.data, server, video) else {
+            self.remote_ui.notice = Some("That library no longer lists this video.".into());
+            cx.notify();
+            return;
+        };
+        let file_name = self
+            .remote_server(server)
+            .and_then(|view| {
+                view.listing
+                    .as_ref()
+                    .and_then(|listing| listing.videos.iter().find(|v| v.id == video))
+                    .map(|v| v.file_name.clone())
+            })
+            .filter(|name| !name.trim().is_empty())
+            .unwrap_or_else(|| playback.title.clone());
+        self.remote_ui
+            .keep_failed
+            .retain(|f| !(f.server == server && f.video == video));
+        self.keep
+            .keep(keep_request(&playback, &file_name, &self.download_folder));
+        cx.notify();
+    }
+
+    /// Opens a remote card's context menu at a window position.
+    fn open_remote_card_menu(
+        &mut self,
+        server: String,
+        video: String,
+        position: gpui::Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.card_menu = None;
+        self.remote_ui.menu = Some(RemoteCardMenu {
+            server,
+            video,
+            position,
+        });
+        // Focus the first item so Escape reaches the menu.
+        self.control_handle(&ElementId::from(("card-menu", 0usize)), cx)
+            .focus(window);
+        cx.notify();
+    }
+
+    /// The open remote card's menu items, each with its action.
+    pub(super) fn remote_card_menu_items(
+        &self,
+    ) -> Option<(gpui::Point<Pixels>, Vec<super::library_ui::MenuItem>)> {
+        let menu = self.remote_ui.menu.as_ref()?;
+        let server = self.remote_server(&menu.server);
+        let complete = server
+            .as_ref()
+            .and_then(|s| s.listing.as_ref())
+            .and_then(|listing| listing.videos.iter().find(|v| v.id == menu.video))
+            .is_some_and(|video| video.complete);
+        let online = server.as_ref().is_some_and(|s| !unreachable(&s.status));
+        let status = self.keep_status(&menu.server, &menu.video);
+        let items = remote_menu_items(&status, online && complete)
+            .into_iter()
+            .map(|item| {
+                let (server, video) = (menu.server.clone(), menu.video.clone());
+                let (icon, label) = (item.icon(), SharedString::from(item.label()));
+                let action: Rc<super::library_ui::MenuAction> = match item {
+                    RemoteMenuItem::Play => {
+                        Rc::new(move |this, w, cx| this.open_remote_video(&server, &video, w, cx))
+                    }
+                    RemoteMenuItem::Keep => {
+                        Rc::new(move |this, _, cx| this.keep_remote_video(&server, &video, cx))
+                    }
+                    RemoteMenuItem::CancelCopy => {
+                        Rc::new(move |this, _, _| this.keep.cancel(&server, &video))
+                    }
+                    RemoteMenuItem::ShowCopy(path) => {
+                        Rc::new(move |_, _, cx| cx.reveal_path(&path))
+                    }
+                    RemoteMenuItem::RemoveCopy(path) => {
+                        Rc::new(move |this, w, cx| this.request_delete_video(path.clone(), w, cx))
+                    }
+                };
+                (icon, label, action)
+            })
+            .collect();
+        Some((menu.position, items))
+    }
+
+    /// Wake for an offline server that told us its hardware addresses.
+    pub(super) fn wake_button(
+        &self,
+        id: impl Into<ElementId>,
+        server: &RemoteServer,
+        status: &Status,
+        cx: &Context<Self>,
+    ) -> Option<Stateful<Div>> {
+        let wake = wake_target(server, status)?.clone();
+        let server_id = server.id.clone();
+        Some(
+            self.button(id, Some("sun"), "Wake", false, cx, move |this, _, cx| {
+                this.remote_ui.discovery.woke.remove(&server_id);
+                this.discovery
+                    .wake(&server_id, wake.mac.clone(), wake.lan_ips.clone());
+                cx.notify();
+            }),
+        )
+    }
+
+    /// The paired server's settings, for Wake.
+    pub(super) fn saved_server(&self, id: &str) -> Option<&RemoteServer> {
+        self.store
+            .data
+            .remote
+            .servers
+            .iter()
+            .find(|server| server.id == id)
+    }
+
+    /// The line after Wake was pressed for this server, while it is offline.
+    pub(super) fn wake_line(&self, server_id: &str, status: &Status) -> Option<String> {
+        if status.is_online() {
+            return None;
+        }
+        self.remote_ui
+            .discovery
+            .woke
+            .get(server_id)
+            .map(wake_message)
+    }
+
+    /// Starts a discovery pass for Add Server or onboarding.
+    pub(super) fn start_discovery(&mut self, cx: &mut Context<Self>) {
+        self.discovery.discover();
+        cx.notify();
+    }
+
+    /// Opens the code field for a found Flick and focuses it.
+    pub(super) fn open_code_field(
+        &mut self,
+        row: &FoundRow,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let field = cx.new(|cx| TextInput::with_placeholder(cx, "Six-digit code"));
+        cx.subscribe(&field, |this, _, event, cx| {
+            match event {
+                InputEvent::Changed => {
+                    if let Some(entry) = this.remote_ui.discovery.code.as_mut() {
+                        entry.error = None;
+                    }
+                }
+                InputEvent::Submit => this.submit_code(cx),
+            }
+            cx.notify();
+        })
+        .detach();
+        field.focus_handle(cx).focus(window);
+        self.remote_ui.discovery.code = Some(CodeEntry {
+            host: row.address.clone(),
+            port: row.port,
+            name: row.name.clone(),
+            field,
+            sending: false,
+            error: None,
+        });
+        cx.notify();
+    }
+
+    /// Sends the typed code to the found Flick.
+    pub(super) fn submit_code(&mut self, cx: &mut Context<Self>) {
+        let Some(entry) = self.remote_ui.discovery.code.as_mut() else {
+            return;
+        };
+        if entry.sending {
+            return;
+        }
+        let code = entry.field.read(cx).value().to_owned();
+        if !code_ready(&code) {
+            entry.error = Some("A pairing code is six digits.".into());
+            cx.notify();
+            return;
+        }
+        entry.sending = true;
+        entry.error = None;
+        let (host, port) = (entry.host.clone(), entry.port);
+        self.discovery.pair_by_code(&host, port, &code);
+        cx.notify();
+    }
+
+    /// "Find on my Tailscale network": a spinner while looking, each found
+    /// Flick with Pair, the code field under the one being paired, and a
+    /// note when nothing answered.
+    pub(super) fn discovery_list(&self, cx: &Context<Self>) -> Div {
+        let t = cx.theme().clone();
+        let discovering = self.discovery.discovering();
+        let found = self.remote_ui.discovery.found.as_deref();
+        let rows = found_rows(found.unwrap_or_default(), &self.store.data.remote.servers);
+        let mut list = v_flex().gap_1().child(
+            h_flex()
+                .gap_2()
+                .items_center()
+                .child(
+                    div()
+                        .flex_1()
+                        .font_weight(FontWeight::MEDIUM)
+                        .child("Find on my Tailscale network"),
+                )
+                .child(if discovering {
+                    h_flex()
+                        .gap_1p5()
+                        .text_size(t.font(12.))
+                        .text_color(t.muted)
+                        .child(spinner(&t))
+                        .child("Searching…")
+                        .into_any_element()
+                } else {
+                    self.button(
+                        "remote-discover",
+                        Some("rotate-cw"),
+                        if found.is_some() {
+                            "Search Again"
+                        } else {
+                            "Search"
+                        },
+                        false,
+                        cx,
+                        |this, _, cx| this.start_discovery(cx),
+                    )
+                    .into_any_element()
+                }),
+        );
+        if let Some(note) = discovery_note(discovering, found) {
+            list = list.child(div().text_size(t.font(12.)).text_color(t.muted).child(note));
+        }
+        let entry = self.remote_ui.discovery.code.as_ref();
+        for (index, row) in rows.into_iter().enumerate() {
+            let pairing_this = entry.is_some_and(|e| e.host == row.address && e.port == row.port);
+            let detail = if row.code_open && !row.paired {
+                format!("{} · {} · showing a pairing code", row.host, row.address)
+            } else {
+                format!("{} · {}", row.host, row.address)
+            };
+            let trailing = if row.paired {
+                div()
+                    .text_size(t.font(12.))
+                    .text_color(t.muted)
+                    .child("Paired")
+                    .into_any_element()
+            } else if pairing_this {
+                div().into_any_element()
+            } else {
+                let found = row.clone();
+                self.button(
+                    ("remote-found-pair", index),
+                    Some("plus"),
+                    "Pair",
+                    false,
+                    cx,
+                    move |this, window, cx| this.open_code_field(&found, window, cx),
+                )
+                .into_any_element()
+            };
+            list = list.child(row_line(&t, &row.name, detail, trailing));
+            if pairing_this && let Some(entry) = entry {
+                list = list.child(self.code_entry(entry, cx));
+            }
+        }
+        list
+    }
+
+    fn code_entry(&self, entry: &CodeEntry, cx: &Context<Self>) -> Div {
+        let t = cx.theme().clone();
+        v_flex()
+            .gap_1()
+            .pl_3()
+            .child(
+                h_flex()
+                    .gap_2()
+                    .child(div().w(px(140.)).child(self.text_field(&entry.field, cx)))
+                    .child(self.button(
+                        "remote-code-pair",
+                        Some("plus"),
+                        if entry.sending { "Pairing…" } else { "Pair" },
+                        true,
+                        cx,
+                        |this, _, cx| this.submit_code(cx),
+                    ))
+                    .child(self.icon_button(
+                        "remote-code-cancel",
+                        "x",
+                        "Cancel",
+                        cx,
+                        |this, _, cx| {
+                            this.remote_ui.discovery.code = None;
+                            cx.notify();
+                        },
+                    )),
+            )
+            .child(
+                div()
+                    .text_size(t.font(12.))
+                    .text_color(t.muted)
+                    .child(format!("Pairing with {}. {CODE_HINT}", entry.name)),
+            )
+            .when_some(entry.error.clone(), |d, error| {
+                d.child(
+                    div()
+                        .text_size(t.font(12.))
+                        .text_color(t.danger)
+                        .child(error),
+                )
+            })
+    }
+
+    /// Downloads: copies to this computer in progress and those that failed.
+    pub(super) fn kept_rows(&self, cx: &Context<Self>) -> Option<Div> {
+        let progress = self.keep.in_progress();
+        let failed = &self.remote_ui.keep_failed;
+        if progress.is_empty() && failed.is_empty() {
+            return None;
+        }
+        let t = cx.theme().clone();
+        let mut rows = Vec::new();
+        for (index, copy) in progress.iter().enumerate() {
+            let name = self.machine_name(&copy.server_id);
+            let (server, video) = (copy.server_id.clone(), copy.video_id.clone());
+            let fraction = copy
+                .total
+                .filter(|total| *total > 0)
+                .map(|total| (copy.downloaded as f32 / total as f32).clamp(0., 1.));
+            rows.push(
+                v_flex()
+                    .child(row(
+                        &t,
+                        Some("download"),
+                        self.remote_video_title(&copy.server_id, &copy.video_id),
+                        Some(keep_detail(copy, &name).into()),
+                        self.button(
+                            ("keep-cancel", index),
+                            None,
+                            "Cancel",
+                            false,
+                            cx,
+                            move |this, _, cx| {
+                                this.keep.cancel(&server, &video);
+                                cx.notify();
+                            },
+                        ),
+                    ))
+                    .when_some(fraction, |d, fraction| {
+                        d.child(
+                            div().px_3().pb_2().child(
+                                div().h(px(4.)).rounded_full().bg(t.control).child(
+                                    div()
+                                        .h_full()
+                                        .w(relative(fraction))
+                                        .rounded_full()
+                                        .bg(t.accent),
+                                ),
+                            ),
+                        )
+                    })
+                    .into_any_element(),
+            );
+        }
+        for (index, failure) in failed.iter().enumerate() {
+            let name = self.machine_name(&failure.server);
+            let (server, video) = (failure.server.clone(), failure.video.clone());
+            let retry = (server.clone(), video.clone());
+            rows.push(
+                row(
+                    &t,
+                    Some("info"),
+                    self.remote_video_title(&failure.server, &failure.video),
+                    Some(format!("From {name} · {}", failure.message).into()),
+                    h_flex()
+                        .gap_2()
+                        .child(self.button(
+                            ("keep-retry", index),
+                            Some("rotate-cw"),
+                            "Retry",
+                            false,
+                            cx,
+                            move |this, _, cx| this.keep_remote_video(&retry.0, &retry.1, cx),
+                        ))
+                        .child(self.icon_button(
+                            ("keep-dismiss", index),
+                            "x",
+                            "Dismiss",
+                            cx,
+                            move |this, _, cx| {
+                                this.remote_ui
+                                    .keep_failed
+                                    .retain(|f| !(f.server == server && f.video == video));
+                                cx.notify();
+                            },
+                        )),
+                )
+                .into_any_element(),
+            );
+        }
+        Some(
+            v_flex()
+                .mt_4()
+                .child(section_title(&t, kept_section_title()))
+                .child(super::chrome_ui::group(&t, rows)),
+        )
+    }
+
+    /// A remote video's title from its server's listing.
+    fn remote_video_title(&self, server: &str, video: &str) -> String {
+        self.remote_server(server)
+            .and_then(|view| {
+                view.listing.as_ref().and_then(|listing| {
+                    listing
+                        .videos
+                        .iter()
+                        .find(|v| v.id == video)
+                        .map(|v| display_title(v).to_owned())
+                })
+            })
+            .unwrap_or_else(|| "A video".to_owned())
+    }
+
+    /// Downloads rows for commands waiting for this server to answer.
+    fn queued_rows(&self, server_id: &str, name: &str, cx: &Context<Self>) -> Vec<AnyElement> {
+        let t = cx.theme().clone();
+        queued_for(&self.store.data.remote.queued, server_id)
+            .into_iter()
+            .map(|command| {
+                let key = gpui::hash(&(
+                    &command.server,
+                    &command.input,
+                    command.created,
+                    command.link,
+                ));
+                let cancel = command.clone();
+                row(
+                    &t,
+                    Some(if command.link { "download" } else { "magnet" }),
+                    queued_title(command),
+                    Some(queued_detail(command, name).into()),
+                    self.button(
+                        SharedString::from(format!("queued-cancel-{key}")),
+                        None,
+                        "Cancel",
+                        false,
+                        cx,
+                        move |this, _, cx| {
+                            if cancel_queued(&mut this.store.data.remote.queued, &cancel) {
+                                this.persist();
+                            }
+                            cx.notify();
+                        },
+                    ),
+                )
+                .into_any_element()
+            })
+            .collect()
+    }
+}
+
+/// A turning arrow while discovery runs; still with reduced motion.
+fn spinner(t: &Theme) -> AnyElement {
+    use gpui::{Animation, AnimationExt, Transformation, percentage};
+    let arrow = icon("rotate-cw", 14., t.muted);
+    if t.reduce_motion {
+        return arrow.into_any_element();
+    }
+    arrow
+        .with_animation(
+            "discovery-spinner",
+            Animation::new(Duration::from_secs(1)).repeat(),
+            |arrow, delta| arrow.with_transformation(Transformation::rotate(percentage(delta))),
+        )
+        .into_any_element()
+}
+
+/// A small label in a poster's top corner; place it with `.left` or `.right`.
+pub(super) fn corner_badge(t: &Theme, text: impl Into<SharedString>) -> Div {
+    div()
+        .absolute()
+        .top(px(6.))
+        .px_1p5()
+        .rounded(px(4.))
+        .bg(rgba(0x000000b3))
+        .text_color(rgb(0xffffff))
+        .text_size(t.font(10.5))
+        .font_weight(FontWeight::SEMIBOLD)
+        .child(text.into())
+}
+
+/// A list line with a title, a muted detail, and a trailing control.
+fn row_line(t: &Theme, title: &str, detail: String, trailing: AnyElement) -> Div {
+    h_flex()
+        .gap_3()
+        .py_1()
+        .child(
+            v_flex()
+                .flex_1()
+                .min_w(px(0.))
+                .child(
+                    div()
+                        .overflow_hidden()
+                        .whitespace_nowrap()
+                        .child(title.to_owned()),
+                )
+                .child(
+                    div()
+                        .text_size(t.font(12.))
+                        .text_color(t.muted)
+                        .overflow_hidden()
+                        .whitespace_nowrap()
+                        .child(detail),
+                ),
+        )
+        .child(trailing)
+}
+
 impl Flick {
     /// The paired server with this id, with its status and listing.
     pub(super) fn remote_server(&self, id: &str) -> Option<ServerView> {
@@ -560,8 +1610,20 @@ impl Flick {
                         .child(server.summary()),
                 )
                 .child(div().flex_1());
+            let wake = self.saved_server(&server.id).and_then(|saved| {
+                self.wake_button(
+                    SharedString::from(format!("remote-wake:{}", server.id)),
+                    saved,
+                    &server.status,
+                    cx,
+                )
+            });
+            let woke = self.wake_line(&server.id, &server.status);
             let id = server.id.clone();
             if unreachable(&server.status) && server.listing.is_some() {
+                if let Some(wake) = wake {
+                    header = header.child(wake.mb_2());
+                }
                 header = header.child(
                     self.button(
                         SharedString::from(format!("remote-retry:{id}")),
@@ -604,20 +1666,41 @@ impl Flick {
                 );
             }
             let mut section = v_flex().w_full().mt(px(28.)).child(header);
+            if let Some(woke) = &woke {
+                section = section.child(
+                    div()
+                        .px_1()
+                        .mb_2()
+                        .text_size(t.font(12.))
+                        .text_color(t.muted)
+                        .child(woke.clone()),
+                );
+            }
             if server.listing.is_none() {
                 let id = server.id.clone();
-                section =
-                    section.child(notice(&t, false, server.status.label()).child(self.button(
-                        SharedString::from(format!("remote-retry:{id}")),
-                        Some("rotate-cw"),
-                        "Retry",
-                        false,
+                let wake = self.saved_server(&server.id).and_then(|saved| {
+                    self.wake_button(
+                        SharedString::from(format!("remote-wake-offline:{}", server.id)),
+                        saved,
+                        &server.status,
                         cx,
-                        move |this, _, cx| {
-                            this.remote.refresh_server(&this.store.data, &id);
-                            cx.notify();
-                        },
-                    )));
+                    )
+                });
+                section = section.child(
+                    notice(&t, false, server.status.label())
+                        .children(wake)
+                        .child(self.button(
+                            SharedString::from(format!("remote-retry:{id}")),
+                            Some("rotate-cw"),
+                            "Retry",
+                            false,
+                            cx,
+                            move |this, _, cx| {
+                                this.remote.refresh_server(&this.store.data, &id);
+                                cx.notify();
+                            },
+                        )),
+                );
                 sections.push(section);
                 continue;
             }
@@ -703,6 +1786,14 @@ impl Flick {
             gpui::hash(&(card.kind, card.server, card.video))
         ));
         let (server, video) = (card.server.to_owned(), card.video.to_owned());
+        let kept = match self.keep_status(card.server, card.video) {
+            KeepStatus::Kept(_) => Some(kept_here_badge()),
+            KeepStatus::Copying => Some("Copying…"),
+            KeepStatus::NotKept => None,
+        };
+        let focused_card = self
+            .keyboard_focused(&id, cx)
+            .then(|| self.focused_card.clone());
         let poster = match self.remote.poster(card.server, card.video) {
             Some(image) => div()
                 .flex_none()
@@ -729,6 +1820,9 @@ impl Flick {
                     .relative()
                     .border_1()
                     .border_color(t.border)
+                    .when_some(kept.filter(|_| width >= 120.), |d, kept| {
+                        d.child(corner_badge(t, kept).left(px(6.)))
+                    })
                     .when_some(card.badge.filter(|_| width >= 120.), |d, badge| {
                         d.child(
                             div()
@@ -800,10 +1894,53 @@ impl Flick {
                     .overflow_hidden()
                     .whitespace_nowrap()
                     .child(card.detail),
-            );
+            )
+            .when_some(focused_card, |d, cell| {
+                d.child(
+                    canvas(move |bounds, _, _| cell.set(bounds), |_, _, _, _| {})
+                        .absolute()
+                        .size_full(),
+                )
+            });
+        let el = self.with_remote_card_menu(el, card.server, card.video, cx);
         let el = self.with_remote_grid_keys(el, (grid.to_owned(), index), (cols, count), cx);
         self.focusable(el, &id, None, t.card_radius, (0., 0.), cx)
             .into_any_element()
+    }
+
+    /// Right-click, Shift+F10, or the Menu key open a remote card's menu.
+    fn with_remote_card_menu(
+        &self,
+        el: Stateful<Div>,
+        server: &str,
+        video: &str,
+        cx: &Context<Self>,
+    ) -> Stateful<Div> {
+        let (server, video) = (server.to_owned(), video.to_owned());
+        let (key_server, key_video) = (server.clone(), video.clone());
+        el.on_mouse_down(
+            MouseButton::Right,
+            cx.listener(move |this, e: &gpui::MouseDownEvent, window, cx| {
+                cx.stop_propagation();
+                this.keyboard_nav = false;
+                this.open_remote_card_menu(server.clone(), video.clone(), e.position, window, cx);
+            }),
+        )
+        .on_key_down(cx.listener(move |this, e: &KeyDownEvent, window, cx| {
+            let key = crate::shortcuts::normalize(&e.keystroke);
+            if key == "shift-f10" || key == "menu" {
+                cx.stop_propagation();
+                let bounds = this.focused_card.get();
+                let position = gpui::point(bounds.left() + px(12.), bounds.top() + px(24.));
+                this.open_remote_card_menu(
+                    key_server.clone(),
+                    key_video.clone(),
+                    position,
+                    window,
+                    cx,
+                );
+            }
+        }))
     }
 
     /// Arrow keys move between cards of one remote grid, as in local grids.
@@ -1008,6 +2145,13 @@ impl Flick {
                     match result {
                         Ok(()) => self.load_remote(pending.remote, pending.resume, window, cx),
                         Err(message) => {
+                            // An automatic drop that was refused: the
+                            // watcher stays on the tier still playing.
+                            if let Some(playing) = self.remote_source().map(|r| r.quality)
+                                && let Some(auto) = &mut self.auto_quality
+                            {
+                                auto.refused(playing, std::time::Instant::now());
+                            }
                             self.status = None;
                             self.error = Some(format!(
                                 "Could not play this video at {}. {}",
@@ -1037,6 +2181,7 @@ impl Flick {
             duration: entry.duration,
             finished: entry.finished,
             updated: entry.updated,
+            revision: 0,
         };
         self.remote
             .put_progress(&self.store.data, server, video, progress);
@@ -1142,6 +2287,7 @@ impl Flick {
                         cx.notify();
                     },
                 ));
+            // The pairing code row follows: `settings_ui::serve_extra_rows`.
             rows.push(
                 row(
                     &t,
@@ -1200,7 +2346,7 @@ impl Flick {
         cx: &mut Context<Self>,
     ) {
         if let Some(old) = self.remote_ui.save_to.remote_torrent.take()
-            && old.info.is_none()
+            && old.resolving()
         {
             self.remote.cancel_resolve(&self.store.data, &old.server_id);
         }
@@ -1231,6 +2377,7 @@ impl Flick {
             info: None,
             selected: HashSet::new(),
             starting: false,
+            asleep: None,
         });
         self.remote.resolve(&self.store.data, &server_id, wire);
         cx.notify();
@@ -1259,12 +2406,28 @@ impl Flick {
     /// Closes the torrent sheet for another machine, cancelling its resolve.
     fn cancel_remote_torrent(&mut self, cx: &mut Context<Self>) {
         if let Some(sheet) = self.remote_ui.save_to.remote_torrent.take()
-            && sheet.info.is_none()
+            && sheet.resolving()
         {
             self.remote
                 .cancel_resolve(&self.store.data, &sheet.server_id);
         }
         self.remote_ui.save_to.torrent_input = None;
+        cx.notify();
+    }
+
+    /// Queues the torrent with every file for the machine that did not
+    /// answer its resolve, and closes the sheet.
+    fn queue_remote_torrent(&mut self, cx: &mut Context<Self>) {
+        let save_to = &mut self.remote_ui.save_to;
+        let Some(sheet) = save_to
+            .remote_torrent
+            .take_if(|sheet| sheet.asleep.is_some())
+        else {
+            return;
+        };
+        save_to.torrent_input = None;
+        let message = self.remote.queue_download(&sheet.server_id, sheet.input);
+        self.show_status_for(message, std::time::Duration::from_secs(6));
         cx.notify();
     }
 
@@ -1457,6 +2620,7 @@ impl Flick {
                         sheet.selected = default_selection(&info.files);
                         sheet.info = Some(info);
                     }
+                    Ok(Outcome::Unanswered { question }) => sheet.asleep = Some(question),
                     Ok(_) => {}
                     Err(message) => {
                         save_to.remote_torrent = None;
@@ -1469,6 +2633,10 @@ impl Flick {
                     .remote_torrent
                     .as_ref()
                     .is_some_and(|sheet| sheet.server_id == server_id && sheet.input == input);
+                let queued = match &result {
+                    Ok(Outcome::Queued { message }) => Some(message.clone()),
+                    _ => None,
+                };
                 match result {
                     Ok(_) if open => {
                         save_to.remote_torrent = None;
@@ -1481,6 +2649,11 @@ impl Flick {
                         }
                         self.error = Some(format!("{name}: {}", sentence(&message)));
                     }
+                }
+                // The machine is asleep: say so, and Downloads shows the
+                // waiting row until it answers.
+                if let Some(message) = queued {
+                    self.show_status_for(message, std::time::Duration::from_secs(6));
                 }
             }
             (
@@ -1513,6 +2686,13 @@ impl Flick {
                     self.error = Some(format!("{name}: {}", sentence(&message)));
                 }
             }
+            (Command::FetchStart { .. }, result) => match result {
+                Ok(Outcome::Queued { message }) => {
+                    self.show_status_for(message, std::time::Duration::from_secs(6));
+                }
+                Ok(_) => {}
+                Err(message) => self.error = Some(format!("{name}: {}", sentence(&message))),
+            },
             (Command::Browse { dir }, result) => {
                 let Some(sheet) = save_to.share.as_mut().filter(|sheet| {
                     sheet.machine.as_deref() == Some(server_id.as_str()) && sheet.dir == dir
@@ -1671,6 +2851,36 @@ impl Flick {
         let name = self.machine_name(&sheet.server_id);
         let mut rows = Vec::new();
         rows.extend(self.torrent_save_to(cx));
+        if let Some(question) = &sheet.asleep {
+            rows.push(row(&t, Some("magnet"), question.clone(), None, div()).into_any_element());
+            return Some(
+                v_flex()
+                    .child(section_title(&t, "New Download"))
+                    .child(super::chrome_ui::group(&t, rows))
+                    .child(
+                        h_flex()
+                            .mt_3()
+                            .gap_2()
+                            .justify_end()
+                            .child(self.button(
+                                "remote-queue-cancel",
+                                None,
+                                "Cancel",
+                                false,
+                                cx,
+                                |this, _, cx| this.cancel_remote_torrent(cx),
+                            ))
+                            .child(self.button(
+                                "remote-queue-confirm",
+                                Some("download"),
+                                "Queue",
+                                true,
+                                cx,
+                                |this, _, cx| this.queue_remote_torrent(cx),
+                            )),
+                    ),
+            );
+        }
         let Some(info) = &sheet.info else {
             rows.push(
                 row(
@@ -2065,12 +3275,44 @@ impl Flick {
         cx: &Context<Self>,
     ) -> Vec<Div> {
         let t = cx.theme().clone();
+        let statuses = self
+            .remote
+            .servers(&self.store.data)
+            .into_iter()
+            .map(|server| (server.id, server.status))
+            .collect::<HashMap<_, _>>();
+        // Commands waiting for a machine that has no section of its own.
+        let mut waiting = Vec::new();
+        for command in &self.store.data.remote.queued {
+            if !machines.iter().any(|m| m.server_id == command.server)
+                && !waiting.contains(&command.server)
+                && self.saved_server(&command.server).is_some()
+            {
+                waiting.push(command.server.clone());
+            }
+        }
+        let extra = waiting.into_iter().map(|server_id| MachineTransfers {
+            name: self.machine_name(&server_id),
+            server_id,
+            loaded: true,
+            ..Default::default()
+        });
+        let machines = machines.iter().cloned().chain(extra).collect::<Vec<_>>();
         machines
             .iter()
-            .map(|machine| {
+            .enumerate()
+            .map(|(index, machine)| {
                 let mut section = v_flex()
                     .mt_6()
                     .child(section_title(&t, machine.name.clone()));
+                let status = statuses
+                    .get(&machine.server_id)
+                    .cloned()
+                    .unwrap_or_default();
+                let wake = self.saved_server(&machine.server_id).and_then(|server| {
+                    self.wake_button(("downloads-wake", index), server, &status, cx)
+                });
+                let woke = self.wake_line(&machine.server_id, &status);
                 if let Some(problem) = &machine.problem {
                     section = section.child(
                         h_flex()
@@ -2079,7 +3321,7 @@ impl Flick {
                             .text_size(t.font(12.))
                             .text_color(t.muted)
                             .child(icon("info", 14., t.muted))
-                            .child(
+                            .child(div().flex_1().child(
                                 if machine.transfers.is_empty() && machine.fetches.is_empty() {
                                     sentence(problem)
                                 } else {
@@ -2088,8 +3330,35 @@ impl Flick {
                                         sentence(problem)
                                     )
                                 },
-                            ),
+                            ))
+                            .children(wake),
                     );
+                } else if let Some(wake) = wake {
+                    section = section.child(
+                        h_flex()
+                            .mb_2()
+                            .gap_2()
+                            .text_size(t.font(12.))
+                            .text_color(t.muted)
+                            .child(icon("info", 14., t.muted))
+                            .child(div().flex_1().child(status.label()))
+                            .child(wake),
+                    );
+                }
+                if let Some(woke) = woke {
+                    section = section.child(
+                        div()
+                            .mb_2()
+                            .text_size(t.font(12.))
+                            .text_color(t.muted)
+                            .child(woke),
+                    );
+                }
+                let queued = self.queued_rows(&machine.server_id, &machine.name, cx);
+                let has_queued = !queued.is_empty();
+                if has_queued {
+                    section =
+                        section.child(div().mb_2().child(super::chrome_ui::group(&t, queued)));
                 }
                 if !machine.transfers.is_empty() {
                     let rows = machine
@@ -2110,6 +3379,7 @@ impl Flick {
                 if machine.transfers.is_empty()
                     && machine.fetches.is_empty()
                     && machine.problem.is_none()
+                    && !has_queued
                 {
                     section =
                         section.child(div().text_size(t.font(12.)).text_color(t.muted).child(
@@ -2559,5 +3829,273 @@ mod tests {
             };
             assert_eq!(RowFigures::remote(&row).state, state);
         }
+    }
+
+    fn found(host: &str, ip: &str, name: &str, open: bool) -> FoundFlick {
+        FoundFlick {
+            peer: crate::remote_discovery::Peer {
+                host: host.into(),
+                ip: ip.parse().unwrap(),
+                online: true,
+                os: "macOS".into(),
+            },
+            hello: flick::remote::protocol::Hello {
+                protocol: 1,
+                server_name: name.into(),
+                pairing_open: open,
+            },
+        }
+    }
+
+    fn paired(id: &str, host: &str, port: u16) -> RemoteServer {
+        RemoteServer {
+            id: id.into(),
+            name: "Mac mini".into(),
+            host: host.into(),
+            port,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn found_flicks_show_their_name_and_whether_they_are_paired() {
+        let port = flick::remote::protocol::DEFAULT_PORT;
+        let list = [
+            found("mohtashams-mac-mini", "100.98.200.69", "Mac mini", true),
+            found("studio", "100.64.0.2", "  ", false),
+            found("laptop", "100.64.0.3", "Laptop", true),
+        ];
+        let servers = [
+            paired("a", "mohtashams-mac-mini.tailnet.ts.net", port),
+            paired("b", "100.64.0.2", port),
+            // Another port is another server.
+            paired("c", "100.64.0.3", 9000),
+        ];
+        let rows = found_rows(&list, &servers);
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].name, "Mac mini");
+        assert_eq!(rows[0].host, "mohtashams-mac-mini");
+        assert_eq!(rows[0].address, "100.98.200.69");
+        assert_eq!(rows[0].port, port);
+        assert!(rows[0].paired, "paired by MagicDNS name");
+        assert_eq!(
+            rows[1].name, "studio",
+            "an empty name falls back to the host"
+        );
+        assert!(rows[1].paired, "paired by address");
+        assert!(!rows[2].paired);
+        assert!(rows[2].code_open);
+        assert!(found_rows(&list, &[]).iter().all(|row| !row.paired));
+    }
+
+    #[test]
+    fn the_discovery_list_says_when_it_searches_or_finds_nothing() {
+        assert!(discovery_note(true, None).unwrap().starts_with("Looking"));
+        assert!(
+            discovery_note(true, Some(&[]))
+                .unwrap()
+                .starts_with("Looking")
+        );
+        assert_eq!(discovery_note(false, None), None);
+        let none = discovery_note(false, Some(&[])).unwrap();
+        assert_eq!(none, NO_FLICKS);
+        assert!(none.contains("Tailscale must be running") && none.contains("sharing"));
+        let one = [found("studio", "100.64.0.2", "Studio", false)];
+        assert_eq!(discovery_note(false, Some(&one)), None);
+        assert!(CODE_HINT.contains("Settings → Remote Libraries"));
+        assert!(CODE_HINT.contains("flick-serve pair-code on that machine"));
+    }
+
+    #[test]
+    fn pairing_codes_are_six_digits() {
+        assert!(code_ready("123456"));
+        assert!(code_ready(" 123-456 "));
+        assert!(code_ready("123 456"));
+        assert!(!code_ready("12345"));
+        assert!(!code_ready("1234567"));
+        assert!(!code_ready("12a456"));
+        assert!(!code_ready(""));
+    }
+
+    #[test]
+    fn wake_is_offered_only_for_an_offline_server_with_hardware() {
+        let target = WakeTarget {
+            mac: vec!["aa:bb:cc:dd:ee:ff".into()],
+            lan_ips: vec!["192.168.1.20".into()],
+        };
+        let mut server = paired("a", "100.98.200.69", 47117);
+        assert_eq!(wake_target(&server, &Status::Offline), None);
+        server.wake = Some(target.clone());
+        assert_eq!(wake_target(&server, &Status::Offline), Some(&target));
+        for status in [
+            Status::Online,
+            Status::Connecting,
+            Status::WrongToken,
+            Status::NotFlick,
+            Status::Failed("x".into()),
+        ] {
+            assert_eq!(wake_target(&server, &status), None, "{status:?}");
+        }
+        server.wake = Some(WakeTarget::default());
+        assert_eq!(wake_target(&server, &Status::Offline), None);
+        assert_eq!(wake_message(&Ok(())), "Wake packet sent; give it a minute.");
+        let failed = wake_message(&Err("There was nowhere to send the wake packet".into()));
+        assert!(
+            failed.starts_with("Could not wake it: There was nowhere to send the wake packet.")
+        );
+        assert!(failed.contains("same network"));
+    }
+
+    #[test]
+    fn remote_card_menus_follow_the_kept_copy() {
+        use RemoteMenuItem::*;
+        let path = PathBuf::from("/Movies/From Mac mini/film.mkv");
+        assert_eq!(remote_menu_items(&KeepStatus::NotKept, true), [Play, Keep]);
+        assert_eq!(remote_menu_items(&KeepStatus::NotKept, false), [Play]);
+        assert_eq!(
+            remote_menu_items(&KeepStatus::Copying, true),
+            [Play, CancelCopy]
+        );
+        assert_eq!(
+            remote_menu_items(&KeepStatus::Kept(path.clone()), false),
+            [Play, ShowCopy(path.clone()), RemoveCopy(path)]
+        );
+        assert_eq!(Keep.label(), keep_label());
+        if cfg!(target_os = "macos") {
+            assert_eq!(keep_label(), "Keep on this Mac");
+            assert_eq!(kept_section_title(), "Copies to this Mac");
+        }
+        assert_eq!(RemoveCopy(PathBuf::new()).label(), "Remove Local Copy…");
+    }
+
+    #[test]
+    fn kept_copies_mark_cards_and_leave_with_their_file() {
+        let path = PathBuf::from("/Movies/From Mac mini/film.mkv");
+        let mut kept = vec![
+            KeptCopy {
+                server: "a".into(),
+                video: "v1".into(),
+                path: path.clone(),
+            },
+            KeptCopy {
+                server: "gone".into(),
+                video: "v2".into(),
+                path: PathBuf::from("/Movies/other.mkv"),
+            },
+        ];
+        let servers = [paired("a", "100.98.200.69", 47117)];
+        assert_eq!(kept_copy(&kept, "a", "v1").map(|c| &c.path), Some(&path));
+        assert_eq!(kept_copy(&kept, "a", "v2"), None);
+        assert_eq!(
+            kept_from(&kept, &servers, &path).as_deref(),
+            Some("Kept from Mac mini")
+        );
+        assert_eq!(
+            kept_from(&kept, &servers, Path::new("/Movies/other.mkv")).as_deref(),
+            Some("Kept from another Flick")
+        );
+        assert_eq!(
+            kept_from(&kept, &servers, Path::new("/elsewhere.mkv")),
+            None
+        );
+        assert!(!prune_kept(&mut kept, |_| true));
+        assert!(prune_kept(&mut kept, |p| p == path));
+        assert_eq!(kept.len(), 1);
+    }
+
+    #[test]
+    fn keep_requests_fetch_the_original_with_the_bearer_header() {
+        let playback = crate::remote_client::RemotePlayback {
+            server_id: "a".into(),
+            server_name: "Mac mini".into(),
+            video_id: "abc123".into(),
+            title: "Film".into(),
+            duration: 60.,
+            quality: Quality::Low720,
+            base_url: "http://100.98.200.69:47117".into(),
+            token: "secret".into(),
+        };
+        let request = keep_request(&playback, "film.mkv", Path::new("/Downloads"));
+        assert_eq!(request.url, "http://100.98.200.69:47117/v1/media/abc123");
+        assert_eq!(request.authorization, "Bearer secret");
+        assert_eq!(request.file_name, "film.mkv");
+        assert_eq!(request.download_dir, PathBuf::from("/Downloads"));
+        assert_eq!(
+            (request.server_id.as_str(), request.video_id.as_str()),
+            ("a", "abc123")
+        );
+        assert_eq!(request.server_name, "Mac mini");
+        assert!(!format!("{request:?}").contains("secret"));
+    }
+
+    #[test]
+    fn copy_rows_show_bytes_and_speed() {
+        let mut progress = KeepProgress {
+            server_id: "a".into(),
+            video_id: "v".into(),
+            downloaded: 0,
+            total: None,
+            bytes_per_second: 0,
+        };
+        assert_eq!(
+            keep_detail(&progress, "Mac mini"),
+            "From Mac mini · waiting to start"
+        );
+        progress.downloaded = 512 * 1024 * 1024;
+        assert_eq!(
+            keep_detail(&progress, "Mac mini"),
+            "From Mac mini · 512.0 MB"
+        );
+        progress.total = Some(1024 * 1024 * 1024);
+        progress.bytes_per_second = 10 * 1024 * 1024;
+        assert_eq!(
+            keep_detail(&progress, "Mac mini"),
+            "From Mac mini · 512.0 MB of 1.0 GB (50%) · 10.0 MB/s"
+        );
+    }
+
+    #[test]
+    fn queued_commands_wait_under_their_server() {
+        let magnet = QueuedCommand {
+            server: "a".into(),
+            input: "magnet:?xt=urn:btih:abcdef&dn=Big%20Buck+Bunny&tr=x".into(),
+            files: vec![0, 2],
+            link: false,
+            created: 1,
+        };
+        let bare = QueuedCommand {
+            input: "magnet:?xt=urn:btih:abcdef".into(),
+            files: Vec::new(),
+            created: 2,
+            ..magnet.clone()
+        };
+        let link = QueuedCommand {
+            server: "b".into(),
+            input: " https://example.com/watch?v=1 ".into(),
+            files: Vec::new(),
+            link: true,
+            created: 3,
+        };
+        assert_eq!(queued_title(&magnet), "Big Buck Bunny");
+        assert_eq!(queued_title(&bare), "Magnet link");
+        assert_eq!(queued_title(&link), "https://example.com/watch?v=1");
+        assert_eq!(
+            queued_detail(&magnet, "Mac mini"),
+            "Download · 2 files · Waiting for Mac mini to answer"
+        );
+        assert_eq!(
+            queued_detail(&bare, "Mac mini"),
+            "Download · Waiting for Mac mini to answer"
+        );
+        assert_eq!(
+            queued_detail(&link, "Studio"),
+            "Link download · Waiting for Studio to answer"
+        );
+        let mut queued = vec![magnet.clone(), link.clone(), bare.clone()];
+        assert_eq!(queued_for(&queued, "a"), [&magnet, &bare]);
+        assert_eq!(queued_for(&queued, "b"), [&link]);
+        assert!(cancel_queued(&mut queued, &magnet));
+        assert!(!cancel_queued(&mut queued, &magnet));
+        assert_eq!(queued, [link, bare]);
     }
 }

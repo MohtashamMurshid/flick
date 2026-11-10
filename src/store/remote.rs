@@ -9,7 +9,7 @@ use flick::remote::protocol::Quality;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default)]
 pub struct RemoteSettings {
     pub servers: Vec<RemoteServer>,
@@ -35,9 +35,44 @@ pub struct RemoteSettings {
     /// The Save to default: a paired server's id, or empty for this Mac.
     #[serde(skip_serializing_if = "String::is_empty")]
     pub default_destination: String,
+    /// Remote videos copied to this computer.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub kept: Vec<KeptCopy>,
+    /// Commands waiting for a machine that was asleep.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub queued: Vec<QueuedCommand>,
     /// Set on the last onboarding step; a launch without it starts there.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub setup_done: bool,
+    /// "Keep this Mac awake while sharing": hold a `caffeinate -i` power
+    /// assertion while the in-app server runs. On by default; macOS only.
+    #[serde(skip_serializing_if = "is_true")]
+    pub keep_awake: bool,
+}
+
+/// Written by hand so `keep_awake` defaults to on, in a missing `remote`
+/// and in a `remote` without the field alike.
+impl Default for RemoteSettings {
+    fn default() -> Self {
+        Self {
+            servers: Vec::new(),
+            progress: Vec::new(),
+            serve: false,
+            serve_name: String::new(),
+            allow_downloads: false,
+            download_dir: None,
+            share_roots: Vec::new(),
+            default_destination: String::new(),
+            kept: Vec::new(),
+            queued: Vec::new(),
+            setup_done: false,
+            keep_awake: true,
+        }
+    }
+}
+
+fn is_true(value: &bool) -> bool {
+    *value
 }
 
 impl RemoteSettings {
@@ -50,7 +85,10 @@ impl RemoteSettings {
             && self.download_dir.is_none()
             && self.share_roots.is_empty()
             && self.default_destination.is_empty()
+            && self.kept.is_empty()
+            && self.queued.is_empty()
             && !self.setup_done
+            && self.keep_awake
     }
 }
 
@@ -70,6 +108,48 @@ pub struct RemoteServer {
     pub token: String,
     /// Default tier for this server; the player can change it per video.
     pub quality: Quality,
+    /// Drop a tier on repeated buffering early in playback; on by default.
+    #[serde(default = "default_true")]
+    pub auto_quality: bool,
+    /// Learned from the server's listing for Wake-on-LAN when it is offline.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wake: Option<WakeTarget>,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// Where a Wake-on-LAN packet goes; both lists come from `Hardware`.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default)]
+pub struct WakeTarget {
+    pub mac: Vec<String>,
+    pub lan_ips: Vec<String>,
+}
+
+/// A remote video copied to this computer with "Keep on this Mac".
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default)]
+pub struct KeptCopy {
+    pub server: String,
+    pub video: String,
+    pub path: std::path::PathBuf,
+}
+
+/// A download or link requested while its machine was asleep; sent when the
+/// machine answers again.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default)]
+pub struct QueuedCommand {
+    pub server: String,
+    /// A magnet, infohash, `.torrent` URL, or a video page link.
+    pub input: String,
+    /// Torrent file indices; empty means every file. Ignored for links.
+    pub files: Vec<usize>,
+    pub link: bool,
+    /// Seconds since the Unix epoch.
+    pub created: u64,
 }
 
 /// Keeps the token out of logs, panic messages, and `Settings`' Debug.
@@ -104,6 +184,14 @@ pub struct RemoteProgress {
     pub finished: bool,
     /// Seconds since the Unix epoch.
     pub updated: u64,
+    /// The server's revision of the last claim merged from its listing, so
+    /// the same claim is never applied twice however the clocks run.
+    #[serde(skip_serializing_if = "is_zero_u64")]
+    pub server_revision: u64,
+}
+
+fn is_zero_u64(value: &u64) -> bool {
+    *value == 0
 }
 
 #[cfg(test)]
@@ -121,6 +209,8 @@ mod tests {
             port: 47117,
             token: TOKEN.into(),
             quality: Quality::Original,
+            auto_quality: true,
+            wake: None,
         };
         let text = format!("{server:?}");
         assert!(!text.contains(TOKEN), "{text}");
@@ -139,5 +229,29 @@ mod tests {
             ..Default::default()
         };
         assert!(!format!("{all:?}").contains(TOKEN));
+    }
+
+    #[test]
+    fn keep_awake_defaults_on_and_is_saved_only_when_off() {
+        assert!(RemoteSettings::default().keep_awake);
+        let parsed: RemoteSettings = serde_json::from_str(r#"{"serve": true}"#).unwrap();
+        assert!(parsed.keep_awake);
+        assert!(
+            !serde_json::to_string(&parsed)
+                .unwrap()
+                .contains("keep_awake")
+        );
+        let off = RemoteSettings {
+            keep_awake: false,
+            ..Default::default()
+        };
+        assert!(!off.is_empty());
+        let text = serde_json::to_string(&off).unwrap();
+        assert!(text.contains(r#""keep_awake":false"#), "{text}");
+        assert!(
+            !serde_json::from_str::<RemoteSettings>(&text)
+                .unwrap()
+                .keep_awake
+        );
     }
 }

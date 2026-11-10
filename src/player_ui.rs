@@ -1266,6 +1266,9 @@ impl Flick {
                         );
                     }
                 }
+                // A remote transcode carries one audio stream; the others
+                // are asked of the server, which reloads like a tier switch.
+                let (server_audio, current_audio) = self.remote_audio_choices();
                 for (kind, title) in [("audio", "Audio"), ("sub", "Subtitles")] {
                     panel = panel.child(
                         div()
@@ -1276,11 +1279,29 @@ impl Flick {
                             .text_color(t.muted)
                             .child(title),
                     );
+                    if kind == "audio" {
+                        for audio in &server_audio {
+                            let track = audio.track;
+                            panel = panel.child(
+                                option(
+                                    format!("remote-audio-{track}").into(),
+                                    crate::source::audio_track_label(audio),
+                                    current_audio == Some(track),
+                                )
+                                .on_click(cx.listener(
+                                    move |this, _, window, cx| {
+                                        this.switch_remote_audio(track, window, cx)
+                                    },
+                                )),
+                            );
+                        }
+                    }
+                    let libmpv_tracks = kind != "audio" || server_audio.is_empty();
                     for track in self
                         .snapshot
                         .tracks
                         .iter()
-                        .filter(|track| track.kind == kind)
+                        .filter(|track| libmpv_tracks && track.kind == kind)
                     {
                         let id = track.id.to_string();
                         let property = if kind == "audio" { "aid" } else { "sid" };

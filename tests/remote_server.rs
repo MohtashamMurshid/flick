@@ -77,6 +77,8 @@ impl Fixture {
             ffmpeg: Some(self.state.join("no-ffmpeg")),
             max_transcodes: 2,
             transfers: None,
+            pairing: None,
+            advertise_hardware: true,
         }
     }
 
@@ -133,6 +135,14 @@ impl Running {
             .context("Film.mp4 is listed")?
             .id)
     }
+}
+
+/// Equal apart from the revision the server assigns on each accepted save.
+fn same_progress(got: &Progress, want: &Progress) -> bool {
+    got.position == want.position
+        && got.duration == want.duration
+        && got.finished == want.finished
+        && got.updated == want.updated
 }
 
 async fn error_message(response: reqwest::Response) -> Result<String> {
@@ -654,6 +664,7 @@ async fn progress_round_trips_and_survives_restarts() -> Result<()> {
             duration: 100.0,
             finished: false,
             updated: now() - 600,
+            revision: 0,
         };
         let response = running
             .request(reqwest::Method::PUT, &paths::progress(&id))
@@ -661,19 +672,20 @@ async fn progress_round_trips_and_survives_restarts() -> Result<()> {
             .send()
             .await?;
         ensure!(response.status() == StatusCode::OK, "{}", response.status());
-        ensure!(response.json::<Progress>().await? == saved);
+        ensure!(same_progress(&response.json::<Progress>().await?, &saved));
         let got: Progress = running
             .get(&paths::progress(&id))
             .send()
             .await?
             .json()
             .await?;
-        ensure!(got == saved);
+        ensure!(same_progress(&got, &saved));
 
         // Much older progress from an offline client does not rewind it.
         let older = Progress {
             position: 1.0,
             updated: saved.updated - 3600,
+            revision: 0,
             ..saved.clone()
         };
         let response = running
@@ -681,12 +693,13 @@ async fn progress_round_trips_and_survives_restarts() -> Result<()> {
             .json(&older)
             .send()
             .await?;
-        ensure!(response.json::<Progress>().await? == saved);
+        ensure!(same_progress(&response.json::<Progress>().await?, &saved));
 
         // Within the same minute, the client wins.
         let close = Progress {
             position: 40.0,
             updated: saved.updated - 30,
+            revision: 0,
             ..saved.clone()
         };
         let response = running
@@ -694,7 +707,7 @@ async fn progress_round_trips_and_survives_restarts() -> Result<()> {
             .json(&close)
             .send()
             .await?;
-        ensure!(response.json::<Progress>().await? == close);
+        ensure!(same_progress(&response.json::<Progress>().await?, &close));
 
         let response = running
             .request(reqwest::Method::PUT, &paths::progress(&id))
@@ -712,7 +725,7 @@ async fn progress_round_trips_and_survives_restarts() -> Result<()> {
             .await?
             .json()
             .await?;
-        ensure!(got == close);
+        ensure!(same_progress(&got, &close));
         again.server.shutdown().await;
         Ok(())
     })
@@ -733,6 +746,7 @@ async fn progress_from_a_future_clock_is_clamped() -> Result<()> {
             duration: 100.0,
             finished: false,
             updated: before + 10 * 365 * 24 * 3600,
+            revision: 0,
         };
         let stored: Progress = running
             .request(reqwest::Method::PUT, &paths::progress(&id))
@@ -753,18 +767,20 @@ async fn progress_from_a_future_clock_is_clamped() -> Result<()> {
             duration: 100.0,
             finished: false,
             updated: now(),
+            revision: 0,
         };
         let response = running
             .request(reqwest::Method::PUT, &paths::progress(&id))
             .json(&later)
             .send()
             .await?;
-        ensure!(response.json::<Progress>().await? == later);
+        ensure!(same_progress(&response.json::<Progress>().await?, &later));
         // So does u64::MAX, clamped the same way without overflow.
         let response = running
             .request(reqwest::Method::PUT, &paths::progress(&id))
             .json(&Progress {
                 updated: u64::MAX,
+                revision: 0,
                 ..later.clone()
             })
             .send()
@@ -1226,6 +1242,11 @@ async fn with_ffmpeg_tiers_probed_details_and_embedded_subtitles_are_served() ->
             tokio::time::sleep(Duration::from_millis(200)).await;
         }
         let clip_entry = clip_entry.context("ffprobe filled in the duration and size")?;
+        ensure!(
+            clip_entry.audio_tracks.len() == 1 && clip_entry.audio_tracks[0].channels > 0,
+            "the generated clip has one audio track: {:?}",
+            clip_entry.audio_tracks
+        );
         let response = running
             .get(&paths::hls_playlist(&clip_entry.id, Quality::Data480))
             .send()
@@ -1255,6 +1276,345 @@ async fn with_ffmpeg_tiers_probed_details_and_embedded_subtitles_are_served() ->
             .send()
             .await?;
         ensure!(response.status() == StatusCode::NOT_FOUND);
+        running.server.shutdown().await;
+        Ok(())
+    })
+    .await?
+}
+
+/// The listing carries this machine's own Wake-on-LAN addresses unless the
+/// owner turned them off.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn hardware_is_listed_only_when_advertised() -> Result<()> {
+    timeout(DEADLINE, async {
+        let fixture = Fixture::new()?;
+        let running = fixture.start().await?;
+        let listed = running.library().await?.hardware;
+        let expected = flick::remote::hardware::local();
+        let expected =
+            (!expected.mac.is_empty() || !expected.lan_ips.is_empty()).then_some(expected);
+        ensure!(listed == expected, "{listed:?} != {expected:?}");
+        if let Some(hardware) = &listed {
+            for ip in &hardware.lan_ips {
+                let ip: std::net::Ipv4Addr = ip.parse()?;
+                ensure!(ip.is_private(), "{ip} is not a LAN address");
+            }
+            ensure!(hardware.mac.len() <= 8 && hardware.lan_ips.len() <= 8);
+            for mac in &hardware.mac {
+                ensure!(
+                    mac != "02:00:00:00:00:00" && mac != "00:00:00:00:00:00",
+                    "{mac} wakes nothing"
+                );
+            }
+        } else {
+            eprintln!("this machine reports no LAN interface; only absence is checked");
+        }
+        running.server.shutdown().await;
+
+        let mut config = fixture.config(Sources::Folders(vec![fixture.media.clone()]));
+        config.advertise_hardware = false;
+        let server = Server::start(config).await?;
+        let library: Library = reqwest::Client::builder()
+            .no_proxy()
+            .build()?
+            .get(format!("http://{}{}", server.addr(), paths::library()))
+            .header(header::AUTHORIZATION, protocol::bearer(&fixture.token))
+            .send()
+            .await?
+            .json()
+            .await?;
+        ensure!(library.hardware.is_none(), "{:?}", library.hardware);
+        server.shutdown().await;
+        Ok(())
+    })
+    .await?
+}
+
+/// A position saved with `PUT /v1/progress` comes back in the listing, so
+/// Continue Watching follows the person; videos without one have none.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_listing_carries_saved_progress() -> Result<()> {
+    timeout(DEADLINE, async {
+        let fixture = Fixture::new()?;
+        let running = fixture.start().await?;
+        let library = running.library().await?;
+        ensure!(library.videos.iter().all(|video| video.resume.is_none()));
+        let id = running.film_id().await?;
+        let saved = Progress {
+            position: 61.5,
+            duration: 120.0,
+            finished: false,
+            updated: now() - 5,
+            revision: 0,
+        };
+        let response = running
+            .request(reqwest::Method::PUT, &paths::progress(&id))
+            .json(&saved)
+            .send()
+            .await?;
+        ensure!(response.status() == StatusCode::OK);
+        let library = running.library().await?;
+        for video in &library.videos {
+            if video.id == id {
+                ensure!(
+                    video
+                        .resume
+                        .as_ref()
+                        .is_some_and(|resume| same_progress(resume, &saved) && resume.revision == 1),
+                    "{:?}",
+                    video.resume
+                );
+            } else {
+                ensure!(
+                    video.resume.is_none(),
+                    "{}: {:?}",
+                    video.file_name,
+                    video.resume
+                );
+            }
+        }
+        running.server.shutdown().await;
+        // The listing reads the saved file, so it survives a restart.
+        let again = fixture.start().await?;
+        let film = again
+            .library()
+            .await?
+            .videos
+            .into_iter()
+            .find(|video| video.id == id)
+            .context("Film.mp4 is listed")?;
+        ensure!(
+            film.resume
+                .as_ref()
+                .is_some_and(|resume| same_progress(resume, &saved) && resume.revision == 1)
+        );
+        again.server.shutdown().await;
+        Ok(())
+    })
+    .await?
+}
+
+/// A stand-in ffprobe reports two audio streams; the listing shows them,
+/// and `?audio=1` on a tier makes FFmpeg map `0:a:1` for that job.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn audio_tracks_are_listed_and_chosen_for_transcodes() -> Result<()> {
+    use flick::remote::protocol::AudioTrack;
+    use std::os::unix::fs::PermissionsExt;
+    timeout(DEADLINE, async {
+        let fixture = Fixture::new()?;
+        let bin = fixture.state.parent().unwrap().join("bin");
+        std::fs::create_dir_all(&bin)?;
+        let log = bin.join("args.log");
+        let script = |name: &str, body: String| -> Result<()> {
+            let path = bin.join(name);
+            std::fs::write(&path, body)?;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))?;
+            Ok(())
+        };
+        // Like FFmpeg with -f hls: init.mp4, then each segment, renamed
+        // into place when complete. Every run's arguments are logged.
+        script(
+            "ffmpeg",
+            format!(
+                r#"#!/bin/sh
+case "$*" in
+  *-encoders*) echo ' V....D libx264              libx264 H.264'; exit 0 ;;
+esac
+echo "$*" >> '{log}'
+start=0; pattern=''; prev=''
+for arg in "$@"; do
+  case "$prev" in
+    -start_number) start="$arg" ;;
+    -hls_segment_filename) pattern="$arg" ;;
+  esac
+  prev="$arg"
+done
+out="${{pattern%/*}}"
+printf 'init\n' > "$out/init.mp4"
+n=$start
+while [ "$n" -lt 25 ]; do
+  printf 'segment %s\n' "$n" > "$out/$n.m4s.tmp"
+  mv "$out/$n.m4s.tmp" "$out/$n.m4s"
+  n=$((n + 1))
+  sleep 0.05
+done
+"#,
+                log = log.display()
+            ),
+        )?;
+        script(
+            "ffprobe",
+            r#"#!/bin/sh
+echo '{"format":{"duration":"100"},"streams":[{"codec_type":"video","width":64,"height":64},{"codec_type":"audio","channels":6,"tags":{"language":"eng","title":"Surround"}},{"codec_type":"audio","channels":2,"tags":{"language":"jpn"}}]}'
+"#
+            .into(),
+        )?;
+        let mut config = fixture.config(Sources::Folders(vec![fixture.media.clone()]));
+        config.ffmpeg = Some(bin.join("ffmpeg"));
+        let server = Server::start(config).await?;
+        let running = Running {
+            base: format!("http://{}", server.addr()),
+            token: fixture.token.clone(),
+            client: reqwest::Client::builder()
+                .no_proxy()
+                .timeout(Duration::from_secs(20))
+                .build()?,
+            server,
+        };
+        // ffprobe runs in the background; the listing fills in once it has.
+        let mut film = None;
+        for _ in 0..100 {
+            let found = running
+                .library()
+                .await?
+                .videos
+                .into_iter()
+                .find(|v| v.file_name == "Film.mp4")
+                .context("Film.mp4 is listed")?;
+            if !found.audio_tracks.is_empty() {
+                film = Some(found);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let film = film.context("the audio tracks reached the listing")?;
+        ensure!(
+            film.audio_tracks
+                == [
+                    AudioTrack {
+                        track: 0,
+                        language: Some("eng".into()),
+                        title: Some("Surround".into()),
+                        channels: 6
+                    },
+                    AudioTrack {
+                        track: 1,
+                        language: Some("jpn".into()),
+                        title: None,
+                        channels: 2
+                    }
+                ],
+            "{:?}",
+            film.audio_tracks
+        );
+        let q = Quality::Low720;
+        let response = running
+            .get(&paths::hls_playlist_audio(&film.id, q, 1))
+            .send()
+            .await?;
+        ensure!(response.status() == StatusCode::OK, "{}", response.status());
+        let playlist = response.text().await?;
+        ensure!(playlist.contains("#EXT-X-MAP:URI=\"init.mp4?audio=1\""), "{playlist}");
+        ensure!(playlist.contains("\n0.m4s?audio=1\n"), "{playlist}");
+        for path in [
+            format!("{}?audio=1", paths::hls_segment(&film.id, q, 0)),
+            format!("{}?audio=1", paths::hls_init(&film.id, q)),
+        ] {
+            let response = running.get(&path).send().await?;
+            ensure!(response.status() == StatusCode::OK, "{path}: {}", response.status());
+        }
+        let runs = std::fs::read_to_string(&log)?;
+        ensure!(runs.lines().count() == 1, "{runs}");
+        ensure!(runs.contains("-map 0:a:1 "), "{runs}");
+        let response = running.get(&paths::hls_segment(&film.id, q, 0)).send().await?;
+        ensure!(response.status() == StatusCode::OK, "{}", response.status());
+        let runs = std::fs::read_to_string(&log)?;
+        ensure!(runs.lines().count() == 2, "the default track is its own job: {runs}");
+        ensure!(runs.lines().nth(1).unwrap().contains("-map 0:a:0? "), "{runs}");
+        let response = running
+            .get(&paths::hls_playlist_audio(&film.id, q, 2))
+            .send()
+            .await?;
+        ensure!(response.status() == StatusCode::NOT_FOUND);
+        error_message(response).await?;
+        running.server.shutdown().await;
+        Ok(())
+    })
+    .await?
+}
+
+/// The cache cap removes the oldest entries first, by modification time,
+/// counts a folder as one entry, and never removes a kept entry.
+#[test]
+fn caches_are_pruned_oldest_first() -> Result<()> {
+    use flick::remote::cache;
+    use std::time::SystemTime;
+    let root = tempfile::tempdir()?;
+    let dir = root.path().join("cache");
+    ensure!(
+        cache::prune(&dir, 0, |_| false)? == cache::Pruned::default(),
+        "a missing folder is empty"
+    );
+    std::fs::create_dir_all(&dir)?;
+    let base = SystemTime::now() - Duration::from_secs(3600);
+    let write = |name: &str, size: usize, age_rank: u64| -> Result<PathBuf> {
+        let path = dir.join(name);
+        std::fs::write(&path, vec![b'x'; size])?;
+        std::fs::File::options()
+            .write(true)
+            .open(&path)?
+            .set_modified(base + Duration::from_secs(age_rank * 60))?;
+        Ok(path)
+    };
+    let oldest = write("a.vtt", 100, 0)?;
+    let kept = write("b.vtt", 100, 1)?;
+    let middle = write("c.vtt", 100, 2)?;
+    let newest = write("d.vtt", 100, 4)?;
+    let folder = dir.join("leftover");
+    std::fs::create_dir_all(folder.join("inner"))?;
+    std::fs::write(folder.join("inner").join("x.m4s"), vec![0; 150])?;
+    std::fs::File::open(&folder)?.set_modified(base + Duration::from_secs(3 * 60))?;
+
+    // 550 bytes in all; under the cap nothing goes.
+    let pruned = cache::prune(&dir, 1000, |_| false)?;
+    ensure!(
+        pruned
+            == cache::Pruned {
+                removed: 0,
+                kept_bytes: 550
+            },
+        "{pruned:?}"
+    );
+    // To 260: a (oldest) goes, b is kept, c and then the folder go.
+    let pruned = cache::prune(&dir, 260, |path| path == kept)?;
+    ensure!(
+        pruned
+            == cache::Pruned {
+                removed: 3,
+                kept_bytes: 200
+            },
+        "{pruned:?}"
+    );
+    ensure!(!oldest.exists() && !middle.exists() && !folder.exists());
+    ensure!(kept.exists() && newest.exists());
+    let pruned = cache::prune(&dir, 0, |_| false)?;
+    ensure!(
+        pruned
+            == cache::Pruned {
+                removed: 2,
+                kept_bytes: 0
+            },
+        "{pruned:?}"
+    );
+    Ok(())
+}
+
+/// At startup the subtitle cache loses temporary files an earlier process
+/// left behind, and keeps finished entries.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn startup_sweeps_leftover_cache_files() -> Result<()> {
+    timeout(DEADLINE, async {
+        let fixture = Fixture::new()?;
+        let cache = fixture.state.join("subtitles");
+        std::fs::create_dir_all(&cache)?;
+        let leftover = cache.join(".4000000000-3.tmp");
+        let entry = cache.join("0123456789abcdef0123456789abcdef01234567.vtt");
+        std::fs::write(&leftover, b"half a file")?;
+        std::fs::write(&entry, b"WEBVTT\n")?;
+        let running = fixture.start().await?;
+        ensure!(!leftover.exists(), "the leftover temporary file is removed");
+        ensure!(entry.exists(), "a finished entry under the cap is kept");
         running.server.shutdown().await;
         Ok(())
     })

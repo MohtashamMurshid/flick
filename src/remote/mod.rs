@@ -9,12 +9,18 @@
 //!   already final; change them only with a matching client change.
 //! - `ids`, `auth`, `library`, `server` are the server core.
 //! - `transcode`, `hls` are the quality tiers.
+//! - `pairing` holds six-digit pairing codes and the rate limit of the
+//!   routes without a token; `hardware` reads this machine's Wake-on-LAN
+//!   addresses; `cache` caps what the state folder keeps.
 
 pub mod auth;
 pub mod bind;
+pub mod cache;
+pub mod hardware;
 pub mod hls;
 pub mod ids;
 pub mod library;
+pub mod pairing;
 pub mod protocol;
 pub mod server;
 pub mod transcode;

@@ -6,18 +6,25 @@
 //! The types below are the contract the `flick-serve` binary and the
 //! desktop's in-app switch build against.
 //!
-//! Every route, including unknown paths, sits behind the bearer-token layer.
-//! Every error is a JSON [`ErrorBody`]. Media is streamed from disk through
-//! a bounded buffer; nothing reads a whole video into memory.
+//! Every route, including unknown paths, sits behind the bearer-token layer,
+//! except `GET /v1/hello` and `POST /v1/pair`, which are rate-limited per
+//! client address instead. Every error is a JSON [`ErrorBody`]. Media is
+//! streamed from disk through a bounded buffer; nothing reads a whole video
+//! into memory.
 
 pub use crate::remote::library::Sources;
+pub use crate::remote::pairing::PairingCodes;
 
 use crate::remote::{
-    auth,
+    auth, cache, hardware,
     hls::{HlsState, ResolvedVideo, Resolver},
     ids::{self, Salt},
     library::{self, Entry},
-    protocol::{self, Capability, ErrorBody, Library, Progress, SubtitleFile, TransferRow, Video},
+    pairing::{CodeCheck, RateLimiter},
+    protocol::{
+        self, Capability, ErrorBody, Hello, Library, PairReply, PairRequest, Pairing, Progress,
+        SubtitleFile, TransferRow, Video,
+    },
     transcode::{self, Encoder, MediaInfo},
     transfers::{self, TransferBackend, TransferCommand, TransferReply},
 };
@@ -25,11 +32,11 @@ use anyhow::{Context, Result, bail};
 use axum::{
     Json, Router,
     body::{Body, Bytes},
-    extract::{Path as UrlPath, Request, State},
+    extract::{ConnectInfo, Path as UrlPath, Request, State},
     http::{HeaderMap, HeaderValue, Method, StatusCode, header},
     middleware::{self, Next},
     response::{IntoResponse, Response},
-    routing::get,
+    routing::{get, post},
 };
 use futures_util::StreamExt;
 use std::{
@@ -37,7 +44,7 @@ use std::{
     io::SeekFrom,
     net::SocketAddr,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, RwLock},
+    sync::{Arc, Mutex, OnceLock, RwLock},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tokio::{
@@ -52,6 +59,9 @@ const STREAM_BUFFER: usize = 64 * 1024;
 const REBUILD_ON_MISS_INTERVAL: Duration = Duration::from_secs(1);
 /// How long [`Server::shutdown`] waits for connections to close.
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
+/// How long [`Server::shutdown`] lets responses finish before it closes
+/// connections still writing, such as one to a client that stopped reading.
+const SHUTDOWN_STALLED: Duration = Duration::from_secs(1);
 /// Progress older than the saved value by more than this is not applied.
 const PROGRESS_CONFLICT_WINDOW: u64 = 60;
 const PROGRESS_FILE: &str = "progress.json";
@@ -82,6 +92,18 @@ const BACKEND_WAIT: Duration = Duration::from_secs(5);
 const MAX_INCOMPLETE_STREAMS: usize = 8;
 /// Seconds a client waits before asking for an unfinished stream again.
 const INCOMPLETE_STREAM_RETRY: &str = "2";
+/// Requests per minute each client address may make to each route that
+/// needs no token (`/v1/hello`, `/v1/pair`); more answer 429.
+pub const UNAUTHENTICATED_PER_MINUTE: u32 = 30;
+/// Written while the server runs: `{"listen": "ip:port", "pid": n}`, for
+/// `flick-serve status` and `flick-serve pair-code`. Removed on shutdown.
+pub const LISTEN_FILE: &str = "listen";
+/// `POST` with the token from this machine only: opens a pairing code and
+/// answers `{"pair_code": "123456", "expires_in": seconds}`. Not part of the
+/// protocol; `flick-serve pair-code` uses it.
+pub const LOCAL_PAIR_CODE_PATH: &str = "/v1/local/pair-code";
+/// `POST /v1/pair` while no code is open.
+pub const NO_CODE_MESSAGE: &str = "No pairing code is open on that Flick. Open one from its Settings → Remote Libraries, or run `flick-serve pair-code` on that machine.";
 
 #[derive(Clone)]
 pub struct ServerConfig {
@@ -102,6 +124,12 @@ pub struct ServerConfig {
     pub max_transcodes: usize,
     /// Commands from paired Flicks; None serves read-only.
     pub transfers: Option<crate::remote::transfers::TransferBackend>,
+    /// Pairing codes the owner can open; None keeps `POST /v1/pair` closed
+    /// (it answers 404) and `hello` reports `pairing_open: false`.
+    pub pairing: Option<PairingCodes>,
+    /// List this machine's MAC and LAN IPv4 addresses in the listing's
+    /// `hardware`, for Wake-on-LAN. Normally true.
+    pub advertise_hardware: bool,
 }
 
 /// The token is left out, so a logged configuration never reveals it.
@@ -120,6 +148,8 @@ impl std::fmt::Debug for ServerConfig {
                 "transfers",
                 &self.transfers.as_ref().map(TransferBackend::capabilities),
             )
+            .field("pairing", &self.pairing)
+            .field("advertise_hardware", &self.advertise_hardware)
             .finish()
     }
 }
@@ -128,6 +158,11 @@ impl std::fmt::Debug for ServerConfig {
 pub struct Server {
     addr: SocketAddr,
     hls: Arc<HlsState>,
+    pairing: Option<PairingCodes>,
+    /// [`LISTEN_FILE`] in the state folder, removed on shutdown.
+    listen_file: PathBuf,
+    /// Cancelled to make every open connection's reads and writes fail.
+    close_connections: tokio_util::sync::CancellationToken,
     stop: watch::Sender<bool>,
     task: tokio::task::JoinHandle<()>,
     /// Held while serving so two servers cannot share a state directory.
@@ -157,6 +192,7 @@ impl Server {
         let transcode_dir = config.state_dir.join(TRANSCODE_DIR);
         std::fs::create_dir_all(&transcode_dir)
             .with_context(|| format!("Create {}", transcode_dir.display()))?;
+        sweep_subtitle_cache(&config.state_dir.join(SUBTITLE_CACHE_DIR));
         let resolver: Resolver = {
             let index = index.clone();
             let media = media.clone();
@@ -186,9 +222,14 @@ impl Server {
         let hls = Arc::new(HlsState::new(
             encoder,
             config.max_transcodes,
-            transcode_dir,
+            transcode_dir.clone(),
             resolver,
         ));
+        // Job folders from an earlier run are gone now; anything else an
+        // earlier run left is capped like the subtitle cache.
+        if let Err(problem) = cache::prune(&transcode_dir, cache::CACHE_LIMIT_BYTES, |_| false) {
+            tracing::warn!(dir = %transcode_dir.display(), "Could not prune the transcode folder: {problem}");
+        }
         let state = Arc::new(AppState {
             token: config.token,
             name: config.name,
@@ -204,6 +245,10 @@ impl Server {
             rebuild: tokio::sync::Mutex::new(()),
             progress: tokio::sync::Mutex::new(()),
             transfers: config.transfers,
+            pairing: config.pairing.clone(),
+            advertise_hardware: config.advertise_hardware,
+            limiter: RateLimiter::new(UNAUTHENTICATED_PER_MINUTE, Duration::from_secs(60)),
+            listen: OnceLock::new(),
             stopped,
         });
         // A source that cannot be read at all is a configuration mistake;
@@ -216,7 +261,13 @@ impl Server {
             .await
             .with_context(|| format!("Listen on {}", config.bind))?;
         let addr = listener.local_addr()?;
-        let app = router(state.clone());
+        let _ = state.listen.set(addr);
+        let close_connections = tokio_util::sync::CancellationToken::new();
+        let listener = ClosingListener {
+            inner: listener,
+            close: close_connections.clone(),
+        };
+        let app = router(state.clone()).into_make_service_with_connect_info::<Client>();
         let mut stopped = state.stopped.clone();
         let task = tokio::spawn(async move {
             let serve = axum::serve(listener, app).with_graceful_shutdown(async move {
@@ -227,9 +278,17 @@ impl Server {
             }
         });
         tracing::info!(%addr, videos = state.current().order.len(), "Remote library server listening");
+        let listen_file = state.state_dir.join(LISTEN_FILE);
+        let listen = serde_json::json!({ "listen": addr.to_string(), "pid": std::process::id() });
+        if let Err(problem) = std::fs::write(&listen_file, listen.to_string()) {
+            tracing::warn!("Could not record the listening address: {problem:#}");
+        }
         Ok(Server {
             addr,
             hls,
+            pairing: config.pairing,
+            listen_file,
+            close_connections,
             stop,
             task,
             _lock: lock,
@@ -241,12 +300,32 @@ impl Server {
         self.addr
     }
 
+    /// The pairing codes `POST /v1/pair` accepts, as given in
+    /// [`ServerConfig::pairing`]; `open()` on it shows the owner a code.
+    pub fn pairing(&self) -> Option<&PairingCodes> {
+        self.pairing.as_ref()
+    }
+
     /// Stops accepting connections, ends media streams in progress, and
     /// waits briefly for connections to close.
     pub async fn shutdown(self) {
+        let _ = std::fs::remove_file(&self.listen_file);
+        if let Some(pairing) = &self.pairing {
+            pairing.close();
+        }
         let _ = self.stop.send(true);
         self.hls.shutdown().await;
         let mut task = self.task;
+        // Media streams end as soon as they are polled; a response whose
+        // client stopped reading is never polled, so its connection is
+        // closed after a moment instead.
+        if tokio::time::timeout(SHUTDOWN_STALLED, &mut task)
+            .await
+            .is_ok()
+        {
+            return;
+        }
+        self.close_connections.cancel();
         if tokio::time::timeout(SHUTDOWN_GRACE, &mut task)
             .await
             .is_err()
@@ -254,6 +333,116 @@ impl Server {
             task.abort();
             let _ = task.await;
         }
+    }
+}
+
+/// The client's address, as the router's connect info.
+#[derive(Clone, Copy, Debug)]
+struct Client(SocketAddr);
+
+impl axum::extract::connect_info::Connected<axum::serve::IncomingStream<'_, ClosingListener>>
+    for Client
+{
+    fn connect_info(stream: axum::serve::IncomingStream<'_, ClosingListener>) -> Self {
+        Client(*stream.remote_addr())
+    }
+}
+
+/// Accepts TCP connections whose reads and writes fail once `close` is
+/// cancelled, so shutdown can end a connection that hyper would otherwise
+/// keep waiting on.
+struct ClosingListener {
+    inner: tokio::net::TcpListener,
+    close: tokio_util::sync::CancellationToken,
+}
+
+impl axum::serve::Listener for ClosingListener {
+    type Io = ClosingStream;
+    type Addr = SocketAddr;
+
+    async fn accept(&mut self) -> (ClosingStream, SocketAddr) {
+        let (inner, addr) = axum::serve::Listener::accept(&mut self.inner).await;
+        let closed = Box::pin(self.close.clone().cancelled_owned());
+        (ClosingStream { inner, closed }, addr)
+    }
+
+    fn local_addr(&self) -> std::io::Result<SocketAddr> {
+        self.inner.local_addr()
+    }
+}
+
+struct ClosingStream {
+    inner: tokio::net::TcpStream,
+    closed: std::pin::Pin<Box<tokio_util::sync::WaitForCancellationFutureOwned>>,
+}
+
+impl ClosingStream {
+    /// An error once the connection is to close. Polling registers the
+    /// waker, so a read or write waiting on the socket wakes up for it.
+    fn check(&mut self, cx: &mut std::task::Context<'_>) -> std::io::Result<()> {
+        if self.closed.as_mut().poll(cx).is_ready() {
+            Err(std::io::ErrorKind::ConnectionAborted.into())
+        } else {
+            Ok(())
+        }
+    }
+}
+
+impl tokio::io::AsyncRead for ClosingStream {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        if let Err(error) = self.check(cx) {
+            return std::task::Poll::Ready(Err(error));
+        }
+        std::pin::Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+impl tokio::io::AsyncWrite for ClosingStream {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        if let Err(error) = self.check(cx) {
+            return std::task::Poll::Ready(Err(error));
+        }
+        std::pin::Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+
+    fn poll_write_vectored(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        bufs: &[std::io::IoSlice<'_>],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        if let Err(error) = self.check(cx) {
+            return std::task::Poll::Ready(Err(error));
+        }
+        std::pin::Pin::new(&mut self.inner).poll_write_vectored(cx, bufs)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.inner.is_write_vectored()
+    }
+
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        if let Err(error) = self.check(cx) {
+            return std::task::Poll::Ready(Err(error));
+        }
+        std::pin::Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
     }
 }
 
@@ -312,6 +501,12 @@ struct AppState {
     progress: tokio::sync::Mutex<()>,
     /// Commands from paired Flicks, and the state of unfinished downloads.
     transfers: Option<TransferBackend>,
+    pairing: Option<PairingCodes>,
+    advertise_hardware: bool,
+    /// Bounds requests to the routes that need no token.
+    limiter: RateLimiter,
+    /// The bound address, set once the listener exists.
+    listen: OnceLock<SocketAddr>,
     stopped: watch::Receiver<bool>,
 }
 
@@ -523,6 +718,17 @@ fn overlay_transfers(index: &mut Index, rows: &[TransferRow], stream_incomplete:
 }
 
 fn router(state: Arc<AppState>) -> Router {
+    // Enough to recognise this Flick and pair with a code; nothing else is
+    // reachable without the token.
+    let open = Router::new()
+        .route("/v1/hello", get(hello))
+        .route("/v1/pair", post(pair))
+        .method_not_allowed_fallback(method_not_allowed)
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            limit_unauthenticated,
+        ))
+        .with_state(state.clone());
     Router::new()
         .route("/v1/library", get(listing))
         .route("/v1/media/{id}", get(media).head(media))
@@ -535,12 +741,131 @@ fn router(state: Arc<AppState>) -> Router {
         )
         .route("/v1/hash/{id}", get(hash))
         .route("/v1/progress/{id}", get(get_progress).put(put_progress))
+        .route(LOCAL_PAIR_CODE_PATH, post(open_pair_code))
         .with_state(state.clone())
         .merge(crate::remote::hls::router(state.hls.clone()))
         .merge(transfers::router(state.transfers.clone()))
         .fallback(no_route)
         .method_not_allowed_fallback(method_not_allowed)
         .layer(middleware::from_fn_with_state(state, require_token))
+        .merge(open)
+}
+
+/// The client's address, from the connection.
+fn peer(request: &Request) -> Option<SocketAddr> {
+    request
+        .extensions()
+        .get::<ConnectInfo<Client>>()
+        .map(|ConnectInfo(Client(addr))| *addr)
+}
+
+/// [`UNAUTHENTICATED_PER_MINUTE`] per client address and route; more answer
+/// 429 with `Retry-After`.
+async fn limit_unauthenticated(
+    State(state): State<Arc<AppState>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let route = if request.uri().path() == "/v1/pair" {
+        "pair"
+    } else {
+        "hello"
+    };
+    let ip = peer(&request).map_or(std::net::IpAddr::from([0, 0, 0, 0]), |addr| addr.ip());
+    match state.limiter.check(ip, route) {
+        Ok(()) => next.run(request).await,
+        Err(wait) => {
+            let mut response = error(
+                StatusCode::TOO_MANY_REQUESTS,
+                "Too many requests from this address. Wait a minute and try again.",
+            );
+            if let Ok(value) = HeaderValue::from_str(&wait.as_secs().max(1).to_string()) {
+                response.headers_mut().insert(header::RETRY_AFTER, value);
+            }
+            response
+        }
+    }
+}
+
+/// `GET /v1/hello`: the protocol, the name, and whether a code is open.
+async fn hello(State(state): State<Arc<AppState>>) -> Response {
+    Json(Hello {
+        protocol: protocol::VERSION,
+        server_name: state.name.clone(),
+        pairing_open: state.pairing.as_ref().is_some_and(PairingCodes::is_open),
+    })
+    .into_response()
+}
+
+/// `POST /v1/pair` `{"code"}`: the pairing string when the code matches.
+/// 404 while no code is open, 403 for a wrong code (the fifth closes it).
+async fn pair(State(state): State<Arc<AppState>>, request: Request) -> Response {
+    let from = peer(&request);
+    let Some(codes) = state.pairing.as_ref().filter(|codes| codes.is_open()) else {
+        return error(StatusCode::NOT_FOUND, NO_CODE_MESSAGE);
+    };
+    let Ok(body) = axum::body::to_bytes(request.into_body(), 4096).await else {
+        return error(StatusCode::BAD_REQUEST, "The pairing request is too large");
+    };
+    let Ok(PairRequest { code }) = serde_json::from_slice::<PairRequest>(&body) else {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "Send the code as JSON: {\"code\": \"123456\"}",
+        );
+    };
+    match codes.check(&code) {
+        CodeCheck::Matched => {
+            let Some(listen) = state.listen.get() else {
+                return error(StatusCode::SERVICE_UNAVAILABLE, "The server is starting");
+            };
+            tracing::info!(peer = ?from.map(|addr| addr.ip()), "Paired a Flick with a pairing code");
+            let pairing = Pairing {
+                host: listen.ip().to_string(),
+                port: listen.port(),
+                token: state.token.clone(),
+            };
+            Json(PairReply {
+                pairing: pairing.to_string(),
+            })
+            .into_response()
+        }
+        CodeCheck::Wrong { attempts_left } => error(
+            StatusCode::FORBIDDEN,
+            format!(
+                "That code is not the one shown on the server. {attempts_left} attempt{} left before the code is closed.",
+                if attempts_left == 1 { "" } else { "s" }
+            ),
+        ),
+        CodeCheck::Exhausted => error(
+            StatusCode::FORBIDDEN,
+            "That code is not the one shown on the server, and that was the last attempt. The code is closed; open a new one on the server.",
+        ),
+        CodeCheck::NotOpen => error(StatusCode::NOT_FOUND, NO_CODE_MESSAGE),
+    }
+}
+
+/// [`LOCAL_PAIR_CODE_PATH`]: opens a code for `flick-serve pair-code`. Only
+/// from this machine (loopback, or this server's own address), with the
+/// token like every other route.
+async fn open_pair_code(State(state): State<Arc<AppState>>, request: Request) -> Response {
+    let local = peer(&request).is_some_and(|addr| {
+        addr.ip().is_loopback() || state.listen.get().is_some_and(|own| own.ip() == addr.ip())
+    });
+    if !local {
+        return error(
+            StatusCode::FORBIDDEN,
+            "Pairing codes can only be opened on the server itself.",
+        );
+    }
+    let Some(codes) = &state.pairing else {
+        return error(
+            StatusCode::NOT_FOUND,
+            "This server does not accept pairing codes.",
+        );
+    };
+    let code = codes.open();
+    let expires_in = codes.remaining().map_or(0, |left| left.as_secs());
+    Json(serde_json::json!({ "pair_code": code, "expires_in": expires_in })).into_response()
 }
 
 async fn require_token(
@@ -601,18 +926,28 @@ async fn listing(State(state): State<Arc<AppState>>) -> Response {
     let index = state.refresh().await;
     let storage = state.storage().await;
     let media = state.media.clone();
-    let videos = tokio::task::spawn_blocking(move || {
-        index
+    let mut saved = {
+        let _guard = state.progress.lock().await;
+        read_progress(&progress_path(&state)).await
+    };
+    let advertise_hardware = state.advertise_hardware;
+    let described = tokio::task::spawn_blocking(move || {
+        let videos = index
             .order
             .iter()
-            .filter_map(|id| Some(describe(id, index.by_id.get(id)?, &media)))
-            .collect::<Vec<_>>()
+            .filter_map(|id| Some(describe(id, index.by_id.get(id)?, &media, saved.remove(id))))
+            .collect::<Vec<_>>();
+        let hardware = advertise_hardware
+            .then(hardware::local)
+            .filter(|found| !found.mac.is_empty() || !found.lan_ips.is_empty());
+        (videos, hardware)
     })
     .await;
-    match videos {
-        Ok(videos) => Json(Library {
+    match described {
+        Ok((videos, hardware)) => Json(Library {
             protocol: protocol::VERSION,
             server_name: state.name.clone(),
+            hardware,
             qualities: state.hls.qualities(),
             capabilities: state
                 .transfers
@@ -632,8 +967,8 @@ async fn listing(State(state): State<Arc<AppState>>) -> Response {
 
 /// The listing entry for a video. What the source knows (the desktop's
 /// saved duration and size) wins; ffprobe's view fills the gaps once the
-/// file has been inspected.
-fn describe(id: &str, entry: &Entry, media: &MediaCache) -> Video {
+/// file has been inspected. `resume` is the progress saved here, if any.
+fn describe(id: &str, entry: &Entry, media: &MediaCache, resume: Option<Progress>) -> Video {
     // A file still downloading is not inspected: ffprobe would read
     // unverified bytes, and a display-only path is not on disk at all.
     let info = if entry.complete && entry.on_disk() {
@@ -679,7 +1014,12 @@ fn describe(id: &str, entry: &Entry, media: &MediaCache) -> Video {
         progress: if entry.complete { 1.0 } else { entry.progress },
         poster: entry.poster.is_some(),
         subtitles: subtitle_files(&entry.path),
+        audio_tracks: info
+            .as_ref()
+            .map(|info| info.audio.clone())
+            .unwrap_or_default(),
         embedded_subtitles: info.map(|info| info.subtitles).unwrap_or_default(),
+        resume,
     }
 }
 
@@ -1329,6 +1669,7 @@ async fn embedded_subtitle(
         );
     };
     if let Ok(bytes) = tokio::fs::read(&cached).await {
+        touch(cached).await;
         return webvtt(bytes);
     }
     let Ok(_permit) = state.extracting.acquire().await else {
@@ -1340,13 +1681,70 @@ async fn embedded_subtitle(
     }
     match transcode::extract_webvtt(encoder, &entry.path, track).await {
         Ok(bytes) => {
-            if let Err(problem) = save_atomically(&cached, &bytes).await {
-                tracing::warn!(path = %cached.display(), "Could not keep the extracted subtitles: {problem:#}");
+            match save_atomically(&cached, &bytes).await {
+                Ok(()) => {
+                    // Keep the cache under its cap, oldest first, without
+                    // holding up this answer.
+                    let dir = state.state_dir.join(SUBTITLE_CACHE_DIR);
+                    tokio::task::spawn_blocking(move || {
+                        let fresh = cached.clone();
+                        if let Err(problem) = cache::prune(&dir, cache::CACHE_LIMIT_BYTES, |path| {
+                            path == fresh || !is_subtitle_cache_file(path)
+                        }) {
+                            tracing::warn!(dir = %dir.display(), "Could not prune the subtitle cache: {problem}");
+                        }
+                    });
+                }
+                Err(problem) => {
+                    tracing::warn!(path = %cached.display(), "Could not keep the extracted subtitles: {problem:#}");
+                }
             }
             webvtt(bytes)
         }
         Err(problem) => error(StatusCode::BAD_GATEWAY, format!("{problem:#}")),
     }
+}
+
+/// Marks a cached file as just used, so pruning removes the least recently
+/// used first.
+async fn touch(path: PathBuf) {
+    let _ = tokio::task::spawn_blocking(move || {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .and_then(|file| file.set_modified(SystemTime::now()))
+    })
+    .await;
+}
+
+/// At startup: removes temporary files that an earlier process left in the
+/// subtitle cache (this process's own may still be in use), then caps it.
+fn sweep_subtitle_cache(dir: &Path) {
+    let mine = format!(".{}-", std::process::id());
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.starts_with('.') && name.ends_with(".tmp") && !name.starts_with(&mine) {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+    }
+    if let Err(problem) = cache::prune(dir, cache::CACHE_LIMIT_BYTES, |path| {
+        !is_subtitle_cache_file(path)
+    }) {
+        tracing::warn!(dir = %dir.display(), "Could not prune the subtitle cache: {problem}");
+    }
+}
+
+/// What pruning may remove from the subtitle cache: `<hash>.vtt` entries,
+/// and `.<pid>-<n>.tmp` files of other processes. This process's own may be
+/// mid-write; anything else is not the server's.
+fn is_subtitle_cache_file(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    let temporary = name.starts_with('.') && name.ends_with(".tmp");
+    name.ends_with(".vtt") || (temporary && !name.starts_with(&format!(".{}-", std::process::id())))
 }
 
 fn webvtt(bytes: Vec<u8>) -> Response {
@@ -1492,6 +1890,9 @@ async fn put_progress(
     {
         return Json(existing.clone()).into_response();
     }
+    // A monotonic revision tells clients a new save apart from the same
+    // save seen again, since `updated` follows the saving client's clock.
+    progress.revision = saved.get(&id).map_or(0, |existing| existing.revision) + 1;
     saved.insert(id, progress.clone());
     let written = serde_json::to_vec_pretty(&saved)
         .map_err(anyhow::Error::from)

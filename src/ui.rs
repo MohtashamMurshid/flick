@@ -89,6 +89,8 @@ const FADE: Duration = Duration::from_millis(180);
 
 /// How long a keyboard action's status message stays on the video.
 const STATUS_TIMEOUT: Duration = Duration::from_millis(1500);
+/// How long an automatic quality change is explained on the video.
+const AUTO_QUALITY_NOTICE: Duration = Duration::from_secs(4);
 
 /// How long the next episode waits before starting.
 const UP_NEXT_DELAY: Duration = Duration::from_secs(8);
@@ -189,6 +191,17 @@ enum Control {
     PasteMagnet,
 }
 
+/// The audio stream of a remote transcode, by `AudioTrack::track`. None
+/// leaves it to the server, which maps the first.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct RemoteAudio {
+    /// What the playing stream was loaded with.
+    playing: Option<u32>,
+    /// What the next remote load asks for; it becomes `playing` once
+    /// libmpv accepts the load, so a refused switch leaves the menu true.
+    next: Option<u32>,
+}
+
 pub struct Flick {
     player: Option<Player>,
     snapshot: PlaybackSnapshot,
@@ -208,6 +221,10 @@ pub struct Flick {
     remote: crate::remote_client::RemoteState,
     /// First-launch setup state; everything for that flow lives inside it.
     onboarding: onboarding_ui::OnboardingState,
+    /// Finding Flicks on the tailnet, pairing by code, waking machines.
+    discovery: crate::remote_discovery::DiscoveryState,
+    /// Remote videos being copied to this computer.
+    keep: crate::remote_keep::KeepState,
     /// Remote library state of this view: cards, notices, player subtitles.
     remote_ui: remote_library_ui::RemoteUiState,
     /// "Share my library on Tailscale".
@@ -280,6 +297,13 @@ pub struct Flick {
     capturing: Option<Shortcut>,
     /// A short message about the last keyboard action, shown on the video.
     status: Option<(SharedString, Instant)>,
+    /// How long [`Self::status`] stays.
+    status_for: Duration,
+    /// Automatic quality for the playing remote video; None for local
+    /// files, servers that cannot transcode, or with the server's switch off.
+    auto_quality: Option<crate::remote_quality::AutoQuality>,
+    /// The audio stream asked of a remote transcode.
+    remote_audio: RemoteAudio,
     /// The speed before shuttling faster, restored by shuttle-pause.
     shuttle_base: Option<f64>,
     /// Measured slider tracks, keyed by slider ID.
@@ -352,6 +376,8 @@ impl Flick {
         self.quitting = true;
         self.services.begin_shutdown();
         self.remote.shutdown();
+        self.discovery.shutdown();
+        self.keep.shutdown();
         self.serve.shutdown();
         self.up_next = None;
         self.pending_open = None;
@@ -488,6 +514,8 @@ impl Flick {
             library_files_state: library_files_ui::LibraryFilesUiState::default(),
             remote: Default::default(),
             onboarding: Default::default(),
+            discovery: Default::default(),
+            keep: Default::default(),
             remote_ui: Default::default(),
             serve: Default::default(),
             error,
@@ -547,6 +575,9 @@ impl Flick {
             focused: None,
             capturing: None,
             status: None,
+            status_for: STATUS_TIMEOUT,
+            auto_quality: None,
+            remote_audio: RemoteAudio::default(),
             shuttle_base: None,
             slider_bounds: RefCell::default(),
             dragging_slider: None,
@@ -1009,34 +1040,157 @@ impl Flick {
             .store
             .data
             .remote_resume_position(&remote.server_id, &remote.video_id);
+        self.remote_audio = RemoteAudio::default();
+        let choices = crate::remote_client::picker_qualities(
+            self.remote
+                .video_complete(&remote.server_id, &remote.video_id),
+            self.remote_server(&remote.server_id)
+                .map(|server| server.qualities()),
+        );
+        self.auto_quality = crate::remote_quality::AutoQuality::for_open(
+            self.auto_quality_enabled(&remote.server_id),
+            remote.quality,
+            &choices,
+            Instant::now(),
+        );
         self.prepare_remote(remote, resume, window, cx);
     }
 
-    /// Reloads the playing remote video at another tier, at the current
-    /// position. Does nothing for local files.
+    /// The per-server automatic quality switch; on for an unknown server.
+    fn auto_quality_enabled(&self, server_id: &str) -> bool {
+        self.store
+            .data
+            .remote
+            .servers
+            .iter()
+            .find(|server| server.id == server_id)
+            .is_none_or(|server| server.auto_quality)
+    }
+
+    /// Reloads the playing remote video at a tier the person chose, at the
+    /// current position, and stops automatic changes for this video. Does
+    /// nothing for local files.
     pub(crate) fn switch_quality(
         &mut self,
         quality: Quality,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.quitting || self.remote_source().is_none() {
+            return;
+        }
+        if let Some(auto) = &mut self.auto_quality {
+            auto.chosen_by_hand(quality);
+        }
+        self.reload_remote(Some(quality), None, window, cx);
+    }
+
+    /// Reloads the playing remote transcode with another of the server's
+    /// audio streams, at the current position.
+    pub(crate) fn switch_remote_audio(
+        &mut self,
+        track: u32,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.quitting {
             return;
         }
+        self.reload_remote(None, Some(track), window, cx);
+    }
+
+    /// The server audio streams the player's menu offers for the playing
+    /// remote video, and the one playing; empty at Original, where
+    /// libmpv's own tracks are listed instead.
+    pub(crate) fn remote_audio_choices(
+        &self,
+    ) -> (Vec<flick::remote::protocol::AudioTrack>, Option<u32>) {
+        let Some(remote) = self.remote_source() else {
+            return (Vec::new(), None);
+        };
+        let tracks = self
+            .remote
+            .audio_tracks(&remote.server_id, &remote.video_id);
+        if !crate::source::server_audio_menu(remote.quality, &tracks) {
+            return (Vec::new(), None);
+        }
+        let current = crate::source::current_audio(self.remote_audio.playing, &tracks);
+        (tracks, current)
+    }
+
+    /// Reloads the playing remote video at the current position with a new
+    /// tier and/or audio stream. Nothing happens when neither changes.
+    fn reload_remote(
+        &mut self,
+        quality: Option<Quality>,
+        audio: Option<u32>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(remote) = self.remote_source() else {
             return;
         };
-        if remote.quality == quality {
+        let mut remote = remote.clone();
+        let mut next = self.remote_audio.playing;
+        let mut changed = false;
+        if let Some(quality) = quality
+            && quality != remote.quality
+        {
+            remote.quality = quality;
+            changed = true;
+        }
+        if let Some(track) = audio
+            && Some(track) != next
+        {
+            next = Some(track);
+            changed = true;
+        }
+        if !changed {
             return;
         }
-        let mut remote = remote.clone();
-        remote.quality = quality;
+        self.remote_audio.next = next;
         let position = if self.file_loaded {
             self.snapshot.position
         } else {
             self.pending_resume
         };
         self.prepare_remote(remote, position, window, cx);
+    }
+
+    /// Feeds automatic quality one observation and acts on its decision:
+    /// a drop reloads at the lower tier, at the current position, and says
+    /// why on the video for a few seconds.
+    fn observe_auto_quality(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((server_id, playing)) = self
+            .remote_source()
+            .map(|r| (r.server_id.clone(), r.quality))
+        else {
+            return;
+        };
+        // Only while the tier is actually playing: not during a reload,
+        // a server check, or after the person turned the switch off.
+        if !self.file_loaded
+            || self.remote_ui.checking.is_some()
+            || !self.auto_quality_enabled(&server_id)
+        {
+            return;
+        }
+        let Some(auto) = &mut self.auto_quality else {
+            return;
+        };
+        // The tier loaded now confirms a drop, or shows it did not happen.
+        let decision = auto.observe(
+            playing,
+            self.snapshot.buffering,
+            self.snapshot.position,
+            Instant::now(),
+        );
+        if let crate::remote_quality::Decision::Drop { to, reason } = decision {
+            tracing::info!(quality = %to, "Dropping remote quality after buffering");
+            self.reload_remote(Some(to), None, window, cx);
+            self.show_status_for(reason, AUTO_QUALITY_NOTICE);
+            cx.notify();
+        }
     }
 
     /// Loads Original at once. A transcode tier waits for the server to
@@ -1091,8 +1245,9 @@ impl Flick {
             return;
         };
         set_network_profile(player, Some(&remote));
-        match player.load(&remote.url()) {
+        match player.load(&remote.url_with_audio(self.remote_audio.next)) {
             Ok(()) => {
+                self.remote_audio.playing = self.remote_audio.next;
                 tracing::info!(
                     server = %remote.server_name,
                     video = %remote.video_id,
@@ -1129,6 +1284,10 @@ impl Flick {
         self.file_loaded = false;
         self.streaming = streaming;
         self.remote_ui.reset_player();
+        if !matches!(source, Source::Remote(_)) {
+            self.auto_quality = None;
+            self.remote_audio = RemoteAudio::default();
+        }
         let title = source.title();
         let local = source.local_path().map(PathBuf::from);
         self.set_source(Some(source));
@@ -1405,6 +1564,12 @@ impl Flick {
         if self.remote.drain() {
             cx.notify();
         }
+        self.sync_remote_settings(cx);
+        let discovered = self.discovery.drain();
+        self.handle_discovery_events(discovered, cx);
+        let kept = self.keep.drain();
+        self.notify_kept(&kept);
+        self.handle_keep_events(kept, cx);
         self.apply_remote_ready(window, cx);
         for image in self.remote.take_dropped_images() {
             let _ = window.drop_image(image);
@@ -1464,7 +1629,7 @@ impl Flick {
         if self
             .status
             .as_ref()
-            .is_some_and(|(_, shown)| shown.elapsed() >= STATUS_TIMEOUT)
+            .is_some_and(|(_, shown)| shown.elapsed() >= self.status_for)
         {
             self.status = None;
             cx.notify();
@@ -1607,6 +1772,9 @@ impl Flick {
             self.error = Some(format!("Could not save viewing preferences: {error}"));
             changed = true;
         }
+        if self.view == View::Player || self.pip.is_some() {
+            self.observe_auto_quality(window, cx);
+        }
         if changed {
             cx.notify();
         }
@@ -1618,6 +1786,50 @@ impl Flick {
             Duration::from_millis(150)
         } else {
             Duration::from_millis(500)
+        }
+    }
+
+    /// Positions, wake targets, and queued commands the remote client
+    /// learned, saved like any settings change, and its notifications.
+    fn sync_remote_settings(&mut self, cx: &mut Context<Self>) {
+        let synced = self.remote.sync_settings(&mut self.store.data);
+        if synced.changed {
+            if let Err(error) = self.store.queue_save() {
+                tracing::warn!(%error, "Could not save remote library settings");
+            }
+            cx.notify();
+        }
+        for (title, body) in synced.notifications {
+            crate::notify::notify(&title, &body);
+        }
+    }
+
+    /// One notification per finished kept copy, before the views see it.
+    fn notify_kept(&self, events: &[crate::remote_keep::KeepEvent]) {
+        for event in events {
+            let crate::remote_keep::KeepEvent::Done {
+                server_id,
+                video_id,
+                ..
+            } = event
+            else {
+                continue;
+            };
+            let server = self
+                .store
+                .data
+                .remote
+                .servers
+                .iter()
+                .find(|server| server.id == *server_id)
+                .map_or("", |server| server.name.as_str());
+            let title = self
+                .remote
+                .playback(&self.store.data, server_id, video_id)
+                .map(|playback| playback.title)
+                .unwrap_or_default();
+            let (title, body) = crate::remote_client::kept_notification(&title, server);
+            crate::notify::notify(&title, &body);
         }
     }
 
@@ -1920,7 +2132,13 @@ impl Flick {
     }
 
     fn show_status(&mut self, text: impl Into<SharedString>) {
+        self.show_status_for(text, STATUS_TIMEOUT);
+    }
+
+    /// A status message that stays longer than a keyboard action's.
+    fn show_status_for(&mut self, text: impl Into<SharedString>, duration: Duration) {
         self.status = Some((text.into(), Instant::now()));
+        self.status_for = duration;
         self.status_count += 1;
     }
 

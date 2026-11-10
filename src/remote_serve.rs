@@ -25,6 +25,17 @@
 //! yt-dlp is found. They are worked out again whenever the settings change.
 //! Both backends answer through the same helpers in
 //! `flick::remote::transfers`, so they refuse and list alike.
+//!
+//! Each start makes one [`PairingCodes`] and hands the server a clone, so
+//! "Show Pairing Code" opens the code `POST /v1/pair` accepts (and
+//! `flick-serve pair-code` with the same state folder works too). Stopping
+//! closes it at once, before the server thread has finished.
+//!
+//! On macOS, while the server runs and "Keep this Mac awake while sharing"
+//! is on, the server thread holds `caffeinate -i -w <this pid>`: an
+//! idle-sleep assertion that ends with the server, and with this process
+//! even if it crashes. The switch applies at once through a watch channel;
+//! until the settings page sets it, each start reads the saved choice.
 
 use crate::services::{
     FetchListing, FetchState, QueryError, QueryHandle, QueryReply, QueryRequest, TransferListing,
@@ -32,11 +43,12 @@ use crate::services::{
 use flick::remote::{
     auth, bind,
     ids::{self, Salt},
+    pairing::CODE_LIFETIME,
     protocol::{
         self, Capability, FetchPhase, FetchRow, Pairing, ShareResult, Started, TransferFileRow,
         TransferRow,
     },
-    server::{Server, ServerConfig, Sources},
+    server::{PairingCodes, Server, ServerConfig, Sources},
     transfers::{
         self, ShareRoots, TransferBackend, TransferCommand, TransferError, TransferReply,
         TransferRequest,
@@ -48,6 +60,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{Arc, Mutex, mpsc},
     thread,
+    time::{Duration, Instant},
 };
 
 /// Free space where downloads go; the settings page shows it too.
@@ -146,6 +159,11 @@ struct Gate {
     capabilities: Option<Arc<tokio::sync::watch::Sender<Vec<Capability>>>>,
     /// Wakes the server thread to work the capabilities out again.
     changed: Arc<tokio::sync::Notify>,
+    /// The name the server of this generation answers `hello` with.
+    name: Option<(u64, String)>,
+    /// The `caffeinate` holding the Mac awake for the server of this
+    /// generation.
+    caffeinate: Option<(u64, u32)>,
 }
 
 /// What a restart needs from the last start, without its one-shot parts.
@@ -176,6 +194,15 @@ pub struct RemoteServe {
     restart: Option<RestartOptions>,
     /// Tests receive each started server's backend here.
     tap: Option<mpsc::Sender<TransferBackend>>,
+    /// The running server's codes; a clone is in its `ServerConfig`.
+    pairing: Option<PairingCodes>,
+    /// The code "Show Pairing Code" opened, and when.
+    shown_code: Option<(String, Instant)>,
+    /// When the code was last copied, for the button's label.
+    code_copied: Option<Instant>,
+    /// "Keep this Mac awake while sharing"; None until the settings page
+    /// sets it, so each start reads the saved choice.
+    keep_awake: Arc<tokio::sync::watch::Sender<Option<bool>>>,
 }
 
 struct Running {
@@ -197,6 +224,10 @@ impl Default for RemoteServe {
             host: None,
             restart: None,
             tap: None,
+            pairing: None,
+            shown_code: None,
+            code_copied: None,
+            keep_awake: Arc::new(tokio::sync::watch::channel(None).0),
         }
     }
 }
@@ -204,6 +235,73 @@ impl Default for RemoteServe {
 impl RemoteServe {
     pub fn status(&self) -> &ServeStatus {
         &self.status
+    }
+
+    /// Opens a new six-digit pairing code on the running server, replacing
+    /// any open one. Err while the server is not running.
+    pub fn open_pairing_code(&mut self) -> Result<String, String> {
+        let codes = match (&self.status, &self.pairing) {
+            (ServeStatus::Running { .. }, Some(codes)) => codes,
+            _ => return Err("Turn on Share my library on Tailscale first".into()),
+        };
+        let code = codes.open();
+        self.shown_code = Some((code.clone(), Instant::now()));
+        self.code_copied = None;
+        Ok(code)
+    }
+
+    /// The code "Show Pairing Code" opened and how long it stays valid;
+    /// None once it was used, expired, five wrong tries closed it, the
+    /// server stopped, or `flick-serve pair-code` replaced it.
+    pub fn pairing_code(&self) -> Option<(String, Duration)> {
+        if !matches!(self.status, ServeStatus::Running { .. }) {
+            return None;
+        }
+        let (code, opened) = self.shown_code.as_ref()?;
+        let left = self.pairing.as_ref()?.remaining()?;
+        // A code opened through the server's local route has more time
+        // left than ours could, and is not the one we know.
+        let ours = CODE_LIFETIME.saturating_sub(opened.elapsed()) + Duration::from_secs(2);
+        (left <= ours).then(|| (code.clone(), left))
+    }
+
+    /// Notes that the shown code was copied, for the Copy button's label.
+    pub fn mark_code_copied(&mut self) {
+        self.code_copied = Some(Instant::now());
+    }
+
+    /// Whether the shown code was copied in the last two seconds.
+    pub fn code_copied(&self) -> bool {
+        self.code_copied
+            .is_some_and(|at| at.elapsed() < Duration::from_secs(2))
+    }
+
+    /// The name other Flicks find the running server by.
+    pub fn server_name(&self) -> Option<String> {
+        if !matches!(self.status, ServeStatus::Running { .. }) {
+            return None;
+        }
+        let gate = self.gate.lock().unwrap_or_else(|e| e.into_inner());
+        gate.name
+            .as_ref()
+            .filter(|(generation, _)| *generation == self.generation)
+            .map(|(_, name)| name.clone())
+    }
+
+    /// "Keep this Mac awake while sharing": applies at once to a running
+    /// server and to every later start. Does nothing outside macOS.
+    pub fn set_keep_awake(&mut self, on: bool) {
+        self.keep_awake.send_replace(Some(on));
+    }
+
+    /// The `caffeinate` process holding this Mac awake, if any.
+    pub fn keeping_awake(&self) -> Option<u32> {
+        self.gate
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .caffeinate
+            .filter(|(generation, _)| *generation == self.generation)
+            .map(|(_, pid)| pid)
     }
 
     /// Applies the owner's download settings from the next request on.
@@ -265,6 +363,14 @@ impl RemoteServe {
                 generation,
                 tap: self.tap.clone(),
             });
+        let codes = PairingCodes::new();
+        self.pairing = Some(codes.clone());
+        self.shown_code = None;
+        let extras = Extras {
+            pairing: codes,
+            keep_awake: self.keep_awake.subscribe(),
+            gate: self.gate.clone(),
+        };
         let events = self.events_tx.clone();
         let previous = self.stopping.take();
         let (stop, stopped) = tokio::sync::oneshot::channel();
@@ -290,7 +396,9 @@ impl RemoteServe {
                         return;
                     }
                 };
-                runtime.block_on(serve(options, transfers, generation, events, stopped));
+                runtime.block_on(serve(
+                    options, transfers, extras, generation, events, stopped,
+                ));
                 runtime.shutdown_timeout(std::time::Duration::from_secs(2));
             });
         match spawned {
@@ -311,6 +419,7 @@ impl RemoteServe {
     pub fn stop(&mut self) {
         self.generation += 1;
         self.status = ServeStatus::Off;
+        self.close_pairing();
         if let Some(running) = self.running.take() {
             let _ = running.stop.send(());
             if let Some(older) = self.stopping.replace(running.thread) {
@@ -335,17 +444,27 @@ impl RemoteServe {
         let mut changed = false;
         while let Ok((generation, status)) = self.events.try_recv() {
             if generation == self.generation && self.status != status {
-                if matches!(status, ServeStatus::Failed(_))
-                    && let Some(running) = self.running.take()
-                {
-                    // The thread is ending on its own.
-                    self.stopping = Some(running.thread);
+                if matches!(status, ServeStatus::Failed(_)) {
+                    self.close_pairing();
+                    if let Some(running) = self.running.take() {
+                        // The thread is ending on its own.
+                        self.stopping = Some(running.thread);
+                    }
                 }
                 self.status = status;
                 changed = true;
             }
         }
         changed
+    }
+
+    /// Closes the code at once; the server thread may take a moment more.
+    fn close_pairing(&mut self) {
+        if let Some(codes) = self.pairing.take() {
+            codes.close();
+        }
+        self.shown_code = None;
+        self.code_copied = None;
     }
 }
 
@@ -363,9 +482,17 @@ struct TransferSetup {
     tap: Option<mpsc::Sender<TransferBackend>>,
 }
 
+/// What every start passes the server thread besides its options.
+struct Extras {
+    pairing: PairingCodes,
+    keep_awake: tokio::sync::watch::Receiver<Option<bool>>,
+    gate: Arc<Mutex<Gate>>,
+}
+
 async fn serve(
     options: ServeOptions,
     transfers: Option<TransferSetup>,
+    extras: Extras,
     generation: u64,
     events: mpsc::Sender<(u64, ServeStatus)>,
     stopped: tokio::sync::oneshot::Receiver<()>,
@@ -406,6 +533,8 @@ async fn serve(
         None => (None, None, None),
     };
     let state_dir = options.state_dir.clone();
+    let settings_path = options.settings_path.clone();
+    extras.gate.lock().unwrap_or_else(|e| e.into_inner()).name = Some((generation, name.clone()));
     let config = ServerConfig {
         bind,
         token: token.clone(),
@@ -416,6 +545,8 @@ async fn serve(
         ffmpeg: options.ffmpeg,
         max_transcodes: 2,
         transfers: backend.clone(),
+        pairing: Some(extras.pairing),
+        advertise_hardware: true,
     };
     let server = match Server::start(config).await {
         Ok(server) => server,
@@ -460,7 +591,14 @@ async fn serve(
         .to_string(),
     });
     // Resolves on stop, or when the view is gone and the sender dropped.
-    let _ = stopped.await;
+    keep_awake_until(
+        extras.keep_awake,
+        &extras.gate,
+        generation,
+        &settings_path,
+        stopped,
+    )
+    .await;
     tracing::info!("Stopping the in-app remote library server");
     server.shutdown().await;
     if let Some((answering, keeping)) = answering {
@@ -471,6 +609,100 @@ async fn serve(
             let _ = keeping.await;
         }
     }
+}
+
+/// Holds `caffeinate` while the owner wants it, until `stopped` resolves.
+async fn keep_awake_until(
+    mut wanted: tokio::sync::watch::Receiver<Option<bool>>,
+    gate: &Mutex<Gate>,
+    generation: u64,
+    settings_path: &Path,
+    mut stopped: tokio::sync::oneshot::Receiver<()>,
+) {
+    let saved = {
+        let path = settings_path.to_owned();
+        tokio::task::spawn_blocking(move || saved_keep_awake(&path))
+            .await
+            .unwrap_or(true)
+    };
+    let mut held: Option<tokio::process::Child> = None;
+    loop {
+        let on = wanted.borrow_and_update().unwrap_or(saved);
+        match (on, held.is_some()) {
+            (true, false) => held = caffeinate(),
+            (false, true) => release(&mut held).await,
+            _ => {}
+        }
+        let pid = held.as_ref().and_then(tokio::process::Child::id);
+        gate.lock().unwrap_or_else(|e| e.into_inner()).caffeinate =
+            pid.map(|pid| (generation, pid));
+        tokio::select! {
+            _ = &mut stopped => break,
+            changed = wanted.changed() => {
+                if changed.is_err() {
+                    // The view is gone; its stop follows.
+                    let _ = (&mut stopped).await;
+                    break;
+                }
+            }
+        }
+    }
+    release(&mut held).await;
+    let mut gate = gate.lock().unwrap_or_else(|e| e.into_inner());
+    if gate
+        .caffeinate
+        .is_some_and(|(held_by, _)| held_by == generation)
+    {
+        gate.caffeinate = None;
+    }
+}
+
+/// Starts `caffeinate -i -w <this pid>` on macOS; None elsewhere or when it
+/// cannot start, which only costs the assertion.
+fn caffeinate() -> Option<tokio::process::Child> {
+    if !cfg!(target_os = "macos") {
+        return None;
+    }
+    let spawned = tokio::process::Command::new("/usr/bin/caffeinate")
+        .arg("-i")
+        .arg("-w")
+        .arg(std::process::id().to_string())
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .spawn();
+    match spawned {
+        Ok(child) => {
+            tracing::info!("Keeping this Mac awake while sharing");
+            Some(child)
+        }
+        Err(error) => {
+            tracing::warn!(%error, "Could not keep this Mac awake while sharing");
+            None
+        }
+    }
+}
+
+async fn release(held: &mut Option<tokio::process::Child>) {
+    if let Some(mut child) = held.take() {
+        // Kills and reaps it.
+        let _ = child.kill().await;
+        tracing::info!("This Mac may sleep again");
+    }
+}
+
+/// "Keep this Mac awake while sharing" as last saved; on when unreadable.
+fn saved_keep_awake(settings_path: &Path) -> bool {
+    #[derive(Default, serde::Deserialize)]
+    #[serde(default)]
+    struct Saved {
+        remote: crate::store::remote::RemoteSettings,
+    }
+    std::fs::read_to_string(settings_path)
+        .ok()
+        .and_then(|text| serde_json::from_str::<Saved>(&text).ok())
+        .is_none_or(|saved| saved.remote.keep_awake)
 }
 
 type Published = Arc<tokio::sync::watch::Sender<Vec<Capability>>>;
@@ -1046,6 +1278,199 @@ mod tests {
         let thread = serve.stopping.take().unwrap();
         thread.join().unwrap();
         assert!(std::net::TcpStream::connect(second).is_err());
+    }
+
+    fn post(listen: SocketAddr, path: &str, body: &str) -> String {
+        let mut stream = std::net::TcpStream::connect(listen).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        write!(
+            stream,
+            "POST {path} HTTP/1.1\r\nHost: {listen}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+        .unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).unwrap();
+        response
+    }
+
+    fn pair_with(listen: SocketAddr, code: &str) -> String {
+        post(
+            listen,
+            "/v1/pair",
+            &serde_json::json!({ "code": code }).to_string(),
+        )
+    }
+
+    fn library_settings(dir: &std::path::Path, remote: serde_json::Value) {
+        std::fs::write(
+            dir.join("settings.json"),
+            serde_json::json!({"library": [], "remote": remote}).to_string(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn an_opened_code_pairs_through_v1_pair_once() {
+        let dir = tempfile::tempdir().unwrap();
+        library_settings(dir.path(), serde_json::json!({"keep_awake": false}));
+        let mut serve = RemoteServe::default();
+        assert!(serve.open_pairing_code().is_err(), "not running yet");
+        assert_eq!(serve.pairing_code(), None);
+        serve.start(options(dir.path(), false));
+        let ServeStatus::Running { listen, pairing } =
+            wait_for(&mut serve, |s| !matches!(s, ServeStatus::Starting))
+        else {
+            panic!("did not start: {:?}", serve.status());
+        };
+        assert_eq!(serve.server_name().as_deref(), Some("Test Library"));
+        assert_eq!(serve.pairing_code(), None);
+        let hello = get(listen, "/v1/hello", "");
+        assert!(hello.contains(r#""pairing_open":false"#), "{hello}");
+        assert!(pair_with(listen, "123456").starts_with("HTTP/1.1 404"));
+
+        let code = serve.open_pairing_code().unwrap();
+        assert!(
+            code.len() == 6 && code.bytes().all(|b| b.is_ascii_digit()),
+            "{code}"
+        );
+        let (shown, left) = serve.pairing_code().unwrap();
+        assert_eq!(shown, code);
+        assert!(
+            left > Duration::from_secs(9 * 60) && left <= CODE_LIFETIME,
+            "{left:?}"
+        );
+        let hello = get(listen, "/v1/hello", "");
+        assert!(hello.contains(r#""pairing_open":true"#), "{hello}");
+
+        let wrong = if code == "000000" { "000001" } else { "000000" };
+        let refused = pair_with(listen, wrong);
+        assert!(refused.starts_with("HTTP/1.1 403"), "{refused}");
+        assert_eq!(
+            serve.pairing_code().map(|(code, _)| code),
+            Some(code.clone())
+        );
+
+        let paired = pair_with(listen, &code);
+        assert!(paired.starts_with("HTTP/1.1 200"), "{paired}");
+        assert!(
+            paired.contains(&pairing),
+            "the reply carries the pairing string"
+        );
+        assert_eq!(serve.pairing_code(), None, "a match closes the code");
+        assert!(pair_with(listen, &code).starts_with("HTTP/1.1 404"));
+
+        // A new code replaces the open one.
+        let first = serve.open_pairing_code().unwrap();
+        let second = serve.open_pairing_code().unwrap();
+        assert_eq!(
+            serve.pairing_code().map(|(code, _)| code),
+            Some(second.clone())
+        );
+        if first != second {
+            assert!(pair_with(listen, &first).starts_with("HTTP/1.1 403"));
+        }
+        assert!(pair_with(listen, &second).starts_with("HTTP/1.1 200"));
+
+        // The saved choice was off, so nothing held the Mac awake.
+        assert_eq!(serve.keeping_awake(), None);
+        serve.stop();
+    }
+
+    #[test]
+    fn stopping_the_server_closes_its_code() {
+        let dir = tempfile::tempdir().unwrap();
+        library_settings(dir.path(), serde_json::json!({"keep_awake": false}));
+        let mut serve = RemoteServe::default();
+        serve.start(options(dir.path(), false));
+        let ServeStatus::Running { listen, .. } =
+            wait_for(&mut serve, |s| !matches!(s, ServeStatus::Starting))
+        else {
+            panic!("did not start: {:?}", serve.status());
+        };
+        let code = serve.open_pairing_code().unwrap();
+        let codes = serve.pairing.clone().unwrap();
+        assert!(codes.is_open());
+
+        serve.stop();
+        assert!(!codes.is_open(), "closed at once, before the thread ends");
+        assert_eq!(serve.pairing_code(), None);
+        assert!(serve.open_pairing_code().is_err());
+        serve.stopping.take().unwrap().join().unwrap();
+        assert!(std::net::TcpStream::connect(listen).is_err());
+
+        // The next start has its own code, closed until opened.
+        serve.start(options(dir.path(), false));
+        let ServeStatus::Running { listen, .. } =
+            wait_for(&mut serve, |s| !matches!(s, ServeStatus::Starting))
+        else {
+            panic!("did not restart: {:?}", serve.status());
+        };
+        assert_eq!(serve.pairing_code(), None);
+        assert!(pair_with(listen, &code).starts_with("HTTP/1.1 404"));
+        serve.stop();
+    }
+
+    /// Whether a process with this id exists (and is not a zombie).
+    fn alive(pid: u32) -> bool {
+        std::process::Command::new("ps")
+            .args(["-o", "stat=,command=", "-p", &pid.to_string()])
+            .output()
+            .ok()
+            .filter(|output| output.status.success())
+            .is_some_and(|output| !String::from_utf8_lossy(&output.stdout).starts_with('Z'))
+    }
+
+    fn wait_awake(serve: &RemoteServe, held: bool) -> Option<u32> {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let pid = serve.keeping_awake();
+            if pid.is_some() == held {
+                return pid;
+            }
+            assert!(Instant::now() < deadline, "keeping awake: {pid:?}");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[test]
+    fn caffeinate_is_held_while_serving_on_macos_and_follows_the_switch() {
+        let dir = tempfile::tempdir().unwrap();
+        // No saved choice: on by default.
+        library_settings(dir.path(), serde_json::json!({}));
+        let mut serve = RemoteServe::default();
+        serve.start(options(dir.path(), false));
+        wait_for(&mut serve, |s| matches!(s, ServeStatus::Running { .. }));
+        if !cfg!(target_os = "macos") {
+            std::thread::sleep(Duration::from_millis(300));
+            assert_eq!(serve.keeping_awake(), None);
+            serve.stop();
+            return;
+        }
+        let pid = wait_awake(&serve, true).unwrap();
+        let command = std::process::Command::new("ps")
+            .args(["-o", "command=", "-p", &pid.to_string()])
+            .output()
+            .unwrap();
+        let command = String::from_utf8_lossy(&command.stdout);
+        assert_eq!(
+            command.trim(),
+            format!("/usr/bin/caffeinate -i -w {}", std::process::id())
+        );
+
+        serve.set_keep_awake(false);
+        wait_awake(&serve, false);
+        assert!(!alive(pid), "switching off ends caffeinate");
+
+        serve.set_keep_awake(true);
+        let again = wait_awake(&serve, true).unwrap();
+        assert!(alive(again));
+        serve.stop();
+        assert_eq!(serve.keeping_awake(), None);
+        serve.stopping.take().unwrap().join().unwrap();
+        assert!(!alive(again), "stopping the server ends caffeinate");
     }
 
     fn snapshot_file(index: usize, path: PathBuf, selected: bool) -> flick::torrent::FileProgress {

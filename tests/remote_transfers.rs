@@ -147,6 +147,8 @@ impl Headless {
             ffmpeg: Some(state_dir.join("no-ffmpeg")),
             max_transcodes: 1,
             transfers: Some(TransferBackend::new(capabilities, sender)),
+            pairing: None,
+            advertise_hardware: true,
         })
         .await?;
         Ok(Self {
@@ -315,6 +317,8 @@ async fn stub_server(root: &Path, transfers: Option<TransferBackend>) -> Result<
         ffmpeg: Some(state_dir.join("no-ffmpeg")),
         max_transcodes: 1,
         transfers,
+        pairing: None,
+        advertise_hardware: true,
     })
     .await?;
     Ok((server, token))
