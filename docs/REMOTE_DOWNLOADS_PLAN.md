@@ -1,6 +1,6 @@
 # Download to another machine, and onboarding
 
-**Status: proposed on 2026-11-10; not implemented.** Builds on the [remote library](REMOTE_PLAN.md), which is merged and was played across machines the same day. That feature is read-only: a paired Flick can list and play what the server has. This plan lets a paired Flick also *start* things on the server: a torrent, a link download, or a share. It adds a first-launch onboarding that sets all of this up in four screens.
+**Status: proposed and built on 2026-11-10; delivered at `d8cc148` as ticked below. Loopback tests, the desktop typecheck and unit tests, and `curl` against a real Tailscale address pass; nothing has been used from a second machine yet, which is this plan's acceptance test. See [validation](VALIDATION.md#download-to-another-machine-and-onboarding-on-2026-11-10).** Builds on the [remote library](REMOTE_PLAN.md), which is merged and was played across machines the same day. That feature is read-only: a paired Flick can list and play what the server has. This plan lets a paired Flick also *start* things on the server: a torrent, a link download, or a share. It adds a first-launch onboarding that sets all of this up in four screens.
 
 ## Outcome
 
@@ -37,14 +37,14 @@ Listing gains `capabilities` (any of `downloads`, `links`, `shares`, `stream-inc
 
 | Request | Response |
 | --- | --- |
-| `POST /v1/transfers/resolve` `{input}` with a magnet, HTTPS `.torrent` URL, infohash, or base64 `.torrent` bytes | The file list, as the desktop's file-selection sheet shows it. Bounded by the same five-minute peer wait, cancellable with `DELETE`. |
+| `POST /v1/transfers/resolve` `{input}` with a magnet, HTTPS `.torrent` URL, infohash, or base64 `.torrent` bytes | The file list, as the desktop's file-selection sheet shows it. Bounded by the same five-minute peer wait. As built there is no `DELETE`: the server cancels a lookup when the client closes the request. |
 | `POST /v1/transfers` `{input, files: [index]}` | `{id}`; the server picks the folder, never the client. 409 when the transfer already exists. |
 | `GET /v1/transfers` | Snapshots of every transfer the server owns, in the adapter's shape: state, selected files, verified progress, rates, peers, checking percentage. |
 | `POST /v1/transfers/{id}/pause`, `/resume`, `/pause-all`, `/resume-all` | 204. |
 | `DELETE /v1/transfers/{id}` `{delete_files, confirm: [paths]}` | With `delete_files`, the server deletes only the files whose paths the client echoed from the snapshot, exactly as the desktop's Delete Listed Files does; a mismatch is 409 with the current list. |
 | `POST /v1/fetches` `{url}`, `GET /v1/fetches`, `DELETE /v1/fetches/{id}` | Link downloads with yt-dlp or HTTPS on the server; updates in the shape `fetch::FetchUpdate` already has. |
 | `GET /v1/browse?dir=` | Folders and video files under an allowed share root; anything outside answers 404, never the real path. |
-| `POST /v1/shares` `{dir, name}` | Seeds that folder; returns the magnet and infohash. |
+| `POST /v1/shares` `{dir}` | Seeds that folder; returns the magnet and infohash. As built the body has no `name`. |
 | `GET /v1/media/{id}` for `complete: false` | Range requests served through `TransferSession::open_stream`, which returns only verified pieces and steers the picker toward the read position. A read that has to wait blocks up to 30 s, then answers 504 so the player can retry, instead of today's 409. |
 
 Transfers are identified by infohash and fetches by the server's own id, so a client holding stale ids gets 404 and refreshes.
@@ -61,7 +61,7 @@ The desktop already plays an unfinished torrent through a libmpv stream callback
 
 ### Onboarding
 
-A new `onboarding` view replaces the current welcome page and owns the four steps and their state. Step one reuses the pairing code from Remote Libraries; step two reuses the in-app server switch; step three writes the default destination and the seeding choice. A `setup_done` flag in settings, set only on the last step, decides whether first launch shows it; *Set up Flick again* clears the flag. Every step can be skipped, and skipping sets nothing.
+A new `onboarding` view owns the four steps and their state. As built it comes before the welcome page rather than replacing it: an empty library still shows the welcome page after setup. Step one reuses the pairing code from Remote Libraries; step two reuses the in-app server switch; step three writes the default destination and the seeding choice. A `setup_done` flag in settings, set only on the last step, decides whether first launch shows it; *Set up Flick again* clears the flag. Every step can be skipped, and skipping sets nothing.
 
 ## Security and consent
 
@@ -76,32 +76,32 @@ A new `onboarding` view replaces the current welcome page and owns the four step
 
 ### 1. Server command routes, in-app first
 
-- [ ] Listing: `capabilities`, `storage`, in-progress videos with `progress`.
-- [ ] Transfers: resolve, start, list, pause, resume, remove with echoed deletion; adapters over the existing `Services` commands and events.
-- [ ] The owner's switch and folder settings in `store::remote`; 403 everywhere when off.
-- [ ] Loopback tests with generated fixtures and explicit local peers, following `tests/transfers.rs`: start a download from a loopback seed through the route, watch its snapshot complete, pause and resume, remove with a wrong and then a right file list. No trackers, no DHT.
+- [x] Listing: `capabilities`, `storage`, in-progress videos with `progress`.
+- [x] Transfers: resolve, start, list, pause, resume, remove with echoed deletion; adapters over the existing `Services` commands and events.
+- [x] The owner's switch and folder settings in `store::remote`; 403 everywhere when off.
+- [x] Loopback tests with generated fixtures and explicit local peers, following `tests/transfers.rs`: start a download from a loopback seed through the route, watch its snapshot complete, pause and resume, remove with a wrong and then a right file list. No trackers, no DHT.
 
 ### 2. Client: Save to, and Downloads by machine
 
-- [ ] Save to picker in the torrent sheet, the link sheet, and the command center; defaults and memory.
-- [ ] Remote rows in Downloads with the local row component, polling, actions, and the offline status line.
-- [ ] Completed remote downloads appear in that server's library section without a restart.
+- [x] Save to picker in the torrent sheet, the link sheet, and the command center; defaults and memory. The last choice per sheet is remembered for the session, not across launches.
+- [x] Remote rows in Downloads with the local row component, polling, actions, and the offline status line.
+- [x] Completed remote downloads appear in that server's library section without a restart.
 
 ### 3. Watch while downloading over the wire
 
-- [ ] Media route over `VerifiedStream` with bounded waits and cancel on disconnect.
-- [ ] Buffering on seeks into missing pieces, through the existing paused-for-cache state.
-- [ ] Tests with a throttled loopback seed: play starts before completion, a seek past the download waits and resumes, a disconnected read releases the stream.
+- [x] Media route over `VerifiedStream` with bounded waits and cancel on disconnect.
+- [ ] Buffering on seeks into missing pieces, through the existing paused-for-cache state. It relies on the player's existing Buffering state; no player has played an unfinished remote download yet.
+- [ ] Tests with a throttled loopback seed: play starts before completion, a seek past the download waits and resumes, a disconnected read releases the stream. `tests/remote_transfers.rs` reads verified ranges before completion, gets 504 for a range a stopped seed cannot supply, and releases the stream on disconnect; a wait that then resumes, and a real player, are not tested.
 
 ### 4. Onboarding and the headless server
 
-- [ ] The four-step view, `setup_done`, and *Set up Flick again*.
-- [ ] `flick-serve --allow-downloads --download-dir --share-root`, its transfer state, and `remote-downloads.json`; the launchd agent and `docs/REMOTE.md` updated.
+- [x] The four-step view, `setup_done`, and *Set up Flick again*.
+- [x] `flick-serve --allow-downloads --download-dir --share-root`, its transfer state, and `remote-downloads.json`; the launchd agent and `docs/REMOTE.md` updated. The launchd installer already passes options after `--`, so it was not changed; it has not been run with these options.
 
 ### 5. Shares and links from the server
 
-- [ ] `browse` and `shares` with allowed roots; *Seed from* in the Share sheet.
-- [ ] Link downloads through `fetches`; yt-dlp discovery on the server with a clear message when it is missing.
+- [x] `browse` and `shares` with allowed roots; *Seed from* in the Share sheet.
+- [x] Link downloads through `fetches`; yt-dlp discovery on the server with a clear message when it is missing. `flick-serve --links` logs why links are off; the in-app server leaves `links` out of its capabilities, and Save to says Not accepting links.
 
 ## Not in scope
 

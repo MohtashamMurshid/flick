@@ -16,6 +16,72 @@ The earlier macOS build/playback entries later in this log describe pre-PR revis
 
 The presentation adapter transfers decoded BGRA frames through CPU memory into GPUI images. It sizes frames to physical video bounds without a fixed resolution, axis, or pixel-budget cap. Checked native dimensions and allocation failures produce explicit errors. GPU rendering of those images does not establish hardware video decoding or zero-copy presentation. Treat this as a functional prototype. Hardware decoding, efficient GPU surface sharing, HDR correctness, battery use, and claims of being faster than VLC remain unverified.
 
+### Download to another machine and onboarding on 2026-11-10
+
+Tested commit `d8cc148`, the merged `remote-downloads` branch: the server's command routes and the headless backend, the in-app backend over `Services`, Save to and Downloads by machine, Seed from, and the four onboarding screens. Same Mac mini as the entries below: Apple Silicon, Command Line Tools only (no Xcode, no Metal compiler), no libmpv, FFmpeg in `~/.local/bin`, Tailscale address 100.98.200.69. The design is in [the remote downloads plan](REMOTE_DOWNLOADS_PLAN.md).
+
+#### Backend tests (passing)
+
+- `cargo fmt --all -- --check`: passed.
+- `cargo clippy --locked --no-default-features --all-targets -- -D warnings`: passed.
+- `cargo test --locked --no-default-features --all-targets`: 118 library unit tests (1 ignored opt-in), 17 `tests/remote_hls.rs` (1 ignored), 18 `tests/remote_server.rs` (1 ignored), 6 `tests/remote_transfers.rs`, 9 `tests/transfers.rs`; the three binaries have no unit tests. All passed.
+- `tests/remote_transfers.rs` runs on 127.0.0.1 with generated files, a seed `TransferSession`, and that seed as an explicit peer; no trackers, no DHT. It covers: every route answering 403 without a backend or without its capability; resolve, start, progress, pause, resume, completion, and removal with a wrong and then a right file list; `--library` mode listing completed downloads from `remote-downloads.json`; browse and share staying inside the allowed roots; an unfinished download serving verified ranges, answering 504 for a range the stopped seed cannot supply, and releasing the stream when the client goes away; and `flick-serve` as a separate process with its download flags, a generated yt-dlp stand-in for link downloads, and shares.
+
+#### Desktop typecheck and unit tests under `runtime-shaders` (not a shipping build)
+
+- `cargo clippy --locked --features runtime-shaders --all-targets -- -D warnings`: passed.
+- `cargo test --locked --features runtime-shaders --all-targets`: 118 library, 209 desktop (12 ignored opt-ins), 17 HLS, 18 server, 6 remote transfer, and 9 transfer tests passed. The desktop count includes the Save to destinations and choice, the remote Downloads rows, polling and the listing refresh after a remote download completes (against a loopback server), the in-app backend's capabilities and gate, and the onboarding step rules (Next, Skip, Back, the summary, and when a launch starts in setup).
+
+This compiles and unit-tests the desktop code with shaders compiled at run time. It is not a shipping build, and says nothing about drawing or playback.
+
+#### Headless `flick-serve` on the real Tailscale address
+
+`cargo build --locked --release --no-default-features --bin flick-serve` (53 s). In a temporary folder: a 4,900,410-byte clip from `scripts/make-test-video.sh` in `share/Films`, seeded by `flick-transfer share` on `127.0.0.1:45931`. Then:
+
+```sh
+flick-serve --bind 100.98.200.69:47118 --state-dir <tmp>/state --name e2e --folder <tmp>/media \
+  --allow-downloads --download-dir <tmp>/downloads --share-root <tmp>/share \
+  --local-transfers --peer 127.0.0.1:45931 --download-limit 1024
+```
+
+`--peer` is hidden from `--help`; it exists for tests with `--local-transfers`. Port 47118 was used because another `flick-serve` already listened on 47117 and was left alone. The `curl` transcript, with the token redacted:
+
+| Request | Answer |
+| --- | --- |
+| `GET /v1/library` | 200; `capabilities` `downloads`, `stream-incomplete`, `shares` (no `links`: `--links` not given); `storage` `free_bytes` 166965473280, `download_folder_name` `downloads`; 0 videos |
+| `POST /v1/transfers/resolve` with `base64:` and the `.torrent` | 200; infohash `095bdae2…`, one file `clip.mp4`, 4900410 bytes |
+| `POST /v1/transfers/resolve` with `/etc/passwd` | 400 "Paste a magnet link, an infohash, an https:// link to a .torrent file, or the file itself" |
+| `POST /v1/transfers` `{files: [0]}` | 201 `{"id": "095bdae2…"}` |
+| The same again | 409 "This torrent is already on this server. See it in Downloads." |
+| `GET /v1/transfers`, once a second | 0, 2097152, 2803258, 2803258, then `seeding` 4900410 of 4900410 after 4 s |
+| `GET /v1/library` at 2 MiB | the clip with `complete: false`, `progress: 0.428` |
+| `GET /v1/media/{id}`, `Range: bytes=0-65535`, while downloading | 206, 65536 bytes, identical to the source |
+| `GET /v1/library` after completion | the clip, `video/mp4`, `complete: true`, `progress: 1` |
+| `GET /v1/media/{id}`, `Range: bytes=0-99` | 206, `Content-Range: bytes 0-99/4900410`, 100 bytes identical to the source |
+| `DELETE /v1/transfers/{id}` `{delete_files: true, confirm: ["wrong.mp4"]}` | 409 with `"files": ["clip.mp4"]` and "The files to delete have changed. Check the list and confirm again."; the downloaded file was byte-identical afterward |
+| The same with `confirm: ["clip.mp4"]` | 204; the file was gone; `GET /v1/transfers` answered `[]` |
+| `GET /v1/browse?dir=` | 200, one entry `share` (a folder) |
+| `GET /v1/browse?dir=share/Films` | 200, `clip.mp4`, 4900410 bytes |
+| `GET /v1/browse?dir=../`, `dir=share/../../etc` | 404 "No such folder on this server." |
+| `POST /v1/shares` `{dir: "share/Films"}` | 201 with an infohash and its magnet |
+| `POST /v1/shares` `{dir: "../tmp"}` | 404 "No such folder on this server." |
+| `GET /v1/fetches` | 403, link downloads not allowed |
+| Each of the routes above, and the media route, without the token | 401 |
+
+Restarted with the same state folder and without `--allow-downloads`: the listing had empty `capabilities` and no `storage`; `GET /v1/transfers`, resolve, `pause-all`, `DELETE /v1/transfers/{id}`, browse, shares, and fetches each answered 403 naming what is not allowed; without the token, 401. `--share-root` without `--allow-downloads` is refused at startup. The server's log had no warnings or errors and never contained the token. Both processes were stopped, nothing was left listening on 47118 or 45931, and the temporary folder was deleted. The table is from the third of three identical runs: the first ran without `--download-limit` and finished before the first poll, and in the first two the script's own byte comparison used macOS `cmp -n`, which reports EOF when the first file is shorter; the comparison was redone with `head -c`.
+
+One wording problem showed here: a headless server's 403 says "Its owner can allow it in Appearance → Remote Libraries", which is the desktop setting; `flick-serve` needs `--allow-downloads`, `--links`, or `--share-root`.
+
+#### The in-app server on the real Tailscale address
+
+Run by the orchestrator earlier the same day at commit `eb094a2`. The desktop app was launched under `runtime-shaders` with "Share my library on Tailscale" and `allow_downloads` saved on. Over `http://100.98.200.69:47117` with the token: the listing advertised `downloads`, `shares`, `stream-incomplete`, and `links`, with `free_bytes`; `GET /v1/transfers` and `GET /v1/fetches` answered `[]`; `browse?dir=` listed the root and `dir=share/Films` its file; `dir=../` answered 404 "No such folder on this server."; a resolve with an input that is not a torrent answered 400; a request without the token answered 401. No download was started through the in-app server.
+
+#### Interactive use from a second machine: not performed
+
+Nothing in this entry was done from a second machine or through the desktop interface. Not yet observed: the Save to picker in the torrent, link, and Share sheets and in the command center; a download started from the MacBook running on the Mac mini; the Mac mini's section in Downloads with live rows, Pause, Resume, Remove · Keep Files, and Remove and Delete Files…; the offline status line; Watch Now on an unfinished remote download, including a seek into missing pieces showing Buffering; a completed download appearing in the server's library section; Seed from; a link download on the server; and the four onboarding screens and Set Up Again….
+
+It takes: the Mac mini running `flick-serve --allow-downloads` (or the desktop app with both switches on) on its Tailscale address; Flick built on the MacBook with libmpv, as in the [first remote session](#remote-playback-from-the-macbook-pro-on-2026-11-10); a legal torrent with live seeders; yt-dlp on the Mac mini for links; a fresh `FLICK_SETTINGS_PATH` for onboarding; and a person at the MacBook. That session is the acceptance test of the plan.
+
 ### Pull request #7 merged without CI on 2026-11-10
 
 GitHub Actions did not run for the `remote-library` branch: every job of the "Native builds" workflow failed in under five seconds with the annotation "The job was not started because your account is locked due to a billing issue." No Windows or Linux build, lint, or test ran for this change set anywhere. The macOS evidence is the local runs recorded in the entries below, under the dev-only `runtime-shaders` feature rather than the shipping configuration. The pull request was merged on the owner's instruction with that gap known; re-run the workflow on `main` once the account is unlocked and record the result here.

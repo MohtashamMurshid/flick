@@ -140,6 +140,14 @@ The design, delivery order, and checkboxes are in [the remote library plan](REMO
 
 State on 2026-11-10 at `c17bbd6`: the server core and `flick-serve` are built, tested on loopback, and checked on a real Tailscale address. The desktop client has the `Source` type, the Remote Libraries settings page, and the player side of remote playback. The library section that lists remote videos, the quality tiers (transcodes and HLS), and playback from a second machine are not done. See [validation](VALIDATION.md#remote-library-over-tailscale-on-2026-11-10).
 
+Later the same day the library section, the quality tiers, and the in-app server were merged, and a MacBook played remote videos at Original and through a transcode tier. See [validation](VALIDATION.md#remote-playback-from-the-macbook-pro-on-2026-11-10).
+
+### 9. Download to another machine, and onboarding
+
+The design, delivery order, and checkboxes are in [the remote downloads plan](REMOTE_DOWNLOADS_PLAN.md). A paired Flick starts torrents, link downloads, and shares on a server whose owner allows it, follows them in Downloads by machine, and plays them before they finish. A first launch walks through four setup screens.
+
+State on 2026-11-10 at `d8cc148`: the server routes, the headless and in-app backends, Save to, Downloads by machine, Seed from, and onboarding are built. Loopback tests, the desktop typecheck and unit tests, and `curl` on a real Tailscale address pass. Nothing has been used from a second machine, which is the plan's acceptance test. See [validation](VALIDATION.md#download-to-another-machine-and-onboarding-on-2026-11-10).
+
 Watch folders, remote control of the player, accounts, cloud storage, casting, and a general NDJSON agent interface are outside the first release. Search belongs in the library workflow.
 
 ## Existing prototype

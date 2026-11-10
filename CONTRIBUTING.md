@@ -13,7 +13,7 @@ Follow [Getting started](README.md#getting-started) to install Rust, the platfor
 - **Keep playback and torrent transfers separate.** The transfer code builds and tests without GPUI or libmpv (`--no-default-features`), and CI checks that no desktop dependency leaks into that build.
 - **Transfer tests use generated local fixtures and explicit local peers**, never public trackers or DHT.
 - **Link-download tests use a generated stand-in for yt-dlp and loopback servers**, never the Internet.
-- **Remote-library server tests bind loopback and use generated fixtures** (`tests/remote_server.rs`), never Tailscale. Check the real Tailscale address by hand and record it, as described in [Serving a Flick library](docs/REMOTE.md).
+- **Remote-library server tests bind loopback and use generated fixtures** (`tests/remote_server.rs`, `tests/remote_hls.rs`, `tests/remote_transfers.rs`), never Tailscale. Downloads started through the server use a loopback seed as an explicit peer, with `--local-transfers` for `flick-serve`. Check the real Tailscale address by hand and record it, as described in [Serving a Flick library](docs/REMOTE.md).
 - **Record what you actually ran** in [docs/VALIDATION.md](docs/VALIDATION.md). Keep three things distinct: a passing backend test, a desktop build, and actual interactive playback. CI configuration on its own is not evidence that something works.
 
 ## Checks
@@ -113,7 +113,10 @@ GPUI 0.2.2 is pinned. Its transitive `xattr` dependency still uses the `ENOATTR`
 - `src/theme.rs`: interface styles, WCAG contrast adjustment, and appearance settings.
 - `src/bin/flick-transfer.rs`: development transfer diagnostic without GPUI or libmpv.
 - `src/bin/flick-fetch.rs`: development diagnostic for link downloads.
-- `src/remote/`: remote library protocol and server, without GPUI or libmpv. `src/bin/flick-serve.rs` is the headless server.
-- `src/remote_client.rs`, `src/source.rs`, `src/store/remote.rs`: the desktop side of remote libraries: paired servers, listings, and what the player loads.
+- `src/remote/`: remote library protocol and server, without GPUI or libmpv. `src/remote/transfers.rs` holds the command routes for downloads and shares on the server and the headless backend behind them. `src/bin/flick-serve.rs` is the headless server.
+- `src/remote_client.rs`, `src/source.rs`, `src/store/remote.rs`: the desktop side of remote libraries: paired servers, listings, Save to destinations, other machines' transfers, and what the player loads.
+- `src/remote_library_ui.rs`: remote library sections, Save to and Seed from, and Downloads sections for other machines.
+- `src/remote_serve.rs`: the in-app server behind "Share my library on Tailscale", and its answers to other Flicks' download commands through `src/services.rs`.
+- `src/onboarding_ui.rs`: the four first-launch setup screens.
 
 The [implementation plan](docs/PLAN.md) tracks what is built and what is planned.

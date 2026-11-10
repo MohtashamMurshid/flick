@@ -2,13 +2,13 @@
 
 `flick-serve` is a headless server for a machine that keeps the storage, such as a Mac mini. Another Flick on the same [Tailscale](https://tailscale.com) network can browse its library and stream the original files from it. Files are not copied. The design is in [the remote library plan](REMOTE_PLAN.md).
 
-**Status:** the server, this tool, the quality tiers, and the desktop side (pairing in **Appearance → Remote Libraries**, a library section per server, playback, subtitles, and the quality picker) are implemented and covered by loopback tests; the server was checked on a real Tailscale address, including from the desktop app's own "Share my library on Tailscale" switch (see [validation](VALIDATION.md#remote-library-integration-and-quality-tiers-on-2026-11-10)). Playback from a second machine has not been tested yet. You can also check the server with `curl` or stock `mpv`, as shown below.
+**Status:** the server, this tool, the quality tiers, and the desktop side (pairing in **Appearance → Remote Libraries**, a library section per server, playback, subtitles, and the quality picker) are implemented and covered by loopback tests; the server was checked on a real Tailscale address, including from the desktop app's own "Share my library on Tailscale" switch (see [validation](VALIDATION.md#remote-library-integration-and-quality-tiers-on-2026-11-10)), and played from a MacBook (see [validation](VALIDATION.md#remote-playback-from-the-macbook-pro-on-2026-11-10)). Accepting downloads from paired Flicks is implemented, covered by loopback tests, and checked with `curl` on a real Tailscale address; it has not been used from a second machine yet (see [validation](VALIDATION.md#download-to-another-machine-and-onboarding-on-2026-11-10)). You can also check the server with `curl` or stock `mpv`, as shown below.
 
 ## What it does, and what it never does
 
 - It listens **only on this machine's Tailscale address**. It refuses `0.0.0.0`, LAN addresses, and public addresses; `127.0.0.1` is allowed for local checks. Nothing is reachable from the Internet or from your LAN.
 - Every request needs the **pairing token** (`Authorization: Bearer …`). A tailnet can include machines shared in by other people, so a Tailscale address on its own is not enough. Tokens are compared in constant time.
-- It serves files read-only: it never writes to your library or your settings. The only things it writes are in its own state folder (see [Files it keeps](#files-it-keeps)).
+- By default it serves files read-only: it never writes to your library or your settings, and writes only in its own state folder (see [Files it keeps](#files-it-keeps)). With `--allow-downloads` it also writes downloads into its download folder, deletes downloaded files when a paired Flick confirms the exact list, and keeps `remote-downloads.json` in its state folder; see [Accepting downloads from other Flicks](#accepting-downloads-from-other-flicks). It never writes to the desktop's `settings.json`.
 - It speaks plain HTTP. Tailscale's WireGuard link already encrypts the traffic between the two machines.
 
 ## Build
@@ -87,6 +87,12 @@ flick-serve --library --allow-downloads --share-root /Volumes/Media/Films --link
 | `--download-limit KIB`, `--upload-limit KIB` | unlimited | Speed limits in KiB/s for transfers on this server. |
 | `--no-seeding` | seeding on | Stop sharing a download once it completes. |
 | `--local-transfers` | off | Keep transfers off the Internet: no DHT, trackers, or port mapping, and listen on `127.0.0.1` only. For tests with explicit local peers. Without it, the server finds peers the way the desktop app does, since it is your own machine. |
+
+A hidden `--peer IP:PORT`, repeatable, adds an explicit peer to every lookup and resume. It exists for tests with `--local-transfers` and does not appear in `--help`.
+
+`flick-serve` refuses `--download-dir`, `--share-root`, `--links`, and the other options above without `--allow-downloads`. While a feature is off, its routes answer `403` with a message that names the desktop setting, Appearance → Remote Libraries; for `flick-serve` the equivalent is the flag.
+
+To run it at login with these options, pass them to the launchd installer after `--`, as in [Start at login with launchd](#start-at-login-with-launchd).
 
 What paired Flicks may do is advertised in the listing's `capabilities` (`downloads`, `links`, `shares`, `stream-incomplete`) and `storage`; every command route checks again and answers `403` for anything not allowed. At most three torrent lookups and three link downloads run at once; more answer `429`. A lookup waits at most five minutes for peers.
 
@@ -180,12 +186,25 @@ All paths are under `/v1` and need the bearer token. Every error is JSON, `{"mes
 | Request | Answer |
 | --- | --- |
 | `GET /v1/library` | Protocol version, server name, available qualities (`["original"]` for now), and the videos: opaque id, title, file name, size, duration, size in pixels, MIME type, episode, `complete`, whether a poster exists, sidecar subtitles. |
-| `GET`/`HEAD /v1/media/{id}` | The file. One `Range` per request (`206` with `Content-Range`), `Accept-Ranges: bytes`, `Content-Length`, `Content-Type`, a strong `ETag` from size and modification time, and `If-Range`. Several ranges, or a range outside the file, get `416`. Streamed from disk with a 64 KiB buffer. `409` while a torrent file is unverified. |
+| `GET`/`HEAD /v1/media/{id}` | The file. One `Range` per request (`206` with `Content-Range`), `Accept-Ranges: bytes`, `Content-Length`, `Content-Type`, a strong `ETag` from size and modification time, and `If-Range`. Several ranges, or a range outside the file, get `416`. Streamed from disk with a 64 KiB buffer. `409` while a torrent file is unverified, except a download this server runs with `stream-incomplete`: its ranges come from verified pieces, with `504` after a 30-second wait. |
 | `GET /v1/poster/{id}` | The poster PNG, or `404`. |
 | `GET /v1/subtitles/{id}` | Sidecar subtitle files: same name as the video, optionally with a language part (`Film.en.srt`), with extension `.srt`, `.ass`, `.ssa`, `.vtt`, or `.sub`. |
 | `GET /v1/subtitles/{id}/{n}` | Subtitle file `n` from that list. |
 | `GET /v1/hash/{id}` | `{"hash": "<16 hex digits>"}`, the OpenSubtitles movie hash. `422` for files under 64 KiB, `409` while a torrent file is unverified. |
 | `GET`/`PUT /v1/progress/{id}` | Playback position, `{"position", "duration", "finished", "updated"}`. `GET` is `404` when nothing is saved. `PUT` answers with what is stored: an `updated` more than a minute older than the stored value is not applied; within a minute, the newest `PUT` wins. `updated: 0` means now. |
+
+With downloads allowed, the listing also has `capabilities` and `storage` (`free_bytes`, `download_folder_name`), and each video has `progress` from 0 to 1. These routes answer `403` unless the listing advertises the capability in brackets:
+
+| Request | Answer |
+| --- | --- |
+| `POST /v1/transfers/resolve` `{"input"}` [downloads] | The torrent's infohash, name, and files. `input` is a magnet link, a 40-digit infohash, an `https://` link to a `.torrent` file, or `base64:` and the file's bytes (at most 16 MiB); anything else, such as a path, is `400`. `429` when three lookups already run; `504` when no peer supplied the details within five minutes. |
+| `POST /v1/transfers` `{"input", "files": [index]}` [downloads] | `201` `{"id": "<infohash>"}`. An empty `files` selects every file. `409` when this server already has the torrent. |
+| `GET /v1/transfers` [downloads] | Every transfer: phase (`checking`, `downloading`, `paused`, `seeding`, `error`), verified and total bytes, checked bytes, uploaded bytes, peers, rates, and its files with their `path`, verified bytes, and library `video_id`. |
+| `POST /v1/transfers/{id}/pause`, `/resume`, `/v1/transfers/pause-all`, `/resume-all` [downloads] | `204`. |
+| `DELETE /v1/transfers/{id}` `{"delete_files", "confirm": [path]}` [downloads] | `204`. With `delete_files`, `confirm` must list every selected file's `path` exactly; otherwise `409` with the current list in `files`, and nothing is deleted. |
+| `POST /v1/fetches` `{"url"}`, `GET /v1/fetches`, `DELETE /v1/fetches/{id}` [links] | Link downloads into the download folder: `201` `{"id"}`, the list with phase, bytes, speed, errors, and saved video ids, and `204` on cancel. `429` when three already run. |
+| `GET /v1/browse?dir=` [shares] | Folders and video files. `dir` is empty for the allowed roots by name, else `<root name>/<relative path>`; anything outside a root is `404` "No such folder on this server." |
+| `POST /v1/shares` `{"dir"}` [shares] | `201` with the `infohash` and `magnet` of the seeded folder or file. |
 
 A request without the token is `401`, even for a path that does not exist. An unknown id or path is `404`. Ids are SHA-1 of a random per-server salt and the file's canonical path, so they stay the same across restarts and never reveal a path.
 
@@ -199,6 +218,8 @@ In the state folder (`--state-dir`):
 | `salt` | The id salt, mode 0600. Deleting it changes every id; paired Flicks then need a refresh and lose remote progress. |
 | `progress.json` | Saved positions by video id. |
 | `serve.lock` | Held while a server runs, so two servers cannot share the folder. |
+| `transfers/` | With `--allow-downloads`: the transfer session's state, restored at the next start. |
+| `remote-downloads.json` | With `--allow-downloads --library`: the completed downloads it lists beside the desktop's library. |
 
 The desktop Flick keeps its cached listings of paired servers (`<server id>.json`) and downloaded subtitles (`subtitles/`) in the same default folder. On a machine that runs both, the two sets of files sit side by side; their names do not overlap.
 
