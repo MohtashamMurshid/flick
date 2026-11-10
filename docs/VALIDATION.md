@@ -18,6 +18,10 @@ The presentation adapter transfers decoded BGRA frames through CPU memory into G
 
 ### Download to another machine and onboarding on 2026-11-10
 
+#### Public download started from the MacBook, run on the Mac mini (added by the orchestrator)
+
+With `flick-serve --folder ~/Movies/flick-test --allow-downloads --download-dir ~/Movies/flick-test/downloads --share-root ~/Movies/flick-test --links` on the Mac mini's Tailscale address (public discovery on, as is the default without `--local-transfers`), `curl` from the MacBook Pro with the token: the listing advertised `downloads`, `stream-incomplete`, `links`, `shares` and the free space; `POST /v1/transfers/resolve` with the Sintel magnet (`08ada5a7…`, the Blender open movie used in earlier records) answered in 1 s with its eight files; `POST /v1/transfers` answered 201; the 129 MB download completed on the Mac mini within about 70 s and `GET /v1/transfers` then showed `seeding` at 100%; the listing gained `Sintel.mp4` as a complete video with its own id. A range read of the file while unfinished was not possible because it completed before the first read; the loopback test above covers that path. The desktop app on the MacBook was then relaunched with empty settings into onboarding for a hands-on session, whose outcome is recorded separately when it is done.
+
 Tested commit `d8cc148`, the merged `remote-downloads` branch: the server's command routes and the headless backend, the in-app backend over `Services`, Save to and Downloads by machine, Seed from, and the four onboarding screens. Same Mac mini as the entries below: Apple Silicon, Command Line Tools only (no Xcode, no Metal compiler), no libmpv, FFmpeg in `~/.local/bin`, Tailscale address 100.98.200.69. The design is in [the remote downloads plan](REMOTE_DOWNLOADS_PLAN.md).
 
 #### Backend tests (passing)
