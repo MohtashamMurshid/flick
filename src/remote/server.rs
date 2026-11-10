@@ -12,9 +12,11 @@ pub use crate::remote::library::Sources;
 
 use crate::remote::{
     auth,
+    hls::{HlsState, ResolvedVideo, Resolver},
     ids::{self, Salt},
     library::{self, Entry},
-    protocol::{self, ErrorBody, Library, Progress, Quality, SubtitleFile, Video},
+    protocol::{self, ErrorBody, Library, Progress, SubtitleFile, Video},
+    transcode::{self, Encoder, MediaInfo},
 };
 use anyhow::{Context, Result, bail};
 use axum::{
@@ -32,7 +34,7 @@ use std::{
     io::SeekFrom,
     net::SocketAddr,
     path::{Path, PathBuf},
-    sync::{Arc, RwLock},
+    sync::{Arc, Mutex, RwLock},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tokio::{
@@ -53,6 +55,10 @@ const PROGRESS_FILE: &str = "progress.json";
 const LOCK_FILE: &str = "serve.lock";
 /// How long a busy state folder lock is retried.
 const LOCK_WAIT: Duration = Duration::from_secs(2);
+/// Transcode job folders live here, inside the state folder.
+const TRANSCODE_DIR: &str = "transcode";
+/// ffprobe runs at once while the library is being inspected.
+const INSPECT_CONCURRENCY: usize = 2;
 
 #[derive(Clone, Debug)]
 pub struct ServerConfig {
@@ -76,6 +82,7 @@ pub struct ServerConfig {
 /// A running server. Dropping it does not stop it; call [`Server::shutdown`].
 pub struct Server {
     addr: SocketAddr,
+    hls: Arc<HlsState>,
     stop: watch::Sender<bool>,
     task: tokio::task::JoinHandle<()>,
     /// Held while serving so two servers cannot share a state directory.
@@ -97,6 +104,43 @@ impl Server {
         let lock = lock_state_dir(&config.state_dir).await?;
         let salt = Salt::load_or_create(&config.state_dir)?;
         let (stop, stopped) = watch::channel(false);
+        // Quality tiers below Original need FFmpeg; without it the server
+        // still serves Original and says so in the listing.
+        let encoder = transcode::probe(config.ffmpeg.as_deref()).await;
+        let media = Arc::new(MediaCache::new(encoder.clone()));
+        let index: Arc<RwLock<Arc<Index>>> = Arc::new(RwLock::new(Arc::new(Index::default())));
+        let transcode_dir = config.state_dir.join(TRANSCODE_DIR);
+        std::fs::create_dir_all(&transcode_dir)
+            .with_context(|| format!("Create {}", transcode_dir.display()))?;
+        let resolver: Resolver = {
+            let index = index.clone();
+            let media = media.clone();
+            Arc::new(move |id: &str| {
+                let entry = index
+                    .read()
+                    .unwrap_or_else(|poison| poison.into_inner())
+                    .by_id
+                    .get(id)?
+                    .clone();
+                if !entry.complete {
+                    return None;
+                }
+                // A known video stays resolvable without FFmpeg or when
+                // ffprobe fails; the transcoder then explains why it cannot
+                // proceed instead of answering as if the video did not exist.
+                let info = media.resolve_blocking(&entry.path).unwrap_or_default();
+                Some(ResolvedVideo {
+                    path: entry.path.clone(),
+                    info,
+                })
+            })
+        };
+        let hls = Arc::new(HlsState::new(
+            encoder,
+            config.max_transcodes,
+            transcode_dir,
+            resolver,
+        ));
         let state = Arc::new(AppState {
             token: config.token,
             name: config.name,
@@ -104,7 +148,9 @@ impl Server {
             poster_cache: config.poster_cache,
             state_dir: config.state_dir,
             salt,
-            index: RwLock::new(Arc::new(Index::default())),
+            index,
+            media,
+            hls: hls.clone(),
             rebuild: tokio::sync::Mutex::new(()),
             progress: tokio::sync::Mutex::new(()),
             stopped,
@@ -131,6 +177,7 @@ impl Server {
         tracing::info!(%addr, videos = state.current().order.len(), "Remote library server listening");
         Ok(Server {
             addr,
+            hls,
             stop,
             task,
             _lock: lock,
@@ -146,6 +193,7 @@ impl Server {
     /// waits briefly for connections to close.
     pub async fn shutdown(self) {
         let _ = self.stop.send(true);
+        self.hls.shutdown().await;
         let mut task = self.task;
         if tokio::time::timeout(SHUTDOWN_GRACE, &mut task)
             .await
@@ -196,7 +244,11 @@ struct AppState {
     poster_cache: Option<PathBuf>,
     state_dir: PathBuf,
     salt: Salt,
-    index: RwLock<Arc<Index>>,
+    /// Shared with the transcoder's resolver, which runs outside this state.
+    index: Arc<RwLock<Arc<Index>>>,
+    /// What ffprobe knows about each file; fills the listing and the transcoder.
+    media: Arc<MediaCache>,
+    hls: Arc<HlsState>,
     /// Serializes rebuilds so concurrent listings do not scan twice at once.
     rebuild: tokio::sync::Mutex<()>,
     /// Serializes progress file updates.
@@ -234,6 +286,7 @@ impl AppState {
             .index
             .write()
             .unwrap_or_else(|poison| poison.into_inner()) = Arc::new(index);
+        self.media.prefetch(self.current(), self.stopped.clone());
     }
 
     /// Rebuilds the index from the sources. A failed read keeps the last
@@ -281,17 +334,14 @@ fn router(state: Arc<AppState>) -> Router {
         .route("/v1/poster/{id}", get(poster))
         .route("/v1/subtitles/{id}", get(subtitles))
         .route("/v1/subtitles/{id}/{index}", get(subtitle))
-        // SECOND SEAM: `/v1/subtitles/{id}/embedded/{track}` (WebVTT
-        // extraction) and `Video::embedded_subtitles` in `listing` come with
-        // the transcode work; today the listing reports none.
+        .route(
+            "/v1/subtitles/{id}/embedded/{track}",
+            get(embedded_subtitle),
+        )
         .route("/v1/hash/{id}", get(hash))
         .route("/v1/progress/{id}", get(get_progress).put(put_progress))
         .with_state(state.clone())
-        // ORCHESTRATOR SEAM: hls::router(state)
-        // Replace with `crate::remote::hls::router(hls_state)` once the
-        // transcode agent's `HlsState` lands, and advertise its tiers in
-        // `listing` instead of `vec![Quality::Original]`.
-        .merge(crate::remote::hls::router())
+        .merge(crate::remote::hls::router(state.hls.clone()))
         .fallback(no_route)
         .method_not_allowed_fallback(method_not_allowed)
         .layer(middleware::from_fn_with_state(state, require_token))
@@ -356,11 +406,12 @@ async fn method_not_allowed() -> Response {
 
 async fn listing(State(state): State<Arc<AppState>>) -> Response {
     let index = state.refresh().await;
+    let media = state.media.clone();
     let videos = tokio::task::spawn_blocking(move || {
         index
             .order
             .iter()
-            .filter_map(|id| Some(describe(id, index.by_id.get(id)?)))
+            .filter_map(|id| Some(describe(id, index.by_id.get(id)?, &media)))
             .collect::<Vec<_>>()
     })
     .await;
@@ -368,7 +419,7 @@ async fn listing(State(state): State<Arc<AppState>>) -> Response {
         Ok(videos) => Json(Library {
             protocol: protocol::VERSION,
             server_name: state.name.clone(),
-            qualities: vec![Quality::Original],
+            qualities: state.hls.qualities(),
             videos,
         })
         .into_response(),
@@ -379,15 +430,33 @@ async fn listing(State(state): State<Arc<AppState>>) -> Response {
     }
 }
 
-fn describe(id: &str, entry: &Entry) -> Video {
+/// The listing entry for a video. What the source knows (the desktop's
+/// saved duration and size) wins; ffprobe's view fills the gaps once the
+/// file has been inspected.
+fn describe(id: &str, entry: &Entry, media: &MediaCache) -> Video {
+    let info = media.get(&entry.path);
+    let or_probed = |saved: f64, probed: fn(&MediaInfo) -> f64| {
+        if saved > 0.0 {
+            saved
+        } else {
+            info.as_ref().map_or(0.0, probed)
+        }
+    };
+    let or_probed_u32 = |saved: u32, probed: fn(&MediaInfo) -> u32| {
+        if saved > 0 {
+            saved
+        } else {
+            info.as_ref().map_or(0, probed)
+        }
+    };
     Video {
         id: id.to_owned(),
         title: entry.title.clone(),
         file_name: library::file_title(&entry.path),
         size: std::fs::metadata(&entry.path).map_or(0, |m| m.len()),
-        duration: entry.duration,
-        width: entry.width,
-        height: entry.height,
+        duration: or_probed(entry.duration, |info| info.duration),
+        width: or_probed_u32(entry.width, |info| info.width),
+        height: or_probed_u32(entry.height, |info| info.height),
         mime: library::video_mime(&entry.path).to_owned(),
         episode: crate::library::parse_episode(&entry.path).map(|episode| protocol::Episode {
             show: episode.show,
@@ -397,7 +466,113 @@ fn describe(id: &str, entry: &Entry) -> Video {
         complete: entry.complete,
         poster: entry.poster.is_some(),
         subtitles: subtitle_files(&entry.path),
-        embedded_subtitles: Vec::new(),
+        embedded_subtitles: info.map(|info| info.subtitles).unwrap_or_default(),
+    }
+}
+
+/// ffprobe results per file, checked against size and modification time,
+/// so the listing and the transcoder describe the same bytes. Without
+/// FFmpeg nothing is inspected and the listing shows what the source saved.
+struct MediaCache {
+    encoder: Option<Encoder>,
+    entries: Mutex<HashMap<PathBuf, (Stamp, MediaInfo)>>,
+    inspecting: tokio::sync::Semaphore,
+}
+
+type Stamp = (u64, Option<SystemTime>);
+
+impl MediaCache {
+    fn new(encoder: Option<Encoder>) -> Self {
+        Self {
+            encoder,
+            entries: Mutex::new(HashMap::new()),
+            inspecting: tokio::sync::Semaphore::new(INSPECT_CONCURRENCY),
+        }
+    }
+
+    fn stamp(path: &Path) -> Option<Stamp> {
+        let metadata = std::fs::metadata(path).ok()?;
+        Some((metadata.len(), metadata.modified().ok()))
+    }
+
+    /// What is known about a file right now, if it has not changed since.
+    fn get(&self, path: &Path) -> Option<MediaInfo> {
+        let stamp = Self::stamp(path)?;
+        let entries = self
+            .entries
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        entries
+            .get(path)
+            .filter(|(saved, _)| *saved == stamp)
+            .map(|(_, info)| info.clone())
+    }
+
+    /// The cached result, or one ffprobe run. None without FFmpeg, or when
+    /// the file cannot be read or inspected.
+    async fn inspect(&self, path: &Path) -> Option<MediaInfo> {
+        if let Some(info) = self.get(path) {
+            return Some(info);
+        }
+        let encoder = self.encoder.as_ref()?;
+        let _permit = self.inspecting.acquire().await.ok()?;
+        if let Some(info) = self.get(path) {
+            return Some(info);
+        }
+        let stamp = Self::stamp(path)?;
+        match transcode::inspect(encoder, path).await {
+            Ok(info) => {
+                self.entries
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner())
+                    .insert(path.to_owned(), (stamp, info.clone()));
+                Some(info)
+            }
+            Err(error) => {
+                tracing::warn!(video = %path.display(), "Could not inspect the video: {error:#}");
+                None
+            }
+        }
+    }
+
+    /// [`Self::inspect`] for the transcoder's synchronous resolver. On a
+    /// multi-threaded runtime an uninspected file is probed in place; on a
+    /// single-threaded one only the cache answers.
+    fn resolve_blocking(&self, path: &Path) -> Option<MediaInfo> {
+        if let Some(info) = self.get(path) {
+            return Some(info);
+        }
+        let handle = tokio::runtime::Handle::try_current().ok()?;
+        if handle.runtime_flavor() != tokio::runtime::RuntimeFlavor::MultiThread {
+            return None;
+        }
+        tokio::task::block_in_place(|| handle.block_on(self.inspect(path)))
+    }
+
+    /// Inspects every listed file in the background, a few at a time, so
+    /// durations, sizes, and embedded subtitles reach the listing and a
+    /// transcode can start without waiting for ffprobe.
+    fn prefetch(self: &Arc<Self>, index: Arc<Index>, stopped: watch::Receiver<bool>) {
+        if self.encoder.is_none() {
+            return;
+        }
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let cache = self.clone();
+        handle.spawn(async move {
+            for id in &index.order {
+                if *stopped.borrow() {
+                    break;
+                }
+                let Some(entry) = index.by_id.get(id) else {
+                    continue;
+                };
+                if cache.get(&entry.path).is_none() {
+                    cache.inspect(&entry.path).await;
+                }
+            }
+        });
     }
 }
 
@@ -627,6 +802,52 @@ async fn subtitle(
         )
             .into_response(),
         Err(_) => error(StatusCode::NOT_FOUND, "The subtitle file is gone"),
+    }
+}
+
+/// A subtitle stream inside the file, extracted as WebVTT by FFmpeg.
+async fn embedded_subtitle(
+    State(state): State<Arc<AppState>>,
+    UrlPath((id, track)): UrlPath<(String, String)>,
+) -> Response {
+    let Some(entry) = state.lookup(&id).await else {
+        return unknown_video();
+    };
+    if !entry.complete {
+        return incomplete_video();
+    }
+    let Ok(track) = track.parse::<u32>() else {
+        return error(StatusCode::NOT_FOUND, "No subtitle track with this index");
+    };
+    let Some(encoder) = state.hls.encoder() else {
+        return error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "This server has no FFmpeg, so subtitles inside the file cannot be extracted",
+        );
+    };
+    let Some(info) = state.media.inspect(&entry.path).await else {
+        return error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "The video could not be inspected",
+        );
+    };
+    match info
+        .subtitles
+        .iter()
+        .find(|subtitle| subtitle.track == track)
+    {
+        None => return error(StatusCode::NOT_FOUND, "No subtitle track with this index"),
+        Some(subtitle) if !subtitle.text => {
+            return error(
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                "This subtitle track is bitmap, which cannot be sent as text",
+            );
+        }
+        Some(_) => {}
+    }
+    match transcode::extract_webvtt(encoder, &entry.path, track).await {
+        Ok(bytes) => ([(header::CONTENT_TYPE, "text/vtt")], bytes).into_response(),
+        Err(problem) => error(StatusCode::BAD_GATEWAY, format!("{problem:#}")),
     }
 }
 

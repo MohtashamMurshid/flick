@@ -66,7 +66,8 @@ impl Fixture {
             sources,
             poster_cache: None,
             state_dir: self.state.clone(),
-            ffmpeg: None,
+            // A path that is not FFmpeg keeps the test off the real one.
+            ffmpeg: Some(self.state.join("no-ffmpeg")),
             max_transcodes: 2,
         }
     }
@@ -907,6 +908,119 @@ async fn flick_serve_prints_pairing_and_serves() -> Result<()> {
         }
         #[cfg(not(unix))]
         child.kill().await?;
+        Ok(())
+    })
+    .await?
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn without_ffmpeg_only_original_is_offered() -> Result<()> {
+    timeout(DEADLINE, async {
+        let fixture = Fixture::new()?;
+        let running = fixture.start().await?;
+        let library = running.library().await?;
+        ensure!(library.qualities == vec![Quality::Original]);
+        let id = running.film_id().await?;
+        for path in [
+            paths::hls_playlist(&id, Quality::Low720),
+            paths::hls_init(&id, Quality::Low720),
+            paths::hls_segment(&id, Quality::Low720, 0),
+            paths::embedded_subtitle(&id, 0),
+        ] {
+            let response = running.get(&path).send().await?;
+            ensure!(
+                response.status() == StatusCode::SERVICE_UNAVAILABLE,
+                "{path}: {}",
+                response.status()
+            );
+            let message = error_message(response).await?;
+            ensure!(message.contains("FFmpeg"), "{path}: {message}");
+        }
+        // Original is never an HLS tier.
+        let response = running
+            .get(&paths::hls_playlist(&id, Quality::Original))
+            .send()
+            .await?;
+        ensure!(response.status() == StatusCode::NOT_FOUND);
+        running.server.shutdown().await;
+        Ok(())
+    })
+    .await?
+}
+
+/// Needs a real FFmpeg and a generated clip:
+/// `bash scripts/make-test-video.sh /tmp/flick-test.mp4 --with-subtitles`
+/// then `FLICK_TEST_VIDEO=/tmp/flick-test.mp4 cargo test … -- --ignored`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires FFmpeg on PATH or FLICK_FFMPEG, and FLICK_TEST_VIDEO"]
+async fn with_ffmpeg_tiers_probed_details_and_embedded_subtitles_are_served() -> Result<()> {
+    timeout(Duration::from_secs(120), async {
+        let clip =
+            PathBuf::from(std::env::var_os("FLICK_TEST_VIDEO").context("Set FLICK_TEST_VIDEO")?);
+        let fixture = Fixture::new()?;
+        std::fs::copy(&clip, fixture.media.join("Clip.mp4"))?;
+        let mut config = fixture.config(Sources::Folders(vec![fixture.media.clone()]));
+        config.ffmpeg = std::env::var_os("FLICK_FFMPEG").map(PathBuf::from);
+        let server = Server::start(config).await?;
+        let running = Running {
+            base: format!("http://{}", server.addr()),
+            token: fixture.token.clone(),
+            client: reqwest::Client::builder()
+                .no_proxy()
+                .timeout(Duration::from_secs(60))
+                .build()?,
+            server,
+        };
+        let mut clip_entry = None;
+        for _ in 0..50 {
+            let library = running.library().await?;
+            ensure!(
+                library.qualities == Quality::ALL.to_vec(),
+                "{:?}",
+                library.qualities
+            );
+            let entry = library
+                .videos
+                .into_iter()
+                .find(|v| v.file_name == "Clip.mp4")
+                .context("Clip.mp4 is listed")?;
+            if entry.duration > 0.0 && entry.width > 0 {
+                clip_entry = Some(entry);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        let clip_entry = clip_entry.context("ffprobe filled in the duration and size")?;
+        let response = running
+            .get(&paths::hls_playlist(&clip_entry.id, Quality::Data480))
+            .send()
+            .await?;
+        ensure!(response.status() == StatusCode::OK, "{}", response.status());
+        let playlist = response.text().await?;
+        ensure!(playlist.starts_with("#EXTM3U") && playlist.contains("#EXT-X-ENDLIST"));
+        let response = running
+            .get(&paths::hls_segment(&clip_entry.id, Quality::Data480, 0))
+            .send()
+            .await?;
+        ensure!(response.status() == StatusCode::OK, "{}", response.status());
+        ensure!(response.bytes().await?.len() > 1000);
+        if let Some(track) = clip_entry.embedded_subtitles.iter().find(|s| s.text) {
+            let response = running
+                .get(&paths::embedded_subtitle(&clip_entry.id, track.track))
+                .send()
+                .await?;
+            ensure!(response.status() == StatusCode::OK, "{}", response.status());
+            ensure!(header_value(&response, header::CONTENT_TYPE).starts_with("text/vtt"));
+            ensure!(response.text().await?.starts_with("WEBVTT"));
+        } else {
+            eprintln!("the clip has no text subtitle track; extraction not exercised");
+        }
+        let response = running
+            .get(&paths::embedded_subtitle(&clip_entry.id, 99))
+            .send()
+            .await?;
+        ensure!(response.status() == StatusCode::NOT_FOUND);
+        running.server.shutdown().await;
         Ok(())
     })
     .await?
