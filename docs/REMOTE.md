@@ -1,0 +1,180 @@
+# Serving a Flick library from a Mac mini
+
+`flick-serve` is a headless server for a machine that keeps the storage, such as a Mac mini. Another Flick on the same [Tailscale](https://tailscale.com) network can browse its library and stream the original files from it. Files are not copied. The design is in [the remote library plan](REMOTE_PLAN.md).
+
+**Status:** the server and this tool are implemented and covered by loopback tests. The desktop client (the Remote libraries page and playback in Flick) and the lower quality tiers are not built yet. Until they are, you can check the server with `curl` or stock `mpv`, as shown below.
+
+## What it does, and what it never does
+
+- It listens **only on this machine's Tailscale address**. It refuses `0.0.0.0`, LAN addresses, and public addresses; `127.0.0.1` is allowed for local checks. Nothing is reachable from the Internet or from your LAN.
+- Every request needs the **pairing token** (`Authorization: Bearer …`). A tailnet can include machines shared in by other people, so a Tailscale address on its own is not enough. Tokens are compared in constant time.
+- It serves files read-only: it never writes to your library or your settings. The only things it writes are in its own state folder (see [Files it keeps](#files-it-keeps)).
+- It speaks plain HTTP. Tailscale's WireGuard link already encrypts the traffic between the two machines.
+
+## Build
+
+You need Rust (the repository pins 1.99.0 in `rust-toolchain.toml`). No Xcode, GPUI, libmpv, or FFmpeg is needed:
+
+```sh
+cargo build --locked --release --no-default-features --bin flick-serve
+./target/release/flick-serve --help
+```
+
+Copy `target/release/flick-serve` somewhere on your `PATH`, such as `/usr/local/bin`, if you like.
+
+## Run it
+
+Start Tailscale first and check the address:
+
+```sh
+tailscale ip -4          # for example 100.98.200.69
+```
+
+On macOS, with the Mac App Store or standalone Tailscale app, the CLI is `/Applications/Tailscale.app/Contents/MacOS/Tailscale`. `flick-serve` looks for `tailscale` on `PATH`, then that path, then `/usr/local/bin/tailscale`.
+
+Then choose what to serve:
+
+```sh
+flick-serve --library                    # the videos in the desktop Flick's library
+flick-serve --folder /Volumes/Media/Films --folder /Volumes/Media/Shows
+```
+
+`--library` reads the desktop app's `settings.json` read-only, so the desktop app can keep running. It finds the file the way the app does: `FLICK_SETTINGS_PATH` if set, else the app's configuration folder (`~/Library/Application Support/app.Flick.Flick/settings.json` on macOS). Posters come from the desktop's poster cache when it has one. Videos still downloading by torrent are listed but answer `409` until Flick has verified them.
+
+`--folder` scans each folder and its subfolders for video files. Symbolic links to folders are not followed.
+
+At startup it prints one line of JSON to stdout and keeps running until Ctrl+C (or SIGTERM):
+
+```json
+{"pairing":"flick-remote://100.98.200.69:47117/#3f1c…","listen":"100.98.200.69:47117"}
+```
+
+Logs go to stderr. Set `RUST_LOG=flick=debug` for more detail. The token never appears in the logs.
+
+### Options
+
+| Option | Default | Meaning |
+| --- | --- | --- |
+| `--library` | | Serve the desktop app's library. |
+| `--folder PATH` | | Serve the videos in a folder; repeat for several. |
+| `--bind IP:PORT` | Tailscale IPv4 address and `--port` | Listen here instead. Only Tailscale addresses (`100.64.0.0/10`, `fd7a:115c:a1e0::/48`) and loopback are accepted. |
+| `--port PORT` | `47117` | Port when `--bind` is not given. Keep it fixed so paired Flicks keep working across restarts. |
+| `--name NAME` | the computer's name (`scutil --get ComputerName`, else the host name) | The section title in the other Flick's library. |
+| `--state-dir DIR` | Flick's data folder, in `remote` (`FLICK_DATA_DIR/remote` if that variable is set) | Where the token, id salt, and progress are kept. |
+| `--print-pairing` | | Print the pairing line for the saved token (making one if needed) and exit. Needs a fixed port. |
+| `--new-token` | | Replace the saved token. Every paired Flick must pair again. |
+| `--ffmpeg PATH`, `--max-transcodes N` | | Reserved for the quality tiers below Original; not used yet. |
+
+The library is re-read on every listing request, so a video added on the desktop appears the next time the other Flick refreshes, without restarting the server.
+
+## Pairing
+
+The pairing string is `flick-remote://<address>:<port>/#<token>`. The token is in the `#` fragment, so pasting the string into a browser by mistake never sends it to a server.
+
+```sh
+flick-serve --print-pairing
+```
+
+prints it again at any time, including while the server is running. On the other Mac, Flick's **Appearance → Remote libraries → Add** will take this string once the desktop client ships.
+
+Treat the string like a password. To revoke every paired Flick, run `flick-serve --new-token --print-pairing` and restart the server.
+
+## Start at login with launchd
+
+`scripts/install-flick-serve.sh` installs a launchd agent for the current user from [packaging/macos/com.flick.serve.plist](../packaging/macos/com.flick.serve.plist):
+
+```sh
+cargo build --locked --release --no-default-features --bin flick-serve
+scripts/install-flick-serve.sh                                     # serves --library
+scripts/install-flick-serve.sh -- --folder /Volumes/Media/Films     # or folders
+scripts/install-flick-serve.sh --print                              # show the plist, install nothing
+scripts/install-flick-serve.sh --uninstall                          # stop and remove it
+```
+
+The agent:
+
+- starts at login and restarts 30 seconds after the server stops, which also covers Tailscale not being connected yet right after login;
+- runs `flick-serve` inside `caffeinate -is`, so the Mac does not idle-sleep while serving (pass `--no-caffeinate` to leave sleep alone);
+- writes logs to `~/Library/Logs/Flick/flick-serve.log`;
+- discards stdout, because the startup line contains the token. Use `flick-serve --print-pairing` to get the pairing string.
+
+Check it with:
+
+```sh
+launchctl print gui/$(id -u)/com.flick.serve | head -20
+tail -f ~/Library/Logs/Flick/flick-serve.log
+```
+
+A launchd agent runs only while you are logged in. For a Mac mini without a display, turn on automatic login (**System Settings → Users & Groups → Automatically log in as**), or keep a session logged in.
+
+If your media is on an external drive, macOS may ask the first time whether `flick-serve` may access removable volumes. Answer in **System Settings → Privacy & Security → Files and Folders**, or grant it Full Disk Access.
+
+## Keep the Mac mini awake and reachable
+
+The server is only reachable while the Mac is awake and Tailscale is connected on both machines.
+
+- `caffeinate -is` in the launchd agent stops idle sleep while the server runs.
+- To stop sleep entirely, use **System Settings → Energy → Prevent automatic sleeping when the display is off**, or `sudo pmset -a sleep 0` (display sleep is fine: `sudo pmset -a displaysleep 10`).
+- **Start up automatically after a power failure** in the same settings pane brings it back after an outage.
+- In the Tailscale app, enable **Launch at login** (or run `tailscaled` as a system daemon), so the tailnet address exists before the server starts.
+
+## Check the link with `tailscale ping`
+
+From the MacBook:
+
+```sh
+tailscale ping mohtashams-mac-mini
+```
+
+`pong from … via 192.168.1.20:41641` means a **direct** path: on the same LAN that comfortably carries the original file of a 4K remux. `via DERP(…)` means the traffic is **relayed** through a Tailscale server, which is slower and varies; expect it to struggle with high bit rate files. Away from home, the Mac mini's home upload speed is the ceiling either way.
+
+## Try it without the desktop client
+
+With the pairing line's address and token:
+
+```sh
+TOKEN=…            # the part after /# in the pairing string
+SERVER=http://100.98.200.69:47117
+
+curl -s -H "Authorization: Bearer $TOKEN" "$SERVER/v1/library" | python3 -m json.tool
+curl -sI -H "Authorization: Bearer $TOKEN" "$SERVER/v1/media/<id>"
+curl -s -H "Authorization: Bearer $TOKEN" -H 'Range: bytes=0-99' "$SERVER/v1/media/<id>" | xxd | head
+mpv --http-header-fields="Authorization: Bearer $TOKEN" "$SERVER/v1/media/<id>"
+```
+
+Do not put the token in a URL; only the `Authorization` header is accepted.
+
+## HTTP interface
+
+All paths are under `/v1` and need the bearer token. Every error is JSON, `{"message": "…"}`. The types are in `src/remote/protocol.rs`.
+
+| Request | Answer |
+| --- | --- |
+| `GET /v1/library` | Protocol version, server name, available qualities (`["original"]` for now), and the videos: opaque id, title, file name, size, duration, size in pixels, MIME type, episode, `complete`, whether a poster exists, sidecar subtitles. |
+| `GET`/`HEAD /v1/media/{id}` | The file. One `Range` per request (`206` with `Content-Range`), `Accept-Ranges: bytes`, `Content-Length`, `Content-Type`, a strong `ETag` from size and modification time, and `If-Range`. Several ranges, or a range outside the file, get `416`. Streamed from disk with a 64 KiB buffer. `409` while a torrent file is unverified. |
+| `GET /v1/poster/{id}` | The poster PNG, or `404`. |
+| `GET /v1/subtitles/{id}` | Sidecar subtitle files: same name as the video, optionally with a language part (`Film.en.srt`), with extension `.srt`, `.ass`, `.ssa`, `.vtt`, or `.sub`. |
+| `GET /v1/subtitles/{id}/{n}` | Subtitle file `n` from that list. |
+| `GET /v1/hash/{id}` | `{"hash": "<16 hex digits>"}`, the OpenSubtitles movie hash. `422` for files under 64 KiB. |
+| `GET`/`PUT /v1/progress/{id}` | Playback position, `{"position", "duration", "finished", "updated"}`. `PUT` answers with what is stored: an `updated` more than a minute older than the stored value is not applied; within a minute, the newest `PUT` wins. `updated: 0` means now. |
+
+An unknown id is `404`. Ids are SHA-1 of a random per-server salt and the file's canonical path, so they stay the same across restarts and never reveal a path.
+
+## Files it keeps
+
+In the state folder (`--state-dir`):
+
+| File | Contents |
+| --- | --- |
+| `token` | The pairing token, mode 0600. |
+| `salt` | The id salt, mode 0600. Deleting it changes every id; paired Flicks then need a refresh and lose remote progress. |
+| `progress.json` | Saved positions by video id. |
+| `serve.lock` | Held while a server runs, so two servers cannot share the folder. |
+
+## Troubleshooting
+
+- **"Could not find this machine's Tailscale address"**: Tailscale is not running or not logged in. Run `tailscale status`. Or pass `--bind` with the address.
+- **"… is not a Tailscale address"**: `--bind` must be a `100.x.y.z` Tailscale address (or `127.0.0.1` for a local check).
+- **"Another Flick server is already using …"**: a server, often the launchd agent, already runs with this state folder. Stop it with `scripts/install-flick-serve.sh --uninstall`, or use another `--state-dir`.
+- **401 on every request**: the token does not match. Copy the pairing string again with `flick-serve --print-pairing`.
+- **Playback stutters away from home**: check `tailscale ping`; a relayed path or a slow home upload cannot carry a high bit rate original.
