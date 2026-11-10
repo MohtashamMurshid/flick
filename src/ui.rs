@@ -12,6 +12,8 @@ mod palette_ui;
 mod pip_ui;
 #[path = "player_ui.rs"]
 mod player_ui;
+#[path = "remote_library_ui.rs"]
+mod remote_library_ui;
 #[path = "settings_ui.rs"]
 mod settings_ui;
 
@@ -193,6 +195,10 @@ pub struct Flick {
     library_files_state: library_files_ui::LibraryFilesUiState,
     /// Remote libraries; everything for that feature lives inside it.
     remote: crate::remote_client::RemoteState,
+    /// Remote library state of this view: cards, notices, player subtitles.
+    remote_ui: remote_library_ui::RemoteUiState,
+    /// "Share my library on Tailscale".
+    serve: crate::remote_serve::RemoteServe,
     error: Option<String>,
     menu: Option<Menu>,
     focus: FocusHandle,
@@ -333,6 +339,7 @@ impl Flick {
         self.quitting = true;
         self.services.begin_shutdown();
         self.remote.shutdown();
+        self.serve.shutdown();
         self.up_next = None;
         self.pending_open = None;
         self.open_generation = self.open_generation.wrapping_add(1);
@@ -466,6 +473,8 @@ impl Flick {
             library_ui_state: library_ui::LibraryUiState::new(cx),
             library_files_state: library_files_ui::LibraryFilesUiState::default(),
             remote: Default::default(),
+            remote_ui: Default::default(),
+            serve: Default::default(),
             error,
             menu: None,
             focus,
@@ -563,9 +572,13 @@ impl Flick {
         this.transfers_changed(cx);
         this.init_library_files(window, cx);
         this.apply_preferences();
+        if this.store.data.remote.serve {
+            this.start_serving(false);
+        }
         cx.on_release(|this, cx| {
             this.persist();
             this.services.begin_shutdown();
+            this.serve.shutdown();
             if let Err(error) = this.store.shutdown() {
                 tracing::warn!(%error, "Could not flush viewing preferences on exit");
             }
@@ -753,6 +766,7 @@ impl Flick {
                         self.store
                             .data
                             .remember_remote(&server, &video, &title, s.position, duration);
+                        self.upload_remote_progress(&server, &video);
                     }
                 } else if s.duration > 0.
                     && let Some(path) = &self.path
@@ -804,10 +818,12 @@ impl Flick {
         self.remote_source().map(|remote| remote.quality)
     }
 
-    /// Tiers the quality picker offers. Narrow this to the listing's
-    /// `qualities` once `remote_client::RemoteState` keeps them per server.
-    pub(crate) fn quality_choices(&self) -> &'static [Quality] {
-        &Quality::ALL
+    /// Tiers the quality picker offers: those the playing video's server
+    /// lists, or every tier before its first listing.
+    pub(crate) fn quality_choices(&self) -> Vec<Quality> {
+        self.remote_source()
+            .and_then(|remote| self.remote_server(&remote.server_id))
+            .map_or_else(|| Quality::ALL.to_vec(), |server| server.qualities())
     }
 
     fn library_changed(&mut self, cx: &mut Context<Self>) {
@@ -953,7 +969,6 @@ impl Flick {
 
     /// Plays a video from a paired remote library. Resumes where it was
     /// left, under the same rules as local files.
-    #[allow(dead_code)] // Called by the remote library section.
     pub(crate) fn open_remote(
         &mut self,
         remote: RemoteSource,
@@ -1050,6 +1065,7 @@ impl Flick {
         self.pending_resume = resume;
         self.file_loaded = false;
         self.streaming = streaming;
+        self.remote_ui.reset_player();
         let title = source.title();
         let local = source.local_path().map(PathBuf::from);
         self.set_source(Some(source));
@@ -1321,8 +1337,28 @@ impl Flick {
         if self.remote.drain() {
             cx.notify();
         }
+        self.apply_remote_ready(cx);
         for image in self.remote.take_dropped_images() {
             let _ = window.drop_image(image);
+        }
+        if self.serve.drain() {
+            if matches!(
+                self.serve.status(),
+                crate::remote_serve::ServeStatus::Running { .. }
+            ) {
+                // A Flick paired with its own library asked before the
+                // server was listening; ask again now that it is.
+                self.remote.refresh(&self.store.data);
+            }
+            cx.notify();
+        }
+        if self
+            .remote_ui
+            .copied
+            .is_some_and(|at| at.elapsed() >= Duration::from_secs(2))
+        {
+            self.remote_ui.copied = None;
+            cx.notify();
         }
         let requested =
             std::mem::take(&mut *OPEN_REQUESTS.lock().unwrap_or_else(|e| e.into_inner()));
@@ -1584,6 +1620,10 @@ impl Flick {
         if page == Page::Shows {
             self.selected_show = None;
         }
+        if page == Page::Home {
+            // Opening the library asks every paired server for its videos.
+            self.remote.refresh(&self.store.data);
+        }
         self.page = page;
         if page == Page::Downloads {
             self.send(ServiceCommand::Load, cx);
@@ -1749,13 +1789,37 @@ impl Flick {
         self.subtitle_search.generation += 1;
         self.subtitle_search.searching = true;
         self.subtitle_search.results = None;
-        let query = self.subtitle_query.read(cx).value().to_owned();
+        let generation = self.subtitle_search.generation;
+        // A remote video's hash comes from its server, which can read the
+        // file; the search waits for it in `apply_remote_ready`.
+        let hash = if self.remote_source().is_some() {
+            match self.remote_search_hash(generation) {
+                Some(hash) => hash,
+                None => {
+                    cx.notify();
+                    return;
+                }
+            }
+        } else {
+            None
+        };
+        self.send_subtitle_search(self.path.clone(), hash, cx);
+    }
+
+    /// Searches OpenSubtitles for the query in the field, matching by the
+    /// local file's hash or a hash the server computed.
+    fn send_subtitle_search(
+        &mut self,
+        video: Option<PathBuf>,
+        hash: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
         let command = ServiceCommand::SubtitleSearch {
             generation: self.subtitle_search.generation,
-            key,
-            query,
-            // The file hash needs a local file; remote searches use the title.
-            video: self.path.clone(),
+            key: self.store.data.subtitle_key(),
+            query: self.subtitle_query.read(cx).value().to_owned(),
+            video,
+            hash,
             languages: self.store.data.subtitle_languages.clone(),
         };
         self.send(command, cx);

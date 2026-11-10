@@ -6,6 +6,7 @@ mod model;
 mod playback;
 mod playback_actor;
 mod remote_client;
+mod remote_serve;
 mod services;
 mod shortcuts;
 mod shutdown;

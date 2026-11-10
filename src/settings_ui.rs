@@ -593,6 +593,8 @@ impl Flick {
             )
             .into_any_element(),
         );
+        let (serve_rows, serve_error) = self.serve_rows(cx);
+        rows.extend(serve_rows);
         v_flex()
             .child(section_title(&t, "Remote Libraries"))
             .child(
@@ -604,6 +606,9 @@ impl Flick {
             )
             .child(group(&t, rows))
             .when_some(fields.pairing_error.clone(), |d, error| {
+                d.child(div().mt_2().child(notice(&t, true, error)))
+            })
+            .when_some(serve_error, |d, error| {
                 d.child(div().mt_2().child(notice(&t, true, error)))
             })
     }

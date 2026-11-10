@@ -1277,6 +1277,32 @@ impl Flick {
                         panel = panel.child(self.audio_delay_row(cx));
                     }
                     if kind == "sub" {
+                        // Subtitles kept on the remote library's server.
+                        for (which, label, state) in self.remote_subtitle_choices() {
+                            let id = match which {
+                                crate::remote_client::SubtitleRef::Sidecar(n) => {
+                                    format!("remote-sub-s{n}")
+                                }
+                                crate::remote_client::SubtitleRef::Embedded(n) => {
+                                    format!("remote-sub-e{n}")
+                                }
+                            };
+                            let label = match state {
+                                Some(remote_library_ui::SubtitleLoad::Loading) => {
+                                    format!("{label} · Loading…")
+                                }
+                                Some(remote_library_ui::SubtitleLoad::Failed) => {
+                                    format!("{label} · Failed, try again")
+                                }
+                                // Once added it is a track listed above.
+                                Some(remote_library_ui::SubtitleLoad::Loaded) => continue,
+                                None => format!("{label} · On server"),
+                            };
+                            panel =
+                                panel.child(option(id.into(), label, false).on_click(cx.listener(
+                                    move |this, _, _, cx| this.load_remote_subtitle(which, cx),
+                                )));
+                        }
                         let off = !self
                             .snapshot
                             .tracks
@@ -1298,7 +1324,7 @@ impl Flick {
                             .text_color(t.muted)
                             .child("Quality"),
                     );
-                    for &quality in self.quality_choices() {
+                    for quality in self.quality_choices() {
                         panel = panel.child(
                             option(
                                 format!("quality-{quality}").into(),

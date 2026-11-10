@@ -20,10 +20,6 @@
 //! The token is never logged or put in a URL. `FLICK_REMOTE_TOKEN`
 //! overrides every saved token for development and is never saved.
 
-// Several entry points are for the library and player views, which call them
-// once their integration lands; drop this then.
-#![allow(dead_code)]
-
 use crate::store::{Settings, remote::RemoteServer};
 use flick::remote::protocol::{self, ErrorBody, Library, Pairing, Progress, Quality};
 use std::{
@@ -230,6 +226,7 @@ pub struct RemoteState {
 
 impl RemoteState {
     /// A state that keeps its cache in `dir` instead of the Flick data dir.
+    #[cfg_attr(not(test), allow(dead_code))] // Tests use a temporary folder.
     pub fn with_data_dir(dir: impl Into<PathBuf>) -> Self {
         let state = Self::default();
         state.inner.borrow_mut().data_dir = Some(dir.into());
@@ -1389,7 +1386,7 @@ pub fn playable_quality(preferred: Quality, listing: &Library) -> Quality {
 }
 
 /// The Flick data dir: `FLICK_DATA_DIR`, else the platform's local data dir.
-fn default_data_dir() -> PathBuf {
+pub fn default_data_dir() -> PathBuf {
     std::env::var_os("FLICK_DATA_DIR")
         .map(PathBuf::from)
         .or_else(|| {
