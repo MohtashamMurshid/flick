@@ -1,5 +1,7 @@
 //! The HTTP server: listing, media with ranges, posters, subtitles, hash,
-//! and progress. Transcode routes come from [`crate::remote::hls`].
+//! and progress. Transcode routes come from [`crate::remote::hls`]; the
+//! command routes for downloads, link downloads, and shares come from
+//! [`crate::remote::transfers`].
 //!
 //! The types below are the contract the `flick-serve` binary and the
 //! desktop's in-app switch build against.
@@ -15,8 +17,9 @@ use crate::remote::{
     hls::{HlsState, ResolvedVideo, Resolver},
     ids::{self, Salt},
     library::{self, Entry},
-    protocol::{self, ErrorBody, Library, Progress, SubtitleFile, Video},
+    protocol::{self, Capability, ErrorBody, Library, Progress, SubtitleFile, TransferRow, Video},
     transcode::{self, Encoder, MediaInfo},
+    transfers::{self, TransferBackend, TransferCommand, TransferReply},
 };
 use anyhow::{Context, Result, bail};
 use axum::{
@@ -69,6 +72,11 @@ const MAX_SIDECAR_BYTES: u64 = 16 * 1024 * 1024;
 /// A progress `updated` time further ahead of the server's clock than this
 /// is taken as now plus this, so a client with a fast clock cannot pin it.
 const PROGRESS_CLOCK_SKEW: u64 = 60;
+/// How long a read of an unfinished download waits for verified pieces
+/// before the media route answers 504, so the player can retry.
+const STREAM_WAIT: Duration = Duration::from_secs(30);
+/// How long the listing waits for the transfer backend's rows and storage.
+const BACKEND_WAIT: Duration = Duration::from_secs(5);
 
 #[derive(Clone)]
 pub struct ServerConfig {
@@ -189,12 +197,14 @@ impl Server {
             extracting: tokio::sync::Semaphore::new(EXTRACT_CONCURRENCY),
             rebuild: tokio::sync::Mutex::new(()),
             progress: tokio::sync::Mutex::new(()),
+            transfers: config.transfers,
             stopped,
         });
         // A source that cannot be read at all is a configuration mistake;
         // say so now rather than serving an empty library.
+        let rows = state.transfer_rows().await.ok().flatten();
         let entries = library::load(&state.sources, state.poster_cache.as_deref()).await?;
-        state.install(entries);
+        state.install(entries, rows.as_deref());
 
         let listener = tokio::net::TcpListener::bind(config.bind)
             .await
@@ -291,6 +301,8 @@ struct AppState {
     rebuild: tokio::sync::Mutex<()>,
     /// Serializes progress file updates.
     progress: tokio::sync::Mutex<()>,
+    /// Commands from paired Flicks, and the state of unfinished downloads.
+    transfers: Option<TransferBackend>,
     stopped: watch::Receiver<bool>,
 }
 
@@ -309,7 +321,9 @@ impl AppState {
             .clone()
     }
 
-    fn install(&self, entries: Vec<Entry>) {
+    /// Replaces the index with `entries`, adjusted by the transfer
+    /// backend's `rows` when there are any (see [`overlay_transfers`]).
+    fn install(&self, entries: Vec<Entry>, rows: Option<&[TransferRow]>) {
         let mut index = Index {
             built: Some(Instant::now()),
             ..Index::default()
@@ -319,6 +333,9 @@ impl AppState {
             if index.by_id.insert(id.clone(), Arc::new(entry)).is_none() {
                 index.order.push(id);
             }
+        }
+        if let Some(rows) = rows {
+            overlay_transfers(&mut index, rows, self.allows(Capability::StreamIncomplete));
         }
         *self
             .index
@@ -330,13 +347,59 @@ impl AppState {
     /// Rebuilds the index from the sources. A failed read keeps the last
     /// good index, so a settings file caught mid-write does not empty the
     /// library.
+    ///
+    /// With a transfer backend, its rows decide which files are still
+    /// downloading. When it does not answer, the previous index is kept, so
+    /// a partial file is never served as if it were complete.
     async fn refresh(&self) -> Arc<Index> {
         let _guard = self.rebuild.lock().await;
+        let Ok(rows) = self.transfer_rows().await else {
+            tracing::warn!("Keeping the previous library: the transfer backend did not answer");
+            return self.current();
+        };
         match library::load(&self.sources, self.poster_cache.as_deref()).await {
-            Ok(entries) => self.install(entries),
+            Ok(entries) => self.install(entries, rows.as_deref()),
             Err(error) => tracing::warn!("Keeping the previous library: {error:#}"),
         }
         self.current()
+    }
+
+    fn allows(&self, capability: Capability) -> bool {
+        self.transfers
+            .as_ref()
+            .is_some_and(|backend| backend.allows(capability))
+    }
+
+    /// The backend's transfers when it runs downloads; `Ok(None)` without
+    /// one, `Err` when it does not answer in time.
+    async fn transfer_rows(&self) -> Result<Option<Vec<TransferRow>>, ()> {
+        let Some(backend) = self
+            .transfers
+            .as_ref()
+            .filter(|backend| backend.allows(Capability::Downloads))
+        else {
+            return Ok(None);
+        };
+        match tokio::time::timeout(BACKEND_WAIT, backend.call(TransferCommand::List)).await {
+            Ok(Ok(TransferReply::Transfers(rows))) => Ok(Some(rows)),
+            Ok(Err(error)) => {
+                tracing::warn!("The transfer backend refused its list: {}", error.message);
+                Err(())
+            }
+            Ok(Ok(_)) | Err(_) => Err(()),
+        }
+    }
+
+    /// Free space in the download folder, when the backend accepts downloads.
+    async fn storage(&self) -> Option<protocol::Storage> {
+        let backend = self
+            .transfers
+            .as_ref()
+            .filter(|backend| backend.allows(Capability::Downloads))?;
+        match tokio::time::timeout(BACKEND_WAIT, backend.call(TransferCommand::Storage)).await {
+            Ok(Ok(TransferReply::Storage(storage))) => Some(storage),
+            _ => None,
+        }
     }
 
     async fn lookup(&self, id: &str) -> Option<Arc<Entry>> {
@@ -365,6 +428,86 @@ impl AppState {
     }
 }
 
+/// Marks the selected files of transfers that are not fully verified as
+/// incomplete, with their verified fraction and torrent identity. A file is
+/// matched by its listing id (`TransferFileRow::video_id`) or, for the
+/// desktop's library, by the torrent identity the library saved. With
+/// `stream_incomplete`, a downloading video that is not in the sources yet
+/// (not on disk, or in a library that lists only finished files) is added
+/// with a display-only relative path, playable only through the transfer.
+fn overlay_transfers(index: &mut Index, rows: &[TransferRow], stream_incomplete: bool) {
+    let by_torrent: HashMap<library::TorrentFile, String> = index
+        .by_id
+        .iter()
+        .filter_map(|(id, entry)| Some((entry.torrent.clone()?, id.clone())))
+        .collect();
+    for row in rows {
+        let verifying = matches!(
+            row.phase,
+            protocol::TransferPhase::Checking | protocol::TransferPhase::Error
+        );
+        for file in row.files.iter().filter(|file| file.selected) {
+            let done = !verifying && file.verified_bytes >= file.size;
+            let progress = if file.size == 0 {
+                if done { 1.0 } else { 0.0 }
+            } else {
+                (file.verified_bytes as f64 / file.size as f64).clamp(0.0, 1.0)
+            };
+            let torrent = library::TorrentFile {
+                infohash: row.id.clone(),
+                index: file.index,
+            };
+            let found = file
+                .video_id
+                .as_ref()
+                .filter(|id| index.by_id.contains_key(*id))
+                .cloned()
+                .or_else(|| by_torrent.get(&torrent).cloned());
+            match found {
+                Some(id) => {
+                    let Some(entry) = index.by_id.get_mut(&id) else {
+                        continue;
+                    };
+                    let entry = Arc::make_mut(entry);
+                    entry.torrent = Some(torrent);
+                    if done {
+                        if !entry.complete {
+                            entry.progress = progress;
+                        }
+                    } else {
+                        entry.complete = false;
+                        entry.progress = progress.min(0.999_999);
+                        entry.size = Some(file.size);
+                    }
+                }
+                None if !done && stream_incomplete => {
+                    let Some(id) = file.video_id.as_ref().filter(|id| ids::is_valid_id(id)) else {
+                        continue;
+                    };
+                    let path = PathBuf::from(&file.path);
+                    if path.is_absolute()
+                        || path
+                            .components()
+                            .any(|part| !matches!(part, std::path::Component::Normal(_)))
+                        || !crate::library::is_video(&path)
+                    {
+                        continue;
+                    }
+                    let mut entry = Entry::file(path.clone(), library::file_title(&path));
+                    entry.complete = false;
+                    entry.progress = progress.min(0.999_999);
+                    entry.torrent = Some(torrent);
+                    entry.size = Some(file.size);
+                    if index.by_id.insert(id.clone(), Arc::new(entry)).is_none() {
+                        index.order.push(id.clone());
+                    }
+                }
+                None => {}
+            }
+        }
+    }
+}
+
 fn router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/v1/library", get(listing))
@@ -380,6 +523,7 @@ fn router(state: Arc<AppState>) -> Router {
         .route("/v1/progress/{id}", get(get_progress).put(put_progress))
         .with_state(state.clone())
         .merge(crate::remote::hls::router(state.hls.clone()))
+        .merge(transfers::router(state.transfers.clone()))
         .fallback(no_route)
         .method_not_allowed_fallback(method_not_allowed)
         .layer(middleware::from_fn_with_state(state, require_token))
@@ -441,6 +585,7 @@ async fn method_not_allowed() -> Response {
 
 async fn listing(State(state): State<Arc<AppState>>) -> Response {
     let index = state.refresh().await;
+    let storage = state.storage().await;
     let media = state.media.clone();
     let videos = tokio::task::spawn_blocking(move || {
         index
@@ -455,9 +600,12 @@ async fn listing(State(state): State<Arc<AppState>>) -> Response {
             protocol: protocol::VERSION,
             server_name: state.name.clone(),
             qualities: state.hls.qualities(),
-            // ORCHESTRATOR SEAM: the transfers agent fills these from the backend.
-            capabilities: Vec::new(),
-            storage: None,
+            capabilities: state
+                .transfers
+                .as_ref()
+                .map(|backend| backend.capabilities().to_vec())
+                .unwrap_or_default(),
+            storage,
             videos,
         })
         .into_response(),
@@ -472,7 +620,13 @@ async fn listing(State(state): State<Arc<AppState>>) -> Response {
 /// saved duration and size) wins; ffprobe's view fills the gaps once the
 /// file has been inspected.
 fn describe(id: &str, entry: &Entry, media: &MediaCache) -> Video {
-    let info = media.get(&entry.path);
+    // A file still downloading is not inspected: ffprobe would read
+    // unverified bytes, and a display-only path is not on disk at all.
+    let info = if entry.complete && entry.on_disk() {
+        media.get(&entry.path)
+    } else {
+        None
+    };
     let or_probed = |saved: f64, probed: fn(&MediaInfo) -> f64| {
         if saved > 0.0 {
             saved
@@ -491,7 +645,13 @@ fn describe(id: &str, entry: &Entry, media: &MediaCache) -> Video {
         id: id.to_owned(),
         title: entry.title.clone(),
         file_name: library::file_title(&entry.path),
-        size: std::fs::metadata(&entry.path).map_or(0, |m| m.len()),
+        size: entry.size.unwrap_or_else(|| {
+            if entry.on_disk() {
+                std::fs::metadata(&entry.path).map_or(0, |m| m.len())
+            } else {
+                0
+            }
+        }),
         duration: or_probed(entry.duration, |info| info.duration),
         width: or_probed_u32(entry.width, |info| info.width),
         height: or_probed_u32(entry.height, |info| info.height),
@@ -502,7 +662,7 @@ fn describe(id: &str, entry: &Entry, media: &MediaCache) -> Video {
             number: episode.episode,
         }),
         complete: entry.complete,
-        progress: if entry.complete { 1.0 } else { 0.0 },
+        progress: if entry.complete { 1.0 } else { entry.progress },
         poster: entry.poster.is_some(),
         subtitles: subtitle_files(&entry.path),
         embedded_subtitles: info.map(|info| info.subtitles).unwrap_or_default(),
@@ -607,6 +767,9 @@ impl MediaCache {
                 let Some(entry) = index.by_id.get(id) else {
                     continue;
                 };
+                if !entry.complete || !entry.on_disk() {
+                    continue;
+                }
                 if cache.get(&entry.path).is_none() {
                     cache.inspect(&entry.path).await;
                 }
@@ -708,7 +871,12 @@ async fn media(
         return unknown_video();
     };
     if !entry.complete {
-        return incomplete_video();
+        return match (&entry.torrent, &state.transfers) {
+            (Some(torrent), Some(backend)) if backend.allows(Capability::StreamIncomplete) => {
+                stream_incomplete(&state, backend, &entry, torrent, method, &headers).await
+            }
+            _ => incomplete_video(),
+        };
     }
     let Ok(mut file) = tokio::fs::File::open(&entry.path).await else {
         return error(
@@ -788,6 +956,190 @@ async fn media(
     };
     response
         .body(body)
+        .unwrap_or_else(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "Build the response"))
+}
+
+fn timed_out_waiting() -> Response {
+    error(
+        StatusCode::GATEWAY_TIMEOUT,
+        "The server has not downloaded this part of the video yet. Try again shortly.",
+    )
+}
+
+/// A range of a torrent file that is still downloading, read through the
+/// backend's verified-pieces stream: only verified bytes are sent. Opening
+/// the stream, seeking, and the first read must finish within
+/// [`STREAM_WAIT`], or the answer is 504 so the player can retry; a later
+/// read that waits that long ends the response. The response has the full
+/// file's `Content-Length` for its range and no `ETag`: verified bytes never
+/// change. A client that goes away, or the server stopping, cancels the
+/// waiting read and releases the stream.
+async fn stream_incomplete(
+    state: &AppState,
+    backend: &TransferBackend,
+    entry: &Entry,
+    torrent: &library::TorrentFile,
+    method: Method,
+    headers: &HeaderMap,
+) -> Response {
+    let opened = tokio::time::timeout(
+        STREAM_WAIT,
+        backend.call(TransferCommand::OpenStream {
+            id: torrent.infohash.clone(),
+            file_index: torrent.index,
+        }),
+    )
+    .await;
+    let stream = match opened {
+        Err(_) => return timed_out_waiting(),
+        Ok(Err(refusal)) => return transfers::error_response(&refusal),
+        Ok(Ok(TransferReply::Stream(stream))) => stream,
+        Ok(Ok(_)) => {
+            return error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "The transfer backend gave an unexpected answer",
+            );
+        }
+    };
+    let size = stream.len();
+    let request = match headers.get(header::RANGE) {
+        Some(value) => match value.to_str() {
+            Ok(value) => parse_range(value, size),
+            Err(_) => RangeRequest::Unsatisfiable,
+        },
+        None => RangeRequest::Full,
+    };
+    let mut response = Response::builder()
+        .header(header::ACCEPT_RANGES, "bytes")
+        .header(header::CACHE_CONTROL, "private, no-transform");
+    let range = match request {
+        RangeRequest::Unsatisfiable => {
+            let mut refused = error(
+                StatusCode::RANGE_NOT_SATISFIABLE,
+                "The server sends one byte range inside the file",
+            );
+            let headers = refused.headers_mut();
+            headers.insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
+            if let Ok(value) = HeaderValue::from_str(&format!("bytes */{size}")) {
+                headers.insert(header::CONTENT_RANGE, value);
+            }
+            return refused;
+        }
+        RangeRequest::Full => {
+            response = response.status(StatusCode::OK);
+            ByteRange {
+                start: 0,
+                end: size.saturating_sub(1),
+            }
+        }
+        RangeRequest::Partial(range) => {
+            response = response.status(StatusCode::PARTIAL_CONTENT).header(
+                header::CONTENT_RANGE,
+                format!("bytes {}-{}/{size}", range.start, range.end),
+            );
+            range
+        }
+    };
+    let length = if size == 0 {
+        0
+    } else {
+        range.end - range.start + 1
+    };
+    response = response
+        .header(header::CONTENT_TYPE, library::video_mime(&entry.path))
+        .header(header::CONTENT_LENGTH, length);
+    if method == Method::HEAD || length == 0 {
+        return response
+            .body(Body::empty())
+            .unwrap_or_else(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "Build the response"));
+    }
+    let reader = stream.into_blocking(&tokio::runtime::Handle::current());
+    let cancel = reader.canceller();
+    // Cancels a waiting read whenever this function or the body is dropped.
+    let guard = cancel.clone().drop_guard();
+    let start = range.start;
+    let first_len = length.min(STREAM_BUFFER as u64) as usize;
+    let first = tokio::time::timeout(
+        STREAM_WAIT,
+        tokio::task::spawn_blocking(move || {
+            let mut reader = reader;
+            if reader.seek(start)? != start {
+                return Err(std::io::Error::other("The seek landed elsewhere"));
+            }
+            let mut buffer = vec![0; first_len];
+            let read = reader.read(&mut buffer)?;
+            if read == 0 {
+                return Err(std::io::ErrorKind::UnexpectedEof.into());
+            }
+            buffer.truncate(read);
+            Ok((reader, buffer))
+        }),
+    )
+    .await;
+    let (reader, first) = match first {
+        Err(_) => {
+            cancel.cancel();
+            return timed_out_waiting();
+        }
+        Ok(Ok(Ok(read))) => read,
+        Ok(Ok(Err(problem))) => {
+            return error(
+                StatusCode::BAD_GATEWAY,
+                format!("The download could not be read: {problem}"),
+            );
+        }
+        Ok(Err(_)) => return error(StatusCode::INTERNAL_SERVER_ERROR, "Read the download"),
+    };
+    let remaining = length - first.len() as u64;
+    let rest = futures_util::stream::unfold(
+        (Some(reader), remaining, guard, cancel),
+        |(reader, remaining, guard, cancel)| async move {
+            let mut reader = reader?;
+            if remaining == 0 {
+                return None;
+            }
+            let want = remaining.min(STREAM_BUFFER as u64) as usize;
+            let read = tokio::time::timeout(
+                STREAM_WAIT,
+                tokio::task::spawn_blocking(move || {
+                    let mut buffer = vec![0; want];
+                    let read = reader.read(&mut buffer);
+                    (reader, read, buffer)
+                }),
+            )
+            .await;
+            match read {
+                Ok(Ok((reader, Ok(read), mut buffer))) if read > 0 => {
+                    buffer.truncate(read);
+                    let left = remaining - read as u64;
+                    Some((Ok(Bytes::from(buffer)), (Some(reader), left, guard, cancel)))
+                }
+                Ok(Ok((_, Ok(_), _))) => Some((
+                    Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof)),
+                    (None, 0, guard, cancel),
+                )),
+                Ok(Ok((_, Err(problem), _))) => Some((Err(problem), (None, 0, guard, cancel))),
+                Ok(Err(_)) => Some((
+                    Err(std::io::Error::other("The read stopped")),
+                    (None, 0, guard, cancel),
+                )),
+                Err(_) => {
+                    cancel.cancel();
+                    Some((
+                        Err(std::io::Error::from(std::io::ErrorKind::TimedOut)),
+                        (None, 0, guard, cancel),
+                    ))
+                }
+            }
+        },
+    );
+    let body = futures_util::stream::once(std::future::ready(Ok::<_, std::io::Error>(
+        Bytes::from(first),
+    )))
+    .chain(rest)
+    .take_until(state.stopping());
+    response
+        .body(Body::from_stream(body))
         .unwrap_or_else(|_| error(StatusCode::INTERNAL_SERVER_ERROR, "Build the response"))
 }
 

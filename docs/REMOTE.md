@@ -69,6 +69,31 @@ Logs go to stderr. Set `RUST_LOG=flick=debug` for more detail. The token never a
 
 The library is re-read on every listing request, so a video added on the desktop appears the next time the other Flick refreshes, without restarting the server.
 
+### Accepting downloads from other Flicks
+
+By default the server is read-only. With `--allow-downloads`, paired Flicks may also start torrents here, follow and control them, and play them while they download. The design is in [the remote downloads plan](REMOTE_DOWNLOADS_PLAN.md).
+
+```sh
+flick-serve --folder /Volumes/Media/Films --allow-downloads --download-dir /Volumes/Media/Downloads
+flick-serve --library --allow-downloads --share-root /Volumes/Media/Films --links
+```
+
+| Option | Default | Meaning |
+| --- | --- | --- |
+| `--allow-downloads` | off | Accept torrents from paired Flicks: resolve, start, pause, resume, and remove (deleting files only when the client echoes the exact file list). Unfinished downloads are listed and can be played while they download. Every other option below needs this one. |
+| `--download-dir DIR` | Flick's data folder, in `Downloads` (`FLICK_DATA_DIR/Downloads` if that variable is set) | Where downloads go; each torrent gets its own `<infohash>` folder, link downloads go directly here. The client never chooses a path. The listing shows only this folder's name and free space. |
+| `--share-root DIR` | none | A folder paired Flicks may browse and seed from; repeat for several. Only folders and video files inside these roots are shown. A symbolic link is resolved before the check, and anything outside a root answers `404` without naming a path. |
+| `--links` | off | Accept link downloads (yt-dlp and HTTPS). Offered only when yt-dlp is found (`FLICK_YTDLP`, then `PATH`, then the usual install folders); otherwise the server logs why and leaves it off. |
+| `--download-limit KIB`, `--upload-limit KIB` | unlimited | Speed limits in KiB/s for transfers on this server. |
+| `--no-seeding` | seeding on | Stop sharing a download once it completes. |
+| `--local-transfers` | off | Keep transfers off the Internet: no DHT, trackers, or port mapping, and listen on `127.0.0.1` only. For tests with explicit local peers. Without it, the server finds peers the way the desktop app does, since it is your own machine. |
+
+What paired Flicks may do is advertised in the listing's `capabilities` (`downloads`, `links`, `shares`, `stream-incomplete`) and `storage`; every command route checks again and answers `403` for anything not allowed. At most three torrent lookups and three link downloads run at once; more answer `429`. A lookup waits at most five minutes for peers.
+
+Completed downloads join the listing: with `--folder`, the download folder is scanned with the other folders; with `--library`, the server keeps the paths it downloaded in `remote-downloads.json` in its state folder and lists them beside the desktop's library, whose `settings.json` stays read-only. A video still downloading is listed with `complete: false` and its verified `progress`; `GET /v1/media/{id}` serves its ranges from verified pieces only, waits up to 30 seconds for a missing piece, then answers `504` so the player can retry. Quality tiers below Original are not offered for an unfinished file.
+
+The transfer state is kept in `transfers` inside the state folder. Stopping the server cancels running link downloads (their partial files are removed) and stops the transfers; they are restored, after verifying what is on disk, the next time it starts.
+
 ## Pairing
 
 The pairing string is `flick-remote://<address>:<port>/#<token>`. The token is in the `#` fragment, so pasting the string into a browser by mistake never sends it to a server.
