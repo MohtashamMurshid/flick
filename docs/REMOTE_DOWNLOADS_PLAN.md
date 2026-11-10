@@ -14,7 +14,7 @@ A first launch asks four questions and ends with everything paired: where the vi
 
 **Downloads.** One section per machine, *This Mac* first, then each server by name. Remote rows show verified progress, download and upload rates, peers, and the Checking files percentage the local rows show, refreshed every second while the view is open. Pause, Resume, Remove · Keep Files, and Remove and Delete Files… work as they do locally; deletion lists every file the server will delete and needs the same explicit confirmation. Watch Now opens the remote stream. A server that stops answering keeps its last known rows and shows one status line; nothing is removed from view because a machine is asleep.
 
-**Player.** A remote video that is still downloading shows a pill, *Streaming from Mac mini · 34% downloaded*, next to the title. A seek into pieces the server does not have yet shows Buffering and waits; it does not fail.
+**Player.** A remote video that is still downloading plays like any other; there is no extra indicator in the player. A seek into pieces the server does not have yet shows the existing Buffering state and waits; it does not fail.
 
 **Share.** *Seed from Mac mini* opens a folder browser limited to the folders the Mac mini's owner allowed. The magnet link is the server's; the share keeps going after the MacBook closes.
 
@@ -53,7 +53,7 @@ Transfers are identified by infohash and fetches by the server's own id, so a cl
 
 - **In the desktop app**, the in-app server reuses the existing `Services` worker and its `TransferSession`; the new routes are thin adapters over the commands the Downloads view already sends. The owner's seeding preference and bandwidth limits apply to remote-started transfers exactly as to local ones.
 - **Headless `flick-serve`** gets a `TransferSession` and the fetch backend when `--allow-downloads` is given, with `--download-dir`, repeatable `--share-root`, and the same public-discovery settings the desktop uses. Its transfer state lives in its state folder. Completed downloads join its listing: in `--folder` mode because the download folder is scanned, in `--library` mode through a `remote-downloads.json` the server keeps beside its state, since the desktop's `settings.json` stays read-only.
-- **Client**: a `RemoteTransfers` part of `RemoteState` polls `GET /v1/transfers` and `GET /v1/fetches` once a second while Downloads is open and once a minute otherwise, publishes typed rows, and sends commands through the same worker. The Downloads view renders remote rows with the local row component. `Source::Remote` learns `incomplete: bool` for the player pill.
+- **Client**: a `RemoteTransfers` part of `RemoteState` polls `GET /v1/transfers` and `GET /v1/fetches` once a second while Downloads is open and once a minute otherwise, publishes typed rows, and sends commands through the same worker. The Downloads view renders remote rows with the local row component.
 
 ### Streaming an unfinished download
 
@@ -90,7 +90,7 @@ A new `onboarding` view replaces the current welcome page and owns the four step
 ### 3. Watch while downloading over the wire
 
 - [ ] Media route over `VerifiedStream` with bounded waits and cancel on disconnect.
-- [ ] Player pill and Buffering on seeks into missing pieces.
+- [ ] Buffering on seeks into missing pieces, through the existing paused-for-cache state.
 - [ ] Tests with a throttled loopback seed: play starts before completion, a seek past the download waits and resumes, a disconnected read releases the stream.
 
 ### 4. Onboarding and the headless server

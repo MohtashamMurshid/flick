@@ -6,6 +6,8 @@ mod fetch_ui;
 mod library_files_ui;
 #[path = "library_ui.rs"]
 mod library_ui;
+#[path = "onboarding_ui.rs"]
+mod onboarding_ui;
 #[path = "palette_ui.rs"]
 mod palette_ui;
 #[path = "pip_ui.rs"]
@@ -98,6 +100,8 @@ const SHUTTLE_SPEEDS: [f64; 4] = [1., 1.5, 2., 4.];
 enum View {
     Library,
     Player,
+    /// First-launch setup; see `onboarding_ui.rs`.
+    Onboarding,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -202,6 +206,8 @@ pub struct Flick {
     library_files_state: library_files_ui::LibraryFilesUiState,
     /// Remote libraries; everything for that feature lives inside it.
     remote: crate::remote_client::RemoteState,
+    /// First-launch setup state; everything for that flow lives inside it.
+    onboarding: onboarding_ui::OnboardingState,
     /// Remote library state of this view: cards, notices, player subtitles.
     remote_ui: remote_library_ui::RemoteUiState,
     /// "Share my library on Tailscale".
@@ -469,6 +475,7 @@ impl Flick {
         let video_frame = cx.new(|_| VideoFrameView::default());
         let focus = cx.focus_handle();
         focus.focus(window);
+        let needs_setup = onboarding_ui::needs_setup(&store.data);
         let mut this = Self {
             player,
             snapshot: PlaybackSnapshot::default(),
@@ -480,6 +487,7 @@ impl Flick {
             library_ui_state: library_ui::LibraryUiState::new(cx),
             library_files_state: library_files_ui::LibraryFilesUiState::default(),
             remote: Default::default(),
+            onboarding: Default::default(),
             remote_ui: Default::default(),
             serve: Default::default(),
             error,
@@ -495,7 +503,11 @@ impl Flick {
             opened_at: None,
             pending_resume: 0.,
             file_loaded: false,
-            view: View::Library,
+            view: if needs_setup {
+                View::Onboarding
+            } else {
+                View::Library
+            },
             page: Page::Home,
             video_filter: VideoFilter::All,
             search_open: false,
@@ -2342,6 +2354,7 @@ impl Render for Flick {
                 content
             }
             View::Player => self.player_frame(window, cx),
+            View::Onboarding => self.render_onboarding(window, cx),
         };
         let root = div()
             .id("flick")

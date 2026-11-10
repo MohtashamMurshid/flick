@@ -263,6 +263,7 @@ async fn serve(
         state_dir: options.state_dir,
         ffmpeg: options.ffmpeg,
         max_transcodes: 2,
+        transfers: None,
     };
     let server = match Server::start(config).await {
         Ok(server) => server,

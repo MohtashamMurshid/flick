@@ -22,6 +22,22 @@ pub struct RemoteSettings {
     /// computer's name.
     #[serde(skip_serializing_if = "String::is_empty")]
     pub serve_name: String,
+    /// "Let paired Flicks download to this Mac". Off by default; every
+    /// write route answers 403 while it is off.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub allow_downloads: bool,
+    /// Where remote-started downloads go; None uses the app's download folder.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub download_dir: Option<std::path::PathBuf>,
+    /// Folders other Flicks may browse and seed from.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub share_roots: Vec<std::path::PathBuf>,
+    /// The Save to default: a paired server's id, or empty for this Mac.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub default_destination: String,
+    /// Set on the last onboarding step; a launch without it starts there.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub setup_done: bool,
 }
 
 impl RemoteSettings {
@@ -30,6 +46,11 @@ impl RemoteSettings {
             && self.progress.is_empty()
             && !self.serve
             && self.serve_name.is_empty()
+            && !self.allow_downloads
+            && self.download_dir.is_none()
+            && self.share_roots.is_empty()
+            && self.default_destination.is_empty()
+            && !self.setup_done
     }
 }
 

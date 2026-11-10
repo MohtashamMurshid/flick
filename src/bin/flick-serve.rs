@@ -109,6 +109,7 @@ async fn main() -> Result<()> {
         state_dir,
         ffmpeg: args.ffmpeg,
         max_transcodes: args.max_transcodes,
+        transfers: None,
     })
     .await?;
     print_pairing(server.addr(), &token)?;

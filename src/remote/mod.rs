@@ -18,3 +18,4 @@ pub mod library;
 pub mod protocol;
 pub mod server;
 pub mod transcode;
+pub mod transfers;

@@ -27,7 +27,33 @@ pub struct Library {
     /// Tiers this server can deliver. Always contains [`Quality::Original`];
     /// the others appear only when FFmpeg and an H.264 encoder were found.
     pub qualities: Vec<Quality>,
+    /// What a paired Flick may start here. Empty unless the owner allowed it.
+    pub capabilities: Vec<Capability>,
+    /// The download destination this server offers, when it accepts downloads.
+    pub storage: Option<Storage>,
     pub videos: Vec<Video>,
+}
+
+/// What a server lets paired Flicks do, beyond browsing and playing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Capability {
+    /// Start and manage torrents.
+    Downloads,
+    /// Start link downloads (yt-dlp and HTTPS).
+    Links,
+    /// Seed folders under the owner's allowed roots.
+    Shares,
+    /// Play a torrent file before it has finished downloading.
+    StreamIncomplete,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default)]
+pub struct Storage {
+    pub free_bytes: u64,
+    /// The folder's name only, for the Save to picker; never a path.
+    pub download_folder_name: String,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
@@ -47,6 +73,8 @@ pub struct Video {
     /// False while a torrent download is still verifying this file; the
     /// media route answers 409 until it is complete.
     pub complete: bool,
+    /// Verified fraction of a torrent file, 0 to 1; 1 once complete.
+    pub progress: f64,
     /// Whether `GET /v1/poster/{id}` has an image.
     pub poster: bool,
     /// Subtitle files next to the video, by index.
@@ -186,6 +214,169 @@ pub struct Progress {
     pub finished: bool,
     /// Seconds since the Unix epoch when this was saved.
     pub updated: u64,
+}
+
+/// `POST /v1/transfers/resolve`. `input` is a magnet link, an HTTPS
+/// `.torrent` URL, a 40-hex infohash, or `base64:` followed by the bytes of
+/// a `.torrent` file.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default)]
+pub struct ResolveRequest {
+    pub input: String,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default)]
+pub struct TorrentInfo {
+    pub infohash: String,
+    pub name: String,
+    pub files: Vec<TorrentFileInfo>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default)]
+pub struct TorrentFileInfo {
+    pub index: usize,
+    /// The path inside the torrent, for display and selection.
+    pub path: String,
+    pub size: u64,
+}
+
+/// `POST /v1/transfers`. The server chooses the folder.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default)]
+pub struct StartTransfer {
+    pub input: String,
+    /// Indices from [`TorrentInfo::files`]; empty selects every file.
+    pub files: Vec<usize>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default)]
+pub struct Started {
+    /// The infohash for a torrent.
+    pub id: String,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TransferPhase {
+    Checking,
+    #[default]
+    Downloading,
+    Paused,
+    Seeding,
+    Error,
+}
+
+/// One torrent the server owns, as `GET /v1/transfers` lists it. The same
+/// numbers the desktop's Downloads rows show.
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
+#[serde(default)]
+pub struct TransferRow {
+    pub id: String,
+    pub name: String,
+    pub phase: TransferPhase,
+    pub error: Option<String>,
+    pub verified_bytes: u64,
+    pub total_bytes: u64,
+    pub checked_bytes: u64,
+    pub checking_total_bytes: u64,
+    pub uploaded_bytes: u64,
+    pub peers: u32,
+    pub download_bps: u64,
+    pub upload_bps: u64,
+    pub files: Vec<TransferFileRow>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default)]
+pub struct TransferFileRow {
+    pub index: usize,
+    /// The path inside the torrent; echoed back to confirm a deletion.
+    pub path: String,
+    pub size: u64,
+    pub verified_bytes: u64,
+    pub selected: bool,
+    /// The library id of this file once the server lists it as a video,
+    /// playable through the media route (unfinished when the server
+    /// advertises `stream-incomplete`).
+    pub video_id: Option<String>,
+}
+
+/// `DELETE /v1/transfers/{id}`. With `delete_files`, `confirm` must list
+/// every selected file's `path` exactly, or the server answers 409 with the
+/// current list and deletes nothing.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default)]
+pub struct RemoveTransfer {
+    pub delete_files: bool,
+    pub confirm: Vec<String>,
+}
+
+/// `POST /v1/fetches`: a video page or file link for yt-dlp or HTTPS.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default)]
+pub struct StartFetch {
+    pub url: String,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FetchPhase {
+    #[default]
+    Resolving,
+    Downloading,
+    Merging,
+    Done,
+    Failed,
+    Cancelled,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default)]
+pub struct FetchRow {
+    pub id: u64,
+    pub url: String,
+    pub title: String,
+    pub phase: FetchPhase,
+    pub error: Option<String>,
+    pub downloaded_bytes: u64,
+    pub total_bytes: Option<u64>,
+    pub bytes_per_second: Option<u64>,
+    /// Library ids of files saved so far.
+    pub saved: Vec<String>,
+}
+
+/// `GET /v1/browse?dir=`. `dir` is virtual: empty lists the allowed roots
+/// by name; otherwise `<root name>/<relative path>`. Never a filesystem path.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default)]
+pub struct BrowseListing {
+    pub dir: String,
+    pub entries: Vec<BrowseEntry>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default)]
+pub struct BrowseEntry {
+    pub name: String,
+    pub dir: bool,
+    pub size: u64,
+}
+
+/// `POST /v1/shares`: seed a folder or file under an allowed root.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default)]
+pub struct StartShare {
+    pub dir: String,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default)]
+pub struct ShareResult {
+    pub infohash: String,
+    pub magnet: String,
 }
 
 /// JSON body of every error response.
@@ -336,6 +527,50 @@ pub mod paths {
 
     pub fn progress(id: &str) -> String {
         format!("/v1/progress/{id}")
+    }
+
+    pub fn transfers() -> String {
+        "/v1/transfers".into()
+    }
+
+    pub fn transfers_resolve() -> String {
+        "/v1/transfers/resolve".into()
+    }
+
+    pub fn transfer(id: &str) -> String {
+        format!("/v1/transfers/{id}")
+    }
+
+    pub fn transfer_pause(id: &str) -> String {
+        format!("/v1/transfers/{id}/pause")
+    }
+
+    pub fn transfer_resume(id: &str) -> String {
+        format!("/v1/transfers/{id}/resume")
+    }
+
+    pub fn transfers_pause_all() -> String {
+        "/v1/transfers/pause-all".into()
+    }
+
+    pub fn transfers_resume_all() -> String {
+        "/v1/transfers/resume-all".into()
+    }
+
+    pub fn fetches() -> String {
+        "/v1/fetches".into()
+    }
+
+    pub fn fetch(id: u64) -> String {
+        format!("/v1/fetches/{id}")
+    }
+
+    pub fn browse() -> String {
+        "/v1/browse".into()
+    }
+
+    pub fn shares() -> String {
+        "/v1/shares".into()
     }
 
     /// What the player loads for a video at a tier.

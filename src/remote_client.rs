@@ -1652,6 +1652,8 @@ mod tests {
             protocol: protocol::VERSION,
             server_name: "Mac mini".into(),
             qualities: vec![Quality::Original, Quality::Low720],
+            capabilities: Vec::new(),
+            storage: None,
             videos: (0..videos)
                 .map(|index| Video {
                     id: format!("v{index}"),

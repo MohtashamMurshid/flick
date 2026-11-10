@@ -87,6 +87,8 @@ pub struct ServerConfig {
     pub ffmpeg: Option<PathBuf>,
     /// Transcode jobs allowed at once; more get 503.
     pub max_transcodes: usize,
+    /// Commands from paired Flicks; None serves read-only.
+    pub transfers: Option<crate::remote::transfers::TransferBackend>,
 }
 
 /// The token is left out, so a logged configuration never reveals it.
@@ -101,6 +103,10 @@ impl std::fmt::Debug for ServerConfig {
             .field("state_dir", &self.state_dir)
             .field("ffmpeg", &self.ffmpeg)
             .field("max_transcodes", &self.max_transcodes)
+            .field(
+                "transfers",
+                &self.transfers.as_ref().map(|t| t.capabilities().to_vec()),
+            )
             .finish()
     }
 }
@@ -449,6 +455,9 @@ async fn listing(State(state): State<Arc<AppState>>) -> Response {
             protocol: protocol::VERSION,
             server_name: state.name.clone(),
             qualities: state.hls.qualities(),
+            // ORCHESTRATOR SEAM: the transfers agent fills these from the backend.
+            capabilities: Vec::new(),
+            storage: None,
             videos,
         })
         .into_response(),
@@ -493,6 +502,7 @@ fn describe(id: &str, entry: &Entry, media: &MediaCache) -> Video {
             number: episode.episode,
         }),
         complete: entry.complete,
+        progress: if entry.complete { 1.0 } else { 0.0 },
         poster: entry.poster.is_some(),
         subtitles: subtitle_files(&entry.path),
         embedded_subtitles: info.map(|info| info.subtitles).unwrap_or_default(),
