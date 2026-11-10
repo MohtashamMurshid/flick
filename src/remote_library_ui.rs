@@ -382,6 +382,32 @@ struct Card<'a> {
 }
 
 impl Flick {
+    /// Discovery, pairing-by-code, and wake results, drained on tick. Owned
+    /// by the views agent; the tick in `ui.rs` only delivers the events.
+    pub(crate) fn handle_discovery_events(
+        &mut self,
+        events: Vec<crate::remote_discovery::DiscoveryEvent>,
+        cx: &mut Context<Self>,
+    ) {
+        if !events.is_empty() {
+            cx.notify();
+        }
+    }
+
+    /// Progress and completion of copies kept on this computer, drained on
+    /// tick. Owned by the views agent.
+    pub(crate) fn handle_keep_events(
+        &mut self,
+        events: Vec<crate::remote_keep::KeepEvent>,
+        cx: &mut Context<Self>,
+    ) {
+        if !events.is_empty() {
+            cx.notify();
+        }
+    }
+}
+
+impl Flick {
     /// The paired server with this id, with its status and listing.
     pub(super) fn remote_server(&self, id: &str) -> Option<ServerView> {
         self.remote

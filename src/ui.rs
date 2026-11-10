@@ -1413,11 +1413,10 @@ impl Flick {
         if self.remote.drain() {
             cx.notify();
         }
-        // The integration agents handle these events; draining keeps the
-        // workers from backing up meanwhile.
-        if !self.discovery.drain().is_empty() || !self.keep.drain().is_empty() {
-            cx.notify();
-        }
+        let discovered = self.discovery.drain();
+        self.handle_discovery_events(discovered, cx);
+        let kept = self.keep.drain();
+        self.handle_keep_events(kept, cx);
         self.apply_remote_ready(window, cx);
         for image in self.remote.take_dropped_images() {
             let _ = window.drop_image(image);
