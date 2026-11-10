@@ -132,7 +132,7 @@ impl TransferError {
         Self::new(
             403,
             format!(
-                "This Flick does not accept {what} from other Flicks. Its owner can allow it in Appearance → Remote Libraries."
+                "This Flick does not accept {what} from other Flicks. Its owner can allow it in Appearance → Remote Libraries, or start flick-serve with --allow-downloads."
             ),
         )
     }
