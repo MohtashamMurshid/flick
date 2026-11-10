@@ -1,6 +1,6 @@
 # Remote library over Tailscale
 
-**Status: proposed on 2026-11-10; implemented through phase 2 and the in-app switch, playback from a second machine not yet verified.** The ticked items under [Delivery order](#delivery-order) are delivered and reviewed at `3905fac`; see [validation](VALIDATION.md#remote-library-review-fixes-on-2026-11-10). This plan adds a second machine to Flick: one Flick keeps the library and the files, another Flick on the same tailnet browses that library and plays from it at source quality. It does not change local playback, transfers, or link downloads.
+**Status: proposed on 2026-11-10; implemented through phase 2 and the in-app switch, and played from a second machine the same day.** The ticked items under [Delivery order](#delivery-order) are delivered and reviewed at `3905fac`; see [validation](VALIDATION.md#remote-library-review-fixes-on-2026-11-10). This plan adds a second machine to Flick: one Flick keeps the library and the files, another Flick on the same tailnet browses that library and plays from it at source quality. It does not change local playback, transfers, or link downloads.
 
 ## Outcome
 
@@ -111,7 +111,7 @@ flick-serve --bind 127.0.0.1:0 --folder /tmp/fixtures   # tests and local checks
 - [x] `flick-serve` with `--library`, `--folder`, `--bind`, `--port`, `--print-pairing`.
 - [x] Integration tests on loopback with generated fixtures: 401 without token, 404 unknown id, 206 ranges including the last byte and an open-ended range, 416 for multi-range and out-of-bounds, `HEAD` lengths, `If-Range` with a stale ETag, 409 for an incomplete torrent file, and a concurrent-reader test that two clients reading different ranges get the right bytes.
 - [x] `remote::transcode` and `remote::hls`: FFmpeg and encoder discovery, the tier ladder, playlist generation, the segment job manager, WebVTT extraction, and tests driven by a generated stand-in `ffmpeg` script, following the yt-dlp stand-in pattern. Real FFmpeg is exercised only by an ignored test.
-- [ ] Manual check from the MacBook with stock mpv: `mpv --http-header-fields='Authorization: Bearer …' http://mohtashams-mac-mini.taildcfc7a.ts.net:PORT/v1/media/<id>`. This proves the transport end to end before any desktop work and is recorded in validation as a real playback check with the observed bit rate and `tailscale ping` result.
+- [x] Manual check from the MacBook with stock mpv: `mpv --http-header-fields='Authorization: Bearer …' http://mohtashams-mac-mini.taildcfc7a.ts.net:PORT/v1/media/<id>`. This proves the transport end to end before any desktop work and is recorded in validation as a real playback check with the observed bit rate and `tailscale ping` result.
 
 ### 2. Desktop client
 
