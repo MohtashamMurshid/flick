@@ -780,9 +780,10 @@ impl Flick {
                     if !waiting {
                         continue;
                     }
+                    // The pairing was checked to name `host:port`; a code
+                    // never replaces the token of a server already paired.
                     let added = result.and_then(|pairing| {
-                        self.remote
-                            .add_pairing(&mut self.store.data, &pairing.to_string())
+                        self.remote.add_code_pairing(&mut self.store.data, &pairing)
                     });
                     match added {
                         Ok(id) => {
@@ -2134,6 +2135,13 @@ impl Flick {
                     match result {
                         Ok(()) => self.load_remote(pending.remote, pending.resume, window, cx),
                         Err(message) => {
+                            // An automatic drop that was refused: the
+                            // watcher stays on the tier still playing.
+                            if let Some(playing) = self.remote_source().map(|r| r.quality)
+                                && let Some(auto) = &mut self.auto_quality
+                            {
+                                auto.refused(playing, std::time::Instant::now());
+                            }
                             self.status = None;
                             self.error = Some(format!(
                                 "Could not play this video at {}. {}",

@@ -527,13 +527,26 @@ impl Settings {
 
     /// Folds the positions a server's listing carries into saved progress,
     /// so Continue Watching follows the person between machines. For each
-    /// video with `resume`, the newer of the saved entry and the server's
-    /// wins (a tie keeps the saved one); an entry taken from the server
-    /// gets the listing's title. True when anything changed.
+    /// video with `resume`, the server's position replaces a saved entry
+    /// only when it is newer by more than [`RESUME_CONFLICT_WINDOW`], the
+    /// server's own rule, so two clocks a little apart do not trade the
+    /// same position back and forth. The server's time is first capped at
+    /// now plus [`RESUME_CLOCK_SKEW`], so a server clock running ahead
+    /// cannot pin its position. An entry taken from the server gets the
+    /// listing's title. True when anything changed.
     pub fn merge_remote_resume(
         &mut self,
         server: &str,
         videos: &[flick::remote::protocol::Video],
+    ) -> bool {
+        self.merge_remote_resume_at(server, videos, unix_now())
+    }
+
+    fn merge_remote_resume_at(
+        &mut self,
+        server: &str,
+        videos: &[flick::remote::protocol::Video],
+        now: u64,
     ) -> bool {
         if server.is_empty() {
             return false;
@@ -546,9 +559,12 @@ impl Settings {
             if video.id.is_empty() {
                 continue;
             }
+            let updated = resume.updated.min(now.saturating_add(RESUME_CLOCK_SKEW));
             if self
                 .remote_progress(server, &video.id)
-                .is_some_and(|saved| saved.updated >= resume.updated)
+                .is_some_and(|saved| {
+                    updated <= saved.updated.saturating_add(RESUME_CONFLICT_WINDOW)
+                })
             {
                 continue;
             }
@@ -569,7 +585,7 @@ impl Settings {
                 position,
                 duration,
                 finished: resume.finished,
-                updated: resume.updated,
+                updated,
             };
             self.remote
                 .progress
@@ -929,6 +945,13 @@ fn eligible_resume(position: f64, duration: f64) -> f64 {
 fn finite_or(value: f64, fallback: f64) -> f64 {
     if value.is_finite() { value } else { fallback }
 }
+
+/// A server's resume position replaces a saved one only when newer by more
+/// than this many seconds; the server applies the same window to uploads.
+pub const RESUME_CONFLICT_WINDOW: u64 = 60;
+/// A server's resume time further ahead of this computer's clock than this
+/// many seconds is taken as now plus this, as the server does for clients.
+pub const RESUME_CLOCK_SKEW: u64 = 60;
 
 fn unix_now() -> u64 {
     SystemTime::now()
@@ -1923,6 +1946,8 @@ mod tests {
         };
         let mut settings = Settings::default();
         settings.remember_remote("mini", "abc", "Old title", 30.0, 100.0);
+        // Saved a while ago, so a newer server time is not capped at now.
+        settings.remote.progress[0].updated -= 1_000;
         let saved = settings.remote_progress("mini", "abc").unwrap().updated;
         settings.remember_remote("laptop", "abc", "Elsewhere", 10.0, 100.0);
 
@@ -1935,9 +1960,14 @@ mod tests {
             "Old title"
         );
 
-        // Newer: the server's position wins, with the listing's title.
+        // Newer, but within the minute two clocks may differ by: kept.
+        let listing = [video("abc", "Sintel", at(70.0, saved + 60))];
+        assert!(!settings.merge_remote_resume("mini", &listing));
+        assert_eq!(settings.remote_resume_position("mini", "abc"), 30.0);
+
+        // Newer by more: the server's position wins, with its title.
         let listing = [
-            video("abc", "Sintel", at(70.0, saved + 5)),
+            video("abc", "Sintel", at(70.0, saved + 61)),
             video("new", "", at(500.0, 3)),
             video("none", "Never played", None),
         ];
@@ -1945,7 +1975,7 @@ mod tests {
         let merged = settings.remote_progress("mini", "abc").unwrap();
         assert_eq!(
             (merged.position, merged.updated, merged.title.as_str()),
-            (70.0, saved + 5, "Sintel")
+            (70.0, saved + 61, "Sintel")
         );
         assert_eq!(settings.remote_resume_position("mini", "abc"), 70.0);
         // A video with no saved entry joins, clamped, titled by file name.
@@ -1960,6 +1990,40 @@ mod tests {
         // The same listing again changes nothing.
         assert!(!settings.merge_remote_resume("mini", &listing));
         assert!(!settings.merge_remote_resume("", &listing));
+    }
+
+    #[test]
+    fn a_server_clock_ahead_cannot_pin_its_position() {
+        use flick::remote::protocol::{Progress, Video};
+        let listing = |position: f64, updated: u64| {
+            [Video {
+                id: "abc".into(),
+                title: "Sintel".into(),
+                resume: Some(Progress {
+                    position,
+                    duration: 100.0,
+                    finished: false,
+                    updated,
+                }),
+                ..Default::default()
+            }]
+        };
+        let now = 1_800_000_000;
+        let mut settings = Settings::default();
+        // A server a day ahead: its time is taken as now plus a minute.
+        assert!(settings.merge_remote_resume_at("mini", &listing(40.0, now + 86_400), now));
+        let merged = settings.remote_progress("mini", "abc").unwrap();
+        assert_eq!((merged.position, merged.updated), (40.0, now + 60));
+        // Watching here a few minutes later wins over the same claim.
+        let later = now + 300;
+        settings.remote.progress[0].position = 55.0;
+        settings.remote.progress[0].updated = later;
+        assert!(!settings.merge_remote_resume_at("mini", &listing(40.0, now + 86_400), later));
+        assert_eq!(settings.remote_resume_position("mini", "abc"), 55.0);
+        // A real later position from the server, more than a minute on, wins.
+        let after = later + 600;
+        assert!(settings.merge_remote_resume_at("mini", &listing(80.0, after), after));
+        assert_eq!(settings.remote_resume_position("mini", "abc"), 80.0);
     }
 
     #[test]

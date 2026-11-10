@@ -3,11 +3,15 @@
 //! desktop-modules agent; the library view wires the menu items.
 //!
 //! The copy is streamed from `GET /v1/media/{id}` with the bearer header
-//! into `<download folder>/From <server name>/<file name>` through a
-//! temporary file, with progress, cancel, and resume by range on retry. On
-//! completion the integration agent adds the path to the library and records
-//! a `store::remote::KeptCopy`.
+//! into `<download folder>/From <server name>/<file name>` through a part
+//! file named by server id and video id, with progress, cancel, and resume
+//! by range on retry. Beside the part file a small JSON file records the
+//! size and the server's `ETag`/`Last-Modified`; a resume sends `If-Range`
+//! and starts over when either changed. The final name is chosen only at
+//! the rename. On completion the integration agent adds the path to the
+//! library and records a `store::remote::KeptCopy`.
 
+use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, VecDeque},
     path::{Path, PathBuf},
@@ -320,8 +324,10 @@ async fn run(
             path,
         },
         Err(Stop::Cancelled) => {
-            let (_, part) = destination(&request);
-            let _ = tokio::fs::remove_file(part).await;
+            // Only this copy's own part file and its notes.
+            let paths = destination(&request);
+            let _ = tokio::fs::remove_file(&paths.part).await;
+            let _ = tokio::fs::remove_file(&paths.info).await;
             KeepEvent::Cancelled {
                 server_id,
                 video_id,
@@ -335,15 +341,107 @@ async fn run(
     }
 }
 
-/// `<download dir>/From <server>/` and `<file>.part` inside it.
-fn destination(request: &KeepRequest) -> (PathBuf, PathBuf) {
+/// Where one copy lives while it downloads.
+#[derive(Debug, PartialEq)]
+struct Paths {
+    /// `<download dir>/From <server>/`.
+    folder: PathBuf,
+    /// `.<server id>-<video id>.part` inside the folder: two videos with the
+    /// same file name, or two servers with the same name, never share one.
+    part: PathBuf,
+    /// The part file's [`PartInfo`], beside it as `….part.json`.
+    info: PathBuf,
+}
+
+fn destination(request: &KeepRequest) -> Paths {
     let folder = request.download_dir.join(format!(
         "From {}",
         safe_component(&request.server_name, "Flick")
     ));
-    let name = file_name(request);
-    let part = folder.join(format!("{name}.part"));
-    (folder, part)
+    let stem = format!(
+        ".{}-{}",
+        id_component(&request.server_id),
+        id_component(&request.video_id)
+    );
+    Paths {
+        part: folder.join(format!("{stem}.part")),
+        info: folder.join(format!("{stem}.part.json")),
+        folder,
+    }
+}
+
+/// An id as it appears in a part file's name: kept when it is short and
+/// only letters, digits, and underscores (so the `-` between the two ids is
+/// unambiguous), else a stable hash of it.
+fn id_component(id: &str) -> String {
+    if !id.is_empty()
+        && id.len() <= 64
+        && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+    {
+        return id.to_owned();
+    }
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::hash::DefaultHasher::new();
+    id.hash(&mut hasher);
+    format!("h{:016x}", hasher.finish())
+}
+
+/// What the server said about the whole file when the part file was
+/// started, so a resume continues the same file.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+struct PartInfo {
+    total: Option<u64>,
+    etag: Option<String>,
+    last_modified: Option<String>,
+}
+
+impl PartInfo {
+    fn of(response: &reqwest::Response, total: Option<u64>) -> Self {
+        Self {
+            total,
+            etag: header(response, reqwest::header::ETAG),
+            last_modified: header(response, reqwest::header::LAST_MODIFIED),
+        }
+    }
+
+    /// `If-Range`: the strong `ETag` when there is one, else the date.
+    fn if_range(&self) -> Option<&str> {
+        self.etag
+            .as_deref()
+            .filter(|tag| !tag.starts_with("W/"))
+            .or(self.last_modified.as_deref())
+    }
+
+    /// Whether a ranged answer continues the same file: the same size and
+    /// the same validators.
+    fn continues(&self, response: &reqwest::Response, total: Option<u64>) -> bool {
+        self.total == total
+            && self.etag == header(response, reqwest::header::ETAG)
+            && self.last_modified == header(response, reqwest::header::LAST_MODIFIED)
+    }
+}
+
+fn header(response: &reqwest::Response, name: reqwest::header::HeaderName) -> Option<String> {
+    response
+        .headers()
+        .get(name)?
+        .to_str()
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+}
+
+/// The notes beside a part file; None when missing or unreadable.
+async fn read_info(path: &Path) -> Option<PartInfo> {
+    let bytes = tokio::fs::read(path).await.ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+async fn remove_if_present(path: &Path) -> std::io::Result<()> {
+    match tokio::fs::remove_file(path).await {
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error),
+        _ => Ok(()),
+    }
 }
 
 /// The last component of the server's file name, made safe for a folder.
@@ -379,9 +477,23 @@ fn safe_component(name: &str, fallback: &str) -> String {
             fallback
         }
     } else {
-        // Keep names within common file system limits.
-        cleaned.chars().take(200).collect()
+        // Keep names within common file system limits (255 bytes), leaving
+        // room for " (2)": at most 200 bytes, cut on a character boundary.
+        truncate_bytes(&cleaned, 200).trim_end().to_owned()
     }
+}
+
+/// The longest prefix of `text` of at most `limit` bytes that ends on a
+/// character boundary.
+fn truncate_bytes(text: &str, limit: usize) -> &str {
+    if text.len() <= limit {
+        return text;
+    }
+    let mut end = limit;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
 }
 
 /// `name`, or `name (2).ext`, `name (3).ext`, … when taken.
@@ -450,22 +562,31 @@ async fn copy(
     let write_error = |error: std::io::Error| {
         Stop::Failed(format!("Could not save {name}: {}", io_reason(&error)))
     };
-    let (folder, part) = destination(request);
-    tokio::fs::create_dir_all(&folder)
+    let paths = destination(request);
+    tokio::fs::create_dir_all(&paths.folder)
         .await
         .map_err(write_error)?;
 
     let mut restarted = false;
     let (mut response, mut offset, total) = loop {
-        let offset = match tokio::fs::metadata(&part).await {
+        let size = match tokio::fs::metadata(&paths.part).await {
             Ok(meta) if meta.is_file() => meta.len(),
             _ => 0,
         };
+        // A part file without its notes cannot be checked: start over.
+        let saved = match size {
+            0 => None,
+            _ => read_info(&paths.info).await,
+        };
+        let offset = if saved.is_some() { size } else { 0 };
         let mut get = http
             .get(&request.url)
             .header(reqwest::header::AUTHORIZATION, &request.authorization);
-        if offset > 0 {
+        if let Some(saved) = &saved {
             get = get.header(reqwest::header::RANGE, format!("bytes={offset}-"));
+            if let Some(validator) = saved.if_range() {
+                get = get.header(reqwest::header::IF_RANGE, validator);
+            }
         }
         let response = tokio::select! {
             _ = cancel.cancelled() => return Err(Stop::Cancelled),
@@ -474,10 +595,13 @@ async fn copy(
             })?,
         };
         let status = response.status().as_u16();
-        match status {
-            206 if offset > 0 => match content_range(&response) {
-                Some((start, total)) if start == offset => break (response, offset, total),
-                // Not the range asked for: start over rather than splice.
+        match (status, &saved) {
+            (206, Some(saved)) => match content_range(&response) {
+                Some((start, total)) if start == offset && saved.continues(&response, total) => {
+                    break (response, offset, total);
+                }
+                // Not the range asked for, or the file changed on the
+                // server: start over rather than splice.
                 _ if !restarted => {}
                 _ => {
                     return Err(Stop::Failed(format!(
@@ -485,28 +609,33 @@ async fn copy(
                     )));
                 }
             },
-            200 => {
+            // A whole file: the first copy, or the server's file changed
+            // since the part file was started (`If-Range` did not match).
+            (200, _) => {
                 let total = response.content_length();
+                let info = serde_json::to_vec(&PartInfo::of(&response, total))
+                    .map_err(|error| write_error(std::io::Error::other(error)))?;
+                tokio::fs::write(&paths.info, info)
+                    .await
+                    .map_err(write_error)?;
                 break (response, 0, total);
             }
             // The part file is longer than the video now is.
-            416 if offset > 0 && !restarted => {}
+            (416, Some(_)) if !restarted => {}
             _ => return Err(Stop::Failed(refusal(status, server, &name))),
         }
         restarted = true;
-        tokio::fs::remove_file(&part)
-            .await
-            .or_else(|error| match error.kind() {
-                std::io::ErrorKind::NotFound => Ok(()),
-                _ => Err(error),
-            })
-            .map_err(write_error)?;
+        remove_if_present(&paths.part).await.map_err(write_error)?;
+        remove_if_present(&paths.info).await.map_err(write_error)?;
     };
 
     let file = if offset > 0 {
-        tokio::fs::OpenOptions::new().append(true).open(&part).await
+        tokio::fs::OpenOptions::new()
+            .append(true)
+            .open(&paths.part)
+            .await
     } else {
-        tokio::fs::File::create(&part).await
+        tokio::fs::File::create(&paths.part).await
     }
     .map_err(write_error)?;
     let mut file = tokio::io::BufWriter::with_capacity(256 * 1024, file);
@@ -560,8 +689,13 @@ async fn copy(
             "{server} stopped sending {name} before the end. Try again to continue where it stopped"
         )));
     }
-    let path = unused_path(&folder, &name);
-    tokio::fs::rename(&part, &path).await.map_err(write_error)?;
+    // The final name is chosen only now, so a name taken while the copy ran
+    // is not overwritten.
+    let path = unused_path(&paths.folder, &name);
+    tokio::fs::rename(&paths.part, &path)
+        .await
+        .map_err(write_error)?;
+    let _ = tokio::fs::remove_file(&paths.info).await;
     Ok(path)
 }
 
@@ -627,10 +761,15 @@ mod tests {
     const AUTH: &str = "Bearer 0123456789abcdef";
 
     fn fixture() -> Arc<Vec<u8>> {
-        // 3 MB of non-repeating bytes, so a misplaced range shows.
-        let mut state: u32 = 0x1234_5678;
+        fixture_from(0x1234_5678, 3 * 1024 * 1024)
+    }
+
+    /// `length` non-repeating bytes, different for each seed, so a
+    /// misplaced range or a spliced file shows.
+    fn fixture_from(seed: u32, length: usize) -> Arc<Vec<u8>> {
+        let mut state = seed;
         Arc::new(
-            (0..3 * 1024 * 1024)
+            (0..length)
                 .map(|_| {
                     state ^= state << 13;
                     state ^= state >> 17;
@@ -649,10 +788,28 @@ mod tests {
         slow: AtomicBool,
         /// Range headers received, in order (None when absent).
         ranges: Mutex<Vec<Option<String>>>,
+        /// `(path, If-Range)` received, in order.
+        if_ranges: Mutex<Vec<(String, Option<String>)>>,
         requests: AtomicUsize,
+        /// Bodies by request path; others get the server's default body.
+        bodies: Mutex<std::collections::HashMap<String, Arc<Vec<u8>>>>,
+        /// Send no `ETag`.
+        no_etag: AtomicBool,
+        /// Serve the range even when `If-Range` does not match, as a
+        /// careless server might.
+        ignore_if_range: AtomicBool,
     }
 
-    /// Serves `body` at any path with range support, 401 without [`AUTH`].
+    /// A strong tag that changes with the body.
+    fn tag_of(body: &[u8]) -> String {
+        let sum = body.iter().fold(0u64, |sum, b| {
+            sum.wrapping_mul(31).wrapping_add(u64::from(*b))
+        });
+        format!("\"{:x}-{sum:x}\"", body.len())
+    }
+
+    /// Serves `body` (or a path's own in [`Behaviour::bodies`]) with range,
+    /// `ETag`, and `If-Range` support, 401 without [`AUTH`].
     fn server(body: Arc<Vec<u8>>, behaviour: Arc<Behaviour>) -> String {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -665,8 +822,18 @@ mod tests {
                     let mut reader = BufReader::new(stream.try_clone().unwrap());
                     let mut line = String::new();
                     let _ = reader.read_line(&mut line);
+                    let path = line.split_whitespace().nth(1).unwrap_or("").to_owned();
+                    let body = behaviour
+                        .bodies
+                        .lock()
+                        .unwrap()
+                        .get(&path)
+                        .cloned()
+                        .unwrap_or(body);
+                    let tag = tag_of(&body);
                     let mut authorized = false;
                     let mut range = None;
+                    let mut if_range = None;
                     loop {
                         let mut header = String::new();
                         if reader.read_line(&mut header).is_err() || header.trim().is_empty() {
@@ -677,10 +844,25 @@ mod tests {
                                 authorized = value.trim() == AUTH;
                             } else if name.eq_ignore_ascii_case("range") {
                                 range = Some(value.trim().to_owned());
+                            } else if name.eq_ignore_ascii_case("if-range") {
+                                if_range = Some(value.trim().to_owned());
                             }
                         }
                     }
                     behaviour.ranges.lock().unwrap().push(range.clone());
+                    behaviour
+                        .if_ranges
+                        .lock()
+                        .unwrap()
+                        .push((path.clone(), if_range.clone()));
+                    let etag = if behaviour.no_etag.load(Ordering::SeqCst) {
+                        String::new()
+                    } else {
+                        format!("ETag: {tag}\r\n")
+                    };
+                    let range_applies = behaviour.ignore_if_range.load(Ordering::SeqCst)
+                        || if_range.as_ref().is_none_or(|value| *value == tag);
+                    let range = range.filter(|_| range_applies);
                     if !authorized {
                         let reply = r#"{"message":"no"}"#;
                         let _ = write!(
@@ -707,7 +889,7 @@ mod tests {
                         Some(start) => {
                             let _ = write!(
                                 stream,
-                                "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {start}-{}/{}\r\nContent-Length: {}\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n",
+                                "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {start}-{}/{}\r\nContent-Length: {}\r\n{etag}Accept-Ranges: bytes\r\nConnection: close\r\n\r\n",
                                 body.len() - 1,
                                 body.len(),
                                 body.len() - start
@@ -717,7 +899,7 @@ mod tests {
                         None => {
                             let _ = write!(
                                 stream,
-                                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n",
+                                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n{etag}Accept-Ranges: bytes\r\nConnection: close\r\n\r\n",
                                 body.len()
                             );
                             0
@@ -784,6 +966,11 @@ mod tests {
         dir.join("From Mac mini")
     }
 
+    /// The part file of server `s1`'s `video`.
+    fn part(dir: &Path, video: &str) -> PathBuf {
+        folder(dir).join(format!(".s1-{video}.part"))
+    }
+
     #[test]
     fn copies_the_whole_file() {
         let dir = tempfile::tempdir().unwrap();
@@ -804,7 +991,8 @@ mod tests {
             }
         );
         assert_eq!(std::fs::read(&path).unwrap(), *body);
-        assert!(!folder(dir.path()).join("Holiday.mkv.part").exists());
+        assert!(!part(dir.path(), "v1").exists());
+        assert!(!part(dir.path(), "v1").with_extension("part.json").exists());
         assert!(state.in_progress().is_empty());
         // The first report carries the size.
         assert!(seen.iter().any(|event| matches!(
@@ -844,7 +1032,7 @@ mod tests {
             }
             other => panic!("unexpected {other:?}"),
         }
-        let part = folder(dir.path()).join("Holiday.mkv.part");
+        let part = part(dir.path(), "v1");
         assert_eq!(std::fs::read(&part).unwrap(), body[..1_000_000]);
 
         state.keep(request(&url, dir.path(), "v1"));
@@ -857,6 +1045,152 @@ mod tests {
             *behaviour.ranges.lock().unwrap(),
             vec![None, Some("bytes=1000000-".to_owned())]
         );
+        // The resume asked for the same file by its tag.
+        let if_ranges = behaviour.if_ranges.lock().unwrap();
+        assert_eq!(if_ranges[0].1, None);
+        assert_eq!(if_ranges[1].1, Some(tag_of(&body)));
+    }
+
+    #[test]
+    fn videos_with_the_same_name_never_share_a_part_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = fixture_from(1, 2 * 1024 * 1024);
+        let second = fixture_from(2, 2 * 1024 * 1024 + 17);
+        let behaviour = Arc::new(Behaviour::default());
+        behaviour
+            .bodies
+            .lock()
+            .unwrap()
+            .insert("/v1/media/v2".into(), second.clone());
+        *behaviour.cut_after.lock().unwrap() = Some(700_000);
+        let url = server(first.clone(), behaviour.clone());
+        let second_url = url.replace("/v1/media/v1", "/v1/media/v2");
+        let mut state = KeepState::default();
+        let mut seen = Vec::new();
+
+        // The first is cut off, then the second, with the same name, is kept.
+        state.keep(request(&url, dir.path(), "v1"));
+        assert!(matches!(
+            finish(&mut state, "v1", &mut seen),
+            KeepEvent::Failed { .. }
+        ));
+        state.keep(request(&second_url, dir.path(), "v2"));
+        let second_path = match finish(&mut state, "v2", &mut seen) {
+            KeepEvent::Done { path, .. } => path,
+            other => panic!("unexpected {other:?}"),
+        };
+        assert_eq!(second_path, folder(dir.path()).join("Holiday.mkv"));
+        assert_eq!(std::fs::read(&second_path).unwrap(), *second);
+        // The first's part file was left alone.
+        assert_eq!(
+            std::fs::read(part(dir.path(), "v1")).unwrap(),
+            first[..700_000]
+        );
+
+        // The first resumes into its own name.
+        state.keep(request(&url, dir.path(), "v1"));
+        let first_path = match finish(&mut state, "v1", &mut seen) {
+            KeepEvent::Done { path, .. } => path,
+            other => panic!("unexpected {other:?}"),
+        };
+        assert_eq!(first_path, folder(dir.path()).join("Holiday (2).mkv"));
+        assert_eq!(std::fs::read(&first_path).unwrap(), *first);
+        assert_eq!(std::fs::read(&second_path).unwrap(), *second);
+        assert_eq!(
+            behaviour.ranges.lock().unwrap().last().cloned().flatten(),
+            Some("bytes=700000-".to_owned())
+        );
+    }
+
+    /// Interrupts a copy of `before`, changes the server's file to `after`,
+    /// keeps again, and returns the copy and the Range headers seen.
+    fn keep_across_a_change(
+        before: Arc<Vec<u8>>,
+        after: Arc<Vec<u8>>,
+        behaviour: Arc<Behaviour>,
+    ) -> (Vec<u8>, Vec<Option<String>>) {
+        let dir = tempfile::tempdir().unwrap();
+        *behaviour.cut_after.lock().unwrap() = Some(500_000);
+        let url = server(before, behaviour.clone());
+        let mut state = KeepState::default();
+        let mut seen = Vec::new();
+        state.keep(request(&url, dir.path(), "v1"));
+        assert!(matches!(
+            finish(&mut state, "v1", &mut seen),
+            KeepEvent::Failed { .. }
+        ));
+        behaviour
+            .bodies
+            .lock()
+            .unwrap()
+            .insert("/v1/media/v1".into(), after);
+        state.keep(request(&url, dir.path(), "v1"));
+        let path = match finish(&mut state, "v1", &mut seen) {
+            KeepEvent::Done { path, .. } => path,
+            other => panic!("unexpected {other:?}"),
+        };
+        assert!(!part(dir.path(), "v1").exists());
+        let ranges = behaviour.ranges.lock().unwrap().clone();
+        (std::fs::read(path).unwrap(), ranges)
+    }
+
+    #[test]
+    fn a_changed_source_restarts_from_zero() {
+        let before = fixture_from(3, 1_500_000);
+        let after = fixture_from(4, 1_500_000);
+
+        // The server sees If-Range no longer matches and sends it all.
+        let (copy, ranges) = keep_across_a_change(before.clone(), after.clone(), Arc::default());
+        assert_eq!(copy, *after);
+        assert_eq!(ranges, vec![None, Some("bytes=500000-".to_owned())]);
+
+        // A server that sends the range anyway is caught by its new tag.
+        let careless = Arc::new(Behaviour::default());
+        careless.ignore_if_range.store(true, Ordering::SeqCst);
+        let (copy, ranges) = keep_across_a_change(before.clone(), after.clone(), careless);
+        assert_eq!(copy, *after);
+        assert_eq!(ranges, vec![None, Some("bytes=500000-".to_owned()), None]);
+
+        // Without tags, a different size gives it away.
+        let untagged = Arc::new(Behaviour::default());
+        untagged.no_etag.store(true, Ordering::SeqCst);
+        let longer = fixture_from(5, 1_600_000);
+        let (copy, ranges) = keep_across_a_change(before, longer.clone(), untagged);
+        assert_eq!(copy, *longer);
+        assert_eq!(ranges, vec![None, Some("bytes=500000-".to_owned()), None]);
+    }
+
+    #[test]
+    fn cancel_removes_only_its_own_part_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let behaviour = Arc::new(Behaviour::default());
+        *behaviour.cut_after.lock().unwrap() = Some(400_000);
+        let url = server(fixture(), behaviour.clone());
+        let mut state = KeepState::default();
+        let mut seen = Vec::new();
+        state.keep(request(&url, dir.path(), "v1"));
+        assert!(matches!(
+            finish(&mut state, "v1", &mut seen),
+            KeepEvent::Failed { .. }
+        ));
+        behaviour.slow.store(true, Ordering::SeqCst);
+        state.keep(request(&url, dir.path(), "v2"));
+        let started = Instant::now();
+        while !part(dir.path(), "v2").exists() {
+            assert!(started.elapsed() < Duration::from_secs(10), "timed out");
+            state.drain();
+            thread::sleep(Duration::from_millis(10));
+        }
+        state.cancel("s1", "v2");
+        assert!(matches!(
+            finish(&mut state, "v2", &mut seen),
+            KeepEvent::Cancelled { .. }
+        ));
+        assert!(!part(dir.path(), "v2").exists());
+        assert_eq!(
+            std::fs::read(part(dir.path(), "v1")).unwrap(),
+            fixture()[..400_000]
+        );
     }
 
     #[test]
@@ -867,7 +1201,7 @@ mod tests {
         let url = server(fixture(), behaviour);
         let mut state = KeepState::default();
         state.keep(request(&url, dir.path(), "v1"));
-        let part = folder(dir.path()).join("Holiday.mkv.part");
+        let part = part(dir.path(), "v1");
         let started = Instant::now();
         while !(state
             .in_progress()
@@ -911,7 +1245,7 @@ mod tests {
                         .into(),
             }
         );
-        assert!(!folder(dir.path()).join("Holiday.mkv.part").exists());
+        assert!(!part(dir.path(), "v1").exists());
     }
 
     #[test]
@@ -936,11 +1270,7 @@ mod tests {
         state.shutdown();
         assert!(state.in_progress().is_empty());
         for video in ["a", "b", "c"] {
-            assert!(
-                !folder(dir.path())
-                    .join(format!("{video}.mkv.part"))
-                    .exists()
-            );
+            assert!(!part(dir.path(), video).exists());
         }
     }
 
@@ -959,9 +1289,36 @@ mod tests {
         keep.file_name = "..".into();
         assert_eq!(file_name(&keep), "id1");
         keep.server_name = "Mac/mini".into();
-        let (folder, part) = destination(&keep);
-        assert_eq!(folder, Path::new("/tmp/From Mac-mini"));
-        assert_eq!(part, Path::new("/tmp/From Mac-mini/id1.part"));
+        let paths = destination(&keep);
+        assert_eq!(paths.folder, Path::new("/tmp/From Mac-mini"));
+        assert_eq!(paths.part, Path::new("/tmp/From Mac-mini/.s1-id1.part"));
+        assert_eq!(
+            paths.info,
+            Path::new("/tmp/From Mac-mini/.s1-id1.part.json")
+        );
+        // Ids with other characters are hashed, so `-` stays a separator.
+        keep.server_id = "a-b".into();
+        keep.video_id = "c".into();
+        let one = destination(&keep).part;
+        keep.server_id = "a".into();
+        keep.video_id = "b-c".into();
+        assert_ne!(one, destination(&keep).part);
+        assert!(!one.to_string_lossy().contains("a-b"), "{one:?}");
+    }
+
+    #[test]
+    fn long_names_are_cut_by_bytes_on_a_character_boundary() {
+        let cjk = "映画".repeat(60); // 360 bytes, 3 per character
+        let cut = safe_component(&cjk, "v");
+        assert_eq!(cut.len(), 198);
+        assert!(cjk.starts_with(&cut));
+        let emoji = format!("a{}", "🎬".repeat(60)); // 1 + 240 bytes
+        let cut = safe_component(&emoji, "v");
+        assert_eq!(cut.len(), 197);
+        assert!(emoji.starts_with(&cut));
+        let ascii = "x".repeat(300);
+        assert_eq!(safe_component(&ascii, "v").len(), 200);
+        assert_eq!(safe_component("short.mkv", "v"), "short.mkv");
     }
 
     #[test]
