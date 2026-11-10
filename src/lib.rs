@@ -4,5 +4,6 @@ pub mod catalog;
 pub mod fetch;
 pub mod library;
 pub mod presentation;
+pub mod remote;
 pub mod subtitles;
 pub mod torrent;

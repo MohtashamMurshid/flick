@@ -162,6 +162,8 @@ pub struct Flick {
     video_frame: Entity<VideoFrameView>,
     library_ui_state: library_ui::LibraryUiState,
     library_files_state: library_files_ui::LibraryFilesUiState,
+    /// Remote libraries; everything for that feature lives inside it.
+    remote: crate::remote_client::RemoteState,
     error: Option<String>,
     menu: Option<Menu>,
     focus: FocusHandle,
@@ -432,6 +434,7 @@ impl Flick {
             video_frame,
             library_ui_state: library_ui::LibraryUiState::new(cx),
             library_files_state: library_files_ui::LibraryFilesUiState::default(),
+            remote: Default::default(),
             error,
             menu: None,
             focus,

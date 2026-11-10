@@ -25,6 +25,10 @@ required-features = ["desktop"]
 name = "flick-transfer"
 path = "src/bin/flick-transfer.rs"
 
+[[bin]]
+name = "flick-serve"
+path = "src/bin/flick-serve.rs"
+
 [dependencies]
 anyhow = "1"
 directories = "6"
@@ -37,8 +41,9 @@ fs2 = "0.4"
 librqbit = { version = "=9.0.1", default-features = false, features = ["rust-tls"] }
 librqbit-bencode = "=9.0.1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "time", "fs", "io-util", "process"] }
-tokio-util = "0.7"
+tokio-util = { version = "0.7", features = ["io"] }
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio", "query"] }
 unicode-segmentation = "1"
 libloading = "0.8"
 # GPUI 0.2.2 pulls xattr 0.2.3, which needs the ENOATTR alias removed in libc 0.2.190.

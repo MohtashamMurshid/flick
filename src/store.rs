@@ -16,6 +16,8 @@ use crate::model::{file_title, non_negative_finite};
 mod index;
 #[path = "store/persistence.rs"]
 mod persistence;
+#[path = "store/remote.rs"]
+pub mod remote;
 #[path = "store/torrent_integrity.rs"]
 mod torrent_integrity;
 pub use persistence::{SaveBarrier, SaveStatus};
@@ -40,6 +42,9 @@ pub struct Settings {
     /// Comma-separated ISO 639-1 codes for subtitle searches.
     pub subtitle_languages: String,
     pub transfers: TransferPreferences,
+    /// Paired remote libraries and progress on their videos.
+    #[serde(skip_serializing_if = "remote::RemoteSettings::is_empty")]
+    pub remote: remote::RemoteSettings,
     pub torrent_history: Vec<TorrentResume>,
     /// Durable removal markers. Automatic history/transfer updates respect these.
     #[serde(skip_serializing_if = "Vec::is_empty")]

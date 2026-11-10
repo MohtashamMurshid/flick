@@ -5,6 +5,7 @@ mod library_files;
 mod model;
 mod playback;
 mod playback_actor;
+mod remote_client;
 mod services;
 mod shortcuts;
 mod shutdown;
