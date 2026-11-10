@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  launchd agent for flick-serve, the headless Flick remote library server.
+  scripts/install-flick-serve.sh fills in the placeholders and installs it in
+  ~/Library/LaunchAgents; see docs/REMOTE.md.
+
+  Stdout is discarded on purpose: it carries the pairing string, which
+  contains the token. Get the string by running flick-serve with its
+  print-pairing option (XML comments cannot contain a double hyphen).
+  Logs (stderr, never the token) go to ~/Library/Logs/Flick/flick-serve.log.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.flick.serve</string>
+  <key>ProgramArguments</key>
+  <array>
+    <!-- PROGRAM_ARGUMENTS -->
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <!-- Restart after a crash, or when Tailscale was not up yet at login. -->
+  <key>KeepAlive</key>
+  <true/>
+  <key>ThrottleInterval</key>
+  <integer>30</integer>
+  <key>ProcessType</key>
+  <string>Standard</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <key>RUST_LOG</key>
+    <string>flick=info</string>
+  </dict>
+  <key>StandardOutPath</key>
+  <string>/dev/null</string>
+  <key>StandardErrorPath</key>
+  <string>__HOME__/Library/Logs/Flick/flick-serve.log</string>
+</dict>
+</plist>

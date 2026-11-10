@@ -30,7 +30,7 @@ impl Flick {
             self.close_pip(true, cx);
             return;
         }
-        if self.path.is_none() || !self.file_loaded {
+        if self.source().is_none() || !self.file_loaded {
             return;
         }
         let display = window.display(cx);
@@ -90,7 +90,7 @@ impl Flick {
         };
         // Frames shared with the window leave its sprite atlas with it.
         let _ = handle.update(cx, |_, window, _| window.remove_window());
-        if restore && self.path.is_some() {
+        if restore && self.source().is_some() {
             self.view = View::Player;
             if let Some(main) = self.main_window {
                 let _ = main.update(cx, |_, window, _| window.activate_window());
@@ -156,7 +156,7 @@ impl Render for PipView {
                 (
                     flick.video_frame.clone(),
                     flick.playing(),
-                    flick.path.as_deref().map(file_title).unwrap_or_default(),
+                    flick.source().map(Source::title).unwrap_or_default(),
                 )
             })
             .map(|(frame, playing, title)| (Some(frame), playing, title))

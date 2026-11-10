@@ -310,7 +310,7 @@ impl Flick {
 
     fn player_titlebar(&self, window: &Window, cx: &Context<Self>) -> Stateful<Div> {
         let t = cx.theme();
-        let title = self.path.as_deref().map(file_title).unwrap_or_default();
+        let title = self.source().map(Source::title).unwrap_or_default();
         let labels = self.store.data.appearance.show_labels;
         let back = if labels {
             self.overlay_label_button("player-back", "arrow-left", "Library", Control::Library, cx)
@@ -869,7 +869,7 @@ impl Flick {
                 )
                 .into_any_element(),
             Style::Windows => {
-                let title = self.path.as_deref().map(file_title).unwrap_or_default();
+                let title = self.source().map(Source::title).unwrap_or_default();
                 v_flex()
                     .id("player-bar")
                     .absolute()
@@ -1241,6 +1241,31 @@ impl Flick {
             );
         match menu {
             Menu::Tracks => {
+                // Remote videos only, first so it is never below the fold:
+                // switching reloads at the current position.
+                if let Some(current) = self.remote_quality() {
+                    panel = panel.child(
+                        div()
+                            .px_2()
+                            .pt_2()
+                            .pb_1()
+                            .text_size(t.font(11.))
+                            .text_color(t.muted)
+                            .child("Quality"),
+                    );
+                    for quality in self.quality_choices() {
+                        panel = panel.child(
+                            option(
+                                format!("quality-{quality}").into(),
+                                quality.label().into(),
+                                quality == current,
+                            )
+                            .on_click(cx.listener(
+                                move |this, _, window, cx| this.switch_quality(quality, window, cx),
+                            )),
+                        );
+                    }
+                }
                 for (kind, title) in [("audio", "Audio"), ("sub", "Subtitles")] {
                     panel = panel.child(
                         div()
@@ -1277,6 +1302,32 @@ impl Flick {
                         panel = panel.child(self.audio_delay_row(cx));
                     }
                     if kind == "sub" {
+                        // Subtitles kept on the remote library's server.
+                        for (which, label, state) in self.remote_subtitle_choices() {
+                            let id = match which {
+                                crate::remote_client::SubtitleRef::Sidecar(n) => {
+                                    format!("remote-sub-s{n}")
+                                }
+                                crate::remote_client::SubtitleRef::Embedded(n) => {
+                                    format!("remote-sub-e{n}")
+                                }
+                            };
+                            let label = match state {
+                                Some(remote_library_ui::SubtitleLoad::Loading) => {
+                                    format!("{label} · Loading…")
+                                }
+                                Some(remote_library_ui::SubtitleLoad::Failed) => {
+                                    format!("{label} · Failed, try again")
+                                }
+                                // Once added it is a track listed above.
+                                Some(remote_library_ui::SubtitleLoad::Loaded) => continue,
+                                None => format!("{label} · On server"),
+                            };
+                            panel =
+                                panel.child(option(id.into(), label, false).on_click(cx.listener(
+                                    move |this, _, _, cx| this.load_remote_subtitle(which, cx),
+                                )));
+                        }
                         let off = !self
                             .snapshot
                             .tracks

@@ -16,6 +16,8 @@ use crate::model::{file_title, non_negative_finite};
 mod index;
 #[path = "store/persistence.rs"]
 mod persistence;
+#[path = "store/remote.rs"]
+pub mod remote;
 #[path = "store/torrent_integrity.rs"]
 mod torrent_integrity;
 pub use persistence::{SaveBarrier, SaveStatus};
@@ -40,6 +42,9 @@ pub struct Settings {
     /// Comma-separated ISO 639-1 codes for subtitle searches.
     pub subtitle_languages: String,
     pub transfers: TransferPreferences,
+    /// Paired remote libraries and progress on their videos.
+    #[serde(skip_serializing_if = "remote::RemoteSettings::is_empty")]
+    pub remote: remote::RemoteSettings,
     pub torrent_history: Vec<TorrentResume>,
     /// Durable removal markers. Automatic history/transfer updates respect these.
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -124,6 +129,7 @@ impl Default for Settings {
             opensubtitles_key: String::new(),
             subtitle_languages: "en".into(),
             transfers: TransferPreferences::default(),
+            remote: remote::RemoteSettings::default(),
             torrent_history: Vec::new(),
             removed_videos: Vec::new(),
             unverified_torrent_files: Vec::new(),
@@ -189,17 +195,23 @@ impl LibraryVideo {
 
     /// A short resolution label such as `4K` or `1080p`.
     pub fn resolution(&self) -> Option<&'static str> {
-        let (w, h) = (self.width.max(self.height), self.width.min(self.height));
-        Some(match (w, h) {
-            (0, _) | (_, 0) => return None,
-            (w, h) if w >= 7680 || h >= 4320 => "8K",
-            (w, h) if w >= 3840 || h >= 2160 => "4K",
-            (w, h) if w >= 2560 || h >= 1440 => "1440p",
-            (w, h) if w >= 1920 || h >= 1080 => "1080p",
-            (w, h) if w >= 1280 || h >= 720 => "720p",
-            _ => "SD",
-        })
+        resolution_label(self.width, self.height)
     }
+}
+
+/// A short resolution label such as `4K` or `1080p`, for local and remote
+/// cards alike. None while the size is unknown.
+pub fn resolution_label(width: u32, height: u32) -> Option<&'static str> {
+    let (w, h) = (width.max(height), width.min(height));
+    Some(match (w, h) {
+        (0, _) | (_, 0) => return None,
+        (w, h) if w >= 7680 || h >= 4320 => "8K",
+        (w, h) if w >= 3840 || h >= 2160 => "4K",
+        (w, h) if w >= 2560 || h >= 1440 => "1440p",
+        (w, h) if w >= 1920 || h >= 1080 => "1080p",
+        (w, h) if w >= 1280 || h >= 720 => "720p",
+        _ => "SD",
+    })
 }
 
 impl Settings {
@@ -444,6 +456,80 @@ impl Settings {
 
     pub fn resume_position(&self, path: &Path) -> f64 {
         self.index().resume(self, path)
+    }
+
+    /// Saved progress on a remote video, keyed by local server id and the
+    /// server's video id.
+    pub fn remote_progress(&self, server: &str, video: &str) -> Option<&remote::RemoteProgress> {
+        self.remote
+            .progress
+            .iter()
+            .find(|p| p.server == server && p.video == video)
+    }
+
+    /// Where a remote video resumes, under the same rules as local files.
+    pub fn remote_resume_position(&self, server: &str, video: &str) -> f64 {
+        self.remote_progress(server, video)
+            .map_or(0.0, |p| eligible_resume(p.position, p.duration))
+    }
+
+    /// Records progress on a remote video, newest first. Like local history,
+    /// a finished mark stays, and reaching the end marks it finished.
+    pub fn remember_remote(
+        &mut self,
+        server: &str,
+        video: &str,
+        title: &str,
+        position: f64,
+        duration: f64,
+    ) {
+        if server.is_empty() || video.is_empty() {
+            return;
+        }
+        let finished = self
+            .remote_progress(server, video)
+            .is_some_and(|p| p.finished);
+        let duration = non_negative_finite(duration);
+        let mut position = non_negative_finite(position);
+        if duration > 0.0 {
+            position = position.min(duration);
+        }
+        self.put_remote_progress(remote::RemoteProgress {
+            server: server.to_owned(),
+            video: video.to_owned(),
+            title: title.to_owned(),
+            position,
+            duration,
+            finished: finished || reached_end(position, duration),
+            updated: unix_now(),
+        });
+    }
+
+    /// Records a remote video as finished, keeping its saved duration.
+    #[cfg_attr(not(test), allow(dead_code))] // For the remote library's Mark Watched.
+    pub fn mark_remote_finished(&mut self, server: &str, video: &str, title: &str) {
+        if server.is_empty() || video.is_empty() {
+            return;
+        }
+        let duration = self
+            .remote_progress(server, video)
+            .map_or(0.0, |p| p.duration);
+        self.put_remote_progress(remote::RemoteProgress {
+            server: server.to_owned(),
+            video: video.to_owned(),
+            title: title.to_owned(),
+            position: duration,
+            duration,
+            finished: true,
+            updated: unix_now(),
+        });
+    }
+
+    fn put_remote_progress(&mut self, entry: remote::RemoteProgress) {
+        self.remote
+            .progress
+            .retain(|p| p.server != entry.server || p.video != entry.video);
+        self.remote.progress.insert(0, entry);
     }
 
     pub fn is_removed(&self, path: &Path) -> bool {
@@ -782,6 +868,12 @@ fn finite_or(value: f64, fallback: f64) -> f64 {
     if value.is_finite() { value } else { fallback }
 }
 
+fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs())
+}
+
 pub struct Store {
     pub data: Settings,
     path: Option<PathBuf>,
@@ -789,6 +881,11 @@ pub struct Store {
 }
 
 impl Store {
+    /// The settings file, when Flick has a configuration folder.
+    pub fn path(&self) -> Option<&Path> {
+        self.path.as_deref()
+    }
+
     pub fn load() -> Self {
         if let Some(path) = std::env::var_os("FLICK_SETTINGS_PATH") {
             return Self::load_from(PathBuf::from(path));
@@ -978,8 +1075,26 @@ impl TemporaryFile {
                 ".flick-settings-{}-{timestamp}-{sequence}.tmp",
                 std::process::id()
             ));
-            match OpenOptions::new().write(true).create_new(true).open(&path) {
-                Ok(file) => return Ok((Self { path }, file)),
+            let mut options = OpenOptions::new();
+            options.write(true).create_new(true);
+            // Settings hold remote pairing tokens: readable by this user only.
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            match options.open(&path) {
+                Ok(file) => {
+                    let temporary = Self { path };
+                    // The mode above is masked by the umask; set it exactly.
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        file.set_permissions(fs::Permissions::from_mode(0o600))
+                            .context("Cannot restrict temporary settings")?;
+                    }
+                    return Ok((temporary, file));
+                }
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
                 Err(error) => return Err(error).context("Cannot create temporary settings"),
             }
@@ -1690,6 +1805,74 @@ mod tests {
     }
 
     #[test]
+    fn remote_progress_resumes_like_local_files_and_is_keyed_by_server_and_video() {
+        let mut settings = Settings::default();
+        for (position, duration, expected) in [
+            (5.0, 100.0, 0.0),
+            (5.1, 100.0, 5.1),
+            (90.0, 100.0, 90.0),
+            (90.1, 100.0, 0.0),
+            (25.0, 0.0, 0.0),
+            (f64::NAN, 100.0, 0.0),
+        ] {
+            settings.remember_remote("mini", "abc", "Film", position, duration);
+            assert_eq!(settings.remote_resume_position("mini", "abc"), expected);
+        }
+        assert_eq!(settings.remote.progress.len(), 1);
+        assert_eq!(settings.remote_resume_position("mini", "other"), 0.0);
+        assert_eq!(settings.remote_resume_position("laptop", "abc"), 0.0);
+        settings.remember_remote("laptop", "abc", "Other", 40.0, 100.0);
+        settings.remember_remote("", "abc", "Ignored", 40.0, 100.0);
+        settings.remember_remote("mini", "", "Ignored", 40.0, 100.0);
+        assert_eq!(settings.remote.progress.len(), 2);
+        assert_eq!(settings.remote.progress[0].server, "laptop");
+        assert_eq!(settings.remote_resume_position("laptop", "abc"), 40.0);
+        let saved = settings.remote_progress("mini", "abc").unwrap();
+        assert_eq!((saved.position, saved.duration), (0.0, 100.0));
+        assert!(saved.updated > 0);
+        // Newest first: updating an older entry moves it to the front.
+        settings.remember_remote("mini", "abc", "Film", 30.0, 100.0);
+        assert_eq!(settings.remote.progress[0].server, "mini");
+        // Positions past the end clamp to it.
+        settings.remember_remote("mini", "abc", "Film", 500.0, 100.0);
+        assert_eq!(
+            settings.remote_progress("mini", "abc").unwrap().position,
+            100.0
+        );
+    }
+
+    #[test]
+    fn remote_finished_marks_stick_and_survive_a_save() {
+        let mut settings = Settings::default();
+        settings.remember_remote("mini", "abc", "Film", 95.0, 100.0);
+        assert!(settings.remote_progress("mini", "abc").unwrap().finished);
+        // Rewatching from the start keeps the finished mark, as locally.
+        settings.remember_remote("mini", "abc", "Film", 20.0, 100.0);
+        let saved = settings.remote_progress("mini", "abc").unwrap();
+        assert!(saved.finished);
+        assert_eq!(settings.remote_resume_position("mini", "abc"), 20.0);
+
+        settings.remember_remote("mini", "def", "Show", 30.0, 200.0);
+        settings.mark_remote_finished("mini", "def", "Show");
+        let saved = settings.remote_progress("mini", "def").unwrap();
+        assert!(saved.finished);
+        assert_eq!((saved.position, saved.duration), (200.0, 200.0));
+        assert_eq!(settings.remote_resume_position("mini", "def"), 0.0);
+        settings.mark_remote_finished("mini", "new", "Unseen");
+        assert!(settings.remote_progress("mini", "new").unwrap().finished);
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.json");
+        let mut store = Store::load_from(&path);
+        store.data = settings;
+        store.save().unwrap();
+        let loaded = Store::load_from(&path);
+        assert_eq!(loaded.data.remote.progress.len(), 3);
+        assert!(loaded.data.remote_progress("mini", "abc").unwrap().finished);
+        assert_eq!(loaded.data.remote_resume_position("mini", "abc"), 20.0);
+    }
+
+    #[test]
     fn resume_ignores_the_start_unknown_duration_and_near_end() {
         let mut settings = Settings::default();
         let path = Path::new("video.mkv");
@@ -1757,5 +1940,26 @@ mod tests {
         assert!(store.save_to(&destination).is_err());
         assert_eq!(fs::read_to_string(marker).unwrap(), "prior data");
         assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn saved_settings_are_readable_by_this_user_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.json");
+        // A file left world-readable by an older Flick is replaced, not kept.
+        fs::write(&path, b"{}").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        let mut store = Store::load_from(&path);
+        store.data.remote.servers.push(remote::RemoteServer {
+            id: "id".into(),
+            token: "secret".into(),
+            ..Default::default()
+        });
+        store.save().unwrap();
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "{mode:o}");
+        assert!(fs::read_to_string(&path).unwrap().contains("secret"));
     }
 }

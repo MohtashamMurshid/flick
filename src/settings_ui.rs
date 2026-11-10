@@ -2,7 +2,7 @@
 //! chrome preferences.
 
 use super::{
-    chrome_ui::{group, row, section_title},
+    chrome_ui::{group, notice, row, section_title},
     *,
 };
 use crate::{
@@ -340,6 +340,8 @@ impl Flick {
             .child(div().h(px(24.)))
             .child(self.transfer_settings(cx))
             .child(div().h(px(24.)))
+            .child(self.remote_settings(cx))
+            .child(div().h(px(24.)))
             .child(section_title(&t, "Subtitles"))
             .child(group(
                 &t,
@@ -444,6 +446,231 @@ impl Flick {
         v_flex()
             .child(section_title(&t, "Transfers"))
             .child(group(&t, rows))
+    }
+
+    /// Libraries on other Flicks over Tailscale: add one with its pairing
+    /// string, then rename it, choose its default quality, refresh, or remove.
+    fn remote_settings(&self, cx: &Context<Self>) -> Div {
+        let t = cx.theme().clone();
+        let fields = &self.remote.fields;
+        let mut rows = Vec::new();
+        for (index, server) in self
+            .remote
+            .servers(&self.store.data)
+            .into_iter()
+            .enumerate()
+        {
+            let renaming = fields
+                .renaming
+                .as_ref()
+                .filter(|(id, _)| *id == server.id)
+                .map(|(_, field)| field.clone());
+            let mut trailing = h_flex().gap_2();
+            trailing = match renaming {
+                Some(field) => trailing
+                    .child(div().w(px(180.)).child(self.text_field(&field, cx)))
+                    .child(self.button(
+                        ("remote-rename-done", index),
+                        None,
+                        "Done",
+                        true,
+                        cx,
+                        |this, _, cx| {
+                            this.remote.fields.renaming = None;
+                            cx.notify();
+                        },
+                    )),
+                None => {
+                    let id = server.id.clone();
+                    let name = server.name.clone();
+                    trailing.child(self.button(
+                        ("remote-rename", index),
+                        None,
+                        "Rename",
+                        false,
+                        cx,
+                        move |this, window, cx| this.rename_remote(&id, &name, window, cx),
+                    ))
+                }
+            };
+            let offered = server.qualities();
+            let id = server.id.clone();
+            trailing = trailing.child(self.button(
+                ("remote-quality", index),
+                Some("monitor"),
+                format!("Quality: {}", server.quality.label()),
+                false,
+                cx,
+                move |this, _, cx| {
+                    let current = this
+                        .store
+                        .data
+                        .remote
+                        .servers
+                        .iter()
+                        .find(|server| server.id == id)
+                        .map(|server| server.quality);
+                    if let Some(current) = current {
+                        let next = crate::remote_client::next_quality(current, &offered);
+                        this.remote.set_quality(&mut this.store.data, &id, next);
+                        this.persist();
+                        cx.notify();
+                    }
+                },
+            ));
+            let id = server.id.clone();
+            trailing = trailing.child(self.icon_button(
+                ("remote-refresh", index),
+                "rotate-cw",
+                "Refresh",
+                cx,
+                move |this, _, cx| {
+                    this.remote.refresh_server(&this.store.data, &id);
+                    cx.notify();
+                },
+            ));
+            let id = server.id.clone();
+            trailing = trailing.child(self.icon_button(
+                ("remote-remove", index),
+                "x",
+                format!("Remove {}", server.name),
+                cx,
+                move |this, window, cx| {
+                    this.remote.remove_server(&mut this.store.data, &id);
+                    for image in this.remote.take_dropped_images() {
+                        let _ = window.drop_image(image);
+                    }
+                    this.persist();
+                    cx.notify();
+                },
+            ));
+            rows.push(
+                row(
+                    &t,
+                    Some("library"),
+                    server.name.clone(),
+                    Some(format!("{} · {}", server.address, server.summary()).into()),
+                    trailing,
+                )
+                .into_any_element(),
+            );
+        }
+        let add = match &fields.pairing {
+            Some(field) => h_flex()
+                .gap_2()
+                .child(div().w(px(260.)).child(self.text_field(field, cx)))
+                .child(self.button(
+                    "remote-add",
+                    Some("plus"),
+                    "Add",
+                    true,
+                    cx,
+                    |this, _, cx| this.submit_pairing(cx),
+                ))
+                .child(
+                    self.icon_button("remote-add-cancel", "x", "Cancel", cx, |this, _, cx| {
+                        this.remote.fields.pairing = None;
+                        this.remote.fields.pairing_error = None;
+                        cx.notify();
+                    }),
+                ),
+            None => h_flex().child(self.button(
+                "remote-add",
+                Some("plus"),
+                "Add Server…",
+                false,
+                cx,
+                |this, window, cx| this.open_pairing_field(window, cx),
+            )),
+        };
+        rows.push(
+            row(
+                &t,
+                Some("plus"),
+                "Add a remote library",
+                Some("Paste the pairing string shown by Flick on the other machine".into()),
+                add,
+            )
+            .into_any_element(),
+        );
+        let (serve_rows, serve_error) = self.serve_rows(cx);
+        rows.extend(serve_rows);
+        v_flex()
+            .child(section_title(&t, "Remote Libraries"))
+            .child(
+                div()
+                    .mb_2()
+                    .text_size(t.font(t.text_size - 1.))
+                    .text_color(t.muted)
+                    .child("Watch videos stored on another Flick in your Tailscale network."),
+            )
+            .child(group(&t, rows))
+            .when_some(fields.pairing_error.clone(), |d, error| {
+                d.child(div().mt_2().child(notice(&t, true, error)))
+            })
+            .when_some(serve_error, |d, error| {
+                d.child(div().mt_2().child(notice(&t, true, error)))
+            })
+    }
+
+    /// Shows the pairing string field and focuses it.
+    fn open_pairing_field(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let field = cx.new(|cx| TextInput::with_placeholder(cx, "flick-remote://…"));
+        cx.subscribe(&field, |this, _, event, cx| {
+            match event {
+                InputEvent::Changed => this.remote.fields.pairing_error = None,
+                InputEvent::Submit => this.submit_pairing(cx),
+            }
+            cx.notify();
+        })
+        .detach();
+        field.focus_handle(cx).focus(window);
+        self.remote.fields.pairing = Some(field);
+        self.remote.fields.pairing_error = None;
+        cx.notify();
+    }
+
+    /// Adds the pasted server, or explains why the string was refused.
+    fn submit_pairing(&mut self, cx: &mut Context<Self>) {
+        let Some(field) = self.remote.fields.pairing.clone() else {
+            return;
+        };
+        let text = field.read(cx).value().to_owned();
+        match self.remote.add_pairing(&mut self.store.data, &text) {
+            Ok(_) => {
+                // Closing the field drops the pasted token from the UI.
+                self.remote.fields.pairing = None;
+                self.remote.fields.pairing_error = None;
+                self.persist();
+            }
+            Err(error) => self.remote.fields.pairing_error = Some(error),
+        }
+        cx.notify();
+    }
+
+    /// Edits a server's name in place; every change is saved.
+    fn rename_remote(&mut self, id: &str, name: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let field = cx.new(|cx| {
+            let mut field = TextInput::with_placeholder(cx, "Server name");
+            field.set_value(name.to_owned(), cx);
+            field
+        });
+        let server = id.to_owned();
+        cx.subscribe(&field, move |this, input, event, cx| {
+            match event {
+                InputEvent::Changed => {
+                    let name = input.read(cx).value().to_owned();
+                    this.remote.rename(&mut this.store.data, &server, &name);
+                    this.persist();
+                }
+                InputEvent::Submit => this.remote.fields.renaming = None,
+            }
+            cx.notify();
+        })
+        .detach();
+        field.focus_handle(cx).focus(window);
+        self.remote.fields.renaming = Some((id.to_owned(), field));
+        cx.notify();
     }
 
     /// Player shortcuts with rebinding, plus the fixed keys.

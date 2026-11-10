@@ -49,6 +49,24 @@ Files are saved to the current download folder: `FLICK_DOWNLOAD_DIR` if set, oth
 
 Flick never overwrites an existing file: a different file with the same name gets a numbered name, and an identical Archive file is reused. Partial files use dot-prefixed names until a download finishes. Cancelling, a failure, or closing Flick removes them. An HTTPS download resumes after a dropped connection, and continues from a leftover partial file when the same download starts again.
 
+## Remote libraries
+
+A remote library lets one computer keep the videos and another watch them. A Mac mini with the storage runs `flick-serve`; Flick on a MacBook on the same [Tailscale](https://tailscale.com) network pairs with it and streams the original files. Nothing is copied to the MacBook, and nothing is reachable from the Internet or the LAN: the server listens only on its Tailscale address and every request needs the pairing token. [Serving a Flick library](REMOTE.md) explains how to set up the server.
+
+This feature is partly built. Pairing and the server work. The library section that lists a server's videos and plays them, and the quality tiers below Original, are still in progress, and playback from a second machine has not been tested yet. See [validation](VALIDATION.md#remote-library-over-tailscale-on-2026-11-10).
+
+To pair, run `flick-serve --print-pairing` on the server and copy the `flick-remote://…` string. In Flick, open **Appearance**, find **Remote Libraries**, choose **Add Server…**, paste the string, and choose **Add**. Each paired server has a row with its address and status: Online with its number of videos, Offline, or Wrong token. The row can rename the server, refresh it, change its default quality, and remove it. The token is saved in `settings.json`; treat the pairing string like a password.
+
+**Quality.** Original sends the file as it is: every audio and subtitle track, HDR, and the full bit rate. Use it at home, or on any direct path with room to spare. The planned lower tiers are live H.264 transcodes made on the server: 1080p High (12 Mbit/s) for fast fibre upload, 1080p (6 Mbit/s) for ordinary home upload, 720p (3 Mbit/s) for hotel Wi-Fi and relayed paths, and 480p (1.5 Mbit/s) for cellular. Today a server offers only Original. The player's settings menu will switch tiers for remote videos, reloading at the current position.
+
+Before relying on it:
+
+- **Home upload speed is the limit away from home.** A 4K remux at original quality needs more than most home connections upload.
+- **Direct or relayed.** `tailscale ping <server>` shows `via <address>` for a direct path and `via DERP(…)` for a relay. Relayed paths are slower and vary; expect 720p there.
+- **FFmpeg on the server** will be needed for any tier but Original.
+- **Transcodes will be lossy.** They tone-map HDR to SDR, carry only the default audio track, and cannot show bitmap subtitles such as PGS. Original keeps all of these.
+- **Keep the server awake.** The Mac mini must stay awake, logged in, and connected to Tailscale. The launchd agent from `scripts/install-flick-serve.sh` runs the server inside `caffeinate`; see [keeping the Mac mini awake](REMOTE.md#keep-the-mac-mini-awake-and-reachable).
+
 ## Command center
 
 Press ⌘K on macOS or Ctrl+K elsewhere, from the library or the player. One large field finds library videos and plays them, searches online and lists the results, offers to download a pasted YouTube, X, web, or magnet link, and runs commands such as Open Video, Add Folder, Downloads, Appearance, Fullscreen, Picture in Picture, and Quit. Arrow keys choose a row, Enter runs it, and Escape or a click outside closes it. The library's search field shows the shortcut; clicking it opens the command center too.
@@ -98,12 +116,15 @@ Preferences are saved to `settings.json` in the operating system's per-user appl
 | Variable | Effect |
 | --- | --- |
 | `FLICK_SETTINGS_PATH` | Full path to a settings file to use instead of `settings.json` in the configuration directory. |
-| `FLICK_DATA_DIR` | Base folder for torrent state (in `transfers`) and cached posters (in `thumbnails`). By default, torrent state goes in the platform's data directory and posters in its cache directory. |
+| `FLICK_DATA_DIR` | Base folder for torrent state (in `transfers`), remote library listings and subtitles (in `remote`), and cached posters (in `thumbnails`). By default, torrent state and remote library files go in the platform's data directory and posters in its cache directory. `flick-serve` also keeps its token in `remote` here unless given `--state-dir`. |
 | `FLICK_DOWNLOAD_DIR` | Folder for link downloads. Default: `Downloads/Flick` in your home folder. |
 | `FLICK_YTDLP` | Full path to yt-dlp, checked before `PATH`. |
 | `FLICK_OPENSUBTITLES_KEY` | OpenSubtitles API key. It overrides a key entered in Appearance and is never written to `settings.json`. |
 | `FLICK_MPV_LIBRARY` | Full path to the libmpv shared library, used instead of searching the usual locations. |
 | `FLICK_HWDEC` | Set to `no` to turn off hardware decoding. |
+| `FLICK_FFMPEG` | Full path to the FFmpeg that the remote library server uses for quality tiers below Original, checked before `PATH`. |
+| `FLICK_REMOTE_TOKEN` | Pairing token for remote libraries. It overrides the token of every paired server and is never written to `settings.json`. |
+
 
 These variables exist for development and testing:
 

@@ -32,6 +32,7 @@ Flick is built in Rust with [GPUI](https://crates.io/crates/gpui) for the interf
 - **Torrents built in.** Pick the files you want, pause and resume, set bandwidth limits, export `.torrent` files, and share a file or folder as a magnet link.
 - **Downloads from links.** Paste a YouTube, X, or other video page and Flick saves it with [yt-dlp](https://github.com/yt-dlp/yt-dlp). Direct HTTPS video links and Internet Archive items download without it, and Archive files are checked against their published SHA-1.
 - **A full player.** Hardware decoding, subtitle files and OpenSubtitles search, audio and subtitle tracks with audio delay, playback speed, frame stepping, chapters, an A–B loop, picture in picture, and resume positions.
+- **Watch from another machine.** `flick-serve` shares a Mac mini's library over Tailscale, and Flick on another Mac pairs with it in Appearance. The server and pairing work; browsing and playing remote videos in the library is still in progress. See [Serving a Flick library](docs/REMOTE.md).
 - **Command center.** Press ⌘K or Ctrl+K to find a video, search online, paste a link, or run any command.
 - **Native look on every platform.** macOS, Windows 11, and GNOME styles, each with its own chrome and player controls. Light and dark schemes, accent colors, and WCAG AA contrast in every combination.
 - **Keyboard first.** Tab and the arrow keys move through the library and controls, and player shortcuts can be rebound.
@@ -129,6 +130,8 @@ See [Packaging for macOS](docs/PACKAGING.md) for signing, notarization, and lice
 | [Packaging for macOS](docs/PACKAGING.md) | Building, signing, and notarizing `Flick.app`, and what it bundles |
 | [Plan](docs/PLAN.md) | What's built and what's next |
 | [Playback and sharing design](docs/SHARING_PLAN.md) | Design and acceptance criteria for playback and sharing |
+| [Remote library over Tailscale](docs/REMOTE_PLAN.md) | Design for watching one Flick's library from another machine on a tailnet, and its delivery state |
+| [Serving a Flick library](docs/REMOTE.md) | Running `flick-serve` on a Mac mini: build, pairing, launchd, and the HTTP interface |
 | [Headless proposal](docs/HEADLESS_PLAN.md) | A deferred proposal for a headless agent interface |
 | [Validation](docs/VALIDATION.md) | Every check that has been run, by date and platform |
 

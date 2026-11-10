@@ -39,7 +39,10 @@ pub enum Command {
         generation: u64,
         key: String,
         query: String,
+        /// Hashed for the search when `hash` is None.
         video: Option<PathBuf>,
+        /// Already known, from a remote library's server.
+        hash: Option<String>,
         languages: String,
     },
     /// Download a subtitle next to its video, or into `fallback` when that
@@ -208,6 +211,12 @@ impl ShutdownWorkers {
             }
         }
     }
+}
+
+/// Joins `worker` in [`finish_shutdown`], after the window closes, instead
+/// of on the UI thread.
+pub fn register_shutdown_worker(worker: thread::JoinHandle<()>) {
+    SHUTDOWN_WORKERS.register(worker);
 }
 
 /// Wait for registered cleanup. Ordinary quit calls this off the UI thread;
@@ -1086,6 +1095,7 @@ fn subtitles(command: Command, events: &mpsc::Sender<Event>) -> Option<Command> 
             key,
             query,
             video,
+            hash,
             languages,
         } => {
             tokio::spawn(async move {
@@ -1093,14 +1103,15 @@ fn subtitles(command: Command, events: &mpsc::Sender<Event>) -> Option<Command> 
                     let client = flick::subtitles::Client::new(&key)?;
                     // The hash reads 128 KiB; an unreadable file just
                     // searches by title.
-                    let hash = match video {
-                        Some(video) => tokio::task::spawn_blocking(move || {
+                    let hash = match (hash, video) {
+                        (Some(hash), _) => Some(hash),
+                        (None, Some(video)) => tokio::task::spawn_blocking(move || {
                             flick::subtitles::movie_hash(&video).ok()
                         })
                         .await
                         .ok()
                         .flatten(),
-                        None => None,
+                        (None, None) => None,
                     };
                     client.search(&query, hash.as_deref(), &languages).await
                 }

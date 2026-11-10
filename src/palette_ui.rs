@@ -239,7 +239,7 @@ impl Flick {
             (!binding.is_empty()).then(|| crate::shortcuts::display(binding))
         };
         let mut items = Vec::new();
-        if self.view == View::Library && self.path.is_some() {
+        if self.view == View::Library && self.source().is_some() {
             items.push(command("play", "Return to Player", None, Action::Player));
         }
         if self.view == View::Player && self.file_loaded {
@@ -347,7 +347,7 @@ impl Flick {
         match item.action {
             Action::Play(path) => self.open(path, window, cx),
             Action::Player => {
-                if self.path.is_some() {
+                if self.source().is_some() {
                     self.entered_player = Instant::now();
                     self.view = View::Player;
                 }
