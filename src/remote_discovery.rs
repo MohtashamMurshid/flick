@@ -57,6 +57,10 @@ const PROBES_IN_FLIGHT: usize = 8;
 const DISCOVERY_BOUND: Duration = Duration::from_secs(10);
 /// Wake-on-LAN's conventional "discard" port.
 const WAKE_PORT: u16 = 9;
+/// The most a hello or pairing answer may be; both are a few hundred bytes.
+const MAX_BODY: usize = 64 * 1024;
+/// The most hardware addresses, and LAN addresses, a wake uses.
+pub const MAX_WAKE_ADDRESSES: usize = 8;
 
 /// Peers of this tailnet, through the Tailscale CLI (searched on `PATH`,
 /// then the Mac App Store app's bundled CLI, then `/usr/local/bin`).
@@ -140,10 +144,15 @@ struct Node {
     online: bool,
     #[serde(rename = "OS")]
     os: String,
+    /// Shared into this tailnet from another one; never probed.
+    #[serde(rename = "ShareeNode")]
+    sharee: bool,
 }
 
 /// The peers in `tailscale status --json` output, without this machine,
-/// sorted by host name. A peer without an address is skipped.
+/// sorted by host name. A peer without an address is skipped, and so is a
+/// machine shared in from another tailnet (`ShareeNode`): it is not the
+/// owner's, so discovery does not knock on it.
 fn parse_status(json: &[u8]) -> Result<Vec<Peer>> {
     let status: Status =
         serde_json::from_slice(json).context("Tailscale's status is not the expected JSON")?;
@@ -152,6 +161,7 @@ fn parse_status(json: &[u8]) -> Result<Vec<Peer>> {
         .peers
         .unwrap_or_default()
         .into_values()
+        .filter(|node| !node.sharee)
         .filter_map(|node| {
             let ips = node_ips(&node);
             if ips.iter().any(|ip| own.contains(ip)) {
@@ -227,7 +237,7 @@ pub async fn hello(base_url: &str) -> Option<Hello> {
     if !response.status().is_success() {
         return None;
     }
-    let body = tokio::time::timeout(HELLO_TIMEOUT, response.bytes())
+    let body = tokio::time::timeout(HELLO_TIMEOUT, read_bounded(response))
         .await
         .ok()?
         .ok()?;
@@ -235,6 +245,31 @@ pub async fn hello(base_url: &str) -> Option<Hello> {
     // Every field has a default, so any JSON object would parse; a Flick
     // always states its protocol.
     (hello.protocol > 0).then_some(hello)
+}
+
+/// Why a body could not be read.
+#[derive(Debug)]
+enum BodyError {
+    TooLarge,
+    Closed,
+}
+
+/// The body, refusing one over [`MAX_BODY`] without reading it all.
+async fn read_bounded(mut response: reqwest::Response) -> Result<Vec<u8>, BodyError> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_BODY as u64)
+    {
+        return Err(BodyError::TooLarge);
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(|_| BodyError::Closed)? {
+        if body.len() + chunk.len() > MAX_BODY {
+            return Err(BodyError::TooLarge);
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
 }
 
 /// Probes every online peer on the default port, a few at a time, within a
@@ -290,15 +325,13 @@ async fn probe(targets: Vec<(Peer, String)>, in_flight: usize, bound: Duration) 
     found
 }
 
-/// Exchanges a code the owner showed for the full pairing string.
-pub async fn pair_with_code(base_url: &str, code: &str) -> Result<Pairing> {
+/// Exchanges a code the owner showed for the full pairing string. The
+/// answer must name the machine the code was sent to: the same host, or a
+/// host resolving to the same address, and the same port.
+pub async fn pair_with_code(host: &str, port: u16, code: &str) -> Result<Pairing> {
     let code = normalize_code(code)?;
     let http = http_client(PAIR_TIMEOUT)?;
-    let url = format!(
-        "{}{}",
-        base_url.trim_end_matches('/'),
-        protocol::paths::pair()
-    );
+    let url = format!("{}{}", base_url(host, port), protocol::paths::pair());
     let response = http
         .post(url)
         .json(&PairRequest { code })
@@ -306,17 +339,62 @@ pub async fn pair_with_code(base_url: &str, code: &str) -> Result<Pairing> {
         .await
         .map_err(|_| anyhow::anyhow!("No Flick answered at that address"))?;
     let status = response.status().as_u16();
-    let body = response
-        .bytes()
-        .await
-        .map_err(|_| anyhow::anyhow!("The connection closed before the server answered"))?;
+    let body = read_bounded(response).await.map_err(|error| match error {
+        BodyError::TooLarge => anyhow::anyhow!("The server's answer is not a Flick pairing"),
+        BodyError::Closed => anyhow::anyhow!("The connection closed before the server answered"),
+    })?;
     if !(200..300).contains(&status) {
         bail!("{}", pair_error(status, &body));
     }
     let reply: PairReply = serde_json::from_slice(&body)
         .map_err(|_| anyhow::anyhow!("The server's answer is not a Flick pairing"))?;
-    Pairing::parse(&reply.pairing)
-        .map_err(|_| anyhow::anyhow!("The server sent a pairing string this Flick cannot read"))
+    let pairing = Pairing::parse(&reply.pairing)
+        .map_err(|_| anyhow::anyhow!("The server sent a pairing string this Flick cannot read"))?;
+    if !names_the_same_machine(host, port, &pairing).await {
+        bail!(
+            "The Flick at {} answered with a pairing for another address. Paste its pairing string instead",
+            crate::remote_client::address(host, port)
+        );
+    }
+    Ok(pairing)
+}
+
+/// Whether a pairing names `host:port`: the same port, and the same host
+/// or one resolving to an address `host` resolves to.
+async fn names_the_same_machine(host: &str, port: u16, pairing: &Pairing) -> bool {
+    if pairing.port != port {
+        return false;
+    }
+    let (expected, named) = (bare_host(host), bare_host(&pairing.host));
+    if expected.eq_ignore_ascii_case(named) {
+        return true;
+    }
+    let lookup = async {
+        let (expected, named) = tokio::join!(resolve(expected, port), resolve(named, port));
+        named.iter().any(|ip| expected.contains(ip))
+    };
+    tokio::time::timeout(PAIR_TIMEOUT, lookup)
+        .await
+        .unwrap_or(false)
+}
+
+/// A host without the brackets around an IPv6 address.
+fn bare_host(host: &str) -> &str {
+    let host = host.trim();
+    host.strip_prefix('[')
+        .and_then(|host| host.strip_suffix(']'))
+        .unwrap_or(host)
+}
+
+/// The addresses a host names; nothing when it does not resolve.
+async fn resolve(host: &str, port: u16) -> Vec<IpAddr> {
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        return vec![ip];
+    }
+    match tokio::net::lookup_host((host, port)).await {
+        Ok(addresses) => addresses.map(|address| address.ip()).collect(),
+        Err(_) => Vec::new(),
+    }
 }
 
 /// Six digits, ignoring spaces and dashes the person may type.
@@ -348,26 +426,85 @@ fn pair_error(status: u16, body: &[u8]) -> String {
 }
 
 /// Sends a Wake-on-LAN magic packet for each MAC to the LAN broadcast and
-/// to each LAN address. Only works from the same network.
+/// to each LAN address. Only works from the same network. Whatever the
+/// server listed is filtered first ([`wake_macs`], [`wake_ips`]): a packet
+/// never goes to a public, broadcast, or multicast address it named.
 pub fn wake(mac: &[String], lan_ips: &[String]) -> Result<()> {
     let macs = parse_macs(mac)?;
     let mut targets = vec![SocketAddr::from((Ipv4Addr::BROADCAST, WAKE_PORT))];
     targets.extend(
-        lan_ips
-            .iter()
-            .filter_map(|ip| ip.trim().parse::<Ipv4Addr>().ok())
+        wake_ips(lan_ips)
+            .into_iter()
             .map(|ip| SocketAddr::from((ip, WAKE_PORT))),
     );
     send_magic(&macs, &targets)
 }
 
+/// The usable hardware addresses, skipping malformed ones; an error only
+/// when none is left.
 fn parse_macs(macs: &[String]) -> Result<Vec<[u8; 6]>> {
     if macs.is_empty() {
         bail!("This machine has not shared a hardware address to wake it with");
     }
-    macs.iter()
-        .map(|mac| parse_mac(mac).with_context(|| format!("{mac:?} is not a hardware address")))
-        .collect()
+    let parsed: Vec<[u8; 6]> = wake_macs(macs)
+        .iter()
+        .filter_map(|mac| parse_mac(mac))
+        .collect();
+    if parsed.is_empty() {
+        bail!("{:?} is not a hardware address", macs[0]);
+    }
+    Ok(parsed)
+}
+
+/// The hardware addresses worth waking: well formed, one device's own (not
+/// all zeros, not group addresses), without repeats, at most
+/// [`MAX_WAKE_ADDRESSES`].
+pub fn wake_macs(macs: &[String]) -> Vec<String> {
+    let mut kept: Vec<String> = Vec::new();
+    for mac in macs {
+        let Some(bytes) = parse_mac(mac) else {
+            continue;
+        };
+        if bytes == [0; 6] || bytes[0] & 1 == 1 {
+            continue;
+        }
+        let mac = mac.trim().to_owned();
+        if !kept.iter().any(|seen| parse_mac(seen) == Some(bytes)) {
+            kept.push(mac);
+        }
+        if kept.len() == MAX_WAKE_ADDRESSES {
+            break;
+        }
+    }
+    kept
+}
+
+/// The LAN addresses a wake packet may go to: private IPv4 (10/8,
+/// 172.16/12, 192.168/16) only, never a broadcast or network address (`.255`
+/// or `.0`), multicast, or public address, without repeats, at most
+/// [`MAX_WAKE_ADDRESSES`].
+pub fn wake_ips(ips: &[String]) -> Vec<Ipv4Addr> {
+    let mut kept = Vec::new();
+    for ip in ips {
+        let Ok(ip) = ip.trim().parse::<Ipv4Addr>() else {
+            continue;
+        };
+        let last = ip.octets()[3];
+        if !ip.is_private()
+            || ip.is_broadcast()
+            || ip.is_multicast()
+            || last == 255
+            || last == 0
+            || kept.contains(&ip)
+        {
+            continue;
+        }
+        kept.push(ip);
+        if kept.len() == MAX_WAKE_ADDRESSES {
+            break;
+        }
+    }
+    kept
 }
 
 /// `aa:bb:cc:dd:ee:ff` or `aa-bb-cc-dd-ee-ff`.
@@ -427,7 +564,8 @@ fn send_magic(macs: &[[u8; 6]], targets: &[SocketAddr]) -> Result<()> {
 pub enum DiscoveryEvent {
     /// A discovery pass finished; offline peers and non-Flicks are omitted.
     Found(Vec<FoundFlick>),
-    /// A pairing code was accepted (`Ok`) or refused with the server's message.
+    /// A pairing code was accepted (`Ok`, with a pairing checked to name
+    /// `host:port`) or refused with the server's message.
     Paired {
         host: String,
         port: u16,
@@ -518,7 +656,8 @@ async fn handle(request: Request) -> DiscoveryEvent {
             DiscoveryEvent::Found(discover(peers).await)
         }
         Request::Pair { host, port, code } => {
-            let result = pair_with_code(&base_url(&host, port), &code)
+            // Only a pairing that names `host:port` comes back as `Ok`.
+            let result = pair_with_code(&host, port, &code)
                 .await
                 .map_err(|error| error.to_string());
             DiscoveryEvent::Paired { host, port, result }
@@ -635,7 +774,8 @@ mod tests {
     const TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
     /// Shaped like real `tailscale status --json` output, trimmed, with
-    /// made-up machines: this one, an online Mac, and an offline Linux box.
+    /// made-up machines: this one, an online Mac, an offline Linux box, and
+    /// a NAS shared in from another tailnet.
     const STATUS: &str = r#"{
       "Version": "1.90.6-t0123456789-g0123456789",
       "BackendState": "Running",
@@ -658,6 +798,15 @@ mod tests {
           "TailscaleIPs": ["100.109.155.32", "fd7a:115c:a1e0::cb2e:9b21"],
           "Online": true,
           "Relay": "sin"
+        },
+        "nodekey:eeee": {
+          "ID": "nShared",
+          "HostName": "friends-nas",
+          "DNSName": "friends-nas.other-tailnet.ts.net.",
+          "OS": "linux",
+          "TailscaleIPs": ["100.77.1.2"],
+          "Online": true,
+          "ShareeNode": true
         },
         "nodekey:bbbb": {
           "ID": "nB",
@@ -736,9 +885,10 @@ mod tests {
     }
 
     /// A one-request-per-connection HTTP server on loopback.
-    /// `answer(method, path, body)` gives the status line code and body.
+    /// `answer(own port, method, path, body)` gives the status line code and
+    /// body.
     fn loopback_server(
-        answer: impl Fn(&str, &str, &str) -> (u16, String) + Send + Sync + 'static,
+        answer: impl Fn(u16, &str, &str, &str) -> (u16, String) + Send + Sync + 'static,
     ) -> String {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -753,7 +903,11 @@ mod tests {
         format!("http://127.0.0.1:{port}")
     }
 
-    fn serve(mut stream: TcpStream, answer: &dyn Fn(&str, &str, &str) -> (u16, String)) {
+    /// `(own port, method, path, body)` to `(status, body)`.
+    type Answer = dyn Fn(u16, &str, &str, &str) -> (u16, String);
+
+    fn serve(mut stream: TcpStream, answer: &Answer) {
+        let own_port = stream.local_addr().map_or(0, |addr| addr.port());
         let mut reader = BufReader::new(stream.try_clone().unwrap());
         let mut line = String::new();
         if reader.read_line(&mut line).is_err() {
@@ -776,7 +930,7 @@ mod tests {
         }
         let mut body = vec![0; length];
         let _ = reader.read_exact(&mut body);
-        let (code, reply) = answer(&method, &path, &String::from_utf8_lossy(&body));
+        let (code, reply) = answer(own_port, &method, &path, &String::from_utf8_lossy(&body));
         let _ = write!(
             stream,
             "HTTP/1.1 {code} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}",
@@ -784,19 +938,29 @@ mod tests {
         );
     }
 
-    /// A fake Flick that pairs with code 123456.
+    /// A fake Flick that pairs with code 123456, naming its own address.
+    /// Codes 900001 to 900004 answer with a pairing for another host,
+    /// another port, `localhost`, and a host that does not resolve.
     fn fake_flick() -> String {
-        loopback_server(|method, path, body| match (method, path) {
+        loopback_server(|port, method, path, body| match (method, path) {
             ("GET", "/v1/hello") => (
                 200,
                 r#"{"protocol":1,"server_name":"Mac mini","pairing_open":true}"#.into(),
             ),
             ("POST", "/v1/pair") => {
                 let request: PairRequest = serde_json::from_str(body).unwrap();
-                if request.code == "123456" {
+                let authority = match request.code.as_str() {
+                    "123456" => Some(format!("127.0.0.1:{port}")),
+                    "900001" => Some(format!("100.98.200.69:{port}")),
+                    "900002" => Some(format!("127.0.0.1:{}", port.wrapping_add(1))),
+                    "900003" => Some(format!("localhost:{port}")),
+                    "900004" => Some(format!("no-such-host.invalid:{port}")),
+                    _ => None,
+                };
+                if let Some(authority) = authority {
                     (
                         200,
-                        format!(r#"{{"pairing":"flick-remote://100.98.200.69:47117/#{TOKEN}"}}"#),
+                        format!(r#"{{"pairing":"flick-remote://{authority}/#{TOKEN}"}}"#),
                     )
                 } else {
                     (
@@ -837,34 +1001,80 @@ mod tests {
                 pairing_open: true,
             })
         );
-        let other = loopback_server(|_, _, _| (200, r#"{"hello":"world"}"#.into()));
+        let other = loopback_server(|_, _, _, _| (200, r#"{"hello":"world"}"#.into()));
         assert_eq!(rt.block_on(hello(&other)), None);
-        let missing = loopback_server(|_, _, _| (404, String::new()));
+        let missing = loopback_server(|_, _, _, _| (404, String::new()));
         assert_eq!(rt.block_on(hello(&missing)), None);
         let nothing = format!("http://127.0.0.1:{}", closed_port());
         assert_eq!(rt.block_on(hello(&nothing)), None);
+    }
+
+    fn port_of(base_url: &str) -> u16 {
+        base_url.rsplit(':').next().unwrap().parse().unwrap()
+    }
+
+    /// Pairs with the loopback server at `base_url` by code.
+    fn pair(rt: &tokio::runtime::Runtime, base_url: &str, code: &str) -> Result<Pairing> {
+        rt.block_on(pair_with_code("127.0.0.1", port_of(base_url), code))
     }
 
     #[test]
     fn pairing_with_the_right_code_returns_the_pairing() {
         let rt = runtime();
         let flick = fake_flick();
-        let pairing = rt.block_on(pair_with_code(&flick, " 123-456 ")).unwrap();
-        assert_eq!(pairing.host, "100.98.200.69");
-        assert_eq!(pairing.port, 47117);
+        let pairing = pair(&rt, &flick, " 123-456 ").unwrap();
+        assert_eq!(pairing.host, "127.0.0.1");
+        assert_eq!(pairing.port, port_of(&flick));
         assert_eq!(pairing.token, TOKEN);
+        // A name for the same address is the same machine.
+        let pairing = pair(&rt, &flick, "900003").unwrap();
+        assert_eq!(pairing.host, "localhost");
+    }
+
+    #[test]
+    fn a_pairing_for_another_address_is_refused() {
+        let rt = runtime();
+        let flick = fake_flick();
+        // Another host, another port, and a host that resolves to nothing.
+        for code in ["900001", "900002", "900004"] {
+            let error = pair(&rt, &flick, code).unwrap_err().to_string();
+            assert!(
+                error.contains("pairing for another address"),
+                "{code}: {error}"
+            );
+            assert!(!error.contains(TOKEN), "{error}");
+        }
+    }
+
+    #[test]
+    fn the_same_machine_is_checked_by_host_or_address() {
+        let rt = runtime();
+        let named = |host: &str, port: u16| Pairing {
+            host: host.into(),
+            port,
+            token: TOKEN.into(),
+        };
+        let check = |host: &str, port: u16, pairing: Pairing| {
+            rt.block_on(names_the_same_machine(host, port, &pairing))
+        };
+        assert!(check("Box.ts.net", 1, named("box.ts.net", 1)));
+        assert!(check("::1", 1, named("[::1]", 1)));
+        assert!(check("127.0.0.1", 1, named("localhost", 1)));
+        assert!(!check("box.ts.net", 1, named("box.ts.net", 2)));
+        assert!(!check("127.0.0.1", 1, named("127.0.0.2", 1)));
+        assert!(!check("100.98.200.69", 1, named("100.98.200.70", 1)));
     }
 
     #[test]
     fn pairing_with_a_wrong_code_shows_the_server_message() {
         let rt = runtime();
         let flick = fake_flick();
-        let error = rt.block_on(pair_with_code(&flick, "654321")).unwrap_err();
+        let error = pair(&rt, &flick, "654321").unwrap_err();
         assert_eq!(error.to_string(), "That code is not right. 4 tries left.");
-        let error = rt.block_on(pair_with_code(&flick, "12345")).unwrap_err();
+        let error = pair(&rt, &flick, "12345").unwrap_err();
         assert_eq!(error.to_string(), "A pairing code is six digits");
-        let silent = loopback_server(|_, _, _| (429, String::new()));
-        let error = rt.block_on(pair_with_code(&silent, "123456")).unwrap_err();
+        let silent = loopback_server(|_, _, _, _| (429, String::new()));
+        let error = pair(&rt, &silent, "123456").unwrap_err();
         assert!(error.to_string().contains("Too many attempts"), "{error}");
     }
 
@@ -872,23 +1082,45 @@ mod tests {
     fn pairing_where_no_flick_listens_fails_clearly() {
         let rt = runtime();
         let nothing = format!("http://127.0.0.1:{}", closed_port());
-        let error = rt.block_on(pair_with_code(&nothing, "123456")).unwrap_err();
+        let error = pair(&rt, &nothing, "123456").unwrap_err();
         assert_eq!(error.to_string(), "No Flick answered at that address");
-        let other = loopback_server(|_, _, _| (200, r#"{"pairing":"nonsense"}"#.into()));
-        let error = rt.block_on(pair_with_code(&other, "123456")).unwrap_err();
+        let other = loopback_server(|_, _, _, _| (200, r#"{"pairing":"nonsense"}"#.into()));
+        let error = pair(&rt, &other, "123456").unwrap_err();
         assert!(error.to_string().contains("cannot read"), "{error}");
+    }
+
+    #[test]
+    fn oversized_answers_are_not_read() {
+        let rt = runtime();
+        let huge = format!(
+            r#"{{"protocol":1,"server_name":"{}","pairing_open":true}}"#,
+            "x".repeat(MAX_BODY)
+        );
+        let big = loopback_server(move |_, _, _, _| (200, huge.clone()));
+        assert_eq!(rt.block_on(hello(&big)), None);
+        let error = pair(&rt, &big, "123456").unwrap_err();
+        assert!(error.to_string().contains("not a Flick pairing"), "{error}");
+        // Just under the cap is still read.
+        let name = "x".repeat(MAX_BODY - 100);
+        let reply = format!(r#"{{"protocol":1,"server_name":"{name}","pairing_open":true}}"#);
+        let fits = loopback_server(move |_, _, _, _| (200, reply.clone()));
+        assert_eq!(
+            rt.block_on(hello(&fits)).unwrap().server_name.len(),
+            name.len()
+        );
     }
 
     #[test]
     fn the_state_pairs_by_code_through_its_worker() {
         let flick = fake_flick();
-        let port: u16 = flick.rsplit(':').next().unwrap().parse().unwrap();
+        let port = port_of(&flick);
         let mut state = DiscoveryState::default();
         state.pair_by_code("127.0.0.1", port, "000000");
         state.pair_by_code("127.0.0.1", port, "123456");
+        state.pair_by_code("127.0.0.1", port, "900001");
         let mut events = Vec::new();
         let started = Instant::now();
-        while events.len() < 2 {
+        while events.len() < 3 {
             assert!(started.elapsed() < Duration::from_secs(10), "timed out");
             events.extend(state.drain());
             thread::sleep(Duration::from_millis(10));
@@ -909,6 +1141,8 @@ mod tests {
             .collect();
         assert!(results.contains(&Ok(TOKEN.to_owned())));
         assert!(results.contains(&Err("That code is not right. 4 tries left.".to_owned())));
+        // A pairing for another host never reaches the view as `Ok`.
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
         state.shutdown();
         assert!(state.drain().is_empty());
     }
@@ -1019,6 +1253,62 @@ mod tests {
         // Validation happens before anything is sent.
         assert!(wake(&["aa:bb:cc:dd:ee:zz".into()], &[]).is_err());
         assert!(wake(&[], &["127.0.0.1".into()]).is_err());
+        // Malformed ones are skipped when a good one is left.
+        assert_eq!(
+            parse_macs(&["nonsense".into(), "aa:bb:cc:dd:ee:ff".into()]).unwrap(),
+            vec![[0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff]]
+        );
+    }
+
+    #[test]
+    fn wake_uses_only_private_lan_addresses_and_a_few_macs() {
+        let ips: Vec<String> = [
+            "192.168.1.20",
+            "10.0.0.5",
+            "172.20.3.4",
+            " 192.168.1.20 ",  // repeat
+            "8.8.8.8",         // public
+            "172.32.0.1",      // just outside 172.16/12
+            "100.98.200.69",   // Tailscale, not LAN
+            "127.0.0.1",       // loopback
+            "169.254.1.1",     // link-local
+            "255.255.255.255", // broadcast
+            "192.168.1.255",   // a subnet's broadcast
+            "10.0.0.0",        // a network address
+            "224.0.0.1",       // multicast
+            "fe80::1",         // not IPv4
+            "nonsense",
+        ]
+        .map(String::from)
+        .to_vec();
+        assert_eq!(
+            wake_ips(&ips),
+            vec![
+                Ipv4Addr::new(192, 168, 1, 20),
+                Ipv4Addr::new(10, 0, 0, 5),
+                Ipv4Addr::new(172, 20, 3, 4),
+            ]
+        );
+        let many: Vec<String> = (1..=20).map(|n| format!("192.168.0.{n}")).collect();
+        assert_eq!(wake_ips(&many).len(), MAX_WAKE_ADDRESSES);
+
+        let macs: Vec<String> = [
+            "aa:bb:cc:dd:ee:f0",
+            "AA-BB-CC-DD-EE-F0", // the same one
+            "ff:ff:ff:ff:ff:ff", // broadcast
+            "01:00:5e:00:00:01", // multicast
+            "00:00:00:00:00:00",
+            "zz:bb:cc:dd:ee:ff",
+            "02:00:00:00:00:01",
+        ]
+        .map(String::from)
+        .to_vec();
+        assert_eq!(
+            wake_macs(&macs),
+            vec!["aa:bb:cc:dd:ee:f0", "02:00:00:00:00:01"]
+        );
+        let many: Vec<String> = (0..20).map(|n| format!("02:00:00:00:00:{n:02x}")).collect();
+        assert_eq!(wake_macs(&many).len(), MAX_WAKE_ADDRESSES);
     }
 
     #[test]
@@ -1028,11 +1318,11 @@ mod tests {
             .set_read_timeout(Some(Duration::from_secs(5)))
             .unwrap();
         let target = listener.local_addr().unwrap();
-        let macs = parse_macs(&["aa:bb:cc:dd:ee:ff".into(), "01:02:03:04:05:06".into()]).unwrap();
+        let macs = parse_macs(&["aa:bb:cc:dd:ee:ff".into(), "02:03:04:05:06:07".into()]).unwrap();
         send_magic(&macs, &[target]).unwrap();
         for mac in [
             [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff],
-            [0x01, 0x02, 0x03, 0x04, 0x05, 0x06],
+            [0x02, 0x03, 0x04, 0x05, 0x06, 0x07],
         ] {
             let mut buffer = [0u8; 200];
             let (length, _) = listener.recv_from(&mut buffer).unwrap();

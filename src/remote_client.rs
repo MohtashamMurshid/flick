@@ -360,6 +360,22 @@ impl RemoteState {
         Ok(id)
     }
 
+    /// Adds the server a pairing code returned. Unlike a pasted string, a
+    /// code never replaces the token of a server already paired at that
+    /// address: that is refused with its name, and the existing entry kept.
+    pub fn add_code_pairing(
+        &mut self,
+        settings: &mut Settings,
+        pairing: &Pairing,
+    ) -> Result<String, String> {
+        if let Some(server) = paired_server(&settings.remote.servers, pairing) {
+            return Err(already_paired(&server.name));
+        }
+        let id = upsert_pairing(&mut settings.remote.servers, pairing, new_server_id);
+        self.refresh_server(settings, &id);
+        Ok(id)
+    }
+
     /// Forgets a server, its listing, its cache file, its progress, and its
     /// queued commands.
     pub fn remove_server(&mut self, settings: &mut Settings, id: &str) {
@@ -867,7 +883,7 @@ impl Inner {
                 server_id,
                 command,
                 mut result,
-                answered,
+                delivery,
                 replay,
             } => {
                 // Whatever the answer, the rows may have changed.
@@ -877,24 +893,37 @@ impl Inner {
                     machine.last_fetches = None;
                 }
                 // A replay's answer goes to the queue, not to the views.
+                // A replay whose answer was lost after it was sent counts as
+                // sent and leaves the queue: sending it again could start
+                // the same download twice.
                 if let Some(entry) = replay {
                     self.replayed.push(ReplayAnswer {
                         server_id,
-                        accepted: result.is_ok(),
+                        accepted: result.is_ok() || delivery == Delivery::Unknown,
                         entry,
-                        answered,
+                        answered: delivery != Delivery::Offline,
                     });
                     return;
                 }
-                if !answered && let Some(entry) = queue_entry(&server_id, &command, unix_now()) {
-                    let name = self
-                        .servers
-                        .get(&server_id)
-                        .map_or("", |remote| remote.name.as_str());
-                    result = Ok(Outcome::Queued {
-                        message: queued_message(name),
-                    });
-                    self.to_queue.push(entry);
+                let name = self
+                    .servers
+                    .get(&server_id)
+                    .map_or("", |remote| remote.name.as_str());
+                match delivery {
+                    Delivery::Offline => {
+                        if let Some(entry) = queue_entry(&server_id, &command, unix_now()) {
+                            result = Ok(Outcome::Queued {
+                                message: queued_message(name),
+                            });
+                            self.to_queue.push(entry);
+                        }
+                    }
+                    // Sent, but no answer: not queued, so it is never
+                    // started twice.
+                    Delivery::Unknown if queue_entry(&server_id, &command, 0).is_some() => {
+                        result = Err(maybe_taken_message(name));
+                    }
+                    _ => {}
                 }
                 self.ready.push(Ready::Command {
                     server_id,
@@ -1240,7 +1269,7 @@ impl Request {
                 command,
                 result: Err(error),
                 // The worker is gone, not the server: nothing to queue.
-                answered: true,
+                delivery: Delivery::Answered,
                 replay,
             },
         }
@@ -1272,12 +1301,25 @@ enum Reply {
         server_id: String,
         command: Command,
         result: Result<Outcome, String>,
-        /// False when the server did not answer at all (refused, timed
-        /// out, unreachable), as opposed to answering with an error.
-        answered: bool,
+        /// Whether the server answered, could not be reached, or was sent
+        /// the request and then went silent.
+        delivery: Delivery,
         replay: Option<QueuedCommand>,
     },
     None,
+}
+
+/// How far a command got.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Delivery {
+    /// The server answered, with success or an error.
+    Answered,
+    /// Nothing was sent: the connection was refused, timed out, or the
+    /// name did not resolve. Safe to send again later.
+    Offline,
+    /// The request was sent and the answer was lost (a timeout or reset
+    /// after it was written): the server may have acted on it.
+    Unknown,
 }
 
 /// The request thread: its own Tokio runtime, started on first use.
@@ -1541,7 +1583,7 @@ async fn handle(http: &reqwest::Client, request: Request) -> Reply {
             replay,
         } => {
             let run = run_command(http, &endpoint, &command);
-            let (result, answered) = match cancel {
+            let (result, delivery) = match cancel {
                 // Dropping `run` drops the request and closes its connection.
                 Some(cancel) => tokio::select! {
                     result = run => result,
@@ -1553,7 +1595,7 @@ async fn handle(http: &reqwest::Client, request: Request) -> Reply {
                 server_id,
                 command,
                 result,
-                answered,
+                delivery,
                 replay,
             }
         }
@@ -1718,8 +1760,28 @@ fn decode_poster(bytes: &[u8]) -> Result<image::RgbaImage, String> {
     Ok(image)
 }
 
+/// The server already paired at a pairing's host and port.
+pub fn paired_server<'a>(
+    servers: &'a [RemoteServer],
+    pairing: &Pairing,
+) -> Option<&'a RemoteServer> {
+    servers
+        .iter()
+        .find(|s| s.port == pairing.port && s.host.eq_ignore_ascii_case(&pairing.host))
+}
+
+/// Why a code pairing was not used for a server already paired.
+pub fn already_paired(name: &str) -> String {
+    format!(
+        "Already paired with {}. To pair it again, paste its pairing string",
+        display_name(name)
+    )
+}
+
 /// Adds a paired server or, when one already uses the same host and port,
-/// replaces its token. Returns the server's id.
+/// replaces its token. Returns the server's id. Only a pasted pairing
+/// string replaces a token; a code goes through
+/// [`RemoteState::add_code_pairing`].
 pub fn upsert_pairing(
     servers: &mut Vec<RemoteServer>,
     pairing: &Pairing,
@@ -2469,17 +2531,34 @@ pub fn parse_current_list(body: &[u8]) -> Option<Vec<String>> {
         .map(|paths| paths.into_iter().filter(|p| !p.is_empty()).collect())
 }
 
-/// A failed request: no answer, too large, or an HTTP error with its body.
+/// A failed request: never sent, sent without an answer, too large, or an
+/// HTTP error with its body.
 enum Failure {
+    /// Not connected: refused, unreachable, connect timeout, or DNS.
     Offline,
+    /// Connected and sent, then a timeout or reset before the answer.
+    Unknown,
     TooLarge,
-    Http { code: u16, body: Vec<u8> },
+    Http {
+        code: u16,
+        body: Vec<u8>,
+    },
 }
 
 impl Failure {
+    /// Only a failure to connect (which covers a name that does not
+    /// resolve) means the request never reached the server.
+    fn of_send(error: &reqwest::Error) -> Self {
+        if error.is_connect() {
+            Failure::Offline
+        } else {
+            Failure::Unknown
+        }
+    }
+
     fn message(&self) -> String {
         match self {
-            Failure::Offline => "The server did not answer".into(),
+            Failure::Offline | Failure::Unknown => "The server did not answer".into(),
             Failure::TooLarge => "The server's reply is too large".into(),
             Failure::Http { code, body } => command_error(*code, body),
         }
@@ -2536,7 +2615,10 @@ async fn call(
     if let Some(body) = body {
         request = request.json(&body);
     }
-    let mut response = request.send().await.map_err(|_| Failure::Offline)?;
+    let mut response = request
+        .send()
+        .await
+        .map_err(|error| Failure::of_send(&error))?;
     let code = response.status().as_u16();
     let success = (200..300).contains(&code);
     if response
@@ -2553,7 +2635,8 @@ async fn call(
         });
     }
     let mut bytes = Vec::new();
-    while let Some(chunk) = response.chunk().await.map_err(|_| Failure::Offline)? {
+    // The server answered; only its body was lost.
+    while let Some(chunk) = response.chunk().await.map_err(|_| Failure::Unknown)? {
         if bytes.len() + chunk.len() > limit {
             return Err(Failure::TooLarge);
         }
@@ -2566,12 +2649,12 @@ async fn call(
     }
 }
 
-/// The command's answer, and whether the server answered at all.
+/// The command's answer, and how far it got.
 async fn run_command(
     http: &reqwest::Client,
     endpoint: &Endpoint,
     command: &Command,
-) -> (Result<Outcome, String>, bool) {
+) -> (Result<Outcome, String>, Delivery) {
     use protocol::paths;
     use reqwest::Method;
     let json = |value: &dyn erased::Json| Some(value.json());
@@ -2690,8 +2773,12 @@ async fn run_command(
         },
     )
     .await;
-    let answered = !matches!(answer, Err(Failure::Offline));
-    (outcome(command, answer), answered)
+    let delivery = match answer {
+        Err(Failure::Offline) => Delivery::Offline,
+        Err(Failure::Unknown) => Delivery::Unknown,
+        _ => Delivery::Answered,
+    };
+    (outcome(command, answer), delivery)
 }
 
 /// What a command's reply means.
@@ -3123,7 +3210,13 @@ impl RemoteState {
             settings.remote.servers.iter().any(|server| server.id == id)
         };
         for entry in std::mem::take(&mut inner.to_queue) {
-            if paired(settings, &entry.server) {
+            // The same download asked for twice while asleep is sent once.
+            let queued = settings
+                .remote
+                .queued
+                .iter()
+                .any(|other| same_queued(other, &entry));
+            if paired(settings, &entry.server) && !queued {
                 settings.remote.queued.push(entry);
                 sync.changed = true;
             }
@@ -3275,6 +3368,21 @@ pub fn queue_entry(server_id: &str, command: &Command, created: u64) -> Option<Q
     })
 }
 
+/// Whether two queue entries ask for the same thing, whenever they were
+/// made.
+pub fn same_queued(a: &QueuedCommand, b: &QueuedCommand) -> bool {
+    a.server == b.server && a.input == b.input && a.files == b.files && a.link == b.link
+}
+
+/// What a start or link says when it was sent and its answer was lost.
+pub fn maybe_taken_message(name: &str) -> String {
+    if name.trim().is_empty() {
+        "The server may have taken it; check its Downloads.".into()
+    } else {
+        format!("The server may have taken it; check Downloads on {name}.")
+    }
+}
+
 /// The command that sends a queue entry.
 pub fn replay_command(entry: &QueuedCommand) -> Command {
     if entry.link {
@@ -3341,15 +3449,22 @@ pub fn kept_notification(title: &str, server: &str) -> (String, String) {
 }
 
 /// Where a Wake-on-LAN packet for this server goes: the listing's
-/// hardware addresses, or None when it has none to wake.
+/// well-formed hardware addresses and private LAN IPv4 addresses, at most
+/// eight of each, or None when it has no usable hardware address. The
+/// server's list is not trusted: a public, broadcast, or multicast address
+/// it names is dropped here and again when the packet is sent.
 pub fn wake_target(hardware: Option<&Hardware>) -> Option<WakeTarget> {
     let hardware = hardware?;
-    if hardware.mac.is_empty() {
+    let mac = crate::remote_discovery::wake_macs(&hardware.mac);
+    if mac.is_empty() {
         return None;
     }
     Some(WakeTarget {
-        mac: hardware.mac.clone(),
-        lan_ips: hardware.lan_ips.clone(),
+        mac,
+        lan_ips: crate::remote_discovery::wake_ips(&hardware.lan_ips)
+            .into_iter()
+            .map(|ip| ip.to_string())
+            .collect(),
     })
 }
 
@@ -4938,6 +5053,80 @@ mod tests {
                 lan_ips: hardware.lan_ips.clone(),
             })
         );
+        // A server cannot aim wake packets anywhere it likes.
+        let mut hostile = Hardware {
+            mac: vec!["not a mac".into(), "ff:ff:ff:ff:ff:ff".into()],
+            lan_ips: vec!["192.168.1.20".into()],
+        };
+        assert_eq!(wake_target(Some(&hostile)), None);
+        hostile.mac = (0..20).map(|n| format!("02:00:00:00:00:{n:02x}")).collect();
+        hostile.lan_ips = vec![
+            "8.8.8.8".into(),
+            "255.255.255.255".into(),
+            "192.168.1.255".into(),
+            "224.0.0.251".into(),
+            "100.98.200.69".into(),
+            "10.1.2.3".into(),
+        ];
+        hostile
+            .lan_ips
+            .extend((1..=20).map(|n| format!("192.168.7.{n}")));
+        let target = wake_target(Some(&hostile)).unwrap();
+        assert_eq!(target.mac.len(), 8);
+        assert_eq!(target.lan_ips.len(), 8);
+        assert_eq!(target.lan_ips[0], "10.1.2.3");
+        assert!(
+            target.lan_ips[1..]
+                .iter()
+                .all(|ip| ip.starts_with("192.168.7."))
+        );
+    }
+
+    #[test]
+    fn a_code_never_replaces_the_token_of_a_paired_server() {
+        let data = tempfile::tempdir().unwrap();
+        let mut state = RemoteState::with_data_dir(data.path());
+        let mut settings = Settings::default();
+        let port = TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let id = state
+            .add_pairing(
+                &mut settings,
+                &format!("flick-remote://127.0.0.1:{port}/#{TOKEN}"),
+            )
+            .unwrap();
+        settings.remote.servers[0].name = "Mac mini".into();
+        let error = state
+            .add_code_pairing(&mut settings, &pairing("127.0.0.1", port, OTHER))
+            .unwrap_err();
+        assert_eq!(
+            error,
+            "Already paired with Mac mini. To pair it again, paste its pairing string"
+        );
+        assert_eq!(settings.remote.servers.len(), 1);
+        assert_eq!(settings.remote.servers[0].id, id);
+        assert_eq!(settings.remote.servers[0].token, TOKEN);
+        // Another port is another server, and is added.
+        let other = state
+            .add_code_pairing(
+                &mut settings,
+                &pairing("127.0.0.1", port.wrapping_add(1), OTHER),
+            )
+            .unwrap();
+        assert_ne!(other, id);
+        assert_eq!(settings.remote.servers.len(), 2);
+        assert_eq!(settings.remote.servers[0].token, TOKEN);
+        // Pasting the string is still the way to replace a token.
+        state
+            .add_pairing(
+                &mut settings,
+                &format!("flick-remote://127.0.0.1:{port}/#{OTHER}"),
+            )
+            .unwrap();
+        assert_eq!(settings.remote.servers[0].token, OTHER);
     }
 
     #[test]
@@ -5039,8 +5228,19 @@ mod tests {
                 message: "Mac mini is not answering; queued until it does.".into()
             })
         );
-        // The same start again, which the server will refuse as a duplicate.
+        // The same start again is said to be queued but kept once.
         state.start(&settings, &mini, magnet.clone(), vec![0]);
+        assert!(matches!(
+            command_answer(&mut state).2,
+            Ok(Outcome::Queued { .. })
+        ));
+        // Another start, which the server will refuse as one it already has.
+        let known = "magnet:?xt=urn:btih:def".to_owned();
+        fake.started.lock().unwrap().push(protocol::StartTransfer {
+            input: known.clone(),
+            files: Vec::new(),
+        });
+        state.start(&settings, &mini, known.clone(), Vec::new());
         assert!(matches!(
             command_answer(&mut state).2,
             Ok(Outcome::Queued { .. })
@@ -5061,14 +5261,26 @@ mod tests {
         let queued = &settings.remote.queued;
         assert_eq!(queued.len(), 3);
         assert!(queued.iter().all(|entry| entry.server == mini));
+        assert_eq!(
+            queued
+                .iter()
+                .map(|entry| entry.input.as_str())
+                .collect::<Vec<_>>(),
+            [magnet.as_str(), known.as_str(), "https://example.com/watch"]
+        );
         assert_eq!((queued[0].link, queued[2].link), (false, true));
-        assert_eq!(queued[2].input, "https://example.com/watch");
 
-        // It wakes, but its downloads route still does not answer: the
-        // first entry stays, and the rest keep their place behind it.
-        fake.down.store(true, Ordering::SeqCst);
+        // Its listing answers, then it is asleep again before the queue is
+        // sent: the first entry stays, and the rest keep their place.
         settings.remote.servers[0].port = port;
         state.refresh_server(&settings, &mini);
+        let started = Instant::now();
+        while state.inner.borrow().arrived.is_empty() {
+            assert!(started.elapsed() < Duration::from_secs(10), "timed out");
+            state.drain();
+            thread::sleep(Duration::from_millis(10));
+        }
+        settings.remote.servers[0].port = asleep;
         let mut batch_seen = false;
         let notifications = sync_until(&mut state, &mut settings, |state, _| {
             batch_seen |= !state.inner.borrow().replays.is_empty();
@@ -5076,11 +5288,11 @@ mod tests {
         });
         assert!(notifications.is_empty(), "{notifications:?}");
         assert_eq!(settings.remote.queued.len(), 3);
-        assert!(fake.started.lock().unwrap().is_empty());
+        assert_eq!(fake.started.lock().unwrap().len(), 1);
 
-        // Answering now: sent in order, the refused duplicate is dropped
-        // too, and one notification sums it up.
-        fake.down.store(false, Ordering::SeqCst);
+        // Answering now: sent in order, the refused one is dropped too, and
+        // one notification sums it up.
+        settings.remote.servers[0].port = port;
         state.refresh_server(&settings, &mini);
         let notifications = sync_until(&mut state, &mut settings, |_, settings| {
             settings.remote.queued.is_empty()
@@ -5093,14 +5305,16 @@ mod tests {
             )]
         );
         let started = fake.started.lock().unwrap().clone();
+        let start = |input: &str, files: Vec<usize>| protocol::StartTransfer {
+            input: input.to_owned(),
+            files,
+        };
         assert_eq!(
             started,
             vec![
-                protocol::StartTransfer {
-                    input: magnet.clone(),
-                    files: vec![0],
-                };
-                2
+                start(&known, Vec::new()),
+                start(&magnet, vec![0]),
+                start(&known, Vec::new()),
             ]
         );
         // Replays are answered to the queue, not to the views.
@@ -5113,7 +5327,7 @@ mod tests {
                 && state.servers(settings)[0].status == Status::Online
         });
         assert!(notifications.is_empty());
-        assert_eq!(fake.started.lock().unwrap().len(), 2);
+        assert_eq!(fake.started.lock().unwrap().len(), 3);
 
         // Removing the server drops whatever it still had queued.
         settings.remote.queued.push(QueuedCommand {
@@ -5124,6 +5338,122 @@ mod tests {
         });
         state.remove_server(&mut settings, &mini);
         assert!(settings.remote.queued.is_empty());
+    }
+
+    #[test]
+    fn a_start_whose_answer_is_lost_is_not_queued_or_sent_twice() {
+        let fake = Arc::new(Fake::default());
+        let port = transfers_server(fake.clone(), true);
+        let data = tempfile::tempdir().unwrap();
+        let mut state = RemoteState::with_data_dir(data.path());
+        let mut settings = Settings::default();
+        let mini = state
+            .add_pairing(
+                &mut settings,
+                &format!("flick-remote://127.0.0.1:{port}/#{TOKEN}"),
+            )
+            .unwrap();
+        settings.remote.servers[0].name = "Mac mini".into();
+        wait_until(&mut state, |state| {
+            state.servers(&settings)[0].status == Status::Online
+        });
+
+        // The server reads the start, then closes without answering.
+        fake.down.store(true, Ordering::SeqCst);
+        state.start(&settings, &mini, "magnet:?xt=urn:btih:abc".into(), vec![0]);
+        assert_eq!(
+            command_answer(&mut state).2,
+            Err("The server may have taken it; check Downloads on Mac mini.".into())
+        );
+        state.sync_settings(&mut settings);
+        assert!(settings.remote.queued.is_empty());
+
+        // A queued entry whose replay is lost the same way leaves the queue
+        // rather than being sent again.
+        settings.remote.queued.push(QueuedCommand {
+            server: mini.clone(),
+            input: "magnet:?xt=urn:btih:def".into(),
+            created: 1,
+            ..Default::default()
+        });
+        state.refresh_server(&settings, &mini);
+        let notifications = sync_until(&mut state, &mut settings, |_, settings| {
+            settings.remote.queued.is_empty()
+        });
+        assert_eq!(
+            notifications,
+            vec![(
+                "Queued downloads".to_owned(),
+                "Sent 1 queued download to Mac mini".to_owned()
+            )]
+        );
+    }
+
+    #[test]
+    fn only_a_failure_to_connect_counts_as_offline() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let http = http_client().unwrap();
+        let endpoint = |port: u16| Endpoint {
+            base: format!("http://127.0.0.1:{port}"),
+            token: TOKEN.into(),
+        };
+        let start = Command::FetchStart {
+            url: "https://example.com/watch".into(),
+        };
+        // Nothing listening: never sent.
+        let closed = TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let (_, delivery) = rt.block_on(run_command(&http, &endpoint(closed), &start));
+        assert_eq!(delivery, Delivery::Offline);
+        // A name that does not resolve: never sent.
+        let unresolved = Endpoint {
+            base: "http://no-such-host.invalid:1".into(),
+            token: TOKEN.into(),
+        };
+        let (_, delivery) = rt.block_on(run_command(&http, &unresolved, &start));
+        assert_eq!(delivery, Delivery::Offline);
+        // Accepted, read, and closed without an answer: unknown.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let silent = listener.local_addr().unwrap().port();
+        thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(stream) = stream else { continue };
+                let mut reader = BufReader::new(stream);
+                let mut line = String::new();
+                while reader.read_line(&mut line).is_ok_and(|n| n > 2) {
+                    line.clear();
+                }
+            }
+        });
+        let (result, delivery) = rt.block_on(run_command(&http, &endpoint(silent), &start));
+        assert_eq!(delivery, Delivery::Unknown);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn the_same_queued_download_is_kept_once() {
+        let entry = |input: &str, created| QueuedCommand {
+            server: "mini".into(),
+            input: input.into(),
+            files: vec![1],
+            link: false,
+            created,
+        };
+        assert!(same_queued(&entry("a", 1), &entry("a", 2)));
+        assert!(!same_queued(&entry("a", 1), &entry("b", 1)));
+        let mut link = entry("a", 1);
+        link.link = true;
+        assert!(!same_queued(&entry("a", 1), &link));
+        assert_eq!(
+            maybe_taken_message(" "),
+            "The server may have taken it; check its Downloads."
+        );
     }
 
     #[test]
@@ -5167,6 +5497,9 @@ mod tests {
             )
             .unwrap();
         settings.remember_remote(&id, "v0", "Old", 30., 600.);
+        // Saved here ten minutes ago; the server's far-future time counts
+        // as a minute from now, which is newer by more than the window.
+        settings.remote.progress[0].updated -= 600;
         let mut changed = false;
         sync_until(&mut state, &mut settings, |state, settings| {
             changed |= state.inner.borrow().arrived.is_empty()

@@ -1,7 +1,10 @@
 //! Automatic quality: drop a tier when playback keeps stalling early on, and
 //! say so. Pure state machine with no GPUI; the player starts one with
 //! [`AutoQuality::for_open`] when a remote video opens and calls
-//! [`AutoQuality::observe`] on every tick while it plays.
+//! [`AutoQuality::observe`] with the tier actually playing on every tick
+//! while it plays. A drop is only asked for: the watcher moves to the lower
+//! tier when the player reports it playing, and goes back to the tier still
+//! playing when the reload was refused ([`AutoQuality::refused`]).
 
 use flick::remote::protocol::Quality;
 use std::time::{Duration, Instant};
@@ -9,7 +12,10 @@ use std::time::{Duration, Instant};
 /// Watches one remote playback session.
 #[derive(Debug)]
 pub struct AutoQuality {
+    /// The tier playing, as the player last confirmed it.
     current: Quality,
+    /// A drop asked for and not yet playing.
+    pending: Option<Quality>,
     offered: Vec<Quality>,
     /// When the current tier started playing; the early window runs from here.
     tier_started: Instant,
@@ -44,6 +50,7 @@ impl AutoQuality {
     pub fn new(current: Quality, offered: Vec<Quality>, started: Instant) -> Self {
         Self {
             current,
+            pending: None,
             offered,
             tier_started: started,
             early_stalls: 0,
@@ -70,8 +77,8 @@ impl AutoQuality {
         (enabled && ladder).then(|| Self::new(current, choices.to_vec(), now))
     }
 
-    /// Called every tick with libmpv's `paused-for-cache` flag and the
-    /// playback position. The rule: two stalls within the first minute of
+    /// Called every tick with the tier the player has loaded, libmpv's
+    /// `paused-for-cache` flag, and the playback position. The rule: two stalls within the first minute of
     /// playback, or one stall longer than five seconds at any time, drop one
     /// tier (never below the lowest offered, never from a tier the person
     /// picked by hand after the last drop).
@@ -82,7 +89,24 @@ impl AutoQuality {
     /// [`Self::SEEK_GRACE`] of a seek (a jump in `position`) is the seek
     /// refilling the cache, not the link failing, and is not counted; a
     /// long one still is.
-    pub fn observe(&mut self, buffering: bool, position: f64, now: Instant) -> Decision {
+    ///
+    /// After a drop nothing more is decided until `playing` is the lower
+    /// tier, which restarts the clock; a different tier means the reload did
+    /// not happen, and the watcher stays on the tier still playing.
+    pub fn observe(
+        &mut self,
+        playing: Quality,
+        buffering: bool,
+        position: f64,
+        now: Instant,
+    ) -> Decision {
+        if let Some(pending) = self.pending {
+            if playing == pending {
+                self.confirm(now);
+            } else {
+                self.refused(playing, now);
+            }
+        }
         if self.seeked(position, now) {
             self.last_seek = Some(now);
         }
@@ -119,7 +143,36 @@ impl AutoQuality {
     /// session.
     pub fn chosen_by_hand(&mut self, quality: Quality) {
         self.current = quality;
+        self.pending = None;
         self.by_hand = true;
+    }
+
+    /// The lower tier is playing: it becomes current, with its own clock.
+    fn confirm(&mut self, now: Instant) {
+        if let Some(to) = self.pending.take() {
+            self.current = to;
+        }
+        self.restart(now);
+    }
+
+    /// The drop's reload was refused (the server would not prepare the
+    /// tier, or the player would not load it): the watcher goes back to the
+    /// tier still playing and starts counting afresh, so the next drop is
+    /// one tier below what plays, never two.
+    pub fn refused(&mut self, playing: Quality, now: Instant) {
+        self.pending = None;
+        self.current = playing;
+        self.restart(now);
+    }
+
+    /// A new clock for the current tier; a stall still under way is not
+    /// held against it.
+    fn restart(&mut self, now: Instant) {
+        self.tier_started = now;
+        self.early_stalls = 0;
+        self.stall_started = None;
+        self.last = None;
+        self.last_seek = None;
     }
 
     #[cfg_attr(not(test), allow(dead_code))] // The player keeps its own tier.
@@ -166,11 +219,9 @@ impl AutoQuality {
         let Some(to) = self.lower() else {
             return Decision::Keep;
         };
-        self.current = to;
-        self.tier_started = now;
-        self.early_stalls = 0;
-        self.last = None;
-        self.last_seek = None;
+        // Asked for, not assumed: `current` moves once it plays.
+        self.pending = Some(to);
+        self.restart(now);
         Decision::Drop {
             to,
             reason: format!("Dropped to {} {why}.", to.label()),
@@ -182,12 +233,15 @@ impl AutoQuality {
 mod tests {
     use super::*;
 
-    /// A fake clock and a playhead that advances while not buffering.
+    /// A fake clock, a playhead that advances while not buffering, and a
+    /// player that loads each drop unless `refuse` is set.
     struct Session {
         quality: AutoQuality,
         start: Instant,
         at: Duration,
         position: f64,
+        playing: Quality,
+        refuse: bool,
     }
 
     const TICK: Duration = Duration::from_millis(100);
@@ -200,6 +254,8 @@ mod tests {
                 start,
                 at: Duration::ZERO,
                 position: 0.0,
+                playing: current,
+                refuse: false,
             }
         }
 
@@ -208,8 +264,15 @@ mod tests {
             if !buffering {
                 self.position += TICK.as_secs_f64();
             }
-            self.quality
-                .observe(buffering, self.position, self.start + self.at)
+            let decision =
+                self.quality
+                    .observe(self.playing, buffering, self.position, self.start + self.at);
+            if let Decision::Drop { to, .. } = decision
+                && !self.refuse
+            {
+                self.playing = to;
+            }
+            decision
         }
 
         /// Plays or buffers for `length`, returning every non-Keep decision.
@@ -440,6 +503,74 @@ mod tests {
         s.play(5);
         s.seek(600.0);
         assert_eq!(s.buffer(Duration::from_secs(6)).len(), 1);
+    }
+
+    #[test]
+    fn a_drop_is_current_only_once_the_lower_tier_plays() {
+        let start = Instant::now();
+        let at = |seconds: u64| start + Duration::from_secs(seconds);
+        let mut auto = AutoQuality::new(Quality::Original, ALL.to_vec(), start);
+        auto.observe(Quality::Original, false, 1.0, at(1));
+        let drop = auto.observe(Quality::Original, true, 1.0, at(2));
+        assert_eq!(drop, Decision::Keep);
+        assert!(matches!(
+            auto.observe(Quality::Original, true, 1.0, at(8)),
+            Decision::Drop {
+                to: Quality::High1080,
+                ..
+            }
+        ));
+        // Asked for, not yet playing.
+        assert_eq!(auto.current(), Quality::Original);
+        // The player loads it: now it is current.
+        auto.observe(Quality::High1080, false, 1.0, at(10));
+        assert_eq!(auto.current(), Quality::High1080);
+    }
+
+    #[test]
+    fn a_refused_drop_goes_back_to_the_tier_still_playing() {
+        let mut s = Session::new(Quality::Original, &ALL);
+        s.refuse = true;
+        s.play(2);
+        assert_eq!(
+            s.buffer(Duration::from_secs(6)),
+            vec![drop_to(
+                Quality::High1080,
+                "Dropped to 1080p High after a long pause to buffer."
+            )]
+        );
+        // The server refused the tier; Original keeps playing.
+        s.play(1);
+        assert_eq!(s.quality.current(), Quality::Original);
+        // The next drop is one below what plays, not two.
+        s.refuse = false;
+        assert_eq!(
+            s.buffer(Duration::from_secs(6)),
+            vec![drop_to(
+                Quality::High1080,
+                "Dropped to 1080p High after a long pause to buffer."
+            )]
+        );
+        s.play(1);
+        assert_eq!(s.quality.current(), Quality::High1080);
+
+        // Told directly, as the player does when the check fails.
+        let start = Instant::now();
+        let mut auto = AutoQuality::new(Quality::High1080, ALL.to_vec(), start);
+        auto.observe(Quality::High1080, true, 0.0, start);
+        assert!(matches!(
+            auto.observe(Quality::High1080, true, 0.0, start + Duration::from_secs(6)),
+            Decision::Drop { .. }
+        ));
+        auto.refused(Quality::High1080, start + Duration::from_secs(7));
+        assert_eq!(auto.current(), Quality::High1080);
+        // A fresh count: one short stall is not enough.
+        let later = start + Duration::from_secs(10);
+        auto.observe(Quality::High1080, false, 1.0, later);
+        assert_eq!(
+            auto.observe(Quality::High1080, true, 1.0, later + TICK),
+            Decision::Keep
+        );
     }
 
     #[test]

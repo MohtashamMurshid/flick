@@ -1161,7 +1161,10 @@ impl Flick {
     /// a drop reloads at the lower tier, at the current position, and says
     /// why on the video for a few seconds.
     fn observe_auto_quality(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(server_id) = self.remote_source().map(|r| r.server_id.clone()) else {
+        let Some((server_id, playing)) = self
+            .remote_source()
+            .map(|r| (r.server_id.clone(), r.quality))
+        else {
             return;
         };
         // Only while the tier is actually playing: not during a reload,
@@ -1175,7 +1178,9 @@ impl Flick {
         let Some(auto) = &mut self.auto_quality else {
             return;
         };
+        // The tier loaded now confirms a drop, or shows it did not happen.
         let decision = auto.observe(
+            playing,
             self.snapshot.buffering,
             self.snapshot.position,
             Instant::now(),
