@@ -2165,7 +2165,8 @@ impl Flick {
             return;
         }
         let shortcut = self.store.data.shortcuts.lookup(&binding);
-        if self.view == View::Library {
+        // Onboarding has text fields too; player shortcuts must not swallow their keys.
+        if matches!(self.view, View::Library | View::Onboarding) {
             if shortcut == Some(Shortcut::ShowShortcuts) {
                 cx.stop_propagation();
                 self.show_page(Page::Shortcuts, window, cx);
