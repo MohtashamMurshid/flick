@@ -836,6 +836,8 @@ pub fn transfer_row(listing: &TransferListing, salt: &Salt) -> TransferRow {
         peers: snapshot.peers,
         download_bps: snapshot.download_bytes_per_second,
         upload_bps: snapshot.upload_bytes_per_second,
+        // Filled in by the deletion-safety fix: shares and on-disk files.
+        share: false,
         files: snapshot
             .files
             .iter()
@@ -845,6 +847,7 @@ pub fn transfer_row(listing: &TransferListing, salt: &Salt) -> TransferRow {
                 size: file.length,
                 verified_bytes: file.verified_bytes,
                 selected: file.selected,
+                will_delete: file.selected,
                 video_id: (file.selected && flick::library::is_video(&file.path))
                     .then(|| library_id(salt, &file.path))
                     .flatten(),

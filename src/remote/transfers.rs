@@ -801,6 +801,8 @@ impl TransferRows {
             peers: snapshot.peers,
             download_bps: snapshot.download_bytes_per_second,
             upload_bps: snapshot.upload_bytes_per_second,
+            // Filled in by the deletion-safety fix: shares and on-disk files.
+            share: false,
             files: snapshot
                 .files
                 .iter()
@@ -815,6 +817,7 @@ impl TransferRows {
                     size: file.length,
                     verified_bytes: file.verified_bytes,
                     selected: file.selected,
+                    will_delete: file.selected,
                     video_id: self.video_id(&file.path, file.selected),
                 })
                 .collect(),

@@ -2407,6 +2407,7 @@ mod tests {
             download_bps: 7,
             upload_bps: 8,
             error: Some("x".into()),
+            share: false,
             files: Vec::new(),
         };
         let figures = RowFigures::remote(&row);

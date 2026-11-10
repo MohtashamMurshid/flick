@@ -286,6 +286,9 @@ pub struct TransferRow {
     pub peers: u32,
     pub download_bps: u64,
     pub upload_bps: u64,
+    /// An explicit share of the owner's own files: its files are never
+    /// deleted through the wire, only unregistered with Keep Files.
+    pub share: bool,
     pub files: Vec<TransferFileRow>,
 }
 
@@ -298,6 +301,10 @@ pub struct TransferFileRow {
     pub size: u64,
     pub verified_bytes: u64,
     pub selected: bool,
+    /// Whether "Remove and Delete Files" would delete this file: it is
+    /// selected, or unselected but has data on disk. Exactly these paths
+    /// must be echoed in [`RemoveTransfer::confirm`].
+    pub will_delete: bool,
     /// The library id of this file once the server lists it as a video,
     /// playable through the media route (unfinished when the server
     /// advertises `stream-incomplete`).
@@ -305,8 +312,9 @@ pub struct TransferFileRow {
 }
 
 /// `DELETE /v1/transfers/{id}`. With `delete_files`, `confirm` must list
-/// every selected file's `path` exactly, or the server answers 409 with the
-/// current list and deletes nothing.
+/// the `path` of every file whose `will_delete` is true, exactly, or the
+/// server answers 409 with the current list and deletes nothing. A share
+/// (`TransferRow::share`) refuses `delete_files` outright.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default)]
 pub struct RemoveTransfer {

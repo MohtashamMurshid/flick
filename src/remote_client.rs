@@ -3559,6 +3559,7 @@ mod tests {
             size,
             verified_bytes: verified,
             selected,
+            will_delete: selected,
             video_id: selected.then(|| format!("vid{index}")),
         }
     }
