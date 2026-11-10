@@ -333,6 +333,7 @@ async fn routes_refuse_without_a_backend_or_its_capability() -> Result<()> {
                 json!({"input": hash}),
             ),
             (Method::POST, paths::transfers(), json!({"input": hash})),
+            (Method::DELETE, paths::transfers_resolve(), json!(null)),
             (Method::GET, paths::transfers(), json!(null)),
             (Method::POST, paths::transfer_pause(hash), json!(null)),
             (Method::POST, paths::transfer_resume(hash), json!(null)),
@@ -445,30 +446,33 @@ async fn routes_refuse_without_a_backend_or_its_capability() -> Result<()> {
             (Method::DELETE, paths::transfer("../x"), None, 404),
             (Method::DELETE, "/v1/fetches/abc".into(), None, 404),
             (Method::DELETE, "/v1/fetches/01".into(), None, 404),
+            // Invalid input is 422, as the in-app server answers.
             (
                 Method::POST,
                 paths::transfers_resolve(),
                 Some(json!({"input": "/etc/passwd"})),
-                400,
+                422,
             ),
             (
                 Method::POST,
                 paths::transfers_resolve(),
                 Some(json!({"input": "base64:not base64"})),
-                400,
+                422,
             ),
             (
                 Method::POST,
                 paths::transfers(),
                 Some(json!({"input": "http://example.com/a.torrent"})),
-                400,
+                422,
             ),
             (
                 Method::POST,
                 paths::fetches(),
                 Some(json!({"url": "file:///etc/passwd"})),
-                400,
+                422,
             ),
+            // Cancelling a resolve: the client drops its POST; this is 204.
+            (Method::DELETE, paths::transfers_resolve(), None, 204),
             (
                 Method::GET,
                 format!("{}?dir=%2Fetc", paths::browse()),
@@ -516,10 +520,11 @@ async fn routes_refuse_without_a_backend_or_its_capability() -> Result<()> {
                 response.status()
             );
             ensure!(
-                response
-                    .headers()
-                    .get(header::CONTENT_TYPE)
-                    .is_some_and(|value| value == "application/json"),
+                status == 204
+                    || response
+                        .headers()
+                        .get(header::CONTENT_TYPE)
+                        .is_some_and(|value| value == "application/json"),
                 "{method} {path}: not JSON"
             );
         }
@@ -550,6 +555,90 @@ async fn routes_refuse_without_a_backend_or_its_capability() -> Result<()> {
     })
     .await
     .context("The refusal test timed out")?
+}
+
+/// A backend switched off, as the in-app one is when its owner turns the
+/// switch off: it refuses with 403 first, then publishes no capabilities.
+/// The listing keeps refreshing from its sources and stops advertising.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_switched_off_backend_stops_advertising_and_the_listing_refreshes() -> Result<()> {
+    timeout(Duration::from_secs(30), async {
+        let root = TempDir::new()?;
+        let (publish, capabilities) =
+            tokio::sync::watch::channel(vec![Capability::Downloads, Capability::StreamIncomplete]);
+        let refusing = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (sender, mut receiver) = tokio::sync::mpsc::channel::<transfers::TransferRequest>(8);
+        let refuse = refusing.clone();
+        tokio::spawn(async move {
+            while let Some(request) = receiver.recv().await {
+                let reply = if refuse.load(std::sync::atomic::Ordering::SeqCst) {
+                    Err(TransferError::not_allowed("downloads"))
+                } else {
+                    match request.command {
+                        TransferCommand::List => Ok(TransferReply::Transfers(Vec::new())),
+                        TransferCommand::Storage => Ok(TransferReply::Storage(protocol::Storage {
+                            free_bytes: 42,
+                            download_folder_name: "Stub".into(),
+                        })),
+                        _ => Err(TransferError::new(418, "reached the stub")),
+                    }
+                };
+                let _ = request.reply.send(reply);
+            }
+        });
+        let backend = TransferBackend::live(capabilities, sender);
+        let (server, token) = stub_server(root.path(), Some(backend)).await?;
+        let base = format!("http://{}", server.addr());
+        let client = client()?;
+        let library = || async {
+            let response = request(&client, &base, &token, Method::GET, &paths::library())
+                .send()
+                .await?;
+            ensure!(response.status() == StatusCode::OK, "{}", response.status());
+            Ok::<Library, anyhow::Error>(response.json().await?)
+        };
+        let media = root.path().join("media");
+
+        let listed = library().await?;
+        ensure!(listed.capabilities == [Capability::Downloads, Capability::StreamIncomplete]);
+        ensure!(listed.storage.is_some() && listed.videos.is_empty());
+
+        // The backend refuses before its capabilities change: no overlay,
+        // and the sources are read again rather than frozen.
+        refusing.store(true, std::sync::atomic::Ordering::SeqCst);
+        std::fs::write(media.join("First.mp4"), b"first")?;
+        let listed = library().await?;
+        ensure!(listed.videos.len() == 1, "{:?}", listed.videos);
+        ensure!(listed.videos[0].complete);
+
+        // Capabilities published as nothing: the listing advertises
+        // nothing and keeps refreshing; routes refuse with 403.
+        publish.send_replace(Vec::new());
+        std::fs::write(media.join("Second.mp4"), b"second")?;
+        let listed = library().await?;
+        ensure!(listed.capabilities.is_empty(), "{:?}", listed.capabilities);
+        ensure!(listed.storage.is_none());
+        ensure!(listed.videos.len() == 2, "{:?}", listed.videos);
+        let refused = request(&client, &base, &token, Method::GET, &paths::transfers())
+            .send()
+            .await?;
+        ensure!(refused.status() == StatusCode::FORBIDDEN);
+
+        // On again.
+        refusing.store(false, std::sync::atomic::Ordering::SeqCst);
+        publish.send_replace(vec![Capability::Downloads]);
+        let listed = library().await?;
+        ensure!(listed.capabilities == [Capability::Downloads]);
+        ensure!(listed.storage.is_some());
+        let listing = request(&client, &base, &token, Method::GET, &paths::transfers())
+            .send()
+            .await?;
+        ensure!(listing.status() == StatusCode::OK);
+        server.shutdown().await;
+        Ok(())
+    })
+    .await
+    .context("The switch test timed out")?
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -625,6 +714,9 @@ async fn remote_download_resolves_progresses_pauses_completes_and_removes() -> R
                 .send()
                 .await?;
             ensure!(again.status() == StatusCode::CONFLICT, "{}", again.status());
+            // Only a deletion's mismatch carries a list.
+            let body: serde_json::Value = again.json().await?;
+            ensure!(body.get("files").is_none(), "{body}");
 
             // Progress rises; the listing shows the unfinished video under
             // the id the transfer row names.
@@ -728,26 +820,48 @@ async fn remote_download_resolves_progresses_pauses_completes_and_removes() -> R
             ensure!(media.status() == StatusCode::OK);
             ensure!(media.bytes().await? == bytes, "Served bytes differ");
 
-            // Removal: a wrong list deletes nothing and returns the right one.
+            // Removal. clip.mp4 does not end on a piece boundary, so its
+            // last piece also wrote the start of the unselected notes.txt,
+            // which the engine deletes too: the row says so.
             let folder = headless.download_dir.join(&id);
             let clip_path = folder.join("clip.mp4");
+            let notes_path = folder.join("notes.txt");
+            ensure!(notes_path.is_file(), "The boundary piece wrote notes.txt");
+            ensure!(!row.share);
+            let notes = row
+                .files
+                .iter()
+                .find(|f| f.path == "notes.txt")
+                .context("The notes row")?;
+            ensure!(!notes.selected && notes.will_delete, "{notes:?}");
+            ensure!(
+                transfers::deletion_paths(&row) == ["clip.mp4", "notes.txt"]
+                    || transfers::deletion_paths(&row) == ["notes.txt", "clip.mp4"],
+                "{:?}",
+                transfers::deletion_paths(&row)
+            );
             let keep = folder.join("keep.txt");
             std::fs::write(&keep, b"not the torrent's")?;
+            // The selected file alone is a wrong list: nothing is deleted,
+            // and the 409 names the right one.
             let wrong = headless
                 .request(Method::DELETE, &paths::transfer(&id))
-                .json(&json!({ "delete_files": true, "confirm": ["notes.txt"] }))
+                .json(&json!({ "delete_files": true, "confirm": ["clip.mp4"] }))
                 .send()
                 .await?;
             ensure!(wrong.status() == StatusCode::CONFLICT, "{}", wrong.status());
             let body: serde_json::Value = wrong.json().await?;
-            ensure!(body["files"] == json!(["clip.mp4"]), "{body}");
+            let mut files: Vec<String> = serde_json::from_value(body["files"].clone())?;
+            files.sort();
+            ensure!(files == ["clip.mp4", "notes.txt"], "{body}");
             ensure!(body["message"].as_str().is_some_and(|m| !m.is_empty()));
             ensure!(clip_path.is_file(), "A wrong list deleted the clip");
+            ensure!(notes_path.is_file(), "A wrong list deleted notes.txt");
             ensure!(headless.transfers().await?.len() == 1);
 
             let right = headless
                 .request(Method::DELETE, &paths::transfer(&id))
-                .json(&json!({ "delete_files": true, "confirm": ["clip.mp4"] }))
+                .json(&json!({ "delete_files": true, "confirm": files }))
                 .send()
                 .await?;
             ensure!(
@@ -756,6 +870,7 @@ async fn remote_download_resolves_progresses_pauses_completes_and_removes() -> R
                 right.status()
             );
             ensure!(!clip_path.exists(), "The clip was not deleted");
+            ensure!(!notes_path.exists(), "notes.txt was not deleted");
             ensure!(std::fs::read(&keep)? == b"not the torrent's");
             ensure!(headless.transfers().await?.is_empty());
             ensure!(video(&headless.library().await?, &video_id).is_none());
@@ -806,6 +921,55 @@ async fn library_mode_lists_completed_downloads_from_its_own_list() -> Result<()
                 saved == [headless.download_dir.join(&id).join("Film.mkv")],
                 "{saved:?}"
             );
+
+            // A transfer outside the download folder (the owner's own,
+            // added to the session directly): a paired Flick may remove it
+            // with Keep Files, never delete its files.
+            let kept = headless
+                .request(Method::DELETE, &paths::transfer(&id))
+                .json(&json!({ "delete_files": false }))
+                .send()
+                .await?;
+            ensure!(kept.status() == StatusCode::NO_CONTENT, "{}", kept.status());
+            let resolved = headless
+                .session
+                .resolve(
+                    TorrentInput::Bytes(seed.shared.torrent_bytes().to_vec()),
+                    vec![],
+                    Duration::from_secs(10),
+                )
+                .await?;
+            let elsewhere = root.path().join("owner elsewhere");
+            headless
+                .session
+                .download_to(&resolved, None, &elsewhere)
+                .await?;
+            headless.session.resume(&id, vec![seed.peer]).await?;
+            let row = headless.wait_complete(&id, Duration::from_secs(30)).await?;
+            let copy = elsewhere.canonicalize()?.join(&id).join("Film.mkv");
+            ensure!(copy.is_file());
+            let refused = headless
+                .request(Method::DELETE, &paths::transfer(&id))
+                .json(&json!({
+                    "delete_files": true,
+                    "confirm": transfers::deletion_paths(&row),
+                }))
+                .send()
+                .await?;
+            ensure!(
+                refused.status() == StatusCode::FORBIDDEN,
+                "{}",
+                refused.status()
+            );
+            let body: serde_json::Value = refused.json().await?;
+            ensure!(body.get("files").is_none(), "{body}");
+            ensure!(
+                body["message"]
+                    .as_str()
+                    .is_some_and(|m| m.contains("Keep Files")),
+                "{body}"
+            );
+            ensure!(copy.is_file(), "The owner's file was deleted");
             Ok(())
         }
         .await;
@@ -959,6 +1123,41 @@ async fn browse_and_share_stay_inside_allowed_roots() -> Result<()> {
             ensure!(resolved.files.len() == 1 && resolved.files[0].length == clip.len() as u64);
             // The source is left as it was.
             ensure!(std::fs::read(sub.join("day one.mp4"))? == clip);
+
+            // A share's files are the owner's originals: the row says so,
+            // and deleting them is refused whatever the confirmation; Keep
+            // Files unregisters it and leaves them.
+            let row = headless
+                .transfers()
+                .await?
+                .into_iter()
+                .find(|row| row.id == shared.infohash)
+                .context("The share is listed")?;
+            ensure!(row.share);
+            ensure!(row.files.iter().all(|file| !file.will_delete), "{row:?}");
+            for confirm in [json!([]), json!(["day one.mp4"])] {
+                let refused = headless
+                    .request(Method::DELETE, &paths::transfer(&shared.infohash))
+                    .json(&json!({ "delete_files": true, "confirm": confirm }))
+                    .send()
+                    .await?;
+                ensure!(
+                    refused.status() == StatusCode::FORBIDDEN,
+                    "{}",
+                    refused.status()
+                );
+                let message = error_message(refused).await?;
+                ensure!(message.contains("shared folder"), "{message}");
+                ensure!(std::fs::read(sub.join("day one.mp4"))? == clip);
+            }
+            let kept = headless
+                .request(Method::DELETE, &paths::transfer(&shared.infohash))
+                .json(&json!({ "delete_files": false }))
+                .send()
+                .await?;
+            ensure!(kept.status() == StatusCode::NO_CONTENT, "{}", kept.status());
+            ensure!(headless.transfers().await?.is_empty());
+            ensure!(std::fs::read(sub.join("day one.mp4"))? == clip);
             Ok(())
         }
         .await;
@@ -1076,6 +1275,63 @@ async fn unfinished_download_streams_verified_ranges_and_times_out_ahead() -> Re
                 "{waited:?}"
             );
             ensure!(!error_message(response).await?.is_empty());
+
+            // Eight reads waiting for pieces at once are the limit; the
+            // ninth is refused at once with Retry-After, not queued on the
+            // blocking pool.
+            let mut waiting = Vec::new();
+            for _ in 0..8 {
+                waiting.push(tokio::spawn(
+                    headless
+                        .request(Method::GET, &paths::media(&video_id))
+                        .header(header::RANGE, format!("bytes={far}-"))
+                        .send(),
+                ));
+            }
+            sleep(Duration::from_secs(1)).await;
+            let asked = Instant::now();
+            let refused = headless
+                .request(Method::GET, &paths::media(&video_id))
+                .header(header::RANGE, "bytes=0-1023")
+                .send()
+                .await?;
+            ensure!(
+                refused.status() == StatusCode::SERVICE_UNAVAILABLE,
+                "{}",
+                refused.status()
+            );
+            ensure!(asked.elapsed() < Duration::from_secs(5));
+            ensure!(
+                refused
+                    .headers()
+                    .get(header::RETRY_AFTER)
+                    .is_some_and(|value| value == "2")
+            );
+            ensure!(!error_message(refused).await?.is_empty());
+            // Clients that go away give their places back.
+            for request in &waiting {
+                request.abort();
+            }
+            for request in waiting {
+                let _ = request.await;
+            }
+            timeout(Duration::from_secs(10), async {
+                loop {
+                    let response = headless
+                        .request(Method::GET, &paths::media(&video_id))
+                        .header(header::RANGE, "bytes=0-1023")
+                        .send()
+                        .await?;
+                    if response.status() == StatusCode::PARTIAL_CONTENT {
+                        ensure!(response.bytes().await? == bytes[..1024]);
+                        return Ok::<_, anyhow::Error>(());
+                    }
+                    ensure!(response.status() == StatusCode::SERVICE_UNAVAILABLE);
+                    sleep(Duration::from_millis(100)).await;
+                }
+            })
+            .await
+            .context("Abandoned streams kept their places")??;
 
             // A client that goes away while a read waits releases the
             // stream; stopping below would hang otherwise.
