@@ -13,11 +13,22 @@ use serde::{Deserialize, Serialize};
 pub struct RemoteSettings {
     pub servers: Vec<RemoteServer>,
     pub progress: Vec<RemoteProgress>,
+    /// "Share my library on Tailscale": run the remote library server inside
+    /// this Flick. Off by default; started on launch while on.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub serve: bool,
+    /// The name other Flicks show for this library. Empty uses the
+    /// computer's name.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub serve_name: String,
 }
 
 impl RemoteSettings {
     pub fn is_empty(&self) -> bool {
-        self.servers.is_empty() && self.progress.is_empty()
+        self.servers.is_empty()
+            && self.progress.is_empty()
+            && !self.serve
+            && self.serve_name.is_empty()
     }
 }
 

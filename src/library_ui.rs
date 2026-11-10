@@ -1402,6 +1402,7 @@ impl Flick {
             && !self.resolving
             && self.pending_torrent.is_none()
             && self.pending_open.is_none()
+            && self.store.data.remote.servers.is_empty()
     }
 
     /// Width available to page content, used to size card grids.
@@ -2536,11 +2537,18 @@ impl Flick {
         let t = cx.theme().clone();
         let query = self.query.to_lowercase();
         let gap = 16.;
-        let mut page = v_flex().w_full().children(self.search_section(cx));
+        let mut page = v_flex()
+            .w_full()
+            .children(self.remote_notice(cx))
+            .children(self.search_section(cx));
         if self.query_is_link() {
             return page;
         }
         let (continue_cols, _) = columns(width, 220., gap);
+        let (cols, card) = columns(width, 220., gap);
+        // Remote entries get their own row so local order is unchanged;
+        // local history has no timestamps to interleave them by.
+        let remote_continuing = self.remote_continue_cards(&query, cols, (cols, card), cx);
         let continuing = self
             .store
             .data
@@ -2553,8 +2561,7 @@ impl Flick {
             })
             .take(continue_cols)
             .collect::<Vec<_>>();
-        if !continuing.is_empty() {
-            let (cols, card) = columns(width, 220., gap);
+        if !continuing.is_empty() || !remote_continuing.is_empty() {
             let shown = continuing.len();
             self.register_video_section(
                 "continue",
@@ -2573,7 +2580,16 @@ impl Flick {
             page = page
                 .child(section_title(&t, "Continue Watching"))
                 .child(card_grid(cards, cols, gap))
+                .when(!remote_continuing.is_empty(), |d| {
+                    d.child(div().h(px(if shown > 0 { 22. } else { 0. })))
+                        .child(card_grid(remote_continuing, cols, gap))
+                })
                 .child(div().h(px(28.)));
+        }
+        let remote = self.remote_sections(width, &query, cx);
+        if self.store.data.library.is_empty() && !self.store.data.remote.servers.is_empty() {
+            // Only remote libraries: no empty local section above them.
+            return page.children(remote);
         }
         let (cols, card) = columns(width, 180., gap);
         let added = self
@@ -2640,7 +2656,7 @@ impl Flick {
                 .collect();
             page = page.child(card_grid(cards, cols, gap));
         }
-        page
+        page.children(remote)
     }
 
     fn videos_page(&self, width: f32, notices: Div, has_notices: bool, cx: &Context<Self>) -> Div {
@@ -3587,7 +3603,7 @@ fn scroll_key_offset(key: &str, offset: Pixels, max: Pixels, viewport: Pixels) -
 
 /// Arrow-key movement within a card grid.
 #[derive(Clone, Copy, Debug, PartialEq)]
-enum GridStep {
+pub(super) enum GridStep {
     Left,
     Right,
     Up,
@@ -3595,7 +3611,7 @@ enum GridStep {
 }
 
 impl GridStep {
-    fn from_key(key: &str) -> Option<Self> {
+    pub(super) fn from_key(key: &str) -> Option<Self> {
         Some(match key {
             "left" => Self::Left,
             "right" => Self::Right,
@@ -3608,7 +3624,7 @@ impl GridStep {
     /// The card to focus from `index` in a row-major grid of `count` cards,
     /// or `None` to leave the grid. Down from a row above a shorter last row
     /// goes to the last card.
-    fn target(self, index: usize, cols: usize, count: usize) -> Option<usize> {
+    pub(super) fn target(self, index: usize, cols: usize, count: usize) -> Option<usize> {
         let cols = cols.max(1);
         match self {
             Self::Left => index.checked_sub(1),
@@ -3640,7 +3656,7 @@ fn app_icon(size: f32, radius: f32) -> Div {
 }
 
 /// Column count and card width that fill `width` with cards at least `min` wide.
-fn columns(width: f32, min: f32, gap: f32) -> (usize, f32) {
+pub(super) fn columns(width: f32, min: f32, gap: f32) -> (usize, f32) {
     let cols = ((width + gap) / (min + gap)).floor().max(1.) as usize;
     (
         cols,
@@ -3648,7 +3664,7 @@ fn columns(width: f32, min: f32, gap: f32) -> (usize, f32) {
     )
 }
 
-fn card_grid(cards: Vec<AnyElement>, cols: usize, gap: f32) -> Div {
+pub(super) fn card_grid(cards: Vec<AnyElement>, cols: usize, gap: f32) -> Div {
     let mut grid = v_flex().gap(px(gap + 6.));
     let mut cards = cards.into_iter().peekable();
     while cards.peek().is_some() {

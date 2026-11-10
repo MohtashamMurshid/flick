@@ -195,17 +195,23 @@ impl LibraryVideo {
 
     /// A short resolution label such as `4K` or `1080p`.
     pub fn resolution(&self) -> Option<&'static str> {
-        let (w, h) = (self.width.max(self.height), self.width.min(self.height));
-        Some(match (w, h) {
-            (0, _) | (_, 0) => return None,
-            (w, h) if w >= 7680 || h >= 4320 => "8K",
-            (w, h) if w >= 3840 || h >= 2160 => "4K",
-            (w, h) if w >= 2560 || h >= 1440 => "1440p",
-            (w, h) if w >= 1920 || h >= 1080 => "1080p",
-            (w, h) if w >= 1280 || h >= 720 => "720p",
-            _ => "SD",
-        })
+        resolution_label(self.width, self.height)
     }
+}
+
+/// A short resolution label such as `4K` or `1080p`, for local and remote
+/// cards alike. None while the size is unknown.
+pub fn resolution_label(width: u32, height: u32) -> Option<&'static str> {
+    let (w, h) = (width.max(height), width.min(height));
+    Some(match (w, h) {
+        (0, _) | (_, 0) => return None,
+        (w, h) if w >= 7680 || h >= 4320 => "8K",
+        (w, h) if w >= 3840 || h >= 2160 => "4K",
+        (w, h) if w >= 2560 || h >= 1440 => "1440p",
+        (w, h) if w >= 1920 || h >= 1080 => "1080p",
+        (w, h) if w >= 1280 || h >= 720 => "720p",
+        _ => "SD",
+    })
 }
 
 impl Settings {
@@ -875,6 +881,11 @@ pub struct Store {
 }
 
 impl Store {
+    /// The settings file, when Flick has a configuration folder.
+    pub fn path(&self) -> Option<&Path> {
+        self.path.as_deref()
+    }
+
     pub fn load() -> Self {
         if let Some(path) = std::env::var_os("FLICK_SETTINGS_PATH") {
             return Self::load_from(PathBuf::from(path));
