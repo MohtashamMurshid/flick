@@ -148,6 +148,12 @@ The design, delivery order, and checkboxes are in [the remote downloads plan](RE
 
 State on 2026-11-10 at `d8cc148`: the server routes, the headless and in-app backends, Save to, Downloads by machine, Seed from, and onboarding are built. Loopback tests, the desktop typecheck and unit tests, and `curl` on a real Tailscale address pass. Nothing has been used from a second machine, which is the plan's acceptance test. See [validation](VALIDATION.md#download-to-another-machine-and-onboarding-on-2026-11-10).
 
+### 10. Remote library polish
+
+The design and checkboxes are in [the remote library polish plan](REMOTE_POLISH_PLAN.md): finding Flicks on the tailnet and pairing by code, automatic quality, Continue Watching across machines, Keep on this Mac, Wake, audio tracks in transcodes, a queue for a machine that is asleep, and notifications.
+
+State on 2026-11-11 at `981d26a`: implemented. Loopback tests, the desktop typecheck and unit tests, and `curl` against the launchd server on a real Tailscale address pass. Review fixes are in flight, and nothing has been used from a second machine. See [validation](VALIDATION.md#remote-library-polish-on-2026-11-11).
+
 Watch folders, remote control of the player, accounts, cloud storage, casting, and a general NDJSON agent interface are outside the first release. Search belongs in the library workflow.
 
 ## Existing prototype
