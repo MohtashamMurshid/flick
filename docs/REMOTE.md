@@ -2,7 +2,7 @@
 
 `flick-serve` is a headless server for a machine that keeps the storage, such as a Mac mini. Another Flick on the same [Tailscale](https://tailscale.com) network can browse its library and stream the original files from it. Files are not copied. The design is in [the remote library plan](REMOTE_PLAN.md).
 
-**Status:** the server and this tool are implemented, covered by loopback tests, and were checked on a real Tailscale address (see [validation](VALIDATION.md#remote-library-over-tailscale-on-2026-11-10)). In the desktop app, **Appearance → Remote Libraries** pairs with a server and shows whether it is online and how many videos it has. The library section that lists those videos and plays them, and the quality tiers below Original, are not finished yet. Until they are, you can check the server with `curl` or stock `mpv`, as shown below. Playback from a second machine has not been tested yet.
+**Status:** the server, this tool, the quality tiers, and the desktop side (pairing in **Appearance → Remote Libraries**, a library section per server, playback, subtitles, and the quality picker) are implemented and covered by loopback tests; the server was checked on a real Tailscale address, including from the desktop app's own "Share my library on Tailscale" switch (see [validation](VALIDATION.md#remote-library-integration-and-quality-tiers-on-2026-11-10)). Playback from a second machine has not been tested yet. You can also check the server with `curl` or stock `mpv`, as shown below.
 
 ## What it does, and what it never does
 
@@ -65,7 +65,7 @@ Logs go to stderr. Set `RUST_LOG=flick=debug` for more detail. The token never a
 | `--state-dir DIR` | Flick's data folder, in `remote`: `~/Library/Application Support/app.Flick.Flick/remote` on macOS, or `FLICK_DATA_DIR/remote` if that variable is set | Where the token, id salt, and progress are kept. |
 | `--print-pairing` | | Print the pairing line for the saved token (making one if needed) and exit. Needs a fixed port, and Tailscale running unless `--bind` is given. |
 | `--new-token` | | Replace the saved token. Every paired Flick must pair again. |
-| `--ffmpeg PATH`, `--max-transcodes N` | none, `2` | Reserved for the quality tiers below Original; accepted but not used yet. |
+| `--ffmpeg PATH`, `--max-transcodes N` | found on `PATH` (then `~/.local/bin`, `/opt/homebrew/bin`, `/usr/local/bin`), `2` | The FFmpeg used for the quality tiers below Original, and how many transcodes may run at once. Without a working FFmpeg only Original is offered. `FLICK_FFMPEG` also names it. |
 
 The library is re-read on every listing request, so a video added on the desktop appears the next time the other Flick refreshes, without restarting the server.
 

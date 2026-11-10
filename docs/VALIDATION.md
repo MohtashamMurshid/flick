@@ -16,6 +16,29 @@ The earlier macOS build/playback entries later in this log describe pre-PR revis
 
 The presentation adapter transfers decoded BGRA frames through CPU memory into GPUI images. It sizes frames to physical video bounds without a fixed resolution, axis, or pixel-budget cap. Checked native dimensions and allocation failures produce explicit errors. GPU rendering of those images does not establish hardware video decoding or zero-copy presentation. Treat this as a functional prototype. Hardware decoding, efficient GPU surface sharing, HDR correctness, battery use, and claims of being faster than VLC remain unverified.
 
+### Remote library integration and quality tiers on 2026-11-10
+
+Tested commit `7148f60`, which adds to the entry below: the transcode and HLS modules, the server's media inspection cache and embedded WebVTT route, the library section per server, Continue Watching for remote videos, the player's quality picker and server subtitles, Picture in Picture and the palette for remote sources, and the in-app "Share my library on Tailscale" switch. Same machine and versions as below.
+
+#### Backend tests (passing)
+
+- `cargo fmt --all -- --check`, `cargo clippy --locked --no-default-features --all-targets -- -D warnings`: passed.
+- `cargo test --locked --no-default-features --all-targets`: 110 library unit tests (1 ignored opt-in), 13 `tests/remote_hls.rs` (1 ignored), 15 `tests/remote_server.rs` (1 ignored), 9 `tests/transfers.rs`. The HLS tests drive a generated stand-in `ffmpeg`/`ffprobe` script on loopback: playlist shape, segment waits, restart on seek, the job cap (503), idle cleanup, 404s, and a client that disconnects during a wait. The new server test pins that without FFmpeg the listing offers only `original` and every tier route answers 503 naming FFmpeg.
+- Real FFmpeg, opted in: `FLICK_TEST_VIDEO=/tmp/flick-hls-test.mp4 cargo test --locked --no-default-features --test remote_hls -- --ignored` passed with `h264_videotoolbox`: a 480p init segment and first segment in 305 ms, a seek-started segment with the right start time, FFmpeg's own HLS demuxer decoding the playlist from 0 s and 9 s, 206 bytes of WebVTT from an embedded track, and an x265 HDR clip tone-mapped to BT.709. The same for `tests/remote_server.rs` (`with_ffmpeg_tiers_probed_details_and_embedded_subtitles_are_served`): the listing advertised all five tiers, ffprobe filled in the duration and size of a `--folder` video, and a 480p playlist and first segment were served. The generated clip has no embedded text subtitle track, so extraction over the server route was not exercised there; the HLS test above covers `extract_webvtt` directly.
+
+#### Desktop typecheck and unit tests under `runtime-shaders` (not a shipping build)
+
+- `cargo clippy --locked --features runtime-shaders --all-targets -- -D warnings`: passed.
+- `cargo test --locked --features runtime-shaders --all-targets`: 110 library, 174 desktop (12 ignored opt-ins), 13 HLS, 15 server, 9 transfer tests passed. The desktop count includes loopback tests for the in-app server (it serves `settings.json`, New Token revokes the old token, a LAN bind is refused) and for remote card grouping, search, and details.
+
+#### The in-app server on the real Tailscale address
+
+With `FLICK_SETTINGS_PATH` and `FLICK_DATA_DIR` pointed at temporary paths, the desktop app was launched here under `runtime-shaders` (its window opens; libmpv fails to load, as expected on this Mac). With the "Share my library on Tailscale" switch saved on, the app started the server on launch; `curl -H "Authorization: Bearer <token>" http://100.98.200.69:47117/v1/library` returned 200 with the three fixture videos, the same request without the token returned 401, `127.0.0.1:47117` refused the connection, and after quitting nothing answered. The app paired with its own server showed the remote section and a remote Continue Watching card (see the integration agent's window capture); the Remote Libraries settings group itself was not captured because this display stopped repainting after the first frame and does not accept synthetic input.
+
+#### Interactive playback from a second machine: not performed
+
+Unchanged from the entry below. Nothing has been played through libmpv at any tier, no quality switch, remote subtitle, hash search, or progress upload has run against a real player, and the MacBook has not been used. The `launchd` agent and its install script were linted and dry-run only.
+
 ### Remote library over Tailscale on 2026-11-10
 
 Tested commit `c17bbd6` on the `remote-library` work (server core, `flick-serve`, the desktop client, and its settings page). Machine: Mohtasham's Mac Mini, Apple Silicon macOS 27.2 (26B123), Rust 1.99.0 (`rustc 1.99.0 (b940084d7 2026-09-28)`, clippy 0.1.99, rustfmt 1.10.0), Tailscale 1.104.5, FFmpeg 7.0. No Xcode and no libmpv on this Mac.

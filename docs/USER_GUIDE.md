@@ -122,9 +122,9 @@ Preferences are saved to `settings.json` in the operating system's per-user appl
 | `FLICK_OPENSUBTITLES_KEY` | OpenSubtitles API key. It overrides a key entered in Appearance and is never written to `settings.json`. |
 | `FLICK_MPV_LIBRARY` | Full path to the libmpv shared library, used instead of searching the usual locations. |
 | `FLICK_HWDEC` | Set to `no` to turn off hardware decoding. |
+| `FLICK_FFMPEG` | Full path to the FFmpeg that the remote library server uses for quality tiers below Original, checked before `PATH`. |
 | `FLICK_REMOTE_TOKEN` | Pairing token for remote libraries. It overrides the token of every paired server and is never written to `settings.json`. |
 
-`FLICK_FFMPEG` is planned for the remote library's quality tiers, to name the FFmpeg the server uses. No build reads it yet; `flick-serve` has a `--ffmpeg` option reserved for the same purpose.
 
 These variables exist for development and testing:
 
