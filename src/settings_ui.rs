@@ -342,6 +342,8 @@ impl Flick {
             .child(div().h(px(24.)))
             .child(self.remote_settings(cx))
             .child(div().h(px(24.)))
+            .child(self.remote_download_settings(cx))
+            .child(div().h(px(24.)))
             .child(section_title(&t, "Subtitles"))
             .child(group(
                 &t,
@@ -380,6 +382,23 @@ impl Flick {
                         div()
                             .w(px(240.))
                             .child(self.text_field(&self.subtitle_languages_field, cx)),
+                    )
+                    .into_any_element(),
+                ],
+            ))
+            .child(div().h(px(24.)))
+            .child(section_title(&t, "Setup"))
+            .child(group(
+                &t,
+                vec![
+                    row(
+                        &t,
+                        Some("rotate-ccw"),
+                        "Set up Flick again",
+                        Some("Choose where your videos are, whether to share this library, and where downloads go".into()),
+                        self.button("setup-again", None, "Set Up Again…", false, cx, |this, _, cx| {
+                            this.start_onboarding(cx)
+                        }),
                     )
                     .into_any_element(),
                 ],
@@ -611,6 +630,195 @@ impl Flick {
             .when_some(serve_error, |d, error| {
                 d.child(div().mt_2().child(notice(&t, true, error)))
             })
+    }
+
+    /// "Let paired Flicks download to this Mac": the owner's switch, where
+    /// their downloads go, and the folders they may seed from.
+    fn remote_download_settings(&self, cx: &Context<Self>) -> Div {
+        let t = cx.theme().clone();
+        let remote = &self.store.data.remote;
+        let allow = remote.allow_downloads;
+        let mut detail =
+            "Paired Flicks can start torrents, link downloads, and shares on this computer"
+                .to_owned();
+        if allow && !remote.serve {
+            detail.push_str(". Turn on Share my library on Tailscale to accept them");
+        }
+        let mut rows = vec![
+            row(
+                &t,
+                Some("download"),
+                if cfg!(target_os = "macos") {
+                    "Let paired Flicks download to this Mac"
+                } else {
+                    "Let paired Flicks download to this computer"
+                },
+                Some(detail.into()),
+                self.switch("remote-allow-downloads", allow, cx, move |this, _, cx| {
+                    this.store.data.remote.allow_downloads = !allow;
+                    this.remote_downloads_changed(cx);
+                }),
+            )
+            .into_any_element(),
+        ];
+        let folder = remote
+            .download_dir
+            .clone()
+            .unwrap_or_else(|| self.services.download_dir.clone());
+        let free = crate::remote_serve::storage(&folder).free_bytes;
+        let mut folder_actions = h_flex().gap_2().child(self.button(
+            "remote-download-folder",
+            Some("folder-open"),
+            "Choose…",
+            false,
+            cx,
+            |this, window, cx| this.choose_remote_folder(false, window, cx),
+        ));
+        if remote.download_dir.is_some() {
+            folder_actions = folder_actions.child(self.button(
+                "remote-download-folder-reset",
+                None,
+                "Use Default",
+                false,
+                cx,
+                |this, _, cx| {
+                    this.store.data.remote.download_dir = None;
+                    this.remote_downloads_changed(cx);
+                },
+            ));
+        }
+        rows.push(
+            row(
+                &t,
+                Some("folder-open"),
+                "Downloads folder",
+                Some(
+                    format!(
+                        "{} · {} free",
+                        folder.display(),
+                        flick::library::format_bytes(free)
+                    )
+                    .into(),
+                ),
+                folder_actions,
+            )
+            .into_any_element(),
+        );
+        for (index, root) in remote.share_roots.iter().enumerate() {
+            let removed = root.clone();
+            rows.push(
+                row(
+                    &t,
+                    Some("share-2"),
+                    root.file_name()
+                        .map(|name| name.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| root.display().to_string()),
+                    Some(root.display().to_string().into()),
+                    self.icon_button(
+                        ("remote-share-root-remove", index),
+                        "x",
+                        format!("Stop offering {}", root.display()),
+                        cx,
+                        move |this, _, cx| {
+                            this.store
+                                .data
+                                .remote
+                                .share_roots
+                                .retain(|root| *root != removed);
+                            this.remote_downloads_changed(cx);
+                        },
+                    ),
+                )
+                .into_any_element(),
+            );
+        }
+        rows.push(
+            row(
+                &t,
+                Some("folder-plus"),
+                "Folders others may seed from",
+                Some(
+                    if remote.share_roots.is_empty() {
+                        "None yet. Paired Flicks can share only files inside these folders"
+                    } else {
+                        "Paired Flicks can share only files inside these folders"
+                    }
+                    .into(),
+                ),
+                self.button(
+                    "remote-share-root-add",
+                    Some("plus"),
+                    "Add Folder…",
+                    false,
+                    cx,
+                    |this, window, cx| this.choose_remote_folder(true, window, cx),
+                ),
+            )
+            .into_any_element(),
+        );
+        v_flex()
+            .child(section_title(
+                &t,
+                if cfg!(target_os = "macos") {
+                    "Let Paired Flicks Download to This Mac"
+                } else {
+                    "Let Paired Flicks Download to This Computer"
+                },
+            ))
+            .child(group(&t, rows))
+            .child(
+                div()
+                    .mt_2()
+                    .text_size(t.font(t.text_size - 1.))
+                    .text_color(t.muted)
+                    .child("Completed downloads follow Keep sharing completed downloads in Transfers. Bandwidth limits apply too."),
+            )
+    }
+
+    /// Saves the owner's download settings and applies them to the
+    /// running server from its next request.
+    fn remote_downloads_changed(&mut self, cx: &mut Context<Self>) {
+        self.persist();
+        self.serve
+            .set_transfer_settings(crate::remote_serve::TransferSettings::from_remote(
+                &self.store.data.remote,
+            ));
+        cx.notify();
+    }
+
+    /// Picks the downloads folder for paired Flicks, or adds a share root.
+    fn choose_remote_folder(&mut self, share_root: bool, window: &Window, cx: &mut Context<Self>) {
+        let receiver = cx.prompt_for_paths(PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some(
+                if share_root {
+                    "Let paired Flicks seed from this folder"
+                } else {
+                    "Download to folder"
+                }
+                .into(),
+            ),
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            if let Ok(Ok(Some(paths))) = receiver.await
+                && let Some(path) = paths.into_iter().next()
+            {
+                let _ = this.update_in(cx, |this, _, cx| {
+                    let remote = &mut this.store.data.remote;
+                    if share_root {
+                        if !remote.share_roots.contains(&path) {
+                            remote.share_roots.push(path);
+                        }
+                    } else {
+                        remote.download_dir = Some(path);
+                    }
+                    this.remote_downloads_changed(cx);
+                });
+            }
+        })
+        .detach();
     }
 
     /// Shows the pairing string field and focuses it.
