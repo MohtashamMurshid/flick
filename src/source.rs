@@ -22,10 +22,6 @@ impl Source {
         }
     }
 
-    pub fn is_remote(&self) -> bool {
-        matches!(self, Source::Remote(_))
-    }
-
     /// The title shown in the title bar, the window title, and Now Playing.
     pub fn title(&self) -> String {
         match self {
@@ -86,7 +82,8 @@ impl fmt::Debug for RemoteSource {
 }
 
 /// libmpv's HTTP request headers. Set to the bearer header just before a
-/// remote load and cleared once that file loads or fails, so no later load
+/// remote load and kept for that session, because libmpv reads it again for
+/// every HLS segment and reconnect; the next load replaces or clears it, so no later load
 /// can carry the token.
 pub const HTTP_HEADERS: &str = "http-header-fields";
 
@@ -162,13 +159,13 @@ mod tests {
             local.local_path(),
             Some(Path::new("/films/Night Train.mkv"))
         );
-        assert!(!local.is_remote());
+        assert!(matches!(local, Source::Local(_)));
 
         let mut film = remote(Quality::Original);
         let source = Source::Remote(film.clone());
         assert_eq!(source.title(), "A Film");
         assert_eq!(source.local_path(), None);
-        assert!(source.is_remote());
+        assert!(matches!(source, Source::Remote(_)));
         film.title = "  ".into();
         assert_eq!(Source::Remote(film).title(), "Untitled video");
     }

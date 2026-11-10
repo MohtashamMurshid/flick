@@ -61,23 +61,13 @@ fn set_network_profile(player: &Player, remote: Option<&RemoteSource>) {
     }
 }
 
-/// Whether a player event means libmpv no longer needs the bearer header
-/// for the current remote load. `file_loaded` is whether the current load
-/// had loaded before this event.
-///
-/// A replacing load can deliver the previous file's end, tagged with the new
-/// request, before the new file opens its stream; clearing then could make
-/// that open fail with 401. So an end clears only once the current file has
-/// loaded. Every `player.load` sets or clears the header first, so a header
-/// left set after a stop is replaced before the next load.
-fn should_clear_header(event: &PlayerEvent, file_loaded: bool) -> bool {
-    match event {
-        PlayerEvent::FileLoaded | PlayerEvent::Error(_) => true,
-        PlayerEvent::EndFile => file_loaded,
-        PlayerEvent::OperationCompleted { .. } => false,
-    }
-}
-
+/// The bearer header stays set for the whole remote session. libmpv opens a
+/// new HTTP stream for every HLS segment and for reconnects after a seek,
+/// and reads `http-header-fields` each time, so clearing it after the file
+/// loads breaks playback at the next segment (checked on 2026-11-10 with
+/// mpv 0.40: the second segment answered 401 and playback stopped at 8 s).
+/// Every `player.load` sets the header for its own server or clears it for a
+/// local file first, so it never reaches another server or a local load.
 /// Removes the bearer header so no later request or load carries it.
 fn clear_http_headers(player: &Player) {
     if let Err(error) = player.set_property(crate::source::HTTP_HEADERS, "") {
@@ -1485,12 +1475,8 @@ impl Flick {
         let mut changed = false;
         // Once a remote file has loaded or failed, libmpv no longer needs
         // the token for new requests.
-        let remote = self.source().is_some_and(Source::is_remote);
         for event in player.poll_events() {
             changed = true;
-            if remote && should_clear_header(&event, self.file_loaded) {
-                clear_http_headers(player);
-            }
             match event {
                 PlayerEvent::FileLoaded => {
                     self.file_loaded = true;
@@ -2484,24 +2470,24 @@ mod tests {
     }
 
     #[test]
-    fn the_bearer_header_outlives_the_previous_files_end() {
-        // A replacing load: the old file's end arrives before the new file
-        // loads, and must not clear the header the new load needs.
-        assert!(!should_clear_header(&PlayerEvent::EndFile, false));
-        assert!(should_clear_header(&PlayerEvent::FileLoaded, false));
-        // The current file ending after it loaded, or failing, clears it.
-        assert!(should_clear_header(&PlayerEvent::EndFile, true));
-        assert!(should_clear_header(
-            &PlayerEvent::Error("401".into()),
-            false
-        ));
-        assert!(should_clear_header(&PlayerEvent::Error("eof".into()), true));
-        let completed = PlayerEvent::OperationCompleted {
-            id: 1,
-            result: crate::playback::OperationResult::Completed,
+    fn network_profile_header_is_set_for_remote_and_empty_for_local() {
+        let remote = crate::source::RemoteSource {
+            server_id: "s".into(),
+            server_name: "Mac mini".into(),
+            video_id: "v".into(),
+            title: "Clip".into(),
+            duration: 90.,
+            quality: flick::remote::protocol::Quality::Low720,
+            base_url: "http://100.98.200.69:47117".into(),
+            token: "t0ken".into(),
         };
-        assert!(!should_clear_header(&completed, false));
-        assert!(!should_clear_header(&completed, true));
+        // The header libmpv sends on every stream it opens for this source.
+        assert_eq!(remote.header(), "Authorization: Bearer t0ken");
+        // A local load passes None, which maps to an empty header.
+        let header = None::<&crate::source::RemoteSource>
+            .map(crate::source::RemoteSource::header)
+            .unwrap_or_default();
+        assert_eq!(header, "");
     }
 
     #[test]

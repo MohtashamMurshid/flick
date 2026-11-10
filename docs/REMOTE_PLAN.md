@@ -80,7 +80,7 @@ A later step can replace the token with the caller's tailnet identity from Tails
 
 ### Client playback
 
-The desktop loads `http://<server>/v1/media/<id>` through the existing `Player::load`, which already accepts any string libmpv understands. libmpv's HTTP demuxer does range requests, so seeking is native. Before the load the client sets `http-header-fields` to the bearer header and clears it after the file loads, so the token never appears in a URL. For smooth high bit rate playback the client raises `demuxer-max-bytes`, sets `demuxer-readahead-secs`, and sets `network-timeout`; the values are decided by measurement in validation, not guessed.
+The desktop loads `http://<server>/v1/media/<id>` through the existing `Player::load`, which already accepts any string libmpv understands. libmpv's HTTP demuxer does range requests, so seeking is native. Before the load the client sets `http-header-fields` to the bearer header and keeps it for the whole remote session, because libmpv opens a new stream for every HLS segment and for reconnects after a seek and reads the option each time; the next load replaces it or clears it for a local file. The token never appears in a URL. For smooth high bit rate playback the client raises `demuxer-max-bytes`, sets `demuxer-readahead-secs`, and sets `network-timeout`; the values are decided by measurement in validation, not guessed.
 
 Sidecar subtitles load with `sub-add` on their HTTP URL. OpenSubtitles search uses the hash endpoint instead of reading the file. Posters are fetched as PNG bytes and shown with GPUI's image element rather than decoded by the client's thumbnail worker.
 
