@@ -3694,7 +3694,7 @@ mod tests {
 
     #[test]
     fn command_errors_carry_the_servers_message() {
-        const OFF: &str = "This Flick does not accept downloads from other Flicks. Its owner can allow it in Appearance → Remote Libraries.";
+        const OFF: &str = "This Flick does not accept downloads from other Flicks. Its owner can allow it in Settings → Remote Libraries.";
         let body = |message: &str| error_body(message);
         assert_eq!(command_error(403, &body(OFF)), OFF);
         assert_eq!(
@@ -3883,7 +3883,7 @@ mod tests {
 
     type StartTransferBody = protocol::StartTransfer;
 
-    const OWNER_OFF: &str = "This Flick does not accept downloads from other Flicks. Its owner can allow it in Appearance → Remote Libraries.";
+    const OWNER_OFF: &str = "This Flick does not accept downloads from other Flicks. Its owner can allow it in Settings → Remote Libraries.";
 
     /// A loopback Flick that answers the command routes. `writes` is false
     /// for a server whose owner has not allowed downloads: its listing has

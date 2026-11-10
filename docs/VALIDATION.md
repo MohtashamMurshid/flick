@@ -16,6 +16,16 @@ The earlier macOS build/playback entries later in this log describe pre-PR revis
 
 The presentation adapter transfers decoded BGRA frames through CPU memory into GPUI images. It sizes frames to physical video bounds without a fixed resolution, axis, or pixel-budget cap. Checked native dimensions and allocation failures produce explicit errors. GPU rendering of those images does not establish hardware video decoding or zero-copy presentation. Treat this as a functional prototype. Hardware decoding, efficient GPU surface sharing, HDR correctness, battery use, and claims of being faster than VLC remain unverified.
 
+### Appearance page renamed to Settings on 2026-11-10
+
+The sidebar page that held style, Transfers, Remote Libraries, the downloads switch, and "Set up Flick again" is now **Settings**, with **Appearance** (style, color scheme, accent color) as its first group. `Page::Appearance` became `Page::Settings`; the command center entry, the ⌘, / Ctrl+, shortcut row, the `--help` text, onboarding text, subtitle messages, and the docs now say Settings. The key binding is unchanged. The server's 403 wording in `src/remote/transfers.rs` still says "Appearance → Remote Libraries" at this commit and is renamed separately. Same Mac mini as the entries below: no Xcode, no libmpv.
+
+- `cargo fmt --all -- --check`: passed.
+- `cargo clippy --locked --features runtime-shaders --all-targets -- -D warnings`: passed.
+- `cargo test --locked --features runtime-shaders --all-targets`: 118 library unit tests (1 ignored), 215 desktop unit tests (12 ignored, the native libmpv tests among them), 17 `tests/remote_hls.rs` (1 ignored), 18 `tests/remote_server.rs` (1 ignored), 6 `tests/remote_transfers.rs`, 9 `tests/transfers.rs`. All passed.
+- `cargo clippy --locked --no-default-features --all-targets -- -D warnings`: passed.
+- Not done: no desktop app was built into a bundle or launched, and nothing was played; this machine has no libmpv. The renamed page, sidebar item, and command center entry have not been seen on screen.
+
 ### Download to another machine and onboarding on 2026-11-10
 
 #### Public download started from the MacBook, run on the Mac mini (added by the orchestrator)

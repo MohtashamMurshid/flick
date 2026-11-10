@@ -4,14 +4,14 @@ This guide covers everything Flick does, screen by screen. For installation, see
 
 ## First launch
 
-A new Flick, with an empty library and no paired server, opens to setup: four screens, each with Back, Skip, and Next. Skip leaves that screen's settings as they were when you reached it. Each choice is saved as you make it, through the same settings Appearance uses.
+A new Flick, with an empty library and no paired server, opens to setup: four screens, each with Back, Skip, and Next. Skip leaves that screen's settings as they were when you reached it. Each choice is saved as you make it, through the same controls as Settings.
 
-1. **Where are your videos?** *On this Mac* (*On this computer* on Windows and Linux), or *On another machine on my Tailscale network*. For another machine, paste the pairing string that Flick shows in **Appearance → Remote Libraries** there, or that `flick-serve --print-pairing` prints, and choose **Test Connection**. Next is enabled once that server answers. Going on with *On this Mac* unpairs a server that was only tested here.
+1. **Where are your videos?** *On this Mac* (*On this computer* on Windows and Linux), or *On another machine on my Tailscale network*. For another machine, paste the pairing string that Flick shows in **Settings → Remote Libraries** there, or that `flick-serve --print-pairing` prints, and choose **Test Connection**. Next is enabled once that server answers. Going on with *On this Mac* unpairs a server that was only tested here.
 2. **Share this library?** The **Share my library on Tailscale** switch, off by default, with the pairing string, Copy, and New Token once sharing starts. See [Remote libraries](#remote-libraries).
 3. **Where should downloads go?** This Mac and every paired machine. A machine that is offline, or does not accept downloads, cannot be chosen; the others show their download folder and free space. Below it, **Keep sharing completed downloads?** asks the seeding question with *Keep sharing completed downloads* or *Stop sharing*. Next needs both answers.
 4. **You're set.** One line each for Videos, Share this library, Downloads go to, and After downloading, with **Change** to go back to that screen. **Open Library** finishes setup and shows Home.
 
-To run it again, open **Appearance**, find **Setup**, and choose **Set Up Again…**. It starts at the first screen, with your first paired server already chosen. If you quit before the last screen, the next launch starts in setup again only when the library is empty and no server is paired.
+To run it again, open **Settings**, find **Setup**, and choose **Set Up Again…**. It starts at the first screen, with your first paired server already chosen. If you quit before the last screen, the next launch starts in setup again only when the library is empty and no server is paired.
 
 A Flick that already had a library or a paired server before setup existed opens to its library as before.
 
@@ -29,11 +29,11 @@ The Linux file picker uses the desktop portal. Drag and drop and command-line pa
 
 ## Playback
 
-Flick plays video inside its window with libmpv: play and pause, seeking, volume and mute, playback speed, frame stepping, chapters, an A–B loop, fullscreen, picture in picture, audio and subtitle track selection with audio delay, external subtitle loading, recent files, and resume positions. Playback controls appear after media loads. While a video plays, its controls hide after 2.5 seconds without pointer movement, and subtitles move above the controls whenever they show. Turn hiding off in **Appearance**.
+Flick plays video inside its window with libmpv: play and pause, seeking, volume and mute, playback speed, frame stepping, chapters, an A–B loop, fullscreen, picture in picture, audio and subtitle track selection with audio delay, external subtitle loading, recent files, and resume positions. Playback controls appear after media loads. While a video plays, its controls hide after 2.5 seconds without pointer movement, and subtitles move above the controls whenever they show. Turn hiding off in **Settings → Playback**.
 
 libmpv uses the platform's hardware decoder when available (`hwdec=auto-copy`). Set `FLICK_HWDEC=no` to compare against software decoding. libmpv renders into the frame GPUI uploads. This frame transfer follows the display's physical video bounds with no fixed resolution or pixel-budget cap, and native dimension or allocation failures are reported instead of silently lowering resolution. Efficient native GPU video presentation is a separate milestone; this version makes no claim of being faster than VLC.
 
-The captions icon opens **Audio & subtitles** to select tracks, adjust audio delay, load a subtitle file, or find subtitles on OpenSubtitles.com. Finding subtitles needs a free personal API key from OpenSubtitles, entered in **Appearance** or set with `FLICK_OPENSUBTITLES_KEY`. A key entered in Appearance is stored in `settings.json`; the environment variable overrides it and is never stored.
+The captions icon opens **Audio & subtitles** to select tracks, adjust audio delay, load a subtitle file, or find subtitles on OpenSubtitles.com. Finding subtitles needs a free personal API key from OpenSubtitles, entered in **Settings → Subtitles** or set with `FLICK_OPENSUBTITLES_KEY`. A key entered in Settings is stored in `settings.json`; the environment variable overrides it and is never stored.
 
 ## Torrents and Watch Now
 
@@ -43,7 +43,7 @@ Choose torrent files and a destination; completed, verified videos join the libr
 
 **Downloads** shows torrent download and upload rates, verification progress, and Pause All / Resume All. Export exact metainfo with **Export .torrent…**. Removing a transfer keeps its files unless you choose **Remove and Delete Files…** and confirm the listed paths.
 
-Setup's third screen asks whether completed downloads keep sharing; until you answer, the welcome page and Downloads ask too, and completed downloads pause. Change this, and the live torrent bandwidth limits, in **Appearance → Transfers**. Explicit shares keep sharing regardless of that preference, and all transfers stop when Flick closes. Verified torrent videos save their resume position by infohash and file index, so downloading the same video again into another folder keeps your place.
+Setup's third screen asks whether completed downloads keep sharing; until you answer, the welcome page and Downloads ask too, and completed downloads pause. Change this, and the live torrent bandwidth limits, in **Settings → Transfers**. Explicit shares keep sharing regardless of that preference, and all transfers stop when Flick closes. Verified torrent videos save their resume position by infohash and file index, so downloading the same video again into another folder keeps your place.
 
 To share a file or folder, choose it and copy its magnet link. See [transfer controls](TRANSFERS.md#desktop-transfer-controls) for details, and the [transfer diagnostic](TRANSFERS.md), which uses the same native transfer backend without the desktop.
 
@@ -68,7 +68,7 @@ A remote library lets one computer keep the videos and another watch them. A Mac
 
 Each paired server has its own section in the library, and its videos play like local ones, with Continue Watching. It has been played from a MacBook at Original and through a transcode tier; see [validation](VALIDATION.md#remote-playback-from-the-macbook-pro-on-2026-11-10).
 
-To pair, run `flick-serve --print-pairing` on the server and copy the `flick-remote://…` string. In Flick, open **Appearance**, find **Remote Libraries**, choose **Add Server…**, paste the string, and choose **Add**. Each paired server has a row with its address and status: Online with its number of videos, Offline, or Wrong token. The row can rename the server, refresh it, change its default quality, and remove it. The token is saved in `settings.json`; treat the pairing string like a password.
+To pair, run `flick-serve --print-pairing` on the server and copy the `flick-remote://…` string. In Flick, open **Settings**, find **Remote Libraries**, choose **Add Server…**, paste the string, and choose **Add**. Each paired server has a row with its address and status: Online with its number of videos, Offline, or Wrong token. The row can rename the server, refresh it, change its default quality, and remove it. The token is saved in `settings.json`; treat the pairing string like a password.
 
 **Quality.** Original sends the file as it is: every audio and subtitle track, HDR, and the full bit rate. Use it at home, or on any direct path with room to spare. The lower tiers are live H.264 transcodes made on the server: 1080p High (12 Mbit/s) for fast fibre upload, 1080p (6 Mbit/s) for ordinary home upload, 720p (3 Mbit/s) for hotel Wi-Fi and relayed paths, and 480p (1.5 Mbit/s) for cellular. A server offers them only when it has FFmpeg. **Quality**, at the top of the player's Audio & subtitles menu, switches tiers for a remote video and reloads at the current position.
 
@@ -88,7 +88,7 @@ This has been checked with loopback tests and with `curl` against a real Tailsca
 
 **On the machine that keeps the files.** Nothing is accepted until its owner allows it:
 
-- In Flick, open **Appearance**, find **Remote Libraries**, turn on **Share my library on Tailscale**, then turn on **Let paired Flicks download to this Mac** in the group below it. Choose the **Downloads folder** (the default is Flick's download folder) and, to let others seed from this machine, add folders under **Folders others may seed from**. Turning the switch off refuses new commands at once.
+- In Flick, open **Settings**, find **Remote Libraries**, turn on **Share my library on Tailscale**, then turn on **Let paired Flicks download to this Mac** in the group below it. Choose the **Downloads folder** (the default is Flick's download folder) and, to let others seed from this machine, add folders under **Folders others may seed from**. Turning the switch off refuses new commands at once.
 - With `flick-serve`, pass `--allow-downloads`, and `--download-dir`, `--share-root`, and `--links` as needed. See [accepting downloads](REMOTE.md#accepting-downloads-from-other-flicks).
 
 The owner's own preferences govern what it downloads for others: keep sharing completed downloads, bandwidth limits, and public peer discovery. Another Flick cannot change them, and never chooses a folder; the server saves into its download folder. Link downloads need yt-dlp on that machine.
@@ -112,7 +112,7 @@ Limits:
 
 ## Command center
 
-Press ⌘K on macOS or Ctrl+K elsewhere, from the library or the player. One large field finds library videos and plays them, searches online and lists the results, offers to download a pasted YouTube, X, web, or magnet link, and runs commands such as Open Video, Add Folder, Downloads, Appearance, Fullscreen, Picture in Picture, and Quit. Arrow keys choose a row, Enter runs it, and Escape or a click outside closes it. The library's search field shows the shortcut; clicking it opens the command center too.
+Press ⌘K on macOS or Ctrl+K elsewhere, from the library or the player. One large field finds library videos and plays them, searches online and lists the results, offers to download a pasted YouTube, X, web, or magnet link, and runs commands such as Open Video, Add Folder, Downloads, Open Settings, Fullscreen, Picture in Picture, and Quit. Arrow keys choose a row, Enter runs it, and Escape or a click outside closes it. The library's search field shows the shortcut; clicking it opens the command center too.
 
 ## Keyboard and mouse
 
@@ -137,7 +137,7 @@ Player keys can be changed on the **Keyboard Shortcuts** page, which also lists 
 | Ctrl+O / Cmd+O | Add videos in the library or open a video in the player |
 | Ctrl+K / Cmd+K | Open the command center |
 | Ctrl+F / Cmd+F | Focus the library search field |
-| Ctrl+, / Cmd+, | Open Appearance |
+| Ctrl+, / Cmd+, | Open Settings |
 | Ctrl+L / Cmd+L | Load a subtitle file |
 | Ctrl+Q / Cmd+Q | Quit Flick |
 | ? | Show keyboard shortcuts |
@@ -148,9 +148,9 @@ Click or drag the timeline to seek, or the volume slider to adjust sound. Hover 
 
 ## Appearance
 
-Flick draws its interface in a macOS, Windows 11, or GNOME style and matches the running system by default. Each style has its own window chrome, sidebar, controls, typography, and player: a floating HUD on macOS, a transport bar on Windows, and a rounded OSD on GNOME. Choose the style, a light or dark scheme, and an accent color in **Appearance**. The native style uses the platform UI font; other styles use the closest installed font or the bundled Inter. Icons come from the free Hugeicons set. See [asset sources and licenses](../assets/README.md).
+Flick draws its interface in a macOS, Windows 11, or GNOME style and matches the running system by default. Each style has its own window chrome, sidebar, controls, typography, and player: a floating HUD on macOS, a transport bar on Windows, and a rounded OSD on GNOME. Choose the style, a light or dark scheme, and an accent color in the **Appearance** group of **Settings**. The native style uses the platform UI font; other styles use the closest installed font or the bundled Inter. Icons come from the free Hugeicons set. See [asset sources and licenses](../assets/README.md).
 
-**Appearance** also sets text size, contrast, button labels, and subtitle size, color, background, and position. Auto contrast follows the system's increased-contrast setting on macOS, Windows, and GNOME. Colors meet WCAG AA contrast in every style, scheme, and accent.
+**Settings** also sets text size, contrast, and button labels under **Accessibility**, and subtitle size, color, background, and position under **Subtitles**. Auto contrast follows the system's increased-contrast setting on macOS, Windows, and GNOME. Colors meet WCAG AA contrast in every style, scheme, and accent.
 
 ## Settings and environment variables
 
@@ -162,7 +162,7 @@ Preferences are saved to `settings.json` in the operating system's per-user appl
 | `FLICK_DATA_DIR` | Base folder for torrent state (in `transfers`), remote library listings and subtitles (in `remote`), and cached posters (in `thumbnails`). By default, torrent state and remote library files go in the platform's data directory and posters in its cache directory. `flick-serve` also keeps its token in `remote` here unless given `--state-dir`. |
 | `FLICK_DOWNLOAD_DIR` | Folder for link downloads. Default: `Downloads/Flick` in your home folder. |
 | `FLICK_YTDLP` | Full path to yt-dlp, checked before `PATH`. |
-| `FLICK_OPENSUBTITLES_KEY` | OpenSubtitles API key. It overrides a key entered in Appearance and is never written to `settings.json`. |
+| `FLICK_OPENSUBTITLES_KEY` | OpenSubtitles API key. It overrides a key entered in Settings and is never written to `settings.json`. |
 | `FLICK_MPV_LIBRARY` | Full path to the libmpv shared library, used instead of searching the usual locations. |
 | `FLICK_HWDEC` | Set to `no` to turn off hardware decoding. |
 | `FLICK_FFMPEG` | Full path to the FFmpeg that the remote library server uses for quality tiers below Original, checked before `PATH`. |

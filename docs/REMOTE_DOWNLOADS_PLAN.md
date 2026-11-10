@@ -18,14 +18,14 @@ A first launch asks four questions and ends with everything paired: where the vi
 
 **Share.** *Seed from Mac mini* opens a folder browser limited to the folders the Mac mini's owner allowed. The magnet link is the server's; the share keeps going after the MacBook closes.
 
-**Onboarding.** Four screens on first launch, also reachable from Appearance as *Set up Flick again*:
+**Onboarding.** Four screens on first launch, also reachable from Settings as *Set up Flick again*:
 
 1. *Where are your videos?* On this Mac, or on another machine on my Tailscale network (paste its pairing string; the connection is tested before Next is enabled).
 2. *Share this library?* The in-app server switch with its pairing string and Copy. Off by default.
 3. *Where should downloads go?* The Save to picker, listing this Mac and every paired machine that accepts downloads; with the seeding choice that the welcome page asks today.
 4. *Done.* A summary of what was set, with each line linking to its settings page.
 
-**Server side.** Appearance → Remote Libraries gets a second group, *Let paired Flicks download to this Mac*, off by default, with the downloads folder and the list of folders other Flicks may share from. A headless `flick-serve` gets the same as flags.
+**Server side.** Settings → Remote Libraries gets a second group, *Let paired Flicks download to this Mac*, off by default, with the downloads folder and the list of folders other Flicks may share from. A headless `flick-serve` gets the same as flags.
 
 ## Architecture
 

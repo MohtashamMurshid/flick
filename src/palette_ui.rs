@@ -364,9 +364,9 @@ impl Flick {
             ),
             command(
                 "palette",
-                "Appearance",
+                "Open Settings",
                 key(","),
-                Action::Page(Page::Appearance),
+                Action::Page(Page::Settings),
             ),
             command(
                 "keyboard",

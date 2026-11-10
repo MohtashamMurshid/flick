@@ -2,7 +2,7 @@
 
 `flick-serve` is a headless server for a machine that keeps the storage, such as a Mac mini. Another Flick on the same [Tailscale](https://tailscale.com) network can browse its library and stream the original files from it. Files are not copied. The design is in [the remote library plan](REMOTE_PLAN.md).
 
-**Status:** the server, this tool, the quality tiers, and the desktop side (pairing in **Appearance → Remote Libraries**, a library section per server, playback, subtitles, and the quality picker) are implemented and covered by loopback tests; the server was checked on a real Tailscale address, including from the desktop app's own "Share my library on Tailscale" switch (see [validation](VALIDATION.md#remote-library-integration-and-quality-tiers-on-2026-11-10)), and played from a MacBook (see [validation](VALIDATION.md#remote-playback-from-the-macbook-pro-on-2026-11-10)). Accepting downloads from paired Flicks is implemented, covered by loopback tests, and checked with `curl` on a real Tailscale address; it has not been used from a second machine yet (see [validation](VALIDATION.md#download-to-another-machine-and-onboarding-on-2026-11-10)). You can also check the server with `curl` or stock `mpv`, as shown below.
+**Status:** the server, this tool, the quality tiers, and the desktop side (pairing in **Settings → Remote Libraries**, a library section per server, playback, subtitles, and the quality picker) are implemented and covered by loopback tests; the server was checked on a real Tailscale address, including from the desktop app's own "Share my library on Tailscale" switch (see [validation](VALIDATION.md#remote-library-integration-and-quality-tiers-on-2026-11-10)), and played from a MacBook (see [validation](VALIDATION.md#remote-playback-from-the-macbook-pro-on-2026-11-10)). Accepting downloads from paired Flicks is implemented, covered by loopback tests, and checked with `curl` on a real Tailscale address; it has not been used from a second machine yet (see [validation](VALIDATION.md#download-to-another-machine-and-onboarding-on-2026-11-10)). You can also check the server with `curl` or stock `mpv`, as shown below.
 
 ## What it does, and what it never does
 
@@ -90,7 +90,7 @@ flick-serve --library --allow-downloads --share-root /Volumes/Media/Films --link
 
 A hidden `--peer IP:PORT`, repeatable, adds an explicit peer to every lookup and resume. It exists for tests with `--local-transfers` and does not appear in `--help`.
 
-`flick-serve` refuses `--download-dir`, `--share-root`, `--links`, and the other options above without `--allow-downloads`. While a feature is off, its routes answer `403` with a message that names the desktop setting, Appearance → Remote Libraries; for `flick-serve` the equivalent is the flag.
+`flick-serve` refuses `--download-dir`, `--share-root`, `--links`, and the other options above without `--allow-downloads`. While a feature is off, its routes answer `403` with a message that names the desktop setting, Settings → Remote Libraries; for `flick-serve` the equivalent is the flag.
 
 To run it at login with these options, pass them to the launchd installer after `--`, as in [Start at login with launchd](#start-at-login-with-launchd).
 
@@ -110,7 +110,7 @@ flick-serve --print-pairing
 
 prints it again at any time, including while the server is running. Give it the same `--state-dir`, and the same `--port` or `--bind`, as the running server, or it prints a different address or makes a new token.
 
-On the other Mac, open Flick's **Appearance**, find **Remote Libraries**, choose **Add Server…**, paste the string, and choose **Add**. The row then shows the server's address and "Online · N videos", "Offline", or "Wrong token. Pair again". Pasting a string for an address that is already paired replaces its token.
+On the other Mac, open Flick's **Settings**, find **Remote Libraries**, choose **Add Server…**, paste the string, and choose **Add**. The row then shows the server's address and "Online · N videos", "Offline", or "Wrong token. Pair again". Pasting a string for an address that is already paired replaces its token.
 
 Treat the string like a password. To revoke every paired Flick, run `flick-serve --new-token --print-pairing` and restart the server.
 

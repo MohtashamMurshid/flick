@@ -111,7 +111,7 @@ enum Page {
     History,
     Shows,
     Downloads,
-    Appearance,
+    Settings,
     Shortcuts,
 }
 
@@ -123,7 +123,7 @@ impl Page {
             Self::History => "History",
             Self::Shows => "Shows",
             Self::Downloads => "Downloads",
-            Self::Appearance => "Appearance",
+            Self::Settings => "Settings",
             Self::Shortcuts => "Keyboard Shortcuts",
         }
     }
@@ -1845,7 +1845,7 @@ impl Flick {
         let key = self.store.data.subtitle_key();
         if key.is_empty() {
             self.subtitle_search.results = Some(Err(
-                "Add an OpenSubtitles API key in Appearance › Subtitles to search.".into(),
+                "Add an OpenSubtitles API key in Settings › Subtitles to search.".into(),
             ));
             cx.notify();
             return;
@@ -2111,7 +2111,7 @@ impl Flick {
             return;
         }
         if command && key == "," {
-            self.show_page(Page::Appearance, window, cx);
+            self.show_page(Page::Settings, window, cx);
             cx.stop_propagation();
             return;
         }

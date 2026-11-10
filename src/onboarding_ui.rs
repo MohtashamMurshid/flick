@@ -169,7 +169,7 @@ fn this_computer() -> &'static str {
 
 impl Flick {
     /// Switches to the onboarding view at its first step. Called by
-    /// "Set up Flick again" in Appearance. Clears `setup_done`, so quitting
+    /// "Set up Flick again" in Settings. Clears `setup_done`, so quitting
     /// halfway comes back here on an empty library.
     #[allow(dead_code)]
     pub(crate) fn start_onboarding(&mut self, cx: &mut Context<Self>) {
@@ -642,7 +642,7 @@ impl Flick {
                 "onboarding-source-remote",
                 "library",
                 "On another machine on my Tailscale network",
-                "Paste the pairing string shown in that Flick's Appearance → Remote Libraries.",
+                "Paste the pairing string shown in that Flick's Settings → Remote Libraries.",
                 remote,
                 cx,
                 |this, window, cx| {
@@ -892,7 +892,7 @@ impl Flick {
         v_flex()
             .gap_2()
             .child(div().text_color(t.muted).child(
-                "Everything here is also in Appearance, and you can run this setup again from there.",
+                "Everything here is also in Settings, and you can run this setup again from there.",
             ))
             .child(group(&t, rows))
     }

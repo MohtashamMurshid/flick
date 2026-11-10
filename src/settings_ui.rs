@@ -1,5 +1,5 @@
-//! The Appearance page: interface style, color scheme, accent, and playback
-//! chrome preferences.
+//! The Settings page: appearance, accessibility, playback, transfers, remote
+//! libraries, subtitles, and setup, plus the Keyboard Shortcuts page.
 
 use super::{
     chrome_ui::{group, notice, row, section_title},
@@ -15,7 +15,7 @@ use crate::{
 use gpui::{FontWeight, hsla, linear_color_stop, linear_gradient};
 
 impl Flick {
-    pub(super) fn appearance_page(&self, cx: &Context<Self>) -> Div {
+    pub(super) fn settings_page(&self, cx: &Context<Self>) -> Div {
         let t = cx.theme().clone();
         let appearance = self.store.data.appearance.clone();
         let native = format!("{} detected", Style::native().label());
@@ -257,17 +257,16 @@ impl Flick {
         v_flex()
             .w_full()
             .max_w(px(760.))
-            .child(section_title(&t, "Interface Style"))
+            .child(section_title(&t, "Appearance"))
             .child(
                 div()
                     .mb_2()
                     .text_size(t.font(t.text_size - 1.))
                     .text_color(t.muted)
-                    .child("Changes window chrome, controls, typography, and the player for each platform."),
+                    .child("The interface style changes window chrome, controls, typography, and the player for each platform."),
             )
             .child(tile_row)
-            .child(div().h(px(24.)))
-            .child(section_title(&t, "Look"))
+            .child(div().h(px(16.)))
             .child(group(
                 &t,
                 vec![
@@ -961,7 +960,7 @@ impl Flick {
             ),
             (format!("{command}L"), "Load subtitles"),
             (format!("{command}K"), "Search"),
-            (format!("{command},"), "Appearance"),
+            (format!("{command},"), "Settings"),
             ("Tab / Shift+Tab".to_owned(), "Move between controls"),
             ("Arrow keys".to_owned(), "Move between video cards"),
             ("Enter / Space".to_owned(), "Activate the focused control"),

@@ -1045,7 +1045,7 @@ impl Flick {
                 ("magnet", "Paste Link", Control::PasteMagnet),
                 ("share-2", "Share Files…", Control::Share),
             ],
-            Page::History | Page::Appearance | Page::Shortcuts => &[],
+            Page::History | Page::Settings | Page::Shortcuts => &[],
         }
     }
 
@@ -1247,7 +1247,7 @@ impl Flick {
         let settings = v_flex()
             .gap_0p5()
             .child(item(Page::Shortcuts, "keyboard", None))
-            .child(item(Page::Appearance, "palette", None));
+            .child(item(Page::Settings, "palette", None));
         let heading = |text: &'static str| {
             div()
                 .px_2p5()
@@ -1613,7 +1613,7 @@ impl Flick {
             Page::Shows => self.shows_page(width, cx),
             Page::History => self.history_page(cx),
             Page::Downloads => self.downloads_page(cx),
-            Page::Appearance => self.appearance_page(cx),
+            Page::Settings => self.settings_page(cx),
             Page::Shortcuts => self.shortcuts_page(cx),
         };
         body = body.child(page.when(!virtual_page, |d| d.flex_none()));
@@ -1746,7 +1746,7 @@ impl Flick {
                     .mt_2()
                     .text_size(t.font(12.))
                     .text_color(t.muted)
-                    .child(format!("{command}K to search or paste a link  ·  {command}, for Appearance")),
+                    .child(format!("{command}K to search or paste a link  ·  {command}, for Settings")),
             )
     }
 
