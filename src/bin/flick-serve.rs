@@ -72,7 +72,6 @@ async fn main() -> Result<()> {
         Some(dir) => dir,
         None => default_state_dir()?,
     };
-    let token = auth::load_or_create_token(&state_dir, args.new_token)?;
     let bind = match args.bind {
         Some(bind) => bind,
         None => SocketAddr::new(IpAddr::V4(bind::tailscale_ipv4().await?), args.port),
@@ -80,6 +79,9 @@ async fn main() -> Result<()> {
     if let Some(reason) = bind::refusal(bind.ip()) {
         bail!(reason);
     }
+    // Only after the address is acceptable, so a refused start leaves no
+    // state folder or token behind.
+    let token = auth::load_or_create_token(&state_dir, args.new_token)?;
 
     if args.print_pairing {
         if bind.port() == 0 {
