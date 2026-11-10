@@ -129,6 +129,7 @@ impl Default for Settings {
             opensubtitles_key: String::new(),
             subtitle_languages: "en".into(),
             transfers: TransferPreferences::default(),
+            remote: remote::RemoteSettings::default(),
             torrent_history: Vec::new(),
             removed_videos: Vec::new(),
             unverified_torrent_files: Vec::new(),
@@ -449,6 +450,80 @@ impl Settings {
 
     pub fn resume_position(&self, path: &Path) -> f64 {
         self.index().resume(self, path)
+    }
+
+    /// Saved progress on a remote video, keyed by local server id and the
+    /// server's video id.
+    pub fn remote_progress(&self, server: &str, video: &str) -> Option<&remote::RemoteProgress> {
+        self.remote
+            .progress
+            .iter()
+            .find(|p| p.server == server && p.video == video)
+    }
+
+    /// Where a remote video resumes, under the same rules as local files.
+    pub fn remote_resume_position(&self, server: &str, video: &str) -> f64 {
+        self.remote_progress(server, video)
+            .map_or(0.0, |p| eligible_resume(p.position, p.duration))
+    }
+
+    /// Records progress on a remote video, newest first. Like local history,
+    /// a finished mark stays, and reaching the end marks it finished.
+    pub fn remember_remote(
+        &mut self,
+        server: &str,
+        video: &str,
+        title: &str,
+        position: f64,
+        duration: f64,
+    ) {
+        if server.is_empty() || video.is_empty() {
+            return;
+        }
+        let finished = self
+            .remote_progress(server, video)
+            .is_some_and(|p| p.finished);
+        let duration = non_negative_finite(duration);
+        let mut position = non_negative_finite(position);
+        if duration > 0.0 {
+            position = position.min(duration);
+        }
+        self.put_remote_progress(remote::RemoteProgress {
+            server: server.to_owned(),
+            video: video.to_owned(),
+            title: title.to_owned(),
+            position,
+            duration,
+            finished: finished || reached_end(position, duration),
+            updated: unix_now(),
+        });
+    }
+
+    /// Records a remote video as finished, keeping its saved duration.
+    #[cfg_attr(not(test), allow(dead_code))] // For the remote library's Mark Watched.
+    pub fn mark_remote_finished(&mut self, server: &str, video: &str, title: &str) {
+        if server.is_empty() || video.is_empty() {
+            return;
+        }
+        let duration = self
+            .remote_progress(server, video)
+            .map_or(0.0, |p| p.duration);
+        self.put_remote_progress(remote::RemoteProgress {
+            server: server.to_owned(),
+            video: video.to_owned(),
+            title: title.to_owned(),
+            position: duration,
+            duration,
+            finished: true,
+            updated: unix_now(),
+        });
+    }
+
+    fn put_remote_progress(&mut self, entry: remote::RemoteProgress) {
+        self.remote
+            .progress
+            .retain(|p| p.server != entry.server || p.video != entry.video);
+        self.remote.progress.insert(0, entry);
     }
 
     pub fn is_removed(&self, path: &Path) -> bool {
@@ -785,6 +860,12 @@ fn eligible_resume(position: f64, duration: f64) -> f64 {
 
 fn finite_or(value: f64, fallback: f64) -> f64 {
     if value.is_finite() { value } else { fallback }
+}
+
+fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs())
 }
 
 pub struct Store {
@@ -1692,6 +1773,74 @@ mod tests {
         assert_eq!(order(Sort::Added), ["a.mkv", "C.mkv", "b.mkv"]);
         assert_eq!(order(Sort::Title), ["a.mkv", "b.mkv", "C.mkv"]);
         assert_eq!(order(Sort::Watched), ["b.mkv", "C.mkv", "a.mkv"]);
+    }
+
+    #[test]
+    fn remote_progress_resumes_like_local_files_and_is_keyed_by_server_and_video() {
+        let mut settings = Settings::default();
+        for (position, duration, expected) in [
+            (5.0, 100.0, 0.0),
+            (5.1, 100.0, 5.1),
+            (90.0, 100.0, 90.0),
+            (90.1, 100.0, 0.0),
+            (25.0, 0.0, 0.0),
+            (f64::NAN, 100.0, 0.0),
+        ] {
+            settings.remember_remote("mini", "abc", "Film", position, duration);
+            assert_eq!(settings.remote_resume_position("mini", "abc"), expected);
+        }
+        assert_eq!(settings.remote.progress.len(), 1);
+        assert_eq!(settings.remote_resume_position("mini", "other"), 0.0);
+        assert_eq!(settings.remote_resume_position("laptop", "abc"), 0.0);
+        settings.remember_remote("laptop", "abc", "Other", 40.0, 100.0);
+        settings.remember_remote("", "abc", "Ignored", 40.0, 100.0);
+        settings.remember_remote("mini", "", "Ignored", 40.0, 100.0);
+        assert_eq!(settings.remote.progress.len(), 2);
+        assert_eq!(settings.remote.progress[0].server, "laptop");
+        assert_eq!(settings.remote_resume_position("laptop", "abc"), 40.0);
+        let saved = settings.remote_progress("mini", "abc").unwrap();
+        assert_eq!((saved.position, saved.duration), (0.0, 100.0));
+        assert!(saved.updated > 0);
+        // Newest first: updating an older entry moves it to the front.
+        settings.remember_remote("mini", "abc", "Film", 30.0, 100.0);
+        assert_eq!(settings.remote.progress[0].server, "mini");
+        // Positions past the end clamp to it.
+        settings.remember_remote("mini", "abc", "Film", 500.0, 100.0);
+        assert_eq!(
+            settings.remote_progress("mini", "abc").unwrap().position,
+            100.0
+        );
+    }
+
+    #[test]
+    fn remote_finished_marks_stick_and_survive_a_save() {
+        let mut settings = Settings::default();
+        settings.remember_remote("mini", "abc", "Film", 95.0, 100.0);
+        assert!(settings.remote_progress("mini", "abc").unwrap().finished);
+        // Rewatching from the start keeps the finished mark, as locally.
+        settings.remember_remote("mini", "abc", "Film", 20.0, 100.0);
+        let saved = settings.remote_progress("mini", "abc").unwrap();
+        assert!(saved.finished);
+        assert_eq!(settings.remote_resume_position("mini", "abc"), 20.0);
+
+        settings.remember_remote("mini", "def", "Show", 30.0, 200.0);
+        settings.mark_remote_finished("mini", "def", "Show");
+        let saved = settings.remote_progress("mini", "def").unwrap();
+        assert!(saved.finished);
+        assert_eq!((saved.position, saved.duration), (200.0, 200.0));
+        assert_eq!(settings.remote_resume_position("mini", "def"), 0.0);
+        settings.mark_remote_finished("mini", "new", "Unseen");
+        assert!(settings.remote_progress("mini", "new").unwrap().finished);
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.json");
+        let mut store = Store::load_from(&path);
+        store.data = settings;
+        store.save().unwrap();
+        let loaded = Store::load_from(&path);
+        assert_eq!(loaded.data.remote.progress.len(), 3);
+        assert!(loaded.data.remote_progress("mini", "abc").unwrap().finished);
+        assert_eq!(loaded.data.remote_resume_position("mini", "abc"), 20.0);
     }
 
     #[test]

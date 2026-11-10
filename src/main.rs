@@ -10,6 +10,7 @@ mod services;
 mod shortcuts;
 mod shutdown;
 mod smoke;
+mod source;
 mod store;
 mod theme;
 mod thumbnails;

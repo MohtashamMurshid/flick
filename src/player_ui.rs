@@ -310,7 +310,7 @@ impl Flick {
 
     fn player_titlebar(&self, window: &Window, cx: &Context<Self>) -> Stateful<Div> {
         let t = cx.theme();
-        let title = self.path.as_deref().map(file_title).unwrap_or_default();
+        let title = self.source().map(Source::title).unwrap_or_default();
         let labels = self.store.data.appearance.show_labels;
         let back = if labels {
             self.overlay_label_button("player-back", "arrow-left", "Library", Control::Library, cx)
@@ -869,7 +869,7 @@ impl Flick {
                 )
                 .into_any_element(),
             Style::Windows => {
-                let title = self.path.as_deref().map(file_title).unwrap_or_default();
+                let title = self.source().map(Source::title).unwrap_or_default();
                 v_flex()
                     .id("player-bar")
                     .absolute()
@@ -1285,6 +1285,30 @@ impl Flick {
                         panel = panel.child(option("subs-off".into(), "Off".into(), off).on_click(
                             cx.listener(|this, _, _, cx| this.property("sid", "no", cx)),
                         ));
+                    }
+                }
+                // Remote videos only: switching reloads at the current position.
+                if let Some(current) = self.remote_quality() {
+                    panel = panel.child(
+                        div()
+                            .px_2()
+                            .pt_2()
+                            .pb_1()
+                            .text_size(t.font(11.))
+                            .text_color(t.muted)
+                            .child("Quality"),
+                    );
+                    for &quality in self.quality_choices() {
+                        panel = panel.child(
+                            option(
+                                format!("quality-{quality}").into(),
+                                quality.label().into(),
+                                quality == current,
+                            )
+                            .on_click(cx.listener(
+                                move |this, _, window, cx| this.switch_quality(quality, window, cx),
+                            )),
+                        );
                     }
                 }
                 panel = panel.child(

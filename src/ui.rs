@@ -23,11 +23,13 @@ use crate::{
     playback_actor::PlayerProxy as Player,
     services::{Command as ServiceCommand, Event as ServiceEvent, Services},
     shortcuts::Shortcut,
+    source::{RemoteSource, Source},
     store::Store,
     theme::{ActiveTheme, Appearance, Style, Theme},
     video_frame_ui::VideoFrameView,
 };
 use chrome_ui::{h_flex, v_flex};
+use flick::remote::protocol::Quality;
 use gpui::{
     Animation, AnimationExt, AnyWindowHandle, App, Bounds, ClickEvent, ClipboardItem, Context, Div,
     ElementId, Entity, ExternalPaths, FocusHandle, Focusable, KeyDownEvent, MouseButton, ObjectFit,
@@ -42,6 +44,27 @@ use std::{
     sync::Arc,
     time::{Duration, Instant},
 };
+
+/// Sets network properties before a load: the bearer header and cache
+/// tuning for a remote video, or no header and libmpv's defaults for local
+/// files, so nothing carries over from an earlier remote load.
+fn set_network_profile(player: &Player, remote: Option<&RemoteSource>) {
+    let header = remote.map(RemoteSource::header).unwrap_or_default();
+    if let Err(error) = player.set_property(crate::source::HTTP_HEADERS, &header) {
+        tracing::warn!(%error, "Could not set HTTP request headers");
+    }
+    for (name, tuned, default) in crate::source::NETWORK_TUNING {
+        let value = if remote.is_some() { tuned } else { default };
+        let _ = player.set_optional_property(name, value);
+    }
+}
+
+/// Removes the bearer header so no later request or load carries it.
+fn clear_http_headers(player: &Player) {
+    if let Err(error) = player.set_property(crate::source::HTTP_HEADERS, "") {
+        tracing::warn!(%error, "Could not clear HTTP request headers");
+    }
+}
 
 /// How long playback controls stay visible without pointer movement.
 const CONTROLS_TIMEOUT: Duration = Duration::from_millis(2500);
@@ -157,7 +180,13 @@ pub struct Flick {
     player: Option<Player>,
     snapshot: PlaybackSnapshot,
     store: Store,
+    /// The local file of [`Self::source`], kept in sync by `set_source` for
+    /// sub-modules that read it directly. `library_files_ui` clears it when
+    /// it releases a deleted file; [`Self::source`] then reports nothing.
     path: Option<PathBuf>,
+    /// What is playing. Read through [`Self::source`], set through
+    /// [`Self::set_source`].
+    source: Option<Source>,
     frame: Option<Arc<RenderImage>>,
     video_frame: Entity<VideoFrameView>,
     library_ui_state: library_ui::LibraryUiState,
@@ -430,6 +459,7 @@ impl Flick {
             snapshot: PlaybackSnapshot::default(),
             store,
             path: None,
+            source: None,
             frame: None,
             video_frame,
             library_ui_state: library_ui::LibraryUiState::new(cx),
@@ -705,22 +735,78 @@ impl Flick {
             self.store.data.volume = s.volume;
             self.store.data.muted = s.muted;
             self.store.data.speed = s.speed;
-            if self.file_loaded
-                && self.pending_resume == 0.
-                && s.duration > 0.
-                && let Some(path) = &self.path
-            {
-                self.store.remember(path, s.position, s.duration);
+            if self.file_loaded && self.pending_resume == 0. {
+                if let Some(remote) = self.remote_source() {
+                    // The listing's duration covers streams libmpv cannot size.
+                    let duration = if s.duration > 0. {
+                        s.duration
+                    } else {
+                        remote.duration
+                    };
+                    let (server, video, title) = (
+                        remote.server_id.clone(),
+                        remote.video_id.clone(),
+                        remote.title.clone(),
+                    );
+                    if duration > 0. {
+                        self.store
+                            .data
+                            .remember_remote(&server, &video, &title, s.position, duration);
+                    }
+                } else if s.duration > 0.
+                    && let Some(path) = &self.path
+                {
+                    self.store.remember(path, s.position, s.duration);
+                }
             }
         }
         if let Err(error) = self.store.queue_save() {
             tracing::warn!(%error, "Could not save viewing preferences");
         }
         self.last_saved = Instant::now();
-        self.saved_position = self
-            .path
-            .clone()
-            .map(|path| (path, self.snapshot.position, self.snapshot.paused));
+        self.saved_position = self.source().map(|_| {
+            (
+                self.path.clone().unwrap_or_default(),
+                self.snapshot.position,
+                self.snapshot.paused,
+            )
+        });
+    }
+
+    /// What is playing. A local source counts only while `path` still names
+    /// it, because `library_files_ui` clears `path` on its own.
+    fn source(&self) -> Option<&Source> {
+        match &self.source {
+            Some(Source::Local(path)) if self.path.as_ref() != Some(path) => None,
+            source => source.as_ref(),
+        }
+    }
+
+    fn set_source(&mut self, source: Option<Source>) {
+        self.path = source
+            .as_ref()
+            .and_then(Source::local_path)
+            .map(PathBuf::from);
+        self.source = source;
+    }
+
+    /// The playing remote video, if any.
+    fn remote_source(&self) -> Option<&RemoteSource> {
+        match self.source() {
+            Some(Source::Remote(remote)) => Some(remote),
+            _ => None,
+        }
+    }
+
+    /// The tier of the playing remote video, for the player's quality picker.
+    pub(crate) fn remote_quality(&self) -> Option<Quality> {
+        self.remote_source().map(|remote| remote.quality)
+    }
+
+    /// Tiers the quality picker offers. Narrow this to the listing's
+    /// `qualities` once `remote_client::RemoteState` keeps them per server.
+    pub(crate) fn quality_choices(&self) -> &'static [Quality] {
+        &Quality::ALL
     }
 
     fn library_changed(&mut self, cx: &mut Context<Self>) {
@@ -853,48 +939,148 @@ impl Flick {
             cx.notify();
             return;
         };
+        set_network_profile(player, None);
         match player.load(&source) {
             Ok(()) => {
-                self.thumbnails.idle_close();
-                self.poster_requests.clear();
-                self.poster_queue.clear();
-                self.posters_dirty = true;
-                if let Some(previews) = &self.previews {
-                    previews.idle_close();
-                }
-                self.pending_resume = self.store.resume_position(&path);
-                self.file_loaded = false;
-                self.streaming = stream.is_some();
-                self.path = Some(path.clone());
-                self.library_files_restored([&path]);
-                self.store.data.restore_video(&path);
-                self.library_changed(cx);
-                if self.view != View::Player {
-                    self.entered_player = Instant::now();
-                }
-                self.view = View::Player;
-                self.focus.focus(window);
-                self.snapshot = PlaybackSnapshot::default();
-                self.error = None;
-                self.menu = None;
-                self.opened_at = Some(Instant::now());
-                self.up_next = None;
-                self.was_eof = false;
-                self.hover = None;
-                self.preview_requested = f64::NAN;
-                self.preview_shown = self.preview_generation;
-                if let Some(old) = self.preview_image.take() {
-                    let _ = window.drop_image(old);
-                }
-                self.pointer_moved_at = Instant::now();
-                self.controls_shown = true;
-                self.clear_frame(window, cx);
-                window.set_window_title(&format!("{} — Flick", file_title(&path)));
-                tracing::info!(path = %path.display(), "Opening video");
+                let resume = self.store.resume_position(&path);
+                self.begin_playback(Source::Local(path), resume, stream.is_some(), window, cx);
             }
             Err(error) => self.error = Some(format!("Could not play this file. {error:#}")),
         }
         cx.notify();
+    }
+
+    /// Plays a video from a paired remote library. Resumes where it was
+    /// left, under the same rules as local files.
+    #[allow(dead_code)] // Called by the remote library section.
+    pub(crate) fn open_remote(
+        &mut self,
+        remote: RemoteSource,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.quitting {
+            return;
+        }
+        let resume = self
+            .store
+            .data
+            .remote_resume_position(&remote.server_id, &remote.video_id);
+        self.load_remote(remote, resume, window, cx);
+    }
+
+    /// Reloads the playing remote video at another tier, at the current
+    /// position. Does nothing for local files.
+    pub(crate) fn switch_quality(
+        &mut self,
+        quality: Quality,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.quitting {
+            return;
+        }
+        let Some(remote) = self.remote_source() else {
+            return;
+        };
+        if remote.quality == quality {
+            return;
+        }
+        let mut remote = remote.clone();
+        remote.quality = quality;
+        let position = if self.file_loaded {
+            self.snapshot.position
+        } else {
+            self.pending_resume
+        };
+        self.load_remote(remote, position, window, cx);
+    }
+
+    fn load_remote(
+        &mut self,
+        remote: RemoteSource,
+        resume: f64,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // A local open still resolving in the background must not replace this.
+        self.open_generation = self.open_generation.wrapping_add(1);
+        self.pending_open = None;
+        self.persist();
+        let Some(player) = &self.player else {
+            cx.notify();
+            return;
+        };
+        set_network_profile(player, Some(&remote));
+        match player.load(&remote.url()) {
+            Ok(()) => {
+                tracing::info!(
+                    server = %remote.server_name,
+                    video = %remote.video_id,
+                    quality = %remote.quality,
+                    "Opening remote video"
+                );
+                self.begin_playback(Source::Remote(remote), resume, false, window, cx);
+            }
+            Err(error) => {
+                clear_http_headers(player);
+                self.error = Some(format!("Could not play this video. {error:#}"));
+            }
+        }
+        cx.notify();
+    }
+
+    /// Player state for a source `player.load` accepted.
+    fn begin_playback(
+        &mut self,
+        source: Source,
+        resume: f64,
+        streaming: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.thumbnails.idle_close();
+        self.poster_requests.clear();
+        self.poster_queue.clear();
+        self.posters_dirty = true;
+        if let Some(previews) = &self.previews {
+            previews.idle_close();
+        }
+        self.pending_resume = resume;
+        self.file_loaded = false;
+        self.streaming = streaming;
+        let title = source.title();
+        let local = source.local_path().map(PathBuf::from);
+        self.set_source(Some(source));
+        if let Some(path) = &local {
+            self.library_files_restored([path]);
+            self.store.data.restore_video(path);
+        }
+        self.library_changed(cx);
+        if self.view != View::Player {
+            self.entered_player = Instant::now();
+        }
+        self.view = View::Player;
+        self.focus.focus(window);
+        self.snapshot = PlaybackSnapshot::default();
+        self.error = None;
+        self.menu = None;
+        self.opened_at = Some(Instant::now());
+        self.up_next = None;
+        self.was_eof = false;
+        self.hover = None;
+        self.preview_requested = f64::NAN;
+        self.preview_shown = self.preview_generation;
+        if let Some(old) = self.preview_image.take() {
+            let _ = window.drop_image(old);
+        }
+        self.pointer_moved_at = Instant::now();
+        self.controls_shown = true;
+        self.clear_frame(window, cx);
+        window.set_window_title(&format!("{title} — Flick"));
+        if let Some(path) = &local {
+            tracing::info!(path = %path.display(), "Opening video");
+        }
     }
 
     /// The torrent and file index of a selected file that is still
@@ -971,7 +1157,7 @@ impl Flick {
     }
 
     fn playing(&self) -> bool {
-        self.path.is_some() && !self.snapshot.paused && !self.snapshot.eof
+        self.source().is_some() && !self.snapshot.paused && !self.snapshot.eof
     }
 
     /// Player controls hide while video plays and the pointer is still.
@@ -1095,6 +1281,7 @@ impl Flick {
     fn hover_timeline(&mut self, x: Pixels, cx: &mut Context<Self>) {
         let bounds = self.timeline.get();
         let duration = self.snapshot.duration;
+        // Previews decode the local file; remote videos have none.
         let Some(path) = self.path.clone() else {
             return;
         };
@@ -1203,8 +1390,14 @@ impl Flick {
             return Duration::from_millis(500);
         };
         let mut changed = false;
+        // Only the current request's events arrive. Once a remote file has
+        // loaded or failed, libmpv no longer needs the token for new requests.
+        let remote = self.source().is_some_and(Source::is_remote);
         for event in player.poll_events() {
             changed = true;
+            if remote && !matches!(event, PlayerEvent::OperationCompleted { .. }) {
+                clear_http_headers(player);
+            }
             match event {
                 PlayerEvent::FileLoaded => {
                     self.file_loaded = true;
@@ -1447,7 +1640,7 @@ impl Flick {
             Control::PasteMagnet => self.paste_link(cx),
             Control::Open => self.pick(false, window, cx),
             Control::Subtitle => self.pick(true, window, cx),
-            Control::Play if self.path.is_some() => {
+            Control::Play if self.source().is_some() => {
                 if self.snapshot.eof {
                     self.command(&["seek", "0", "absolute+exact"], cx);
                     self.property("pause", "no", cx);
@@ -1456,7 +1649,7 @@ impl Flick {
                 }
                 self.pointer_moved_at = Instant::now();
             }
-            Control::Back | Control::Forward if self.path.is_some() => {
+            Control::Back | Control::Forward if self.source().is_some() => {
                 let delta = if matches!(control, Control::Back) {
                     -10.
                 } else {
@@ -1517,6 +1710,7 @@ impl Flick {
     }
 
     /// The next (`step` 1) or previous (-1) episode of the playing show.
+    /// Local files only; remote videos have no episodes here yet.
     fn adjacent_episode(&self, step: isize) -> Option<PathBuf> {
         let current = self.path.as_deref()?;
         self.store.data.adjacent_episode(current, step)
@@ -1524,7 +1718,7 @@ impl Flick {
 
     /// Opens the OpenSubtitles search with the video's title filled in.
     fn find_subtitles(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let title = self.path.as_deref().map(file_title).unwrap_or_default();
+        let title = self.source().map(Source::title).unwrap_or_default();
         let query = flick::subtitles::query_from_title(&title);
         self.subtitle_query
             .update(cx, |field, cx| field.set_value(query, cx));
@@ -1553,6 +1747,7 @@ impl Flick {
             generation: self.subtitle_search.generation,
             key,
             query,
+            // The file hash needs a local file; remote searches use the title.
             video: self.path.clone(),
             languages: self.store.data.subtitle_languages.clone(),
         };
@@ -1564,21 +1759,26 @@ impl Flick {
         result: flick::subtitles::SubtitleResult,
         cx: &mut Context<Self>,
     ) {
-        let Some(path) = self.path.clone() else {
-            return;
+        let fallback = thumbnail_cache()
+            .and_then(|cache| cache.parent().map(|base| base.join("subtitles")))
+            .unwrap_or_else(|| std::env::temp_dir().join("flick-subtitles"));
+        // Beside a local file; a remote video's folder is on its server.
+        let (folder, stem) = match self.source() {
+            Some(Source::Local(path)) => (
+                path.parent().map(PathBuf::from).unwrap_or_default(),
+                path.file_stem()
+                    .map(|stem| stem.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "subtitles".into()),
+            ),
+            Some(Source::Remote(remote)) => (fallback.clone(), remote.video_id.clone()),
+            None => return,
         };
         self.subtitle_search.downloading = Some(result.file_id);
-        let stem = path
-            .file_stem()
-            .map(|stem| stem.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "subtitles".into());
         let command = ServiceCommand::SubtitleDownload {
             key: self.store.data.subtitle_key(),
             result,
-            folder: path.parent().map(PathBuf::from).unwrap_or_default(),
-            fallback: thumbnail_cache()
-                .and_then(|cache| cache.parent().map(|base| base.join("subtitles")))
-                .unwrap_or_else(|| std::env::temp_dir().join("flick-subtitles")),
+            folder,
+            fallback,
             stem,
         };
         self.send(command, cx);
@@ -1603,7 +1803,7 @@ impl Flick {
     }
 
     fn shortcut(&mut self, shortcut: Shortcut, window: &mut Window, cx: &mut Context<Self>) {
-        let loaded = self.path.is_some() && self.file_loaded;
+        let loaded = self.source().is_some() && self.file_loaded;
         match shortcut {
             Shortcut::PlayPause => self.handle(Control::Play, window, cx),
             Shortcut::SeekBack => self.handle(Control::Back, window, cx),
