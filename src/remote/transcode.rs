@@ -6,7 +6,7 @@
 //! script, as the yt-dlp tests do; real FFmpeg is only used by an
 //! `#[ignore]` test in `tests/remote_hls.rs`.
 
-use super::protocol::{EmbeddedSubtitle, HLS_SEGMENT_SECONDS, Quality};
+use super::protocol::{AudioTrack, EmbeddedSubtitle, HLS_SEGMENT_SECONDS, Quality};
 use anyhow::{Context, Result, bail};
 use serde_json::Value;
 use std::{
@@ -59,6 +59,9 @@ pub struct MediaInfo {
     pub color_transfer: String,
     /// Subtitle streams in file order; `track` is the index among them.
     pub subtitles: Vec<EmbeddedSubtitle>,
+    /// Audio streams in file order; `track` is the index among them, as
+    /// FFmpeg's `0:a:<track>` counts them.
+    pub audio: Vec<AudioTrack>,
 }
 
 /// Finds ffmpeg and ffprobe and the best H.264 encoder that works.
@@ -345,7 +348,8 @@ fn file_url(path: &Path) -> OsString {
     url
 }
 
-/// Reads duration, size, frame rate, HDR, and subtitle streams with ffprobe.
+/// Reads duration, size, frame rate, HDR, and audio and subtitle streams
+/// with ffprobe.
 pub async fn inspect(encoder: &Encoder, path: &Path) -> Result<MediaInfo> {
     let mut args: Vec<OsString> = [
         "-v",
@@ -411,25 +415,38 @@ pub fn parse_probe(json: &str) -> Result<MediaInfo> {
         .and_then(|format| number(format, "duration"))
         .or_else(|| video.and_then(|v| number(v, "duration")))
         .unwrap_or(0.0);
-    info.subtitles = streams
-        .iter()
-        .filter(|s| text(s, "codec_type").as_deref() == Some("subtitle"))
-        .zip(0..)
-        .map(|(stream, track)| {
-            let tag = |key| {
-                stream
-                    .pointer(&format!("/tags/{key}"))
-                    .and_then(Value::as_str)
-                    .map(str::trim)
-                    .filter(|t| !t.is_empty() && *t != "und")
-                    .map(str::to_owned)
-            };
-            EmbeddedSubtitle {
-                track,
-                language: tag("language"),
-                title: tag("title"),
-                text: text(stream, "codec_name").is_some_and(|codec| is_text_subtitle(&codec)),
-            }
+    let tag = |stream: &Value, key: &str| {
+        stream
+            .pointer(&format!("/tags/{key}"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|t| !t.is_empty() && *t != "und")
+            .map(str::to_owned)
+    };
+    let of_type = |kind: &'static str| {
+        streams
+            .iter()
+            .filter(move |s| text(s, "codec_type").as_deref() == Some(kind))
+            .zip(0..)
+    };
+    info.subtitles = of_type("subtitle")
+        .map(|(stream, track)| EmbeddedSubtitle {
+            track,
+            language: tag(stream, "language"),
+            title: tag(stream, "title"),
+            text: text(stream, "codec_name").is_some_and(|codec| is_text_subtitle(&codec)),
+        })
+        .collect();
+    info.audio = of_type("audio")
+        .map(|(stream, track)| AudioTrack {
+            track,
+            language: tag(stream, "language"),
+            title: tag(stream, "title"),
+            channels: stream
+                .get("channels")
+                .and_then(Value::as_u64)
+                .and_then(|n| u32::try_from(n).ok())
+                .unwrap_or(0),
         })
         .collect();
     Ok(info)
@@ -462,12 +479,16 @@ fn box_width(height: u32) -> u32 {
 /// absolute time, so segments from different jobs of the same source and
 /// tier are interchangeable.
 ///
+/// `audio` picks an audio stream by its index among the audio streams
+/// ([`MediaInfo::audio`]); None takes the first one if there is any.
+///
 /// [`Quality::Original`] is not a transcode; it is treated as 1080p High.
 pub fn job_args(
     encoder: &Encoder,
     source: &Path,
     info: &MediaInfo,
     quality: Quality,
+    audio: Option<u32>,
     start_segment: u32,
     out_dir: &Path,
 ) -> Vec<OsString> {
@@ -527,9 +548,14 @@ pub fn job_args(
     args.push("-i".into());
     args.push(file_url(source));
     let mut push = |values: &[&str]| args.extend(values.iter().map(OsString::from));
-    // The first video stream that is not cover art, and the default audio
-    // track if there is one. No subtitles, data, chapters, or metadata.
-    push(&["-map", "0:V:0", "-map", "0:a:0?"]);
+    // The first video stream that is not cover art, and the chosen audio
+    // track, else the first one if there is one. No subtitles, data,
+    // chapters, or metadata.
+    let audio_map = match audio {
+        Some(track) => format!("0:a:{track}"),
+        None => "0:a:0?".to_owned(),
+    };
+    push(&["-map", "0:V:0", "-map", &audio_map]);
     push(&["-map_metadata", "-1", "-map_chapters", "-1"]);
     push(&["-vf", &filters]);
     push(&["-c:v", encoder_name, "-profile:v", "high"]);
@@ -747,6 +773,7 @@ mod tests {
                 Path::new("/media/film.mkv"),
                 &info,
                 quality,
+                None,
                 7,
                 Path::new("/tmp/job"),
             ));
@@ -825,6 +852,7 @@ mod tests {
             Path::new("/m/hdr.mkv"),
             &pq,
             Quality::Low720,
+            None,
             0,
             Path::new("/tmp/job"),
         ));
@@ -859,9 +887,16 @@ mod tests {
             Path::new("/m/hlg.mkv"),
             &hlg,
             Quality::Data480,
+            Some(2),
             3,
             Path::new("/tmp/50%"),
         ));
+        let maps: Vec<_> = args
+            .windows(2)
+            .filter(|w| w[0] == "-map")
+            .map(|w| w[1].as_str())
+            .collect();
+        assert_eq!(maps, ["0:V:0", "0:a:2"], "a chosen audio track is required");
         assert!(value_after(&args, "-vf").contains("tin=arib-std-b67"));
         assert!(value_after(&args, "-vf").ends_with(",format=nv12"));
         assert_eq!(
@@ -879,10 +914,12 @@ mod tests {
             {"index":1,"codec_name":"hevc","codec_type":"video","width":3840,"height":2160,
              "avg_frame_rate":"24000/1001","color_transfer":"smpte2084","color_primaries":"bt2020",
              "disposition":{"attached_pic":0}},
-            {"index":2,"codec_name":"eac3","codec_type":"audio"},
+            {"index":2,"codec_name":"eac3","codec_type":"audio","channels":6,"tags":{"language":"eng","title":"Surround"}},
             {"index":3,"codec_name":"subrip","codec_type":"subtitle","tags":{"language":"eng","title":"English"}},
             {"index":4,"codec_name":"hdmv_pgs_subtitle","codec_type":"subtitle","tags":{"language":"fre"}},
-            {"index":5,"codec_name":"ass","codec_type":"subtitle","tags":{"language":"und"}}
+            {"index":5,"codec_name":"ass","codec_type":"subtitle","tags":{"language":"und"}},
+            {"index":6,"codec_name":"aac","codec_type":"audio","channels":2,"tags":{"language":"jpn"}},
+            {"index":7,"codec_name":"opus","codec_type":"audio"}
           ],
           "format": {"duration":"5423.125000"}
         }"#;
@@ -912,6 +949,30 @@ mod tests {
                     language: None,
                     title: None,
                     text: true
+                },
+            ]
+        );
+
+        assert_eq!(
+            info.audio,
+            [
+                AudioTrack {
+                    track: 0,
+                    language: Some("eng".into()),
+                    title: Some("Surround".into()),
+                    channels: 6
+                },
+                AudioTrack {
+                    track: 1,
+                    language: Some("jpn".into()),
+                    title: None,
+                    channels: 2
+                },
+                AudioTrack {
+                    track: 2,
+                    language: None,
+                    title: None,
+                    channels: 0
                 },
             ]
         );

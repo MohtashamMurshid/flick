@@ -3,17 +3,20 @@
 //! `docs/REMOTE_DOWNLOADS_PLAN.md` for accepting downloads from other Flicks.
 //!
 //! Stdout carries one JSON line, `{"pairing": "...", "listen": "..."}`,
-//! at startup or for `--print-pairing`. Logs go to stderr and never contain
-//! the token.
+//! at startup or for `--print-pairing`; with `--pair-code` the startup line
+//! also has `pair_code` and `expires_in`. The `status` and `pair-code`
+//! subcommands talk to the server already running with the state folder
+//! and print one JSON line each. Logs go to stderr and never contain the
+//! token or a pairing code.
 
 use anyhow::{Context, Result, bail};
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use flick::{
     remote::{
         auth, bind,
         ids::Salt,
-        protocol::Pairing,
-        server::{Server, ServerConfig, Sources},
+        protocol::{self, Capability, Library, Pairing, TransferPhase, TransferRow},
+        server::{self, PairingCodes, Server, ServerConfig, Sources},
         transfers::{self, BackendOptions, TransferBackend},
     },
     torrent::{TransferConfig, TransferSession},
@@ -21,8 +24,9 @@ use flick::{
 use std::{
     net::{IpAddr, SocketAddr},
     num::NonZeroU32,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::Arc,
+    time::Duration,
 };
 
 /// Inside the state folder: the transfer session's state.
@@ -36,6 +40,8 @@ const DOWNLOADS_LIST: &str = "remote-downloads.json";
     long_about = "Serves the desktop app's library, or folders, over HTTP on this machine's Tailscale address only. Pair another Flick with the string printed at startup or by --print-pairing."
 )]
 struct Args {
+    #[command(subcommand)]
+    command: Option<Command>,
     /// Serve the videos in the desktop app's settings.json.
     #[arg(long, conflicts_with = "folders")]
     library: bool,
@@ -54,7 +60,7 @@ struct Args {
     name: Option<String>,
     /// Where the token, id salt, and transcode temporaries are kept.
     /// Defaults to the Flick data directory, in `remote`.
-    #[arg(long, value_name = "DIR")]
+    #[arg(long, value_name = "DIR", global = true)]
     state_dir: Option<PathBuf>,
     /// Full path to ffmpeg, used for quality tiers below Original.
     #[arg(long, value_name = "PATH")]
@@ -68,6 +74,15 @@ struct Args {
     /// Replace the saved token with a new one, revoking every paired Flick.
     #[arg(long)]
     new_token: bool,
+    /// Open a six-digit pairing code at startup, valid for ten minutes, and
+    /// print it in the startup line. `flick-serve pair-code` opens another
+    /// later.
+    #[arg(long, conflicts_with = "print_pairing")]
+    pair_code: bool,
+    /// Leave this machine's MAC and LAN addresses out of the listing, so
+    /// paired Flicks cannot offer to wake it.
+    #[arg(long)]
+    no_wake_info: bool,
     /// Let paired Flicks start, pause, and remove torrents here, and play
     /// them while they download. Off unless given.
     #[arg(long)]
@@ -106,6 +121,17 @@ struct Args {
     no_seeding: bool,
 }
 
+#[derive(Subcommand)]
+enum Command {
+    /// Print the state of the server running with this state folder as one
+    /// JSON line: its address, video count, transfers, and free space.
+    /// Exits with 1 when no server is running.
+    Status,
+    /// Open a new six-digit pairing code on the server running with this
+    /// state folder, replacing any open one, and print it as JSON.
+    PairCode,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
@@ -121,6 +147,11 @@ async fn main() -> Result<()> {
         Some(dir) => dir,
         None => default_state_dir()?,
     };
+    match args.command {
+        Some(Command::Status) => return status(&state_dir).await,
+        Some(Command::PairCode) => return pair_code(&state_dir).await,
+        None => {}
+    }
     let bind = match args.bind {
         Some(bind) => bind,
         None => SocketAddr::new(IpAddr::V4(bind::tailscale_ipv4().await?), args.port),
@@ -138,7 +169,7 @@ async fn main() -> Result<()> {
                 "--print-pairing needs a fixed port; port 0 is chosen when the server starts, and its startup line shows the real one"
             );
         }
-        print_pairing(bind, &token)?;
+        print_pairing(bind, &token, None)?;
         return Ok(());
     }
 
@@ -177,6 +208,9 @@ async fn main() -> Result<()> {
         transfers: downloads
             .as_ref()
             .map(|downloads| downloads.backend.clone()),
+        // Closed until the owner opens a code, here or with `pair-code`.
+        pairing: Some(PairingCodes::new()),
+        advertise_hardware: !args.no_wake_info,
     })
     .await;
     let server = match started {
@@ -188,7 +222,11 @@ async fn main() -> Result<()> {
             return Err(error);
         }
     };
-    print_pairing(server.addr(), &token)?;
+    let code = server
+        .pairing()
+        .filter(|_| args.pair_code)
+        .map(|codes| (codes.open(), codes.remaining().unwrap_or_default()));
+    print_pairing(server.addr(), &token, code)?;
 
     wait_for_stop().await?;
     tracing::info!("Stopping the remote library server");
@@ -275,21 +313,192 @@ async fn start_downloads(args: &Args, state_dir: &std::path::Path) -> Result<Dow
     })
 }
 
-fn print_pairing(listen: SocketAddr, token: &str) -> Result<()> {
-    use std::io::Write;
+fn print_pairing(listen: SocketAddr, token: &str, code: Option<(String, Duration)>) -> Result<()> {
     let pairing = Pairing {
         host: listen.ip().to_string(),
         port: listen.port(),
         token: token.to_owned(),
     };
-    let line = serde_json::json!({
+    let mut line = serde_json::json!({
         "pairing": pairing.to_string(),
         "listen": listen.to_string(),
     });
+    if let Some((code, left)) = code {
+        line["pair_code"] = code.into();
+        line["expires_in"] = left.as_secs().into();
+    }
+    print_line(&line)
+}
+
+fn print_line(line: &serde_json::Value) -> Result<()> {
+    use std::io::Write;
     let mut stdout = std::io::stdout().lock();
     writeln!(stdout, "{line}")?;
     stdout.flush()?;
     Ok(())
+}
+
+/// The server running with `state_dir`: its address and token. None when
+/// no server holds the state folder's lock.
+fn running_server(state_dir: &Path) -> Result<Option<(SocketAddr, String)>> {
+    let lock = state_dir.join("serve.lock");
+    let held = match std::fs::File::open(&lock) {
+        // A shared lock is refused while the server holds its exclusive one.
+        Ok(file) => file.try_lock_shared().is_err(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => return Err(error).with_context(|| format!("Open {}", lock.display())),
+    };
+    if !held {
+        return Ok(None);
+    }
+    let path = state_dir.join(server::LISTEN_FILE);
+    let text = std::fs::read_to_string(&path).with_context(|| {
+        format!(
+            "A server holds {} but has not recorded its address in {}",
+            state_dir.display(),
+            path.display()
+        )
+    })?;
+    let listen: serde_json::Value =
+        serde_json::from_str(&text).with_context(|| format!("Read {}", path.display()))?;
+    let listen: SocketAddr = listen["listen"]
+        .as_str()
+        .context("The listen file has no address")?
+        .parse()
+        .context("The listen file's address is not valid")?;
+    Ok(Some((listen, auth::saved_token(state_dir)?)))
+}
+
+fn local_client() -> Result<reqwest::Client> {
+    Ok(reqwest::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(15))
+        .build()?)
+}
+
+fn base_url(listen: SocketAddr) -> String {
+    match listen {
+        SocketAddr::V4(_) => format!("http://{listen}"),
+        SocketAddr::V6(v6) => format!("http://[{}]:{}", v6.ip(), v6.port()),
+    }
+}
+
+/// GET `path` from the running server as JSON, with the saved token.
+async fn get_json<T: serde::de::DeserializeOwned>(
+    client: &reqwest::Client,
+    listen: SocketAddr,
+    token: &str,
+    path: &str,
+) -> Result<T> {
+    let response = client
+        .get(format!("{}{path}", base_url(listen)))
+        .header(reqwest::header::AUTHORIZATION, protocol::bearer(token))
+        .send()
+        .await
+        .with_context(|| format!("Ask the server at {listen} for {path}"))?;
+    let status = response.status();
+    if !status.is_success() {
+        let message = response
+            .json::<protocol::ErrorBody>()
+            .await
+            .map(|body| body.message)
+            .unwrap_or_default();
+        bail!("The server answered {status} for {path}: {message}");
+    }
+    Ok(response.json().await?)
+}
+
+/// `flick-serve status`.
+async fn status(state_dir: &Path) -> Result<()> {
+    let Some((listen, token)) = running_server(state_dir)? else {
+        print_line(&serde_json::json!({
+            "running": false,
+            "state_dir": state_dir.display().to_string(),
+        }))?;
+        std::process::exit(1);
+    };
+    let client = local_client()?;
+    let library: Library = get_json(&client, listen, &token, &protocol::paths::library()).await?;
+    let hello: protocol::Hello = get_json(&client, listen, &token, &protocol::paths::hello())
+        .await
+        .unwrap_or_default();
+    let transfers = if library.capabilities.contains(&Capability::Downloads) {
+        let rows: Vec<TransferRow> =
+            get_json(&client, listen, &token, &protocol::paths::transfers()).await?;
+        Some(transfer_summary(&rows))
+    } else {
+        None
+    };
+    let free_bytes = match &library.storage {
+        Some(storage) => Some(storage.free_bytes),
+        None => fs2::available_space(state_dir).ok(),
+    };
+    let line = serde_json::json!({
+        "running": true,
+        "listen": listen.to_string(),
+        "server_name": library.server_name,
+        "protocol": library.protocol,
+        "videos": library.videos.len(),
+        "incomplete_videos": library.videos.iter().filter(|video| !video.complete).count(),
+        "qualities": library.qualities,
+        "capabilities": library.capabilities,
+        "pairing_open": hello.pairing_open,
+        "transfers": transfers,
+        "download_folder_name": library.storage.as_ref().map(|s| s.download_folder_name.clone()),
+        "free_bytes": free_bytes,
+        "state_dir": state_dir.display().to_string(),
+    });
+    print_line(&line)
+}
+
+/// Counts by phase and the total rates of the server's transfers.
+fn transfer_summary(rows: &[TransferRow]) -> serde_json::Value {
+    let count = |phase: TransferPhase| rows.iter().filter(|row| row.phase == phase).count();
+    serde_json::json!({
+        "total": rows.len(),
+        "downloading": count(TransferPhase::Downloading),
+        "seeding": count(TransferPhase::Seeding),
+        "paused": count(TransferPhase::Paused),
+        "checking": count(TransferPhase::Checking),
+        "error": count(TransferPhase::Error),
+        "shares": rows.iter().filter(|row| row.share).count(),
+        "download_bps": rows.iter().map(|row| row.download_bps).sum::<u64>(),
+        "upload_bps": rows.iter().map(|row| row.upload_bps).sum::<u64>(),
+        "verified_bytes": rows.iter().map(|row| row.verified_bytes).sum::<u64>(),
+        "total_bytes": rows.iter().map(|row| row.total_bytes).sum::<u64>(),
+    })
+}
+
+/// `flick-serve pair-code`.
+async fn pair_code(state_dir: &Path) -> Result<()> {
+    let Some((listen, token)) = running_server(state_dir)? else {
+        bail!(
+            "No Flick server is running with {}. Start it with --pair-code instead.",
+            state_dir.display()
+        );
+    };
+    let response = local_client()?
+        .post(format!(
+            "{}{}",
+            base_url(listen),
+            server::LOCAL_PAIR_CODE_PATH
+        ))
+        .header(reqwest::header::AUTHORIZATION, protocol::bearer(&token))
+        .send()
+        .await
+        .with_context(|| format!("Ask the server at {listen} for a pairing code"))?;
+    let status = response.status();
+    if !status.is_success() {
+        let message = response
+            .json::<protocol::ErrorBody>()
+            .await
+            .map(|body| body.message)
+            .unwrap_or_default();
+        bail!("The server answered {status}: {message}");
+    }
+    let mut line: serde_json::Value = response.json().await?;
+    line["listen"] = listen.to_string().into();
+    print_line(&line)
 }
 
 /// Ctrl+C, or SIGTERM from launchd or systemd.

@@ -416,6 +416,8 @@ async fn serve(
         ffmpeg: options.ffmpeg,
         max_transcodes: 2,
         transfers: backend.clone(),
+        pairing: None,
+        advertise_hardware: true,
     };
     let server = match Server::start(config).await {
         Ok(server) => server,

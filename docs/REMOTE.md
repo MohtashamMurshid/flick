@@ -7,7 +7,7 @@
 ## What it does, and what it never does
 
 - It listens **only on this machine's Tailscale address**. It refuses `0.0.0.0`, LAN addresses, and public addresses; `127.0.0.1` is allowed for local checks. Nothing is reachable from the Internet or from your LAN.
-- Every request needs the **pairing token** (`Authorization: Bearer …`). A tailnet can include machines shared in by other people, so a Tailscale address on its own is not enough. Tokens are compared in constant time.
+- Every request needs the **pairing token** (`Authorization: Bearer …`), except two: `GET /v1/hello`, which only says that a Flick is here, its name, and whether a pairing code is open, and `POST /v1/pair`, which trades a six-digit code the owner opened for the pairing string. Both are limited to 30 requests a minute from each address. A tailnet can include machines shared in by other people, so a Tailscale address on its own is not enough. Tokens and codes are compared in constant time.
 - By default it serves files read-only: it never writes to your library or your settings, and writes only in its own state folder (see [Files it keeps](#files-it-keeps)). With `--allow-downloads` it also writes downloads into its download folder, deletes downloaded files when a paired Flick confirms the exact list, and keeps `remote-downloads.json` in its state folder; see [Accepting downloads from other Flicks](#accepting-downloads-from-other-flicks). It never writes to the desktop's `settings.json`.
 - It speaks plain HTTP. Tailscale's WireGuard link already encrypts the traffic between the two machines.
 
@@ -51,7 +51,9 @@ At startup it prints one line of JSON to stdout and keeps running until Ctrl+C (
 {"listen":"100.98.200.69:47117","pairing":"flick-remote://100.98.200.69:47117/#3f1c…"}
 ```
 
-Logs go to stderr. Set `RUST_LOG=flick=debug` for more detail. The token never appears in the logs.
+With `--pair-code` the line also carries a six-digit code and its remaining seconds, `"pair_code":"483920","expires_in":600`; see [Pairing](#pairing).
+
+Logs go to stderr. Set `RUST_LOG=flick=debug` for more detail. The token and pairing codes never appear in the logs; opening, using, and closing a code are logged without the code.
 
 ### Options
 
@@ -65,9 +67,30 @@ Logs go to stderr. Set `RUST_LOG=flick=debug` for more detail. The token never a
 | `--state-dir DIR` | Flick's data folder, in `remote`: `~/Library/Application Support/app.Flick.Flick/remote` on macOS, or `FLICK_DATA_DIR/remote` if that variable is set | Where the token, id salt, and progress are kept. |
 | `--print-pairing` | | Print the pairing line for the saved token (making one if needed) and exit. Needs a fixed port, and Tailscale running unless `--bind` is given. |
 | `--new-token` | | Replace the saved token. Every paired Flick must pair again. |
+| `--pair-code` | | Open a six-digit pairing code at startup, valid for ten minutes, and print it in the startup line. Not with `--print-pairing`. |
+| `--no-wake-info` | wake info on | Leave this machine's MAC and LAN IPv4 addresses out of the listing's `hardware`, so paired Flicks cannot offer to wake it with Wake-on-LAN. |
 | `--ffmpeg PATH`, `--max-transcodes N` | found on `PATH` (then `~/.local/bin`, `/opt/homebrew/bin`, `/usr/local/bin`), `2` | The FFmpeg used for the quality tiers below Original, and how many transcodes may run at once. Without a working FFmpeg only Original is offered. `FLICK_FFMPEG` also names it. |
 
 The library is re-read on every listing request, so a video added on the desktop appears the next time the other Flick refreshes, without restarting the server.
+
+### Commands for a running server
+
+Two subcommands talk to the server already running with the same state folder (give them the same `--state-dir`, before or after the subcommand). They find it through the `listen` file it writes at startup and the saved token, and each prints one line of JSON.
+
+```sh
+flick-serve status
+flick-serve pair-code
+```
+
+`status` prints whether a server is running, and if so its address, name, video count (and how many are still downloading), qualities, capabilities, whether a pairing code is open, a summary of its transfers (counts by phase, shares, total rates and bytes; `null` without `--allow-downloads`), and the free space in its download folder, or in the state folder without downloads:
+
+```json
+{"running":true,"listen":"100.98.200.69:47117","server_name":"Mac mini","videos":214,"incomplete_videos":1,"transfers":{"total":2,"downloading":1,"seeding":1,"paused":0,"checking":0,"error":0,"shares":0,"download_bps":5242880,"upload_bps":0,"verified_bytes":…,"total_bytes":…},"free_bytes":812345678848,…}
+```
+
+With no server running it prints `{"running":false,…}` and exits with status 1. A server holds the state folder's lock while it runs, so a `listen` file left by a crash is not mistaken for a running server.
+
+`pair-code` opens a new six-digit code on the running server, replacing any open one, and prints `{"pair_code":"…","expires_in":600,"listen":"…"}`. It asks the server through a route that needs the token and answers only connections from the server's own machine. It fails when no server is running; start one with `--pair-code` instead.
 
 ### Accepting downloads from other Flicks
 
@@ -101,6 +124,21 @@ Completed downloads join the listing: with `--folder`, the download folder is sc
 The transfer state is kept in `transfers` inside the state folder. Stopping the server cancels running link downloads (their partial files are removed) and stops the transfers; they are restored, after verifying what is on disk, the next time it starts.
 
 ## Pairing
+
+Pair another Flick either with a six-digit code, or by pasting the pairing string.
+
+### With a code
+
+Open a code on the server with `flick-serve --pair-code` at startup, or `flick-serve pair-code` while it runs (the desktop's in-app server opens one from **Settings → Remote Libraries**). The other Flick finds this one on the tailnet through `GET /v1/hello` and sends the code to `POST /v1/pair`, which answers with the pairing string.
+
+- A code is six random digits and is valid for ten minutes. Opening a new one replaces the old one.
+- Using it closes it. Five wrong codes close it too, and the server logs that.
+- While no code is open, `POST /v1/pair` answers `404` with "No pairing code is open on that Flick…".
+- Each address may make 30 requests a minute to `/v1/hello` and 30 to `/v1/pair`; more answer `429` with `Retry-After`.
+
+With a launchd agent stdout is discarded, so use `flick-serve pair-code` from a terminal on the server to get a code.
+
+### With the pairing string
 
 The pairing string is `flick-remote://<address>:<port>/#<token>`. The token is in the `#` fragment, so pasting the string into a browser by mistake never sends it to a server.
 
@@ -181,17 +219,28 @@ Do not put the token in a URL; only the `Authorization` header is accepted.
 
 ## HTTP interface
 
-All paths are under `/v1` and need the bearer token. Every error is JSON, `{"message": "…"}`. The types are in `src/remote/protocol.rs`.
+All paths are under `/v1` and need the bearer token, except `hello` and `pair`. Every error is JSON, `{"message": "…"}`. The types are in `src/remote/protocol.rs`.
+
+Without the token, rate-limited to 30 requests a minute per address and route (`429` with `Retry-After` beyond that):
 
 | Request | Answer |
 | --- | --- |
-| `GET /v1/library` | Protocol version, server name, available qualities (`["original"]` for now), and the videos: opaque id, title, file name, size, duration, size in pixels, MIME type, episode, `complete`, whether a poster exists, sidecar subtitles. |
+| `GET /v1/hello` | `{"protocol", "server_name", "pairing_open"}`. Nothing about the library. |
+| `POST /v1/pair` `{"code"}` | `{"pairing": "flick-remote://…"}` for the open code, which is then closed. Spaces and dashes in the code are ignored. `403` for a wrong code, saying how many attempts are left; the fifth closes the code. `404` while no code is open or after it expired, `400` for a body that is not `{"code"}`. |
+
+With the token:
+
+| Request | Answer |
+| --- | --- |
+| `GET /v1/library` | Protocol version, server name, available qualities, `hardware` (this machine's MAC and LAN IPv4 addresses for Wake-on-LAN, or `null` with `--no-wake-info` or when none are found), and the videos: opaque id, title, file name, size, duration, size in pixels, MIME type, episode, `complete`, whether a poster exists, sidecar subtitles, embedded subtitle and audio tracks once ffprobe has read the file (`audio_tracks`: `track`, `language`, `title`, `channels`), and `resume`, the progress last saved here by any Flick, when there is one. |
 | `GET`/`HEAD /v1/media/{id}` | The file. One `Range` per request (`206` with `Content-Range`), `Accept-Ranges: bytes`, `Content-Length`, `Content-Type`, a strong `ETag` from size and modification time, and `If-Range`. Several ranges, or a range outside the file, get `416`. Streamed from disk with a 64 KiB buffer. `409` while a torrent file is unverified, except a download this server runs with `stream-incomplete`: its ranges come from verified pieces, with `504` after a 30-second wait. |
 | `GET /v1/poster/{id}` | The poster PNG, or `404`. |
 | `GET /v1/subtitles/{id}` | Sidecar subtitle files: same name as the video, optionally with a language part (`Film.en.srt`), with extension `.srt`, `.ass`, `.ssa`, `.vtt`, or `.sub`. |
 | `GET /v1/subtitles/{id}/{n}` | Subtitle file `n` from that list. |
 | `GET /v1/hash/{id}` | `{"hash": "<16 hex digits>"}`, the OpenSubtitles movie hash. `422` for files under 64 KiB, `409` while a torrent file is unverified. |
 | `GET`/`PUT /v1/progress/{id}` | Playback position, `{"position", "duration", "finished", "updated"}`. `GET` is `404` when nothing is saved. `PUT` answers with what is stored: an `updated` more than a minute older than the stored value is not applied; within a minute, the newest `PUT` wins. `updated: 0` means now. |
+| `GET /v1/subtitles/{id}/embedded/{track}` | A text subtitle stream inside the file as WebVTT, extracted by FFmpeg and kept in `subtitles/` in the state folder. |
+| `GET /v1/hls/{id}/{quality}/index.m3u8`, `init.mp4`, `{n}.m4s` | A transcode tier as HLS. `?audio=<track>` picks an audio stream from the video's `audio_tracks`; the playlist then names its init file and segments with the same query, and that track gets its own transcode job, which counts toward `--max-transcodes`. Without it, or with `audio=0`, the first audio track is used. An unknown track is `404`; anything but a plain number is `400`. |
 
 With downloads allowed, the listing also has `capabilities` and `storage` (`free_bytes`, `download_folder_name`), and each video has `progress` from 0 to 1. These routes answer `403` unless the listing advertises the capability in brackets:
 
@@ -206,7 +255,7 @@ With downloads allowed, the listing also has `capabilities` and `storage` (`free
 | `GET /v1/browse?dir=` [shares] | Folders and video files. `dir` is empty for the allowed roots by name, else `<root name>/<relative path>`; anything outside a root is `404` "No such folder on this server." |
 | `POST /v1/shares` `{"dir"}` [shares] | `201` with the `infohash` and `magnet` of the seeded folder or file. |
 
-A request without the token is `401`, even for a path that does not exist. An unknown id or path is `404`. Ids are SHA-1 of a random per-server salt and the file's canonical path, so they stay the same across restarts and never reveal a path.
+Apart from `hello` and `pair`, a request without the token is `401`, even for a path that does not exist. An unknown id or path is `404`. Ids are SHA-1 of a random per-server salt and the file's canonical path, so they stay the same across restarts and never reveal a path.
 
 ## Files it keeps
 
@@ -218,10 +267,13 @@ In the state folder (`--state-dir`):
 | `salt` | The id salt, mode 0600. Deleting it changes every id; paired Flicks then need a refresh and lose remote progress. |
 | `progress.json` | Saved positions by video id. |
 | `serve.lock` | Held while a server runs, so two servers cannot share the folder. |
+| `listen` | While a server runs: `{"listen": "ip:port", "pid": n}`, for `flick-serve status` and `pair-code`. Removed when it stops. |
+| `subtitles/` | Embedded subtitles extracted as WebVTT. Kept to 256 MB: the least recently used entries are removed first, at startup and after each new one. |
+| `transcode/` | Folders of running transcodes, removed when each stops. Job folders an earlier run left are removed at startup; anything else there is capped at 256 MB, oldest first. |
 | `transfers/` | With `--allow-downloads`: the transfer session's state, restored at the next start. |
 | `remote-downloads.json` | With `--allow-downloads --library`: the completed downloads it lists beside the desktop's library. |
 
-The desktop Flick keeps its cached listings of paired servers (`<server id>.json`) and downloaded subtitles (`subtitles/`) in the same default folder. On a machine that runs both, the two sets of files sit side by side; their names do not overlap.
+The desktop Flick keeps its cached listings of paired servers (`<server id>.json`) and downloaded subtitles in `remote-listings` beside this folder, so the caps above never touch them. Pruning `subtitles/` here removes only the `.vtt` files and temporary files the server wrote.
 
 ## Troubleshooting
 
@@ -229,4 +281,6 @@ The desktop Flick keeps its cached listings of paired servers (`<server id>.json
 - **"… is not a Tailscale address"**: `--bind` must be a `100.x.y.z` Tailscale address (or `127.0.0.1` for a local check).
 - **"Another Flick server is already using …"**: a server, often the launchd agent, already runs with this state folder. Stop it with `scripts/install-flick-serve.sh --uninstall`, or use another `--state-dir`.
 - **401 on every request**: the token does not match. Copy the pairing string again with `flick-serve --print-pairing`.
+- **"No pairing code is open on that Flick"**: open one with `flick-serve pair-code` on the server. A code lasts ten minutes and closes after five wrong tries.
+- **429 from `/v1/hello` or `/v1/pair`**: more than 30 requests in a minute from one address. Wait a minute.
 - **Playback stutters away from home**: check `tailscale ping`; a relayed path or a slow home upload cannot carry a high bit rate original.
