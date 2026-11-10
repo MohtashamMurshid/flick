@@ -129,7 +129,7 @@ Pair another Flick either with a six-digit code, or by pasting the pairing strin
 
 ### With a code
 
-Open a code on the server with `flick-serve --pair-code` at startup, or `flick-serve pair-code` while it runs (the desktop's in-app server opens one from **Settings → Remote Libraries**). The other Flick finds this one on the tailnet through `GET /v1/hello` and sends the code to `POST /v1/pair`, which answers with the pairing string.
+Open a code on the server with `flick-serve --pair-code` at startup, or `flick-serve pair-code` while it runs (the desktop's in-app server opens one from **Settings → Remote Libraries**, below). The other Flick finds this one on the tailnet through `GET /v1/hello` and sends the code to `POST /v1/pair`, which answers with the pairing string.
 
 - A code is six random digits and is valid for ten minutes. Opening a new one replaces the old one.
 - Using it closes it. Five wrong codes close it too, and the server logs that.
@@ -137,6 +137,17 @@ Open a code on the server with `flick-serve --pair-code` at startup, or `flick-s
 - Each address may make 30 requests a minute to `/v1/hello` and 30 to `/v1/pair`; more answer `429` with `Retry-After`.
 
 With a launchd agent stdout is discarded, so use `flick-serve pair-code` from a terminal on the server to get a code.
+
+#### In the desktop app
+
+While **Share my library on Tailscale** is on and the server is running, **Settings → Remote Libraries** has a **Pairing code** row under the pairing string. It says that other Flicks find this Mac by its name (the name in `hello`) and type a code shown there.
+
+- **Show Pairing Code** opens a code and shows its six digits large, with "Expires in N min", **Copy**, and **New Code**. New Code replaces the open code; the old one stops working.
+- When the code is used, expires, or takes five wrong tries, the row goes back to **Show Pairing Code**.
+- Turning sharing off, or anything that restarts the server (New Token, or turning on downloads for paired Flicks), closes the code at once.
+- The second onboarding screen, **Share this library?**, shows the same row once sharing starts.
+
+Each start of the in-app server makes one set of codes and gives it to the server, so `flick-serve pair-code --state-dir "<data folder>/remote"` opens a code on the in-app server too. The app then stops showing its own code, because that one was replaced.
 
 ### With the pairing string
 
@@ -160,33 +171,65 @@ Treat the string like a password. To revoke every paired Flick, run `flick-serve
 cargo build --locked --release --no-default-features --bin flick-serve
 scripts/install-flick-serve.sh                                     # serves --library
 scripts/install-flick-serve.sh -- --folder /Volumes/Media/Films     # or folders
-scripts/install-flick-serve.sh --print                              # show the plist, install nothing
+scripts/install-flick-serve.sh -- --folder "$HOME/Movies" --allow-downloads \
+  --download-dir "$HOME/Movies/Downloads" --share-root "$HOME/Movies" --links
+scripts/install-flick-serve.sh --print -- --folder …               # show the plist, install nothing
 scripts/install-flick-serve.sh --uninstall                          # stop and remove it
 ```
 
+Everything after `--` is passed to `flick-serve`: `--library` or `--folder` (repeatable), and the options from [Accepting downloads](#accepting-downloads-from-other-flicks) (`--allow-downloads`, `--download-dir`, `--share-root`, `--links`, the speed limits, `--no-seeding`), `--name`, `--port`, `--bind`, `--state-dir`, `--ffmpeg`, `--max-transcodes`, and `--no-wake-info`. The installer refuses `--pair-code` (nobody reads the agent's stdout; run `flick-serve pair-code` instead), `--print-pairing`, `--new-token` (it would revoke every paired Flick at every restart), and the `status` and `pair-code` subcommands.
+
+The installer:
+
+- copies the binary to `~/.local/bin/flick-serve` (`--no-copy` runs it in place), so rebuilding or deleting the checkout leaves the running server alone. Run the installer again after a rebuild to update it. Without `--binary` it takes `target/release/flick-serve` from the repository if it is built, else `flick-serve` on `PATH`;
+- writes `~/Library/LaunchAgents/com.flick.serve.plist`, checks it with `plutil -lint`, stops a running agent, and starts the new one with `launchctl bootstrap`;
+- waits up to 30 seconds for `flick-serve status` (with the same `--state-dir`) to report the server, prints that line, and exits with 1 if the server did not answer.
+
 The agent:
 
-- starts at login and restarts 30 seconds after the server stops, which also covers Tailscale not being connected yet right after login;
-- runs `flick-serve` inside `caffeinate -is`, so the Mac does not idle-sleep while serving (pass `--no-caffeinate` to leave sleep alone);
-- writes logs to `~/Library/Logs/Flick/flick-serve.log`;
-- discards stdout, because the startup line contains the token. Use `flick-serve --print-pairing` to get the pairing string.
+- has the label `com.flick.serve`, starts at login, and restarts after the server stops for any reason: a crash, a `kill`, or Tailscale not being connected yet right after login. launchd waits until 30 seconds after the previous start (`ThrottleInterval`);
+- runs `flick-serve` inside `caffeinate -is`, so the Mac does not idle-sleep while serving (`--no-caffeinate` leaves sleep alone);
+- has `~/.local/bin`, `/usr/local/bin`, and `/opt/homebrew/bin` on its `PATH`, for yt-dlp, FFmpeg, and the `tailscale` CLI;
+- writes logs to `~/Library/Logs/Flick/flick-serve.log`, without colour codes (`NO_COLOR=1`). The file is not rotated;
+- discards stdout, because the startup line contains the token. Use `flick-serve --print-pairing` for the pairing string and `flick-serve pair-code` for a code, with the same `--state-dir` as the agent.
 
 Check it with:
 
 ```sh
-launchctl print gui/$(id -u)/com.flick.serve | head -20
+launchctl print gui/$(id -u)/com.flick.serve | grep -E 'state =|pid =|runs =|last exit'
+flick-serve status                      # add --state-dir if the agent has one
+curl http://$(tailscale ip -4):47117/v1/hello
 tail -f ~/Library/Logs/Flick/flick-serve.log
+launchctl kickstart -k gui/$(id -u)/com.flick.serve   # restart it now
 ```
 
 A launchd agent runs only while you are logged in. For a Mac mini without a display, turn on automatic login (**System Settings → Users & Groups → Automatically log in as**), or keep a session logged in.
 
 If your media is on an external drive, macOS may ask the first time whether `flick-serve` may access removable volumes. Answer in **System Settings → Privacy & Security → Files and Folders**, or grant it Full Disk Access.
 
+### Checked on the Mac mini on 2026-11-11
+
+Installed on the Mac mini (macOS 27.2, Tailscale address `100.98.200.69`) with:
+
+```sh
+cargo build --locked --release --no-default-features --bin flick-serve
+scripts/install-flick-serve.sh -- --folder "$HOME/Movies/flick-test" --allow-downloads \
+  --download-dir "$HOME/Movies/flick-test/downloads" --share-root "$HOME/Movies/flick-test" --links
+```
+
+- The installer copied the binary to `~/.local/bin/flick-serve` and printed `Running: {…"listen":"100.98.200.69:47117",…"running":true,"server_name":"Mohtasham’s Mac Mini","state_dir":"…/app.Flick.Flick/remote",…"capabilities":["downloads","stream-incomplete","links","shares"],…"videos":3}`.
+- `launchctl print gui/501/com.flick.serve` showed `state = running` with `program = /usr/bin/caffeinate`; `pmset -g assertions` listed caffeinate's `PreventUserIdleSystemSleep` and `PreventSystemSleep` on behalf of `flick-serve`.
+- `curl http://100.98.200.69:47117/v1/hello` answered `{"protocol":1,"server_name":"Mohtasham’s Mac Mini","pairing_open":false}` with 200; `/v1/library` without the token answered 401. `flick-serve pair-code` opened a code (`"expires_in":599`), after which `hello` said `"pairing_open":true`.
+- `launchctl kickstart -k` restarted it (`runs = 2`). After `kill <pid>` (SIGTERM), `status` said `"running":false`; launchd started it again and it answered 21 seconds later (`runs = 3`). After `kill -9` it answered again 21 seconds later (`runs = 4`, `last terminating signal = Killed: 9`), with one caffeinate left.
+- `--uninstall` printed `Stopped com.flick.serve` and `Removed …/com.flick.serve.plist`. Afterwards `launchctl print` could not find the service, no `flick-serve` process was left, `status` said `"running":false`, and `curl` could not connect.
+- It was installed again the same way and left running.
+
 ## Keep the Mac mini awake and reachable
 
 The server is only reachable while the Mac is awake and Tailscale is connected on both machines.
 
 - `caffeinate -is` in the launchd agent stops idle sleep while the server runs.
+- The desktop app's in-app server does the same while **Keep this Mac awake while sharing** is on (Settings → Remote Libraries, on by default, macOS only): it holds `caffeinate -i -w <Flick's pid>` while the server runs, ends it when sharing stops or the switch is turned off, and the assertion also ends if Flick quits or crashes. The display can still sleep.
 - To stop sleep entirely, use **System Settings → Energy → Prevent automatic sleeping when the display is off**, or `sudo pmset -a sleep 0` (display sleep is fine: `sudo pmset -a displaysleep 10`).
 - **Start up automatically after a power failure** in the same settings pane brings it back after an outage.
 - In the Tailscale app, enable **Launch at login** (or run `tailscaled` as a system daemon), so the tailnet address exists before the server starts.

@@ -116,6 +116,7 @@ impl Nav {
 struct Snapshot {
     servers: Vec<String>,
     serve: bool,
+    keep_awake: bool,
     default_destination: String,
     seed_completed: Option<bool>,
 }
@@ -130,6 +131,7 @@ impl Snapshot {
                 .map(|server| server.id.clone())
                 .collect(),
             serve: settings.remote.serve,
+            keep_awake: settings.remote.keep_awake,
             default_destination: settings.remote.default_destination.clone(),
             seed_completed: settings.transfers.seed_completed,
         }
@@ -246,6 +248,11 @@ impl Flick {
                 self.onboarding.pairing_error = None;
             }
             Step::Share => {
+                if self.store.data.remote.keep_awake != snapshot.keep_awake {
+                    self.store.data.remote.keep_awake = snapshot.keep_awake;
+                    self.serve.set_keep_awake(snapshot.keep_awake);
+                    self.persist();
+                }
                 if self.store.data.remote.serve != snapshot.serve {
                     self.set_serving(snapshot.serve, cx);
                 }
@@ -733,11 +740,12 @@ impl Flick {
 
     fn share_step(&self, cx: &Context<Self>) -> Div {
         let t = cx.theme().clone();
-        let (rows, error) = self.serve_rows(cx);
+        let (mut rows, error) = self.serve_rows(cx);
+        rows.extend(self.serve_extra_rows(cx));
         v_flex()
             .gap_2()
             .child(div().text_color(t.muted).child(
-                "Let your other Flicks play this library over Tailscale. They pair with the string shown here once sharing starts.",
+                "Let your other Flicks play this library over Tailscale. Once sharing starts, they find this one by name and type the pairing code shown here, or paste the pairing string.",
             ))
             .child(group(&t, rows))
             .when_some(error, |d, error| d.child(notice(&t, true, error)))
@@ -1335,12 +1343,14 @@ mod tests {
             });
         settings.remote.serve = true;
         settings.remote.default_destination = "a".into();
+        settings.remote.keep_awake = false;
         settings.transfers.seed_completed = Some(true);
         assert_eq!(
             Snapshot::of(&settings),
             Snapshot {
                 servers: vec!["a".into()],
                 serve: true,
+                keep_awake: false,
                 default_destination: "a".into(),
                 seed_completed: Some(true),
             }

@@ -5,6 +5,12 @@
   scripts/install-flick-serve.sh fills in the placeholders and installs it in
   ~/Library/LaunchAgents; see docs/REMOTE.md.
 
+  PROGRAM_ARGUMENTS becomes caffeinate -is (unless left out), the copied
+  binary (~/.local/bin/flick-serve), and the server's options: library or
+  folder, and optionally allow-downloads, download-dir, share-root, links,
+  and the rest. Never the pairing-code option: nobody reads stdout here.
+  Open a code with the pair-code subcommand from a terminal instead.
+
   Stdout is discarded on purpose: it carries the pairing string, which
   contains the token. Get the string by running flick-serve with its
   print-pairing option (XML comments cannot contain a double hyphen).
@@ -30,9 +36,13 @@
   <key>EnvironmentVariables</key>
   <dict>
     <key>PATH</key>
-    <string>/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <!-- ~/.local/bin: yt-dlp for links, ffmpeg, and the tailscale CLI. -->
+    <string>__HOME__/.local/bin:/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
     <key>RUST_LOG</key>
     <string>flick=info</string>
+    <!-- The log is a file: no terminal colour codes. -->
+    <key>NO_COLOR</key>
+    <string>1</string>
   </dict>
   <key>StandardOutPath</key>
   <string>/dev/null</string>

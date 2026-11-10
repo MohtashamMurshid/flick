@@ -2267,15 +2267,8 @@ impl Flick {
                         this.start_serving(true);
                         cx.notify();
                     },
-                ))
-                // WAVE SEAM: pairing code. `RemoteServe` has no
-                // `open_pairing_code()` yet; when it does, this becomes a
-                // button calling `this.serve.open_pairing_code()` and showing
-                // the six-digit code it returns.
-                .child(super::onboarding_ui::disabled_button(
-                    &t,
-                    "Show Pairing Code",
                 ));
+            // The pairing code row follows: `settings_ui::serve_extra_rows`.
             rows.push(
                 row(
                     &t,
