@@ -916,6 +916,10 @@ impl Inner {
                                 message: queued_message(name),
                             });
                             self.to_queue.push(entry);
+                        } else if matches!(command, Command::Resolve { .. }) {
+                            result = Ok(Outcome::Unanswered {
+                                question: unanswered_resolve_question(name),
+                            });
                         }
                     }
                     // Sent, but no answer: not queued, so it is never
@@ -2077,13 +2081,27 @@ impl Destination {
         }
     }
 
-    /// Whether the picker lets this be chosen for `sheet`.
+    /// Whether the picker lets this be chosen for `sheet`. An offline
+    /// server whose last listing allowed a download or link stays
+    /// selectable: what is started there waits in the queue.
     pub fn selectable(&self, sheet: Sheet) -> bool {
-        self.online && self.allows(sheet)
+        self.allows(sheet) && (self.online || self.queues(sheet))
+    }
+
+    /// Offline, with a last listing that allows `sheet`'s download or link:
+    /// a start there is queued until it answers.
+    fn queues(&self, sheet: Sheet) -> bool {
+        !self.online
+            && self.status == Status::Offline
+            && sheet != Sheet::Share
+            && self.allows(sheet)
     }
 
     /// The line under its segment: free space, or why it cannot be chosen.
     pub fn detail(&self, sheet: Sheet) -> String {
+        if self.queues(sheet) {
+            return "Asleep · will queue".into();
+        }
         if !self.online {
             return match &self.status {
                 Status::Connecting => "Connecting…".into(),
@@ -2260,6 +2278,12 @@ pub enum Outcome {
     Queued {
         message: String,
     },
+    /// A resolve the server did not answer: nothing was sent.
+    /// `question` offers to queue the download with every file
+    /// ([`RemoteState::queue_download`]).
+    Unanswered {
+        question: String,
+    },
 }
 
 /// One server's section in Downloads.
@@ -2371,18 +2395,18 @@ pub fn transfers_finished(old: &[TransferRow], new: &[TransferRow]) -> bool {
 }
 
 /// Downloads (not shares) that moved from downloading or checking to
-/// seeding since the previous poll, as (id, name).
+/// seeding since the previous poll, including one that started and
+/// finished between two polls, as (id, name). The caller skips the first
+/// poll for a server, so transfers present then never count.
 pub fn newly_seeding(old: &[TransferRow], new: &[TransferRow]) -> Vec<(String, String)> {
     new.iter()
         .filter(|row| !row.share && row.phase == TransferPhase::Seeding)
-        .filter(|row| {
-            old.iter().any(|before| {
-                before.id == row.id
-                    && matches!(
-                        before.phase,
-                        TransferPhase::Downloading | TransferPhase::Checking
-                    )
-            })
+        .filter(|row| match old.iter().find(|before| before.id == row.id) {
+            Some(before) => matches!(
+                before.phase,
+                TransferPhase::Downloading | TransferPhase::Checking
+            ),
+            None => true,
         })
         .map(|row| (row.id.clone(), row.name.clone()))
         .collect()
@@ -3106,6 +3130,26 @@ impl RemoteState {
         self.command(settings, server_id, Command::Resolve { input });
     }
 
+    /// Queues a torrent with every file for a server that did not answer
+    /// its resolve ([`Outcome::Unanswered`]); it is sent when the server
+    /// answers again, once however often it is asked for. Returns the
+    /// sentence to show.
+    pub fn queue_download(&mut self, server_id: &str, input: String) -> String {
+        let inner = self.inner.get_mut();
+        let command = Command::Start {
+            input,
+            files: Vec::new(),
+        };
+        inner
+            .to_queue
+            .extend(queue_entry(server_id, &command, unix_now()));
+        let name = inner
+            .servers
+            .get(server_id)
+            .map_or("", |remote| remote.name.as_str());
+        queued_message(name)
+    }
+
     /// Ends the resolve in flight on a server: its request is dropped,
     /// which closes the connection and so ends the lookup on the server,
     /// and its answer is discarded. `DELETE /v1/transfers/resolve` is also
@@ -3401,6 +3445,14 @@ pub fn replay_command(entry: &QueuedCommand) -> Command {
 pub fn queued_message(name: &str) -> String {
     format!(
         "{} is not answering; queued until it does.",
+        display_name(name)
+    )
+}
+
+/// What [`Outcome::Unanswered`] asks.
+pub fn unanswered_resolve_question(name: &str) -> String {
+    format!(
+        "{} is not answering. Queue this download with every file and start it when it answers?",
         display_name(name)
     )
 }
@@ -4096,10 +4148,26 @@ mod tests {
         assert!(!read_only.selectable(Sheet::Torrent) && read_only.online);
         assert_eq!(read_only.detail(Sheet::Torrent), "Not accepting downloads");
         assert_eq!(read_only.detail(Sheet::Share), "Not sharing folders");
-        // Offline keeps its last known capabilities but cannot be chosen.
+        // Offline keeps its last known capabilities: downloads and links
+        // there are queued, but nothing is shared from it.
         let asleep = &destinations[3];
-        assert!(asleep.allows_downloads && !asleep.selectable(Sheet::Torrent));
-        assert_eq!(asleep.detail(Sheet::Torrent), "Offline");
+        assert!(!asleep.online && asleep.allows_downloads);
+        assert!(asleep.selectable(Sheet::Torrent) && asleep.selectable(Sheet::Link));
+        assert!(!asleep.selectable(Sheet::Share));
+        assert_eq!(asleep.detail(Sheet::Torrent), "Asleep · will queue");
+        assert_eq!(asleep.detail(Sheet::Link), "Asleep · will queue");
+        assert_eq!(asleep.detail(Sheet::Share), "Offline");
+        // Offline without those capabilities, or never listed: not chosen.
+        let none = library(1);
+        let bare = destinations_from(
+            None,
+            &[
+                facts("ro", Some(&none), &offline),
+                facts("never", None, &offline),
+            ],
+        );
+        assert!(!bare[1].selectable(Sheet::Torrent) && !bare[2].selectable(Sheet::Link));
+        assert_eq!(bare[1].detail(Sheet::Torrent), "Offline");
         assert_eq!(destinations[4].detail(Sheet::Link), "Connecting…");
         assert!(!destinations[4].allows_links);
 
@@ -4132,11 +4200,12 @@ mod tests {
             choose_destination(&destinations, Sheet::Torrent, None, ""),
             None
         );
-        // A default that is offline, unknown, or not allowed falls back.
+        // An asleep default that took downloads is kept: they queue there.
         assert_eq!(
             choose_destination(&destinations, Sheet::Torrent, None, "asleep"),
-            None
+            Some("asleep".to_owned())
         );
+        // A default that is unknown or not allowed falls back.
         assert_eq!(
             choose_destination(&destinations, Sheet::Torrent, None, "gone"),
             None
@@ -4154,7 +4223,8 @@ mod tests {
             choose_destination(&destinations, Sheet::Torrent, Some(&mini), ""),
             mini
         );
-        // A remembered machine that went offline gives way to the default.
+        // A remembered machine that went to sleep stays chosen; one that
+        // can no longer be chosen gives way to the default.
         assert_eq!(
             choose_destination(
                 &destinations,
@@ -4162,7 +4232,11 @@ mod tests {
                 Some(&Some("asleep".into())),
                 "mini"
             ),
-            mini
+            Some("asleep".to_owned())
+        );
+        assert_eq!(
+            choose_destination(&destinations, Sheet::Link, Some(&Some("asleep".into())), ""),
+            None
         );
     }
 
@@ -5141,15 +5215,25 @@ mod tests {
             ),
             vec![(id.clone(), "Show".to_owned())]
         );
-        // Already seeding, never seen downloading, or a share: no news.
+        // Already seeding at the previous poll, or a share: no news.
         let seen = std::slice::from_ref(&seeding);
         assert!(newly_seeding(seen, seen).is_empty());
-        assert!(newly_seeding(&[], seen).is_empty());
         let share = TransferRow {
             share: true,
             ..seeding.clone()
         };
-        assert!(newly_seeding(&[downloading], &[share]).is_empty());
+        assert!(newly_seeding(std::slice::from_ref(&downloading), &[share]).is_empty());
+        // Started and finished between two polls: first seen seeding.
+        let other = transfer(&"d".repeat(40), TransferPhase::Seeding, 200);
+        assert_eq!(
+            newly_seeding(seen, &[seeding.clone(), other.clone()]),
+            vec![("d".repeat(40), "Show".to_owned())]
+        );
+        let shared_new = TransferRow {
+            share: true,
+            ..other.clone()
+        };
+        assert!(newly_seeding(seen, &[shared_new]).is_empty());
 
         let fetch = |id: u64, phase: FetchPhase| FetchRow {
             id,
@@ -5338,6 +5422,62 @@ mod tests {
         });
         state.remove_server(&mut settings, &mini);
         assert!(settings.remote.queued.is_empty());
+    }
+
+    #[test]
+    fn a_resolve_on_a_sleeping_machine_offers_to_queue_every_file() {
+        let asleep = TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let data = tempfile::tempdir().unwrap();
+        let mut state = RemoteState::with_data_dir(data.path());
+        let mut settings = Settings::default();
+        let mini = state
+            .add_pairing(
+                &mut settings,
+                &format!("flick-remote://127.0.0.1:{asleep}/#{TOKEN}"),
+            )
+            .unwrap();
+        settings.remote.servers[0].name = "Mac mini".into();
+        wait_until(&mut state, |state| {
+            state.servers(&settings)[0].status == Status::Offline
+        });
+
+        // The resolve reaches nothing: the sheet is asked whether to queue.
+        let magnet = "magnet:?xt=urn:btih:abc".to_owned();
+        state.resolve(&settings, &mini, magnet.clone());
+        let (_, command, result) = command_answer(&mut state);
+        assert!(matches!(command, Command::Resolve { .. }));
+        assert_eq!(
+            result,
+            Ok(Outcome::Unanswered {
+                question: "Mac mini is not answering. Queue this download with every file and start it when it answers?".into()
+            })
+        );
+        state.sync_settings(&mut settings);
+        assert!(settings.remote.queued.is_empty());
+
+        // Queue: every file, kept once however often it is pressed.
+        let message = state.queue_download(&mini, magnet.clone());
+        assert_eq!(message, "Mac mini is not answering; queued until it does.");
+        state.queue_download(&mini, magnet.clone());
+        assert!(state.sync_settings(&mut settings).changed);
+        assert_eq!(
+            settings
+                .remote
+                .queued
+                .iter()
+                .map(|entry| (
+                    entry.server.as_str(),
+                    entry.input.as_str(),
+                    entry.files.clone(),
+                    entry.link
+                ))
+                .collect::<Vec<_>>(),
+            [(mini.as_str(), magnet.as_str(), Vec::new(), false)]
+        );
     }
 
     #[test]

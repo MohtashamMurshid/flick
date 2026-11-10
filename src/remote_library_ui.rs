@@ -88,6 +88,16 @@ pub(super) struct RemoteTorrent {
     pub(super) selected: HashSet<usize>,
     /// Download Selected was pressed and the server has not answered.
     pub(super) starting: bool,
+    /// The server did not answer the resolve: the question offering to
+    /// queue the download with every file.
+    pub(super) asleep: Option<String>,
+}
+
+impl RemoteTorrent {
+    /// Its resolve is still on the server.
+    fn resolving(&self) -> bool {
+        self.info.is_none() && self.asleep.is_none()
+    }
 }
 
 /// A pasted video page link waiting for Save to.
@@ -391,7 +401,7 @@ struct Card<'a> {
 }
 
 /// Shown under Add Server and on onboarding step one while a code is typed.
-pub(super) const CODE_HINT: &str = "Ask the owner for the code shown in Settings → Remote Libraries, or printed by flick-serve --pair-code.";
+pub(super) const CODE_HINT: &str = "Ask the owner for a code: open one from its Settings → Remote Libraries, or run flick-serve pair-code on that machine.";
 
 /// The discovery list after a pass that found nothing.
 pub(super) const NO_FLICKS: &str = "No Flicks found. Tailscale must be running on this computer, and the other Flick must be sharing its library on Tailscale.";
@@ -2335,7 +2345,7 @@ impl Flick {
         cx: &mut Context<Self>,
     ) {
         if let Some(old) = self.remote_ui.save_to.remote_torrent.take()
-            && old.info.is_none()
+            && old.resolving()
         {
             self.remote.cancel_resolve(&self.store.data, &old.server_id);
         }
@@ -2366,6 +2376,7 @@ impl Flick {
             info: None,
             selected: HashSet::new(),
             starting: false,
+            asleep: None,
         });
         self.remote.resolve(&self.store.data, &server_id, wire);
         cx.notify();
@@ -2394,12 +2405,28 @@ impl Flick {
     /// Closes the torrent sheet for another machine, cancelling its resolve.
     fn cancel_remote_torrent(&mut self, cx: &mut Context<Self>) {
         if let Some(sheet) = self.remote_ui.save_to.remote_torrent.take()
-            && sheet.info.is_none()
+            && sheet.resolving()
         {
             self.remote
                 .cancel_resolve(&self.store.data, &sheet.server_id);
         }
         self.remote_ui.save_to.torrent_input = None;
+        cx.notify();
+    }
+
+    /// Queues the torrent with every file for the machine that did not
+    /// answer its resolve, and closes the sheet.
+    fn queue_remote_torrent(&mut self, cx: &mut Context<Self>) {
+        let save_to = &mut self.remote_ui.save_to;
+        let Some(sheet) = save_to
+            .remote_torrent
+            .take_if(|sheet| sheet.asleep.is_some())
+        else {
+            return;
+        };
+        save_to.torrent_input = None;
+        let message = self.remote.queue_download(&sheet.server_id, sheet.input);
+        self.show_status_for(message, std::time::Duration::from_secs(6));
         cx.notify();
     }
 
@@ -2592,6 +2619,7 @@ impl Flick {
                         sheet.selected = default_selection(&info.files);
                         sheet.info = Some(info);
                     }
+                    Ok(Outcome::Unanswered { question }) => sheet.asleep = Some(question),
                     Ok(_) => {}
                     Err(message) => {
                         save_to.remote_torrent = None;
@@ -2822,6 +2850,36 @@ impl Flick {
         let name = self.machine_name(&sheet.server_id);
         let mut rows = Vec::new();
         rows.extend(self.torrent_save_to(cx));
+        if let Some(question) = &sheet.asleep {
+            rows.push(row(&t, Some("magnet"), question.clone(), None, div()).into_any_element());
+            return Some(
+                v_flex()
+                    .child(section_title(&t, "New Download"))
+                    .child(super::chrome_ui::group(&t, rows))
+                    .child(
+                        h_flex()
+                            .mt_3()
+                            .gap_2()
+                            .justify_end()
+                            .child(self.button(
+                                "remote-queue-cancel",
+                                None,
+                                "Cancel",
+                                false,
+                                cx,
+                                |this, _, cx| this.cancel_remote_torrent(cx),
+                            ))
+                            .child(self.button(
+                                "remote-queue-confirm",
+                                Some("download"),
+                                "Queue",
+                                true,
+                                cx,
+                                |this, _, cx| this.queue_remote_torrent(cx),
+                            )),
+                    ),
+            );
+        }
         let Some(info) = &sheet.info else {
             rows.push(
                 row(
@@ -3844,7 +3902,7 @@ mod tests {
         let one = [found("studio", "100.64.0.2", "Studio", false)];
         assert_eq!(discovery_note(false, Some(&one)), None);
         assert!(CODE_HINT.contains("Settings → Remote Libraries"));
-        assert!(CODE_HINT.contains("flick-serve --pair-code"));
+        assert!(CODE_HINT.contains("flick-serve pair-code on that machine"));
     }
 
     #[test]

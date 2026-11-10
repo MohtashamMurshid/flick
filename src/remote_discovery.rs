@@ -417,8 +417,7 @@ fn pair_error(status: u16, body: &[u8]) -> String {
         .filter(|message| !message.is_empty());
     message.unwrap_or_else(|| match status {
         400 | 401 | 403 => "That code was not accepted. Check it on the other Flick".into(),
-        404 => "That Flick does not pair with codes. Paste its pairing string instead".into(),
-        410 => "That code has expired. Show a new one on the other Flick".into(),
+        404 => "No pairing code is open on that Flick.".into(),
         429 => "Too many attempts. Wait a minute, then try again".into(),
         500..=599 => format!("Server error ({status})"),
         _ => format!("Unexpected reply ({status})"),

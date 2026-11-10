@@ -103,7 +103,7 @@ pub const LISTEN_FILE: &str = "listen";
 /// protocol; `flick-serve pair-code` uses it.
 pub const LOCAL_PAIR_CODE_PATH: &str = "/v1/local/pair-code";
 /// `POST /v1/pair` while no code is open.
-pub const NO_CODE_MESSAGE: &str = "No pairing code is open on that Flick. Open one from its Settings → Remote Libraries or run `flick-serve --pair-code`.";
+pub const NO_CODE_MESSAGE: &str = "No pairing code is open on that Flick. Open one from its Settings → Remote Libraries, or run `flick-serve pair-code` on that machine.";
 
 #[derive(Clone)]
 pub struct ServerConfig {

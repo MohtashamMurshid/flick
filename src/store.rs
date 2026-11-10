@@ -528,12 +528,10 @@ impl Settings {
     /// Folds the positions a server's listing carries into saved progress,
     /// so Continue Watching follows the person between machines. For each
     /// video with `resume`, the server's position replaces a saved entry
-    /// only when it is newer by more than [`RESUME_CONFLICT_WINDOW`], the
-    /// server's own rule, so two clocks a little apart do not trade the
-    /// same position back and forth. The server's time is first capped at
-    /// now plus [`RESUME_CLOCK_SKEW`], so a server clock running ahead
-    /// cannot pin its position. An entry taken from the server gets the
-    /// listing's title. True when anything changed.
+    /// when its time is strictly newer. The server's time is first capped
+    /// at now plus [`RESUME_CLOCK_SKEW`], so a server clock running ahead
+    /// cannot claim a time far in the future. An entry taken from the
+    /// server gets the listing's title. True when anything changed.
     pub fn merge_remote_resume(
         &mut self,
         server: &str,
@@ -562,9 +560,7 @@ impl Settings {
             let updated = resume.updated.min(now.saturating_add(RESUME_CLOCK_SKEW));
             if self
                 .remote_progress(server, &video.id)
-                .is_some_and(|saved| {
-                    updated <= saved.updated.saturating_add(RESUME_CONFLICT_WINDOW)
-                })
+                .is_some_and(|saved| updated <= saved.updated)
             {
                 continue;
             }
@@ -946,9 +942,6 @@ fn finite_or(value: f64, fallback: f64) -> f64 {
     if value.is_finite() { value } else { fallback }
 }
 
-/// A server's resume position replaces a saved one only when newer by more
-/// than this many seconds; the server applies the same window to uploads.
-pub const RESUME_CONFLICT_WINDOW: u64 = 60;
 /// A server's resume time further ahead of this computer's clock than this
 /// many seconds is taken as now plus this, as the server does for clients.
 pub const RESUME_CLOCK_SKEW: u64 = 60;
@@ -1960,14 +1953,9 @@ mod tests {
             "Old title"
         );
 
-        // Newer, but within the minute two clocks may differ by: kept.
-        let listing = [video("abc", "Sintel", at(70.0, saved + 60))];
-        assert!(!settings.merge_remote_resume("mini", &listing));
-        assert_eq!(settings.remote_resume_position("mini", "abc"), 30.0);
-
-        // Newer by more: the server's position wins, with its title.
+        // Newer by a second: the server's position wins, with its title.
         let listing = [
-            video("abc", "Sintel", at(70.0, saved + 61)),
+            video("abc", "Sintel", at(70.0, saved + 1)),
             video("new", "", at(500.0, 3)),
             video("none", "Never played", None),
         ];
@@ -1975,7 +1963,7 @@ mod tests {
         let merged = settings.remote_progress("mini", "abc").unwrap();
         assert_eq!(
             (merged.position, merged.updated, merged.title.as_str()),
-            (70.0, saved + 61, "Sintel")
+            (70.0, saved + 1, "Sintel")
         );
         assert_eq!(settings.remote_resume_position("mini", "abc"), 70.0);
         // A video with no saved entry joins, clamped, titled by file name.
@@ -2014,14 +2002,12 @@ mod tests {
         assert!(settings.merge_remote_resume_at("mini", &listing(40.0, now + 86_400), now));
         let merged = settings.remote_progress("mini", "abc").unwrap();
         assert_eq!((merged.position, merged.updated), (40.0, now + 60));
-        // Watching here a few minutes later wins over the same claim.
-        let later = now + 300;
+        // The same claim at the same moment is not newer than the capped time.
         settings.remote.progress[0].position = 55.0;
-        settings.remote.progress[0].updated = later;
-        assert!(!settings.merge_remote_resume_at("mini", &listing(40.0, now + 86_400), later));
+        assert!(!settings.merge_remote_resume_at("mini", &listing(40.0, now + 86_400), now));
         assert_eq!(settings.remote_resume_position("mini", "abc"), 55.0);
-        // A real later position from the server, more than a minute on, wins.
-        let after = later + 600;
+        // A real later position from the server wins.
+        let after = now + 600;
         assert!(settings.merge_remote_resume_at("mini", &listing(80.0, after), after));
         assert_eq!(settings.remote_resume_position("mini", "abc"), 80.0);
     }

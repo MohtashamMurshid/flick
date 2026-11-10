@@ -278,7 +278,10 @@ async fn pairing_without_an_open_code_is_not_found() -> Result<()> {
             );
             let text = message(response).await?;
             ensure!(text == server::NO_CODE_MESSAGE, "{text}");
-            ensure!(text.contains("Settings → Remote Libraries") && text.contains("--pair-code"));
+            ensure!(
+                text.contains("Settings → Remote Libraries")
+                    && text.contains("`flick-serve pair-code` on that machine")
+            );
             running.server.shutdown().await;
         }
         // A code that expired is closed too.

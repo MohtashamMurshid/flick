@@ -496,20 +496,34 @@ fn truncate_bytes(text: &str, limit: usize) -> &str {
     &text[..end]
 }
 
-/// `name`, or `name (2).ext`, `name (3).ext`, … when taken.
-fn unused_path(folder: &Path, name: &str) -> PathBuf {
-    let first = folder.join(name);
-    if !first.exists() {
-        return first;
-    }
+/// Moves `part` to `name` in `folder`, or `name (2).ext`, `name (3).ext`,
+/// … when taken. Each name is claimed with `create_new` before the rename
+/// replaces the claim, so two copies finishing at once never pick the same
+/// name and an existing file is never overwritten.
+fn publish(part: &Path, folder: &Path, name: &str) -> std::io::Result<PathBuf> {
     let (stem, extension) = match name.rsplit_once('.') {
         Some((stem, extension)) if !stem.is_empty() => (stem, format!(".{extension}")),
         _ => (name, String::new()),
     };
-    (2..)
-        .map(|n| folder.join(format!("{stem} ({n}){extension}")))
-        .find(|path| !path.exists())
-        .unwrap_or(first)
+    let candidates = std::iter::once(folder.join(name))
+        .chain((2..).map(|n| folder.join(format!("{stem} ({n}){extension}"))));
+    for path in candidates {
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(claim) => drop(claim),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+        if let Err(error) = std::fs::rename(part, &path) {
+            let _ = std::fs::remove_file(&path);
+            return Err(error);
+        }
+        return Ok(path);
+    }
+    unreachable!("the numbered names never run out")
 }
 
 /// Measures bytes per second over a short sliding window.
@@ -691,9 +705,10 @@ async fn copy(
     }
     // The final name is chosen only now, so a name taken while the copy ran
     // is not overwritten.
-    let path = unused_path(&paths.folder, &name);
-    tokio::fs::rename(&paths.part, &path)
+    let (part, folder, wanted) = (paths.part.clone(), paths.folder.clone(), name.clone());
+    let path = tokio::task::spawn_blocking(move || publish(&part, &folder, &wanted))
         .await
+        .map_err(|error| write_error(std::io::Error::other(error)))?
         .map_err(write_error)?;
     let _ = tokio::fs::remove_file(&paths.info).await;
     Ok(path)
@@ -1100,6 +1115,31 @@ mod tests {
             behaviour.ranges.lock().unwrap().last().cloned().flatten(),
             Some("bytes=700000-".to_owned())
         );
+    }
+
+    #[test]
+    fn two_finished_copies_of_one_name_get_two_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let (first, second) = (dir.path().join("a.part"), dir.path().join("b.part"));
+        std::fs::write(&first, b"first").unwrap();
+        std::fs::write(&second, b"second").unwrap();
+        let (a, b) = thread::scope(|scope| {
+            let a = scope.spawn(|| publish(&first, dir.path(), "Holiday.mkv").unwrap());
+            let b = scope.spawn(|| publish(&second, dir.path(), "Holiday.mkv").unwrap());
+            (a.join().unwrap(), b.join().unwrap())
+        });
+        let mut names = [a.clone(), b.clone()]
+            .map(|path| path.file_name().unwrap().to_string_lossy().into_owned());
+        names.sort();
+        assert_eq!(names, ["Holiday (2).mkv", "Holiday.mkv"]);
+        assert_eq!(std::fs::read(&a).unwrap(), b"first");
+        assert_eq!(std::fs::read(&b).unwrap(), b"second");
+        assert!(!first.exists() && !second.exists());
+        // A third finds both names taken and leaves them alone.
+        std::fs::write(&first, b"third").unwrap();
+        let c = publish(&first, dir.path(), "Holiday.mkv").unwrap();
+        assert_eq!(c, dir.path().join("Holiday (3).mkv"));
+        assert_eq!(std::fs::read(&a).unwrap(), b"first");
     }
 
     /// Interrupts a copy of `before`, changes the server's file to `after`,
