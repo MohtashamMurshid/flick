@@ -29,6 +29,10 @@ const INSPECT_TIMEOUT: Duration = Duration::from_secs(60);
 const EXTRACT_TIMEOUT: Duration = Duration::from_secs(300);
 /// WebVTT output larger than this is not a subtitle track.
 const MAX_WEBVTT_BYTES: usize = 64 * 1024 * 1024;
+/// Output kept from `ffmpeg -encoders` and ffprobe, which are far smaller.
+const MAX_QUIET_BYTES: usize = 16 * 1024 * 1024;
+/// The end of a program's error output kept for its error message.
+const STDERR_TAIL_BYTES: usize = 16 * 1024;
 
 /// The FFmpeg installation the server transcodes with.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -246,33 +250,79 @@ async fn run_quiet(
     args: impl IntoIterator<Item = OsString>,
     limit: Duration,
 ) -> Result<String> {
-    let output = run(program, args, limit).await?;
+    let output = run(program, args, limit, MAX_QUIET_BYTES).await?;
     String::from_utf8(output).context("The output was not UTF-8")
 }
 
+/// Runs a program to completion and returns its stdout. Stdout past
+/// `max_stdout` bytes stops the program with an error, and only the end of
+/// stderr is kept, so memory stays bounded whatever the program writes.
 async fn run(
     program: &Path,
     args: impl IntoIterator<Item = OsString>,
     limit: Duration,
+    max_stdout: usize,
 ) -> Result<Vec<u8>> {
+    use tokio::io::AsyncReadExt;
     let mut command = command(program);
     command
         .args(args)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let output = tokio::time::timeout(limit, command.output())
-        .await
-        .with_context(|| format!("{} did not finish in time", program.display()))?
+    let mut child = command
+        .spawn()
         .with_context(|| format!("Could not start {}", program.display()))?;
-    if !output.status.success() {
+    let stdout = child.stdout.take().context("stdout")?;
+    let mut stderr = child.stderr.take().context("stderr")?;
+    let finished = tokio::time::timeout(limit, async {
+        let mut output = Vec::new();
+        let mut tail = Vec::new();
+        let read_stdout = async {
+            let read = stdout
+                .take(max_stdout as u64 + 1)
+                .read_to_end(&mut output)
+                .await;
+            if output.len() > max_stdout {
+                // Stop it now rather than wait for it to notice the closed
+                // pipe while stderr is still being drained.
+                let _ = child.start_kill();
+            }
+            read
+        };
+        // Drained to the end, so a chatty program never blocks on it.
+        let read_stderr = async {
+            let mut chunk = [0u8; 4096];
+            loop {
+                let read = stderr.read(&mut chunk).await?;
+                if read == 0 {
+                    return Ok::<_, std::io::Error>(());
+                }
+                tail.extend_from_slice(&chunk[..read]);
+                if tail.len() > STDERR_TAIL_BYTES {
+                    tail.drain(..tail.len() - STDERR_TAIL_BYTES);
+                }
+            }
+        };
+        let (read, _) = tokio::join!(read_stdout, read_stderr);
+        read.with_context(|| format!("Read the output of {}", program.display()))?;
+        if output.len() > max_stdout {
+            bail!("{} wrote more than {max_stdout} bytes", program.display());
+        }
+        let status = child.wait().await?;
+        Ok((status, output, tail))
+    })
+    .await
+    .with_context(|| format!("{} did not finish in time", program.display()))?;
+    let (status, output, tail) = finished?;
+    if !status.success() {
         bail!(
             "{} failed ({}): {}",
             program.display(),
-            output.status,
-            stderr_tail(&output.stderr)
+            status,
+            stderr_tail(&tail)
         );
     }
-    Ok(output.stdout)
+    Ok(output)
 }
 
 /// The last non-empty line of FFmpeg's error output.
@@ -566,13 +616,11 @@ pub async fn extract_webvtt(encoder: &Encoder, source: &Path, track: u32) -> Res
         ]
         .map(OsString::from),
     );
-    let output = run(&encoder.ffmpeg, args, EXTRACT_TIMEOUT)
+    // Read through a bound rather than buffered whole, so a runaway
+    // conversion stops at the limit instead of filling memory.
+    run(&encoder.ffmpeg, args, EXTRACT_TIMEOUT, MAX_WEBVTT_BYTES)
         .await
-        .with_context(|| format!("Could not extract subtitle track {track}"))?;
-    if output.len() > MAX_WEBVTT_BYTES {
-        bail!("Subtitle track {track} is too large");
-    }
-    Ok(output)
+        .with_context(|| format!("Could not extract subtitle track {track}"))
 }
 
 #[cfg(test)]
@@ -612,6 +660,40 @@ mod tests {
  A....D aac                  AAC (Advanced Audio Coding)
  S..... webvtt               WebVTT subtitle
 ";
+
+    /// A program that writes without end is stopped at the limit instead of
+    /// filling memory, and its error output is kept only to the end.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn output_is_read_through_a_bound() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("endless");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\ncase \"$1\" in\n  out) exec yes ;;\n  err) yes >&2 & sleep 0.3; kill $!; echo 'last line' >&2; exit 3 ;;\n  ok) printf 'small' ;;\nesac\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let limit = Duration::from_secs(20);
+        let started = std::time::Instant::now();
+        let error = run(&script, [OsString::from("out")], limit, 1024)
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("wrote more than 1024 bytes"),
+            "{error:#}"
+        );
+        assert!(started.elapsed() < Duration::from_secs(10));
+        let error = run(&script, [OsString::from("err")], limit, 1024)
+            .await
+            .unwrap_err();
+        assert!(format!("{error:#}").ends_with("last line"), "{error:#}");
+        let output = run(&script, [OsString::from("ok")], limit, 1024)
+            .await
+            .unwrap();
+        assert_eq!(output, b"small");
+    }
 
     #[test]
     fn encoders_are_chosen_hardware_first() {

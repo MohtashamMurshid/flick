@@ -197,11 +197,22 @@ pub struct ErrorBody {
 /// What one Flick copies from the server and pastes into the other:
 /// `flick-remote://host:port/#token`. The token is in the fragment so it
 /// never reaches a server log if the string is pasted into a browser.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct Pairing {
     pub host: String,
     pub port: u16,
     pub token: String,
+}
+
+/// The token is left out, so a logged pairing never reveals it.
+impl std::fmt::Debug for Pairing {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Pairing")
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("token", &"<redacted>")
+            .finish()
+    }
 }
 
 impl Pairing {
@@ -376,6 +387,19 @@ mod tests {
             .base_url(),
             "http://[fd7a::1]:1"
         );
+    }
+
+    #[test]
+    fn pairing_debug_leaves_out_the_token() {
+        let pairing = Pairing {
+            host: "box".into(),
+            port: DEFAULT_PORT,
+            token: TOKEN.into(),
+        };
+        for text in [format!("{pairing:?}"), format!("{pairing:#?}")] {
+            assert!(!text.contains(TOKEN), "{text}");
+            assert!(text.contains("box") && text.contains("redacted"), "{text}");
+        }
     }
 
     #[test]
