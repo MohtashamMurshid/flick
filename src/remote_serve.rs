@@ -18,6 +18,13 @@
 //! folder, and share roots are read for every request from a [`Gate`] the
 //! settings page updates; turning the switch off answers 403 without a
 //! restart, and turning it on restarts a server that started without it.
+//!
+//! The backend's capabilities are live ([`TransferBackend::live`]): `[]`
+//! while the switch is off, so the listing stops advertising at once;
+//! `shares` only while an allowed share folder exists; `links` only while
+//! yt-dlp is found. They are worked out again whenever the settings change.
+//! Both backends answer through the same helpers in
+//! `flick::remote::transfers`, so they refuse and list alike.
 
 use crate::services::{
     FetchListing, FetchState, QueryError, QueryHandle, QueryReply, QueryRequest, TransferListing,
@@ -26,21 +33,25 @@ use flick::remote::{
     auth, bind,
     ids::{self, Salt},
     protocol::{
-        self, BrowseEntry, BrowseListing, Capability, FetchPhase, FetchRow, Pairing, ShareResult,
-        Started, Storage, TorrentFileInfo, TorrentInfo, TransferFileRow, TransferPhase,
+        self, Capability, FetchPhase, FetchRow, Pairing, ShareResult, Started, TransferFileRow,
         TransferRow,
     },
     server::{Server, ServerConfig, Sources},
-    transfers::{TransferBackend, TransferCommand, TransferError, TransferReply, TransferRequest},
+    transfers::{
+        self, ShareRoots, TransferBackend, TransferCommand, TransferError, TransferReply,
+        TransferRequest,
+    },
 };
-use flick::torrent::{TorrentInput, TransferState};
 use std::{
     fmt,
     net::{IpAddr, SocketAddr},
-    path::{Component, Path, PathBuf},
+    path::{Path, PathBuf},
     sync::{Arc, Mutex, mpsc},
     thread,
 };
+
+/// Free space where downloads go; the settings page shows it too.
+pub use flick::remote::transfers::storage;
 
 /// Shown when `tailscale ip -4` gives no Tailscale address.
 pub const TAILSCALE_MISSING: &str = if cfg!(target_os = "macos") {
@@ -131,6 +142,10 @@ struct Gate {
     settings: Option<TransferSettings>,
     /// Whether the server of this generation answers transfer commands.
     attached: Option<(u64, bool)>,
+    /// The running backend's capabilities, published here.
+    capabilities: Option<Arc<tokio::sync::watch::Sender<Vec<Capability>>>>,
+    /// Wakes the server thread to work the capabilities out again.
+    changed: Arc<tokio::sync::Notify>,
 }
 
 /// What a restart needs from the last start, without its one-shot parts.
@@ -198,7 +213,14 @@ impl RemoteServe {
         let restart = {
             let mut gate = self.gate.lock().unwrap_or_else(|e| e.into_inner());
             let restart = settings.allow && gate.attached == Some((self.generation, false));
+            if !settings.allow
+                && let Some(capabilities) = &gate.capabilities
+            {
+                // Off takes effect now; the listing stops advertising.
+                capabilities.send_replace(Vec::new());
+            }
             gate.settings = Some(settings);
+            gate.changed.notify_one();
             restart
         };
         if restart
@@ -379,9 +401,9 @@ async fn serve(
             .unwrap_or_else(|_| "Flick".into()),
         name => name.to_owned(),
     };
-    let (backend, requests) = match &transfers {
+    let (backend, requests, capabilities) = match &transfers {
         Some(setup) => attach_transfers(setup, &options.settings_path).await,
-        None => (None, None),
+        None => (None, None, None),
     };
     let state_dir = options.state_dir.clone();
     let config = ServerConfig {
@@ -407,13 +429,16 @@ async fn serve(
                     if let Some(tap) = &setup.tap {
                         let _ = tap.send(backend.clone());
                     }
+                    let keeping = capabilities.map(|capabilities| {
+                        tokio::spawn(keep_capabilities(setup.gate.clone(), capabilities))
+                    });
                     let answerer = Answerer {
                         host: setup.host,
                         gate: setup.gate,
                         salt,
-                        links: backend.allows(Capability::Links),
+                        backend: backend.clone(),
                     };
-                    Some(tokio::spawn(answer_transfers(requests, answerer)))
+                    Some((tokio::spawn(answer_transfers(requests, answerer)), keeping))
                 }
                 Err(error) => {
                     // Requests then answer 503 as the channel closes.
@@ -438,55 +463,113 @@ async fn serve(
     let _ = stopped.await;
     tracing::info!("Stopping the in-app remote library server");
     server.shutdown().await;
-    if let Some(answering) = answering {
+    if let Some((answering, keeping)) = answering {
         answering.abort();
         let _ = answering.await;
+        if let Some(keeping) = keeping {
+            keeping.abort();
+            let _ = keeping.await;
+        }
     }
 }
 
+type Published = Arc<tokio::sync::watch::Sender<Vec<Capability>>>;
+
 /// Decides, once per start, whether this server answers transfer commands,
-/// and makes its backend when it does.
+/// and makes its backend when it does, with live capabilities.
 async fn attach_transfers(
     setup: &TransferSetup,
     settings_path: &Path,
 ) -> (
     Option<TransferBackend>,
     Option<tokio::sync::mpsc::Receiver<TransferRequest>>,
+    Option<Published>,
 ) {
     let path = settings_path.to_owned();
     let saved = tokio::task::spawn_blocking(move || saved_transfer_settings(&path))
         .await
         .unwrap_or_default();
-    let attach = {
+    let settings = {
         let mut gate = setup.gate.lock().unwrap_or_else(|e| e.into_inner());
-        let attach = gate.settings.get_or_insert(saved).allow;
-        gate.attached = Some((setup.generation, attach));
-        attach
+        let settings = gate.settings.get_or_insert(saved).clone();
+        gate.attached = Some((setup.generation, settings.allow));
+        settings
     };
-    if !attach {
-        return (None, None);
+    if !settings.allow {
+        return (None, None, None);
     }
-    let links = tokio::task::spawn_blocking(|| flick::fetch::ytdlp::Tools::discover().is_ok())
+    let initial = tokio::task::spawn_blocking(move || capabilities(&settings))
         .await
-        .unwrap_or(false);
+        .unwrap_or_default();
+    let (publish, receiver) = tokio::sync::watch::channel(initial);
+    let publish = Arc::new(publish);
+    setup
+        .gate
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .capabilities = Some(publish.clone());
+    // Settings changed while the first answer was worked out.
+    setup
+        .gate
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .changed
+        .notify_one();
     let (sender, requests) = tokio::sync::mpsc::channel(32);
     (
-        Some(TransferBackend::new(capabilities(links), sender)),
+        Some(TransferBackend::live(receiver, sender)),
         Some(requests),
+        Some(publish),
     )
 }
 
-/// What this Flick offers paired Flicks while downloads are allowed.
-fn capabilities(links: bool) -> Vec<Capability> {
-    let mut capabilities = vec![
-        Capability::Downloads,
-        Capability::Shares,
-        Capability::StreamIncomplete,
-    ];
-    if links {
+/// What this Flick offers paired Flicks with these settings: nothing while
+/// the switch is off; `shares` only with an allowed folder that exists;
+/// `links` only when yt-dlp is found (found, never run).
+fn capabilities(settings: &TransferSettings) -> Vec<Capability> {
+    if !settings.allow {
+        return Vec::new();
+    }
+    let mut capabilities = vec![Capability::Downloads, Capability::StreamIncomplete];
+    if flick::fetch::ytdlp::Tools::discover().is_ok() {
         capabilities.push(Capability::Links);
     }
+    if !ShareRoots::quiet(&settings.share_roots).is_empty() {
+        capabilities.push(Capability::Shares);
+    }
     capabilities
+}
+
+/// Works the capabilities out again whenever the settings page changes the
+/// settings, until the server stops. A result is published only while the
+/// settings it was worked out from are still current.
+async fn keep_capabilities(gate: Arc<Mutex<Gate>>, publish: Published) {
+    let changed = gate
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .changed
+        .clone();
+    loop {
+        changed.notified().await;
+        let settings = gate
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .settings
+            .clone()
+            .unwrap_or_default();
+        let worked_out = settings.clone();
+        let Ok(next) = tokio::task::spawn_blocking(move || capabilities(&worked_out)).await else {
+            continue;
+        };
+        let gate = gate.lock().unwrap_or_else(|e| e.into_inner());
+        if gate.settings.as_ref() == Some(&settings) {
+            publish.send_if_modified(|current| {
+                let modified = *current != next;
+                *current = next;
+                modified
+            });
+        }
+    }
 }
 
 /// The owner's settings as last saved; defaults when unreadable.
@@ -528,7 +611,8 @@ struct Answerer {
     host: QueryHandle,
     gate: Arc<Mutex<Gate>>,
     salt: Salt,
-    links: bool,
+    /// The backend this answers for; its capabilities are live.
+    backend: TransferBackend,
 }
 
 impl Answerer {
@@ -549,6 +633,14 @@ impl Answerer {
             .map_err(transfer_error)
     }
 
+    fn require(&self, capability: Capability, refusal: &str) -> Result<(), TransferError> {
+        if self.backend.allows(capability) {
+            Ok(())
+        } else {
+            Err(TransferError::not_allowed(refusal))
+        }
+    }
+
     async fn answer(&self, command: TransferCommand) -> Result<TransferReply, TransferError> {
         let settings = self.settings();
         if !settings.allow {
@@ -560,26 +652,18 @@ impl Answerer {
             .unwrap_or_else(|| self.host.download_dir.clone());
         let reply = match command {
             TransferCommand::Resolve { input } => {
-                let (input, key) = parse_input(&input)?;
+                let input = transfers::parse_input(&input)?;
+                let key = transfers::input_key(&input);
                 match self.ask(QueryRequest::Resolve { input, key }).await? {
-                    QueryReply::Resolved(torrent) => TransferReply::Resolved(TorrentInfo {
-                        infohash: torrent.infohash.clone(),
-                        name: torrent.name.clone(),
-                        files: torrent
-                            .files
-                            .iter()
-                            .map(|file| TorrentFileInfo {
-                                index: file.index,
-                                path: slash_path(&file.relative_path),
-                                size: file.length,
-                            })
-                            .collect(),
-                    }),
+                    QueryReply::Resolved(torrent) => {
+                        TransferReply::Resolved(transfers::torrent_info(&torrent))
+                    }
                     _ => return Err(unexpected()),
                 }
             }
             TransferCommand::Start { input, files } => {
-                let (input, key) = parse_input(&input)?;
+                let input = transfers::parse_input(&input)?;
+                let key = transfers::input_key(&input);
                 let request = QueryRequest::Start {
                     input,
                     key,
@@ -615,16 +699,13 @@ impl Answerer {
                     id: infohash(&id)?,
                     delete_files,
                     confirm,
+                    folder,
                 };
                 self.done(request).await?
             }
             TransferCommand::FetchStart { url } => {
-                if !self.links {
-                    return Err(TransferError::new(
-                        403,
-                        "This Flick cannot download links: yt-dlp is not installed on it.",
-                    ));
-                }
+                self.require(Capability::Links, "link downloads")?;
+                transfers::fetch_source(&url)?;
                 match self.ask(QueryRequest::FetchStart { url, folder }).await? {
                     QueryReply::FetchStarted(id) => TransferReply::FetchStarted { id },
                     _ => return Err(unexpected()),
@@ -641,14 +722,16 @@ impl Answerer {
             },
             TransferCommand::FetchCancel { id } => self.done(QueryRequest::FetchCancel(id)).await?,
             TransferCommand::Browse { dir } => {
+                self.require(Capability::Shares, "shares")?;
                 let roots = settings.share_roots;
-                TransferReply::Browse(blocking(move || browse(&roots, &dir)).await?)
+                TransferReply::Browse(
+                    blocking(move || ShareRoots::quiet(&roots).browse(&dir)).await?,
+                )
             }
             TransferCommand::Share { dir } => {
+                self.require(Capability::Shares, "shares")?;
                 let roots = settings.share_roots;
-                let path =
-                    blocking(move || resolve_virtual(&roots, &dir).ok_or_else(outside_roots))
-                        .await?;
+                let path = blocking(move || ShareRoots::quiet(&roots).resolve(&dir)).await?;
                 match self.ask(QueryRequest::Share(path)).await? {
                     QueryReply::Shared(shared) => TransferReply::Shared(ShareResult {
                         infohash: shared.infohash,
@@ -694,123 +777,42 @@ fn unexpected() -> TransferError {
     TransferError::new(500, "Downloads gave an unexpected answer.")
 }
 
-/// The worker's refusal as an HTTP status. A deletion that no longer
-/// matches lists the current files, one per line, after the message.
+/// The worker's refusal as an HTTP status, as the headless backend answers
+/// the same refusal. Only a deletion whose list did not match carries the
+/// current list as `files`; messages never name a path on this machine.
 pub fn transfer_error(error: QueryError) -> TransferError {
+    let public = |message: String| {
+        transfers::public_text(&message).unwrap_or_else(|| {
+            tracing::warn!("A paired Flick's request failed: {message}");
+            "This Flick could not do that. Its owner can see why in the log.".into()
+        })
+    };
     match error {
-        QueryError::NotFound(message) => TransferError::new(404, message),
-        QueryError::Conflict { message, files } if files.is_empty() => {
-            TransferError::new(409, message)
-        }
-        QueryError::Conflict { message, files } => {
-            TransferError::new(409, format!("{message}\n{}", files.join("\n")))
-        }
-        QueryError::Invalid(message) => TransferError::new(422, message),
+        QueryError::NotFound(message) => TransferError::new(404, public(message)),
+        QueryError::Forbidden(message) => TransferError::new(403, message),
+        QueryError::Conflict {
+            files: Some(files), ..
+        } => TransferError::files_changed(files),
+        QueryError::Conflict {
+            message,
+            files: None,
+        } => TransferError::new(409, public(message)),
+        QueryError::Invalid(message) => TransferError::new(422, public(message)),
         QueryError::Busy(message) | QueryError::Unavailable(message) => {
-            TransferError::new(503, message)
+            TransferError::new(503, public(message))
         }
-        QueryError::TimedOut(message) => TransferError::new(504, message),
-        QueryError::Failed(message) => TransferError::new(500, message),
+        QueryError::TimedOut(message) => TransferError::new(504, public(message)),
+        QueryError::Failed(message) => TransferError::new(500, public(message)),
     }
 }
 
 /// A transfer id from a URL: an infohash, else 404.
 fn infohash(id: &str) -> Result<String, TransferError> {
-    if id.len() == 40 && id.bytes().all(|b| b.is_ascii_hexdigit()) {
-        Ok(id.to_ascii_lowercase())
+    if transfers::is_infohash(id) {
+        Ok(id.to_owned())
     } else {
-        Err(TransferError::new(
-            404,
-            "No transfer with that id on this Flick.",
-        ))
+        Err(TransferError::unknown_transfer())
     }
-}
-
-/// A resolve or start input, with the key that matches a Start to the
-/// Resolve before it: the infohash when the input names one.
-fn parse_input(text: &str) -> Result<(TorrentInput, String), TransferError> {
-    let text = text.trim();
-    let invalid = |message: &str| TransferError::new(422, message);
-    if let Some(encoded) = text.strip_prefix("base64:") {
-        let bytes = decode_base64(encoded)
-            .ok_or_else(|| invalid("The .torrent file is not valid base64."))?;
-        let infohash = librqbit::torrent_from_bytes(&bytes)
-            .map_err(|_| invalid("That is not a .torrent file."))?
-            .info_hash
-            .as_string();
-        return Ok((TorrentInput::Bytes(bytes), infohash));
-    }
-    if text.len() == 40 && text.bytes().all(|b| b.is_ascii_hexdigit()) {
-        let hash = text.to_ascii_lowercase();
-        return Ok((
-            TorrentInput::Magnet(format!("magnet:?xt=urn:btih:{hash}")),
-            hash,
-        ));
-    }
-    if text.len() > 7 && text[..7].eq_ignore_ascii_case("magnet:") {
-        let key = magnet_infohash(text).unwrap_or_else(|| text.to_owned());
-        return Ok((TorrentInput::Magnet(text.to_owned()), key));
-    }
-    if text.len() > 8 && text[..8].eq_ignore_ascii_case("https://") {
-        return Ok((TorrentInput::Url(text.to_owned()), text.to_owned()));
-    }
-    Err(invalid(
-        "Send a magnet link, an https link to a .torrent file, an infohash, or base64: and the file.",
-    ))
-}
-
-/// The hex infohash in a magnet link's `xt=urn:btih:` parameter.
-fn magnet_infohash(magnet: &str) -> Option<String> {
-    let query = magnet.split_once('?')?.1;
-    query.split('&').find_map(|pair| {
-        let value = pair.strip_prefix("xt=")?;
-        let hash = value
-            .get(..9)
-            .filter(|prefix| prefix.eq_ignore_ascii_case("urn:btih:"))
-            .map(|_| &value[9..])?;
-        (hash.len() == 40 && hash.bytes().all(|b| b.is_ascii_hexdigit()))
-            .then(|| hash.to_ascii_lowercase())
-    })
-}
-
-/// Standard base64 with optional padding; whitespace is ignored.
-fn decode_base64(text: &str) -> Option<Vec<u8>> {
-    let mut bytes = Vec::with_capacity(text.len() * 3 / 4);
-    let mut buffer = 0u32;
-    let mut bits = 0;
-    let mut padding = 0;
-    for byte in text.bytes().filter(|b| !b.is_ascii_whitespace()) {
-        if byte == b'=' {
-            padding += 1;
-            continue;
-        }
-        if padding > 0 {
-            return None;
-        }
-        let value = match byte {
-            b'A'..=b'Z' => byte - b'A',
-            b'a'..=b'z' => byte - b'a' + 26,
-            b'0'..=b'9' => byte - b'0' + 52,
-            b'+' => 62,
-            b'/' => 63,
-            _ => return None,
-        };
-        buffer = (buffer << 6) | u32::from(value);
-        bits += 6;
-        if bits >= 8 {
-            bits -= 8;
-            bytes.push((buffer >> bits) as u8);
-            buffer &= (1 << bits) - 1;
-        }
-    }
-    (padding <= 2 && !bytes.is_empty()).then_some(bytes)
-}
-
-fn slash_path(path: &Path) -> String {
-    path.components()
-        .map(|part| part.as_os_str().to_string_lossy())
-        .collect::<Vec<_>>()
-        .join("/")
 }
 
 /// A transfer as `GET /v1/transfers` lists it. Each selected video gets
@@ -820,14 +822,11 @@ pub fn transfer_row(listing: &TransferListing, salt: &Salt) -> TransferRow {
     TransferRow {
         id: snapshot.infohash.clone(),
         name: snapshot.name.clone(),
-        phase: match snapshot.state {
-            TransferState::Checking => TransferPhase::Checking,
-            TransferState::Downloading => TransferPhase::Downloading,
-            TransferState::Paused => TransferPhase::Paused,
-            TransferState::Seeding => TransferPhase::Seeding,
-            TransferState::Error => TransferPhase::Error,
-        },
-        error: snapshot.error.clone(),
+        phase: transfers::phase(snapshot.state),
+        error: snapshot
+            .error
+            .as_deref()
+            .map(transfers::public_transfer_error),
         verified_bytes: snapshot.verified_bytes,
         total_bytes: snapshot.total_bytes,
         checked_bytes: snapshot.checked_bytes,
@@ -836,8 +835,7 @@ pub fn transfer_row(listing: &TransferListing, salt: &Salt) -> TransferRow {
         peers: snapshot.peers,
         download_bps: snapshot.download_bytes_per_second,
         upload_bps: snapshot.upload_bytes_per_second,
-        // Filled in by the deletion-safety fix: shares and on-disk files.
-        share: false,
+        share: listing.share,
         files: snapshot
             .files
             .iter()
@@ -847,7 +845,7 @@ pub fn transfer_row(listing: &TransferListing, salt: &Salt) -> TransferRow {
                 size: file.length,
                 verified_bytes: file.verified_bytes,
                 selected: file.selected,
-                will_delete: file.selected,
+                will_delete: transfers::will_delete(file, listing.share),
                 video_id: (file.selected && flick::library::is_video(&file.path))
                     .then(|| library_id(salt, &file.path))
                     .flatten(),
@@ -876,7 +874,15 @@ fn fetch_row(fetch: &FetchListing, salt: &Salt) -> FetchRow {
             None,
         ),
         FetchState::Done => (FetchPhase::Done, None),
-        FetchState::Failed(error) => (FetchPhase::Failed, Some(error.clone())),
+        // Already short and without paths (`services::fetch_job`); checked
+        // again here, at the boundary.
+        FetchState::Failed(error) => (
+            FetchPhase::Failed,
+            Some(
+                transfers::public_text(error)
+                    .unwrap_or_else(|| "The link could not be downloaded on the server.".into()),
+            ),
+        ),
         FetchState::Cancelled => (FetchPhase::Cancelled, None),
     };
     FetchRow {
@@ -894,141 +900,6 @@ fn fetch_row(fetch: &FetchListing, salt: &Salt) -> FetchRow {
             .filter(|path| flick::library::is_video(path))
             .filter_map(|path| library_id(salt, path))
             .collect(),
-    }
-}
-
-fn outside_roots() -> TransferError {
-    TransferError::new(404, "No such folder among the shared folders.")
-}
-
-/// Share roots by the names paired Flicks see: the folder's name, with a
-/// number after repeats. Roots that are gone are left out.
-fn named_roots(roots: &[PathBuf]) -> Vec<(String, PathBuf)> {
-    let mut named: Vec<(String, PathBuf)> = Vec::new();
-    for root in roots {
-        let Ok(canonical) = root.canonicalize() else {
-            continue;
-        };
-        if !canonical.is_dir() {
-            continue;
-        }
-        let base = canonical
-            .file_name()
-            .map(|name| name.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "Shared".to_owned());
-        let mut name = base.clone();
-        let mut count = 1;
-        while named.iter().any(|(known, _)| *known == name) {
-            count += 1;
-            name = format!("{base} {count}");
-        }
-        named.push((name, canonical));
-    }
-    named
-}
-
-/// A virtual `<root name>/<relative path>` as a canonical path inside that
-/// root, with symlinks resolved first. None for anything outside a root,
-/// for `..`, and for paths that do not exist.
-pub fn resolve_virtual(roots: &[PathBuf], dir: &str) -> Option<PathBuf> {
-    let mut parts = dir.split('/').filter(|part| !part.is_empty());
-    let first = parts.next()?;
-    let (_, root) = named_roots(roots)
-        .into_iter()
-        .find(|(name, _)| name == first)?;
-    let mut path = root.clone();
-    for part in parts {
-        let mut components = Path::new(part).components();
-        match (components.next(), components.next()) {
-            (Some(Component::Normal(name)), None) if !part.contains('\\') => path.push(name),
-            _ => return None,
-        }
-    }
-    let canonical = path.canonicalize().ok()?;
-    canonical.starts_with(&root).then_some(canonical)
-}
-
-/// Folders and videos under an allowed root; the roots by name for "".
-pub fn browse(roots: &[PathBuf], dir: &str) -> Result<BrowseListing, TransferError> {
-    let normalized = dir
-        .split('/')
-        .filter(|part| !part.is_empty())
-        .collect::<Vec<_>>()
-        .join("/");
-    if normalized.is_empty() {
-        return Ok(BrowseListing {
-            dir: String::new(),
-            entries: named_roots(roots)
-                .into_iter()
-                .map(|(name, _)| BrowseEntry {
-                    name,
-                    dir: true,
-                    size: 0,
-                })
-                .collect(),
-        });
-    }
-    let root = named_roots(roots)
-        .into_iter()
-        .find(|(name, _)| Some(name.as_str()) == normalized.split('/').next())
-        .map(|(_, root)| root)
-        .ok_or_else(outside_roots)?;
-    let path = resolve_virtual(roots, &normalized).ok_or_else(outside_roots)?;
-    let reading = std::fs::read_dir(&path).map_err(|_| outside_roots())?;
-    let mut entries = Vec::new();
-    for entry in reading.flatten() {
-        let name = entry.file_name().to_string_lossy().into_owned();
-        if name.starts_with('.') {
-            continue;
-        }
-        // Symlinks are followed, and kept only when they stay inside.
-        let Ok(target) = entry.path().canonicalize() else {
-            continue;
-        };
-        if !target.starts_with(&root) {
-            continue;
-        }
-        let Ok(metadata) = std::fs::metadata(&target) else {
-            continue;
-        };
-        if metadata.is_dir() {
-            entries.push(BrowseEntry {
-                name,
-                dir: true,
-                size: 0,
-            });
-        } else if metadata.is_file() && flick::library::is_video(Path::new(&name)) {
-            entries.push(BrowseEntry {
-                name,
-                dir: false,
-                size: metadata.len(),
-            });
-        }
-    }
-    entries.sort_by(|a, b| {
-        b.dir
-            .cmp(&a.dir)
-            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
-    });
-    Ok(BrowseListing {
-        dir: normalized,
-        entries,
-    })
-}
-
-/// Free space where downloads go, from the nearest folder that exists.
-pub fn storage(folder: &Path) -> Storage {
-    let free_bytes = folder
-        .ancestors()
-        .find(|dir| dir.is_dir())
-        .and_then(|dir| fs2::available_space(dir).ok())
-        .unwrap_or(0);
-    Storage {
-        free_bytes,
-        download_folder_name: folder
-            .file_name()
-            .map(|name| name.to_string_lossy().into_owned())
-            .unwrap_or_default(),
     }
 }
 
@@ -1060,6 +931,8 @@ fn computer_name() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use flick::remote::protocol::TransferPhase;
+    use flick::torrent::TransferState;
     use std::{
         io::{Read, Write},
         time::{Duration, Instant},
@@ -1220,6 +1093,7 @@ mod tests {
                 "Film/Other.mp4".into(),
                 "Film/Missing.mkv".into(),
             ],
+            share: false,
         };
         let row = transfer_row(&listing, &salt);
         assert_eq!(row.id, "a".repeat(40));
@@ -1247,6 +1121,31 @@ mod tests {
         assert!(!row.files[2].selected);
         assert_eq!(row.files[2].video_id, None);
         assert_eq!(row.files[3].video_id, None);
+        // Deletion covers selected files, and unselected ones with data.
+        assert!(!row.share);
+        let deleting = row.files.iter().map(|f| f.will_delete).collect::<Vec<_>>();
+        assert_eq!(deleting, [true, true, false, true]);
+        std::fs::write(folder.join("Other.mp4"), b"boundary piece").unwrap();
+        let row = transfer_row(&listing, &salt);
+        assert!(row.files[2].will_delete && !row.files[2].selected);
+        assert_eq!(
+            crate::services::deletion_list(&listing),
+            flick::remote::transfers::deletion_paths(&row)
+        );
+        // A share's files are never deleted through the wire.
+        let shared = TransferListing {
+            share: true,
+            ..listing.clone()
+        };
+        let row = transfer_row(&shared, &salt);
+        assert!(row.share);
+        assert!(row.files.iter().all(|f| !f.will_delete));
+        assert!(crate::services::deletion_list(&shared).is_empty());
+        // Errors never carry the server's paths.
+        let mut failed = listing.clone();
+        failed.snapshot.error = Some(format!("Could not open {}", video.display()));
+        let error = transfer_row(&failed, &salt).error.unwrap();
+        assert!(!error.contains(&*video.to_string_lossy()), "{error}");
         for (state, phase) in [
             (TransferState::Downloading, TransferPhase::Downloading),
             (TransferState::Paused, TransferPhase::Paused),
@@ -1287,16 +1186,15 @@ mod tests {
             let QueryError::Conflict { files, .. } = &error else {
                 panic!("{error:?}");
             };
-            assert_eq!(files, &required);
+            assert_eq!(files.as_ref(), Some(&required));
             let error = transfer_error(error);
             assert_eq!(error.status, 409);
-            let lines = error.message.lines().collect::<Vec<_>>();
             assert!(
-                lines[0].contains("nothing was deleted"),
+                error.message.contains("nothing was deleted"),
                 "{}",
                 error.message
             );
-            assert_eq!(&lines[1..], ["Show/E01.mkv", "Show/E02.mkv"]);
+            assert_eq!(error.files.as_ref(), Some(&required));
         }
         assert_eq!(transfer_error(QueryError::NotFound("x".into())).status, 404);
         assert_eq!(transfer_error(QueryError::Invalid("x".into())).status, 422);
@@ -1305,14 +1203,23 @@ mod tests {
             transfer_error(QueryError::Unavailable("x".into())).status,
             503
         );
+        let forbidden = transfer_error(QueryError::Forbidden("Keep Files.".into()));
+        assert_eq!((forbidden.status, forbidden.files), (403, None));
+        // Other conflicts carry no list.
         let plain = transfer_error(QueryError::Conflict {
             message: "Still checking.".into(),
-            files: vec![],
+            files: None,
         });
         assert_eq!(
-            (plain.status, plain.message.as_str()),
-            (409, "Still checking.")
+            (plain.status, plain.message.as_str(), plain.files),
+            (409, "Still checking.", None)
         );
+        // A path in a worker's message never reaches the client.
+        let leaky = transfer_error(QueryError::Failed(
+            "Could not start the download: Create /Users/owner/Downloads".into(),
+        ));
+        assert_eq!(leaky.status, 500);
+        assert!(!leaky.message.contains("/Users"), "{}", leaky.message);
     }
 
     #[cfg(unix)]
@@ -1335,17 +1242,20 @@ mod tests {
         std::fs::create_dir_all(&other).unwrap();
         let roots = vec![root.clone(), other.clone(), dir.path().join("gone")];
 
-        let top = browse(&roots, "").unwrap();
+        let shares = ShareRoots::quiet(&roots);
+        let browse = |dir: &str| shares.browse(dir);
+        let resolve_virtual = |dir: &str| shares.resolve(dir).ok();
+        let top = browse("").unwrap();
         assert_eq!(top.dir, "");
         let names = top
             .entries
             .iter()
             .map(|e| e.name.as_str())
             .collect::<Vec<_>>();
-        assert_eq!(names, ["Movies", "Movies 2"]);
+        assert_eq!(names, ["Movies", "Movies (2)"]);
         assert!(top.entries.iter().all(|e| e.dir));
 
-        let listing = browse(&roots, "Movies/").unwrap();
+        let listing = browse("Movies/").unwrap();
         assert_eq!(listing.dir, "Movies");
         let names = listing
             .entries
@@ -1360,10 +1270,7 @@ mod tests {
                 ("Film.mkv", false, 5)
             ]
         );
-        assert_eq!(
-            browse(&roots, "Movies/Series").unwrap().entries[0].name,
-            "Season 1"
-        );
+        assert_eq!(browse("Movies/Series").unwrap().entries[0].name, "Season 1");
 
         for refused in [
             "Movies/Escape",
@@ -1374,21 +1281,17 @@ mod tests {
             "Movies/Missing",
             "gone",
         ] {
-            assert_eq!(
-                browse(&roots, refused).unwrap_err().status,
-                404,
-                "{refused}"
-            );
+            assert_eq!(browse(refused).unwrap_err().status, 404, "{refused}");
         }
         assert_eq!(
-            resolve_virtual(&roots, "Movies/Film.mkv"),
+            resolve_virtual("Movies/Film.mkv"),
             Some(root.join("Film.mkv").canonicalize().unwrap())
         );
-        assert_eq!(resolve_virtual(&roots, "Movies/Linked.mp4"), None);
-        assert_eq!(resolve_virtual(&roots, "Movies/Escape/Secret.mp4"), None);
-        assert_eq!(resolve_virtual(&roots, ""), None);
+        assert_eq!(resolve_virtual("Movies/Linked.mp4"), None);
+        assert_eq!(resolve_virtual("Movies/Escape/Secret.mp4"), None);
+        assert_eq!(resolve_virtual(""), None);
         assert_eq!(
-            resolve_virtual(&roots, "Movies 2"),
+            resolve_virtual("Movies (2)"),
             Some(other.canonicalize().unwrap())
         );
     }
@@ -1397,18 +1300,25 @@ mod tests {
     fn inputs_parse_with_a_key_that_matches_start_to_resolve() {
         let hash = "0123456789abcdef0123456789ABCDEF01234567";
         let lower = hash.to_ascii_lowercase();
-        let (input, key) = parse_input(hash).unwrap();
+        let parse = |text: &str| {
+            transfers::parse_input(text).map(|input| {
+                let key = transfers::input_key(&input);
+                (input, key)
+            })
+        };
+        let (input, key) = parse(hash).unwrap();
         assert!(
-            matches!(input, TorrentInput::Magnet(m) if m == format!("magnet:?xt=urn:btih:{lower}"))
+            matches!(input, flick::torrent::TorrentInput::Magnet(m) if m == format!("magnet:?xt=urn:btih:{lower}"))
         );
         assert_eq!(key, lower);
         let magnet = format!("magnet:?dn=Film&xt=urn:btih:{hash}&tr=x");
-        let (input, key) = parse_input(&format!("  {magnet} ")).unwrap();
-        assert!(matches!(input, TorrentInput::Magnet(m) if m == magnet));
+        let (input, key) = parse(&format!("  {magnet} ")).unwrap();
+        assert!(matches!(input, flick::torrent::TorrentInput::Magnet(m) if m == magnet));
         assert_eq!(key, lower);
-        let (input, key) = parse_input("https://example.com/a.torrent").unwrap();
-        assert!(matches!(input, TorrentInput::Url(_)));
+        let (input, key) = parse("https://example.com/a.torrent").unwrap();
+        assert!(matches!(input, flick::torrent::TorrentInput::Url(_)));
         assert_eq!(key, "https://example.com/a.torrent");
+        // Invalid input is 422, as the headless server answers.
         for refused in [
             "",
             "http://example.com/a.torrent",
@@ -1417,16 +1327,14 @@ mod tests {
             "base64:aGVsbG8=",
         ] {
             assert_eq!(
-                parse_input(refused).err().map(|e| e.status),
+                parse(refused).err().map(|e| e.status),
                 Some(422),
                 "{refused}"
             );
         }
-        assert_eq!(decode_base64("aGVsbG8="), Some(b"hello".to_vec()));
-        assert_eq!(decode_base64("aGVs\nbG8"), Some(b"hello".to_vec()));
-        assert_eq!(decode_base64("aGV=sbG8"), None);
         assert_eq!(infohash("nope").unwrap_err().status, 404);
-        assert_eq!(infohash(hash).unwrap(), lower);
+        assert_eq!(infohash(hash).unwrap_err().status, 404, "ids are lowercase");
+        assert_eq!(infohash(&lower).unwrap(), lower);
     }
 
     #[test]
@@ -1494,25 +1402,87 @@ mod tests {
             "a restart keeps the token"
         );
         assert!(backend.allows(Capability::Downloads));
+        let listen = match serve.status() {
+            ServeStatus::Running { listen, .. } => *listen,
+            status => panic!("{status:?}"),
+        };
+        let token = Pairing::parse(&again).unwrap().token;
+        let listing = || {
+            let response = get(listen, "/v1/library", &token);
+            assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+            let body = response.split_once("\r\n\r\n").unwrap().1;
+            serde_json::from_str::<protocol::Library>(body).unwrap()
+        };
+        let library = listing();
+        assert!(library.capabilities.contains(&Capability::Downloads));
+        assert!(library.capabilities.contains(&Capability::StreamIncomplete));
+        // No share folder: shares are not offered.
+        assert!(!library.capabilities.contains(&Capability::Shares));
+        assert!(library.storage.is_some());
+        assert!(library.videos.is_empty());
         let runtime = transfer_test_runtime();
         let answer = runtime.block_on(backend.call(TransferCommand::Storage));
         let Ok(TransferReply::Storage(storage)) = answer else {
             panic!("storage was not answered");
         };
         assert_eq!(storage.download_folder_name, "Remote Downloads");
-        // Off answers 403 at once, without a restart.
+        // Off answers 403 at once, without a restart, and stops advertising.
         serve.set_transfer_settings(TransferSettings {
             allow: false,
             ..settings.clone()
         });
+        assert!(backend.capabilities().is_empty());
         let refused = runtime.block_on(backend.call(TransferCommand::List));
         assert_eq!(refused.err().map(|e| e.status), Some(403));
-        serve.set_transfer_settings(settings);
+        // The listing is not frozen while off: a new video appears.
+        let video = dir.path().join("Clip.mp4");
+        std::fs::write(&video, b"not really a video").unwrap();
+        std::fs::write(
+            dir.path().join("settings.json"),
+            serde_json::json!({"library": [{"path": video, "title": "Clip"}]}).to_string(),
+        )
+        .unwrap();
+        let library = listing();
+        assert!(
+            library.capabilities.is_empty(),
+            "{:?}",
+            library.capabilities
+        );
+        assert!(library.storage.is_none());
+        assert_eq!(library.videos.len(), 1);
+        assert_eq!(library.videos[0].title, "Clip");
+        // On again, now with a share folder: capabilities come back with
+        // shares, on the same server.
+        let shared = dir.path().join("Shared");
+        std::fs::create_dir(&shared).unwrap();
+        serve.set_transfer_settings(TransferSettings {
+            share_roots: vec![shared],
+            ..settings.clone()
+        });
         assert!(taps.try_recv().is_err(), "on again: same server");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let library = loop {
+            let library = listing();
+            if library.capabilities.contains(&Capability::Shares) {
+                break library;
+            }
+            assert!(Instant::now() < deadline, "{:?}", library.capabilities);
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        assert!(library.capabilities.contains(&Capability::Downloads));
+        assert!(library.storage.is_some());
         assert!(matches!(
             runtime.block_on(backend.call(TransferCommand::List)),
             Ok(TransferReply::Transfers(rows)) if rows.is_empty()
         ));
+        // Removing the share folder takes shares away again.
+        serve.set_transfer_settings(settings);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while backend.allows(Capability::Shares) {
+            assert!(Instant::now() < deadline, "shares are still offered");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(backend.allows(Capability::Downloads));
         serve.stop();
         serve.stopping.take().unwrap().join().unwrap();
         drop(services);
@@ -1530,7 +1500,15 @@ mod tests {
         let bytes = (0..4 * 1024 * 1024 + 321)
             .map(|i: usize| ((i.wrapping_mul(31) ^ (i >> 9)) % 251) as u8)
             .collect::<Vec<_>>();
-        std::fs::write(seed_source.join("Film.mp4"), &bytes).unwrap();
+        // Film.mp4 does not end on a piece boundary, so its last piece
+        // also writes the start of the unselected notes.txt.
+        std::fs::create_dir(seed_source.join("Film")).unwrap();
+        std::fs::write(seed_source.join("Film").join("Film.mp4"), &bytes).unwrap();
+        std::fs::write(
+            seed_source.join("Film").join("notes.txt"),
+            vec![7u8; 300_000],
+        )
+        .unwrap();
         let seed = runtime
             .block_on(flick::torrent::TransferSession::start(
                 flick::torrent::TransferConfig::local(
@@ -1540,7 +1518,7 @@ mod tests {
             ))
             .unwrap();
         let shared = runtime
-            .block_on(seed.share(&seed_source.join("Film.mp4"), vec![]))
+            .block_on(seed.share(&seed_source.join("Film"), vec![]))
             .unwrap();
 
         // The window's worker, slowed so progress is seen before completion.
@@ -1595,16 +1573,20 @@ mod tests {
                     panic!("not resolved");
                 };
                 assert_eq!(info.infohash, shared.infohash);
-                assert_eq!(info.files.len(), 1);
-                assert_eq!(
-                    (info.files[0].path.as_str(), info.files[0].size),
-                    ("Film.mp4", bytes.len() as u64)
-                );
+                assert_eq!(info.files.len(), 2);
+                let film = info
+                    .files
+                    .iter()
+                    .find(|file| file.path == "Film.mp4")
+                    .expect("Film.mp4 is in the torrent");
+                assert_eq!(film.size, bytes.len() as u64);
+                let film = film.index;
+                let notes = 1 - film;
 
                 // Start reuses the resolution, by infohash.
                 let Ok(TransferReply::Started(started)) = call(TransferCommand::Start {
                     input: shared.infohash.clone(),
-                    files: vec![0],
+                    files: vec![film],
                 })
                 .await
                 else {
@@ -1613,7 +1595,7 @@ mod tests {
                 assert_eq!(started.id, shared.infohash);
                 let again = call(TransferCommand::Start {
                     input: shared.magnet.clone(),
-                    files: vec![0],
+                    files: vec![film],
                 })
                 .await;
                 assert_eq!(again.err().map(|e| e.status), Some(409));
@@ -1642,16 +1624,24 @@ mod tests {
                     .unwrap()
                     .join(&shared.infohash)
                     .join("Film.mp4");
+                let boundary = downloaded.with_file_name("notes.txt");
                 assert_eq!(std::fs::read(&downloaded).unwrap(), bytes);
-                assert_eq!(row.files[0].path, "Film.mp4");
+                assert!(!row.share);
+                assert_eq!(row.files[film].path, "Film.mp4");
+                assert!(row.files[film].selected && row.files[film].will_delete);
                 assert_eq!(
-                    row.files[0].video_id,
+                    row.files[film].video_id,
                     Some(ids::video_id(&salt, &downloaded.canonicalize().unwrap()))
                 );
+                // The boundary piece wrote into the unselected file, so a
+                // deletion would delete it too, and says so.
+                assert!(boundary.is_file(), "the boundary piece wrote notes.txt");
+                assert_eq!(row.files[notes].path, "notes.txt");
+                assert!(!row.files[notes].selected && row.files[notes].will_delete);
 
                 let Ok(TransferReply::Stream(stream)) = call(TransferCommand::OpenStream {
                     id: shared.infohash.clone(),
-                    file_index: 0,
+                    file_index: film,
                 })
                 .await
                 else {
@@ -1675,32 +1665,106 @@ mod tests {
                     Ok(TransferReply::Fetches(rows)) if rows.is_empty()
                 ));
 
-                // The wrong list deletes nothing and names the right one.
+                // The selected file alone is the wrong list: it deletes
+                // nothing and names the right one.
                 let wrong = call(TransferCommand::Remove {
                     id: shared.infohash.clone(),
                     delete_files: true,
-                    confirm: vec!["Other.mp4".into()],
+                    confirm: vec!["Film.mp4".into()],
                 })
                 .await
                 .err()
                 .expect("a wrong list is refused");
                 assert_eq!(wrong.status, 409);
-                assert_eq!(wrong.message.lines().last(), Some("Film.mp4"));
-                assert!(downloaded.is_file());
+                assert_eq!(
+                    wrong.files,
+                    Some(vec!["Film.mp4".to_owned(), "notes.txt".to_owned()])
+                );
+                assert!(downloaded.is_file() && boundary.is_file());
                 assert!(matches!(
                     call(TransferCommand::Remove {
                         id: shared.infohash.clone(),
                         delete_files: true,
-                        confirm: vec!["Film.mp4".into()],
+                        confirm: flick::remote::transfers::deletion_paths(&row),
                     })
                     .await,
                     Ok(TransferReply::Done)
                 ));
-                assert!(!downloaded.exists());
+                assert!(!downloaded.exists() && !boundary.exists());
                 let Ok(TransferReply::Transfers(rows)) = call(TransferCommand::List).await else {
                     panic!("no list");
                 };
                 assert!(rows.iter().all(|row| row.id != shared.infohash));
+
+                // The owner's own download elsewhere on disk: a paired
+                // Flick may unregister it, never delete its files.
+                let resolver =
+                    flick::torrent::TransferSession::start(flick::torrent::TransferConfig::local(
+                        dir.path().join("resolver-downloads"),
+                        dir.path().join("resolver-state"),
+                    ))
+                    .await
+                    .unwrap();
+                let resolved = resolver
+                    .resolve(
+                        flick::torrent::TorrentInput::Bytes(shared.torrent_bytes().to_vec()),
+                        vec![],
+                        Duration::from_secs(10),
+                    )
+                    .await
+                    .unwrap();
+                resolver.stop().await;
+                let elsewhere = dir.path().join("Owner Elsewhere");
+                services
+                    .send(crate::services::Command::Download {
+                        torrent: resolved,
+                        files: vec![film],
+                        folder: elsewhere.clone(),
+                    })
+                    .unwrap();
+                let local = loop {
+                    let Ok(TransferReply::Transfers(rows)) = call(TransferCommand::List).await
+                    else {
+                        panic!("no list");
+                    };
+                    if let Some(row) = rows.into_iter().find(|row| row.id == shared.infohash)
+                        && row.phase != TransferPhase::Checking
+                    {
+                        break row;
+                    }
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                };
+                assert!(!local.share);
+                let refused = call(TransferCommand::Remove {
+                    id: shared.infohash.clone(),
+                    delete_files: true,
+                    confirm: flick::remote::transfers::deletion_paths(&local),
+                })
+                .await
+                .err()
+                .expect("the owner's files elsewhere are kept");
+                assert_eq!((refused.status, refused.files), (403, None));
+                assert!(
+                    refused.message.contains("Keep Files"),
+                    "{}",
+                    refused.message
+                );
+                assert!(
+                    elsewhere
+                        .canonicalize()
+                        .unwrap()
+                        .join(&shared.infohash)
+                        .is_dir()
+                );
+                assert!(matches!(
+                    call(TransferCommand::Remove {
+                        id: shared.infohash.clone(),
+                        delete_files: false,
+                        confirm: vec![],
+                    })
+                    .await,
+                    Ok(TransferReply::Done)
+                ));
 
                 let Ok(TransferReply::Browse(top)) =
                     call(TransferCommand::Browse { dir: String::new() }).await
@@ -1748,7 +1812,42 @@ mod tests {
                 let Ok(TransferReply::Transfers(rows)) = call(TransferCommand::List).await else {
                     panic!("no list");
                 };
-                assert!(rows.iter().any(|row| row.id == seeded.infohash));
+                let row = rows
+                    .iter()
+                    .find(|row| row.id == seeded.infohash)
+                    .expect("the share is listed");
+                assert!(row.share);
+                assert!(row.files.iter().all(|file| !file.will_delete));
+                // A share's files are the owner's originals: never deleted
+                // through the wire, whatever the confirmation says.
+                let original = share_root.join("Clip.mp4");
+                for confirm in [vec![], vec!["Clip.mp4".to_owned()]] {
+                    let refused = call(TransferCommand::Remove {
+                        id: seeded.infohash.clone(),
+                        delete_files: true,
+                        confirm,
+                    })
+                    .await
+                    .err()
+                    .expect("a share's files are kept");
+                    assert_eq!((refused.status, refused.files), (403, None));
+                    assert!(
+                        refused.message.contains("shared folder"),
+                        "{}",
+                        refused.message
+                    );
+                    assert!(original.is_file());
+                }
+                assert!(matches!(
+                    call(TransferCommand::Remove {
+                        id: seeded.infohash.clone(),
+                        delete_files: false,
+                        confirm: vec![],
+                    })
+                    .await,
+                    Ok(TransferReply::Done)
+                ));
+                assert_eq!(std::fs::read(&original).unwrap(), bytes[..300_000]);
             })
             .await
         });

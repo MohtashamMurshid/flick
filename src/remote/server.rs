@@ -77,6 +77,11 @@ const PROGRESS_CLOCK_SKEW: u64 = 60;
 const STREAM_WAIT: Duration = Duration::from_secs(30);
 /// How long the listing waits for the transfer backend's rows and storage.
 const BACKEND_WAIT: Duration = Duration::from_secs(5);
+/// Unfinished downloads streamed at once. Each holds a blocking-pool thread
+/// while a read waits for pieces; more answer 503 with `Retry-After`.
+const MAX_INCOMPLETE_STREAMS: usize = 8;
+/// Seconds a client waits before asking for an unfinished stream again.
+const INCOMPLETE_STREAM_RETRY: &str = "2";
 
 #[derive(Clone)]
 pub struct ServerConfig {
@@ -113,7 +118,7 @@ impl std::fmt::Debug for ServerConfig {
             .field("max_transcodes", &self.max_transcodes)
             .field(
                 "transfers",
-                &self.transfers.as_ref().map(|t| t.capabilities().to_vec()),
+                &self.transfers.as_ref().map(TransferBackend::capabilities),
             )
             .finish()
     }
@@ -195,6 +200,7 @@ impl Server {
             media,
             hls: hls.clone(),
             extracting: tokio::sync::Semaphore::new(EXTRACT_CONCURRENCY),
+            streaming: Arc::new(tokio::sync::Semaphore::new(MAX_INCOMPLETE_STREAMS)),
             rebuild: tokio::sync::Mutex::new(()),
             progress: tokio::sync::Mutex::new(()),
             transfers: config.transfers,
@@ -297,6 +303,9 @@ struct AppState {
     hls: Arc<HlsState>,
     /// Bounds embedded subtitle extractions running at once.
     extracting: tokio::sync::Semaphore,
+    /// Bounds unfinished downloads streamed at once; a permit lives as long
+    /// as its response body.
+    streaming: Arc<tokio::sync::Semaphore>,
     /// Serializes rebuilds so concurrent listings do not scan twice at once.
     rebuild: tokio::sync::Mutex<()>,
     /// Serializes progress file updates.
@@ -348,9 +357,12 @@ impl AppState {
     /// good index, so a settings file caught mid-write does not empty the
     /// library.
     ///
-    /// With a transfer backend, its rows decide which files are still
-    /// downloading. When it does not answer, the previous index is kept, so
-    /// a partial file is never served as if it were complete.
+    /// With a transfer backend that runs downloads, its rows decide which
+    /// files are still downloading. When it does not answer, the previous
+    /// index is kept, so a partial file is never served as if it were
+    /// complete. A backend that is switched off (no `downloads` capability,
+    /// or a 403) has no rows: the sources alone decide, and the in-app
+    /// server's source marks unverified torrent files itself.
     async fn refresh(&self) -> Arc<Index> {
         let _guard = self.rebuild.lock().await;
         let Ok(rows) = self.transfer_rows().await else {
@@ -371,7 +383,8 @@ impl AppState {
     }
 
     /// The backend's transfers when it runs downloads; `Ok(None)` without
-    /// one, `Err` when it does not answer in time.
+    /// one or when it is switched off (403), `Err` when it does not answer
+    /// in time or fails.
     async fn transfer_rows(&self) -> Result<Option<Vec<TransferRow>>, ()> {
         let Some(backend) = self
             .transfers
@@ -382,6 +395,7 @@ impl AppState {
         };
         match tokio::time::timeout(BACKEND_WAIT, backend.call(TransferCommand::List)).await {
             Ok(Ok(TransferReply::Transfers(rows))) => Ok(Some(rows)),
+            Ok(Err(error)) if error.status == 403 => Ok(None),
             Ok(Err(error)) => {
                 tracing::warn!("The transfer backend refused its list: {}", error.message);
                 Err(())
@@ -603,7 +617,7 @@ async fn listing(State(state): State<Arc<AppState>>) -> Response {
             capabilities: state
                 .transfers
                 .as_ref()
-                .map(|backend| backend.capabilities().to_vec())
+                .map(TransferBackend::capabilities)
                 .unwrap_or_default(),
             storage,
             videos,
@@ -974,6 +988,9 @@ fn timed_out_waiting() -> Response {
 /// file's `Content-Length` for its range and no `ETag`: verified bytes never
 /// change. A client that goes away, or the server stopping, cancels the
 /// waiting read and releases the stream.
+///
+/// At most [`MAX_INCOMPLETE_STREAMS`] run at once, so waiting reads cannot
+/// take every blocking thread; another answers 503 with `Retry-After`.
 async fn stream_incomplete(
     state: &AppState,
     backend: &TransferBackend,
@@ -982,6 +999,17 @@ async fn stream_incomplete(
     method: Method,
     headers: &HeaderMap,
 ) -> Response {
+    let Ok(permit) = state.streaming.clone().try_acquire_owned() else {
+        let mut busy = error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "The server is already streaming several unfinished downloads. Try again shortly.",
+        );
+        busy.headers_mut().insert(
+            header::RETRY_AFTER,
+            HeaderValue::from_static(INCOMPLETE_STREAM_RETRY),
+        );
+        return busy;
+    };
     let opened = tokio::time::timeout(
         STREAM_WAIT,
         backend.call(TransferCommand::OpenStream {
@@ -1091,6 +1119,8 @@ async fn stream_incomplete(
         Ok(Err(_)) => return error(StatusCode::INTERNAL_SERVER_ERROR, "Read the download"),
     };
     let remaining = length - first.len() as u64;
+    // The permit and the cancel guard live as long as the body.
+    let guard = (guard, permit);
     let rest = futures_util::stream::unfold(
         (Some(reader), remaining, guard, cancel),
         |(reader, remaining, guard, cancel)| async move {

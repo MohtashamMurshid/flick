@@ -28,7 +28,10 @@ use super::{
 };
 use crate::{
     fetch::{FetchSource, FetchStage, FetchUpdate, WebLink},
-    torrent::{ResolvedTorrent, TorrentInput, TransferSession, TransferSnapshot, TransferState},
+    torrent::{
+        FileProgress, ResolvedTorrent, TorrentInput, TransferSession, TransferSnapshot,
+        TransferState,
+    },
 };
 use axum::{
     Json, Router,
@@ -49,7 +52,7 @@ use std::{
     },
     time::{Duration, Instant},
 };
-use tokio::sync::{Semaphore, mpsc, oneshot};
+use tokio::sync::{Semaphore, mpsc, oneshot, watch};
 use tokio_util::sync::CancellationToken;
 
 /// What a route asks the backend to do. Paths in `Browse` and `Share` are
@@ -117,6 +120,10 @@ pub enum TransferReply {
 pub struct TransferError {
     pub status: u16,
     pub message: String,
+    /// Only for a deletion whose `confirm` list did not match: the paths
+    /// the server would delete now ([`deletion_paths`]). The route sends
+    /// them as `files` beside `message`. Every other refusal has None.
+    pub files: Option<Vec<String>>,
 }
 
 impl TransferError {
@@ -124,7 +131,38 @@ impl TransferError {
         Self {
             status,
             message: message.into(),
+            files: None,
         }
+    }
+
+    /// A deletion whose `confirm` list is not the current one; 409 with
+    /// the current list. Nothing was deleted.
+    pub fn files_changed(files: Vec<String>) -> Self {
+        Self {
+            files: Some(files),
+            ..Self::new(
+                409,
+                "The files to delete have changed; nothing was deleted. Check the list and confirm again.",
+            )
+        }
+    }
+
+    /// Deleting the files of an explicit share; 403. Removing it with Keep
+    /// Files is allowed.
+    pub fn share_files_kept() -> Self {
+        Self::new(
+            403,
+            "This is a shared folder on its owner's Mac. Remove it with Keep Files.",
+        )
+    }
+
+    /// Deleting the files of a transfer that neither a paired Flick started
+    /// nor lives in the server's download folder; 403.
+    pub fn owner_files_kept() -> Self {
+        Self::new(
+            403,
+            "These files are outside this server's download folder, so only its owner can delete them. Remove it with Keep Files.",
+        )
     }
 
     /// The owner has not allowed this; 403.
@@ -151,10 +189,11 @@ impl TransferError {
         Self::new(404, "No such folder on this server.")
     }
 
-    /// Too many resolves or link downloads at once; 429.
+    /// Too many resolves or link downloads at once; 503, as the in-app
+    /// server answers too.
     pub fn busy(what: &str) -> Self {
         Self::new(
-            429,
+            503,
             format!("This server is already {what}. Try again when one finishes."),
         )
     }
@@ -174,26 +213,43 @@ pub struct TransferRequest {
 }
 
 /// The server's handle to whatever runs transfers. Cheap to clone.
+///
+/// Its capabilities are read live: every route gate, the listing's
+/// `capabilities`, and the decision to overlay transfer progress read the
+/// current value, so an owner turning the switch off (the in-app backend
+/// publishes `[]`) takes effect on the next request, without a restart.
 #[derive(Clone)]
 pub struct TransferBackend {
-    capabilities: Vec<Capability>,
+    capabilities: watch::Receiver<Vec<Capability>>,
     sender: mpsc::Sender<TransferRequest>,
 }
 
 impl TransferBackend {
+    /// A backend whose capabilities never change, as `flick-serve` has.
     pub fn new(capabilities: Vec<Capability>, sender: mpsc::Sender<TransferRequest>) -> Self {
+        // The receiver keeps the last value after the sender is dropped.
+        Self::live(watch::channel(capabilities).1, sender)
+    }
+
+    /// A backend whose capabilities follow `capabilities`; publish `[]` to
+    /// refuse everything and stop advertising.
+    pub fn live(
+        capabilities: watch::Receiver<Vec<Capability>>,
+        sender: mpsc::Sender<TransferRequest>,
+    ) -> Self {
         Self {
             capabilities,
             sender,
         }
     }
 
-    pub fn capabilities(&self) -> &[Capability] {
-        &self.capabilities
+    /// What the backend allows right now.
+    pub fn capabilities(&self) -> Vec<Capability> {
+        self.capabilities.borrow().clone()
     }
 
     pub fn allows(&self, capability: Capability) -> bool {
-        self.capabilities.contains(&capability)
+        self.capabilities.borrow().contains(&capability)
     }
 
     /// Sends one command and waits for its answer. A backend that has gone
@@ -234,7 +290,9 @@ pub fn router(backend: Option<TransferBackend>) -> Router {
         )
         .route(
             "/v1/transfers/resolve",
-            post(resolve).layer(DefaultBodyLimit::max(TORRENT_BODY_LIMIT)),
+            post(resolve)
+                .delete(cancel_resolve)
+                .layer(DefaultBodyLimit::max(TORRENT_BODY_LIMIT)),
         )
         .route("/v1/transfers/pause-all", post(pause_all))
         .route("/v1/transfers/resume-all", post(resume_all))
@@ -261,15 +319,24 @@ pub fn router(backend: Option<TransferBackend>) -> Router {
 
 type Backend = State<Option<TransferBackend>>;
 
-/// The JSON error response for a refusal.
+/// The JSON error response for a refusal: an `ErrorBody`, plus `files`
+/// when the refusal carries the current deletion list.
 pub fn error_response(error: &TransferError) -> Response {
-    (
-        StatusCode::from_u16(error.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
-        Json(ErrorBody {
-            message: error.message.clone(),
-        }),
-    )
-        .into_response()
+    let status = StatusCode::from_u16(error.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    match &error.files {
+        Some(files) => (
+            status,
+            Json(serde_json::json!({ "message": error.message, "files": files })),
+        )
+            .into_response(),
+        None => (
+            status,
+            Json(ErrorBody {
+                message: error.message.clone(),
+            }),
+        )
+            .into_response(),
+    }
 }
 
 fn what(capability: Capability) -> &'static str {
@@ -369,6 +436,16 @@ async fn resolve(State(backend): Backend, body: Result<Bytes, BytesRejection>) -
     .await
 }
 
+/// `DELETE /v1/transfers/resolve`: 204. Nothing to look up: both backends
+/// stop a resolve as soon as its `POST` goes away, so a client cancels by
+/// dropping that request; this route lets it say so without a 405.
+async fn cancel_resolve(State(backend): Backend) -> Response {
+    match gate(&backend, Capability::Downloads) {
+        Ok(_) => StatusCode::NO_CONTENT.into_response(),
+        Err(refused) => refused,
+    }
+}
+
 async fn start_transfer(State(backend): Backend, body: Result<Bytes, BytesRejection>) -> Response {
     let backend = match gate(&backend, Capability::Downloads) {
         Ok(backend) => backend,
@@ -447,9 +524,21 @@ async fn resume_all(State(backend): Backend) -> Response {
     run(backend, TransferCommand::ResumeAll, done).await
 }
 
-/// A 409 for a deletion whose `confirm` list does not match carries the
-/// current list as `files`, beside `message`, so the client can ask again
-/// without another request. Other errors are a plain `ErrorBody`.
+/// `DELETE /v1/transfers/{id}`.
+///
+/// With `delete_files`, both backends apply the same rules, in this order:
+/// - an explicit share (`TransferRow::share`) is refused with 403: its
+///   files are the owner's originals;
+/// - a transfer is deletable only when a paired Flick started it through
+///   this server, or every file lives under the server's download folder;
+///   anything else (a local download the owner saved elsewhere) is 403;
+/// - `confirm` must list exactly [`deletion_paths`] of the current row, or
+///   the answer is 409 with that list as `files` beside `message`, so the
+///   client can ask again without another request.
+///
+/// Every other refusal, including other 409s such as files still being
+/// checked, is a plain `ErrorBody` without `files`. Keep Files is never
+/// refused by these rules.
 async fn remove_transfer(
     State(backend): Backend,
     UrlPath(id): UrlPath<String>,
@@ -467,33 +556,11 @@ async fn remove_transfer(
         return error_response(&TransferError::unknown_transfer());
     }
     let command = TransferCommand::Remove {
-        id: id.clone(),
+        id,
         delete_files: request.delete_files,
         confirm: request.confirm,
     };
-    match backend.call(command).await {
-        Ok(TransferReply::Done) => StatusCode::NO_CONTENT.into_response(),
-        Ok(_) => error_response(&TransferError::new(
-            500,
-            "The transfer backend gave an unexpected answer",
-        )),
-        Err(error) if error.status == 409 && request.delete_files => {
-            let files = match backend.call(TransferCommand::List).await {
-                Ok(TransferReply::Transfers(rows)) => rows
-                    .into_iter()
-                    .find(|row| row.id == id)
-                    .map(|row| selected_paths(&row))
-                    .unwrap_or_default(),
-                _ => Vec::new(),
-            };
-            (
-                StatusCode::CONFLICT,
-                Json(serde_json::json!({ "message": error.message, "files": files })),
-            )
-                .into_response()
-        }
-        Err(error) => error_response(&error),
-    }
+    run(backend, command, done).await
 }
 
 async fn start_fetch(State(backend): Backend, body: Result<Bytes, BytesRejection>) -> Response {
@@ -621,12 +688,12 @@ async fn share(State(backend): Backend, body: Result<Bytes, BytesRejection>) -> 
 const MAX_INPUT_BYTES: usize = 16 * 1024 * 1024 / 3 * 4 + 64;
 
 /// What `ResolveRequest::input` / `StartTransfer::input` name: a magnet
-/// link, a 40-hex infohash, an HTTPS `.torrent` URL, or `base64:` and the
-/// bytes of a `.torrent` file. Anything else, including a local file path,
-/// is refused with 400.
+/// link, a 40-hex infohash (made into a magnet link), an HTTPS `.torrent`
+/// URL, or `base64:` and the bytes of a `.torrent` file. Anything else,
+/// including a local file path, is refused with 422.
 pub fn parse_input(input: &str) -> Result<TorrentInput, TransferError> {
     let input = input.trim();
-    let invalid = |message: &str| TransferError::new(400, message);
+    let invalid = |message: &str| TransferError::new(422, message);
     if input.len() > MAX_INPUT_BYTES {
         return Err(invalid("This torrent is larger than 16 MiB"));
     }
@@ -657,6 +724,12 @@ pub fn parse_input(input: &str) -> Result<TorrentInput, TransferError> {
                 "Only BitTorrent v1 or hybrid magnet links are supported",
             ));
         }
+        if hex {
+            return Ok(TorrentInput::Magnet(format!(
+                "magnet:?xt=urn:btih:{}",
+                input.to_ascii_lowercase()
+            )));
+        }
         return Ok(TorrentInput::Magnet(input.to_owned()));
     }
     Err(invalid(
@@ -664,8 +737,26 @@ pub fn parse_input(input: &str) -> Result<TorrentInput, TransferError> {
     ))
 }
 
+/// What a resolution is remembered under, so a Start finds the Resolve
+/// before it: the infohash when the input names one (a large `.torrent` is
+/// never kept as text), else the URL.
+pub fn input_key(input: &TorrentInput) -> String {
+    match input {
+        TorrentInput::Magnet(value) => librqbit::Magnet::parse(value)
+            .ok()
+            .and_then(|magnet| magnet.as_id20())
+            .map(|id| id.as_string())
+            .unwrap_or_else(|| value.clone()),
+        TorrentInput::Bytes(bytes) => librqbit::torrent_from_bytes(bytes)
+            .map(|torrent| torrent.info_hash.as_string())
+            .unwrap_or_default(),
+        TorrentInput::Url(url) => url.clone(),
+        TorrentInput::File(path) => path.display().to_string(),
+    }
+}
+
 /// Standard base64 with optional padding and no line breaks.
-fn decode_base64(text: &str) -> Option<Vec<u8>> {
+pub fn decode_base64(text: &str) -> Option<Vec<u8>> {
     let text = text.trim().trim_end_matches('=');
     let value = |byte: u8| -> Option<u32> {
         Some(match byte {
@@ -692,7 +783,8 @@ fn decode_base64(text: &str) -> Option<Vec<u8>> {
     Some(out)
 }
 
-fn torrent_info(resolved: &ResolvedTorrent) -> TorrentInfo {
+/// A resolved torrent as `POST /v1/transfers/resolve` answers it.
+pub fn torrent_info(resolved: &ResolvedTorrent) -> TorrentInfo {
     TorrentInfo {
         infohash: resolved.infohash.clone(),
         name: resolved.name.clone(),
@@ -709,33 +801,131 @@ fn torrent_info(resolved: &ResolvedTorrent) -> TorrentInfo {
 }
 
 /// A torrent-relative path with `/` between components on every platform.
-fn slash_path(path: &Path) -> String {
+pub fn slash_path(path: &Path) -> String {
     path.components()
         .map(|part| part.as_os_str().to_string_lossy().into_owned())
         .collect::<Vec<_>>()
         .join("/")
 }
 
-/// The selected files' paths, which a deletion must echo.
-pub fn selected_paths(row: &TransferRow) -> Vec<String> {
+/// Whether "Remove and Delete Files" would delete this file, for
+/// `TransferFileRow::will_delete`: the engine deletes every file the
+/// torrent lists, so a selected file, and an unselected one that has data
+/// on disk (a piece on the boundary with a selected file writes into it).
+/// Nothing of a share is deleted: its files are the owner's originals.
+pub fn will_delete(file: &FileProgress, share: bool) -> bool {
+    !share && (file.selected || std::fs::symlink_metadata(&file.path).is_ok())
+}
+
+/// The paths a deletion must echo: every file whose `will_delete` is set.
+/// Both backends check `confirm` against this, and a 409 sends it back.
+pub fn deletion_paths(row: &TransferRow) -> Vec<String> {
     row.files
         .iter()
-        .filter(|file| file.selected)
+        .filter(|file| file.will_delete)
         .map(|file| file.path.clone())
         .collect()
 }
 
-/// Whether `confirm` lists exactly the row's selected files, each once, in
-/// any order.
+/// Whether `confirm` lists exactly the row's [`deletion_paths`], each
+/// once, in any order.
 pub fn confirm_matches(row: &TransferRow, confirm: &[String]) -> bool {
-    let mut expected = selected_paths(row);
+    same_paths(&deletion_paths(row), confirm)
+}
+
+/// Whether `confirm` is exactly `expected`, each once, in any order.
+pub fn same_paths(expected: &[String], confirm: &[String]) -> bool {
+    let mut expected = expected.to_vec();
     let mut given = confirm.to_vec();
     expected.sort();
     given.sort();
     expected == given
 }
 
-fn phase(state: TransferState) -> TransferPhase {
+/// Whether every file of a transfer lies under `folder`, the server's
+/// download folder (canonicalized when it exists). A transfer without known
+/// files does not.
+pub fn lives_under(files: &[FileProgress], folder: &Path) -> bool {
+    let folder = folder.canonicalize().unwrap_or_else(|_| folder.to_owned());
+    !files.is_empty()
+        && files.iter().all(|file| {
+            file.path.starts_with(&folder)
+                && file
+                    .path
+                    .strip_prefix(&folder)
+                    .is_ok_and(|rest| rest.components().all(|c| matches!(c, Component::Normal(_))))
+        })
+}
+
+/// The longest message from this server's internals that reaches a
+/// client; longer ones are cut.
+const PUBLIC_MESSAGE_CHARS: usize = 300;
+
+/// Whether `text` seems to name a filesystem path: a word that starts with
+/// `/`, `~/`, or a drive letter, or has a backslash. `https://…` does not.
+fn names_a_path(text: &str) -> bool {
+    text.split(|c: char| {
+        c.is_whitespace()
+            || matches!(
+                c,
+                '"' | '\'' | '(' | ')' | '[' | ']' | '`' | ',' | '=' | '<' | '>'
+            )
+    })
+    .any(|word| {
+        let bytes = word.as_bytes();
+        word.starts_with('/')
+            || word.starts_with("~/")
+            || word.contains('\\')
+            || (bytes.len() >= 3
+                && bytes[0].is_ascii_alphabetic()
+                && bytes[1] == b':'
+                && matches!(bytes[2], b'/' | b'\\'))
+    })
+}
+
+/// `text` as a client may see it: its first line, cut short, and None when
+/// it names a path on this machine.
+pub fn public_text(text: &str) -> Option<String> {
+    let line = text.lines().next().unwrap_or_default().trim();
+    if line.is_empty() || names_a_path(text) {
+        return None;
+    }
+    Some(match line.char_indices().nth(PUBLIC_MESSAGE_CHARS) {
+        Some((cut, _)) => format!("{}…", &line[..cut]),
+        None => line.to_owned(),
+    })
+}
+
+/// A refusal message for an adapter failure: `what`, plus the error's
+/// explanation when it names no path. The full error goes to the log.
+pub fn public_error(what: &str, error: &anyhow::Error) -> String {
+    tracing::warn!("{what}: {error:#}");
+    match public_text(&format!("{error:#}")).or_else(|| public_text(&error.to_string())) {
+        Some(reason) => format!("{what}: {reason}"),
+        None => format!("{what}."),
+    }
+}
+
+/// A failed link download's `FetchRow::error`: short, without paths or
+/// yt-dlp's own output. The full error goes to the server's log.
+pub fn public_fetch_error(error: &anyhow::Error) -> String {
+    tracing::warn!("A link download failed: {error:#}");
+    let top = error.to_string();
+    if top.starts_with("yt-dlp") {
+        let mut message = "yt-dlp could not download this link.".to_owned();
+        if top.contains("not supported by yt-dlp") {
+            message.push_str(" This site is not supported by yt-dlp.");
+        }
+        if top.contains("Install FFmpeg") {
+            message.push_str(" FFmpeg is needed on the server to combine video and audio.");
+        }
+        return message;
+    }
+    public_text(&top).unwrap_or_else(|| "The link could not be downloaded on the server.".into())
+}
+
+/// The phase a transfer state is listed as.
+pub fn phase(state: TransferState) -> TransferPhase {
     match state {
         TransferState::Checking => TransferPhase::Checking,
         TransferState::Downloading => TransferPhase::Downloading,
@@ -781,18 +971,25 @@ impl TransferRows {
                     .entry(snapshot.infohash.clone())
                     .or_insert_with(|| Arc::new(relative_paths(session, &snapshot.infohash)))
                     .clone();
-                self.row(snapshot, &relative)
+                let share = session.is_explicit_share(&snapshot.infohash);
+                self.row(snapshot, &relative, share)
             })
             .collect())
     }
 
-    /// One row; `relative` holds torrent-relative paths by file index.
-    pub fn row(&self, snapshot: &TransferSnapshot, relative: &[String]) -> TransferRow {
+    /// One row; `relative` holds torrent-relative paths by file index, and
+    /// `share` says the transfer seeds the owner's own files.
+    pub fn row(
+        &self,
+        snapshot: &TransferSnapshot,
+        relative: &[String],
+        share: bool,
+    ) -> TransferRow {
         TransferRow {
             id: snapshot.infohash.clone(),
             name: snapshot.name.clone(),
             phase: phase(snapshot.state),
-            error: snapshot.error.clone(),
+            error: snapshot.error.as_deref().map(public_transfer_error),
             verified_bytes: snapshot.verified_bytes,
             total_bytes: snapshot.total_bytes,
             checked_bytes: snapshot.checked_bytes,
@@ -801,8 +998,7 @@ impl TransferRows {
             peers: snapshot.peers,
             download_bps: snapshot.download_bytes_per_second,
             upload_bps: snapshot.upload_bytes_per_second,
-            // Filled in by the deletion-safety fix: shares and on-disk files.
-            share: false,
+            share,
             files: snapshot
                 .files
                 .iter()
@@ -817,7 +1013,7 @@ impl TransferRows {
                     size: file.length,
                     verified_bytes: file.verified_bytes,
                     selected: file.selected,
-                    will_delete: file.selected,
+                    will_delete: will_delete(file, share),
                     video_id: self.video_id(&file.path, file.selected),
                 })
                 .collect(),
@@ -857,10 +1053,23 @@ fn relative_paths(session: &TransferSession, infohash: &str) -> Vec<String> {
         .collect()
 }
 
-/// Free space and the folder's name, never its path.
+/// A transfer's error as a client may see it.
+pub fn public_transfer_error(error: &str) -> String {
+    public_text(error).unwrap_or_else(|| {
+        tracing::debug!("Transfer error kept from clients: {error}");
+        "This transfer stopped with an error. Its owner can see why on the server.".into()
+    })
+}
+
+/// Free space and the folder's name, never its path. A folder that does
+/// not exist yet reports the free space of its nearest existing parent.
 pub fn storage(download_dir: &Path) -> Storage {
     Storage {
-        free_bytes: fs2::available_space(download_dir).unwrap_or(0),
+        free_bytes: download_dir
+            .ancestors()
+            .find(|dir| dir.is_dir())
+            .and_then(|dir| fs2::available_space(dir).ok())
+            .unwrap_or(0),
         download_folder_name: download_dir
             .canonicalize()
             .unwrap_or_else(|_| download_dir.to_owned())
@@ -908,12 +1117,24 @@ impl ShareRoots {
     /// Roots that cannot be resolved are skipped with a warning. Two roots
     /// with the same folder name get ` (2)`, ` (3)`, … after the name.
     pub fn new(roots: &[PathBuf]) -> Self {
+        Self::build(roots, true)
+    }
+
+    /// [`Self::new`] without the warnings, for a caller that builds the
+    /// roots for every request from the owner's live settings.
+    pub fn quiet(roots: &[PathBuf]) -> Self {
+        Self::build(roots, false)
+    }
+
+    fn build(roots: &[PathBuf], warn: bool) -> Self {
         let mut named: Vec<(String, PathBuf)> = Vec::new();
         for root in roots {
             let canonical = match root.canonicalize() {
                 Ok(path) if path.is_dir() => path,
                 _ => {
-                    tracing::warn!(root = %root.display(), "Skipping a share root that is not a folder");
+                    if warn {
+                        tracing::warn!(root = %root.display(), "Skipping a share root that is not a folder");
+                    }
                     continue;
                 }
             };
@@ -1039,17 +1260,21 @@ impl ShareRoots {
 
 /// The link download for a pasted URL, as the desktop's paste-link sheet
 /// starts it. Internet Archive items go to yt-dlp as a page.
-fn fetch_source(url: &str) -> Result<FetchSource, TransferError> {
+/// Invalid input is 422 here and in the in-app server.
+pub fn fetch_source(url: &str) -> Result<FetchSource, TransferError> {
     match crate::fetch::web_link(url) {
         None => Err(TransferError::new(
-            400,
+            422,
             "Paste a web link that starts with https://",
         )),
-        Some(Err(error)) => Err(TransferError::new(400, format!("{error:#}"))),
+        Some(Err(error)) => Err(TransferError::new(
+            422,
+            public_text(&format!("{error:#}")).unwrap_or_else(|| "This link is not valid".into()),
+        )),
         Some(Ok(WebLink::Archive(_))) => Ok(FetchSource::Page(url.trim().to_owned())),
         Some(Ok(link)) => link
             .source()
-            .ok_or_else(|| TransferError::new(400, "This link cannot be downloaded")),
+            .ok_or_else(|| TransferError::new(422, "This link cannot be downloaded")),
     }
 }
 
@@ -1219,10 +1444,14 @@ pub const MAX_RESOLVES: usize = 3;
 pub const MAX_FETCHES: usize = 3;
 /// Resolved torrents kept so a start right after a resolve does not ask the
 /// peers again.
-const RESOLVED_CACHE: usize = 16;
-const RESOLVED_TTL: Duration = Duration::from_secs(10 * 60);
+pub const RESOLVED_CACHE: usize = 16;
+/// How long a resolution is reused, by Resolve and by Start, in both
+/// backends.
+pub const RESOLVED_TTL: Duration = Duration::from_secs(10 * 60);
 /// How often completed downloads are written to the download list.
 const RECORD_INTERVAL: Duration = Duration::from_secs(5);
+/// A removal while files are being checked; 409 without `files`.
+pub const STILL_CHECKING: &str = "Files are still being checked. Try again when checking finishes.";
 /// How long stopping waits for link downloads to remove partial files.
 const FETCH_STOP_GRACE: Duration = Duration::from_secs(5);
 
@@ -1395,7 +1624,7 @@ impl Headless {
                 self.session
                     .pause(&id)
                     .await
-                    .map_err(|e| refused(409, "Could not pause this transfer", e))?;
+                    .map_err(|e| refused(409, "Could not pause this transfer", &e))?;
                 Ok(TransferReply::Done)
             }
             TransferCommand::Resume { id } => {
@@ -1403,21 +1632,21 @@ impl Headless {
                 self.session
                     .resume(&id, self.initial_peers.clone())
                     .await
-                    .map_err(|e| refused(409, "Could not resume this transfer", e))?;
+                    .map_err(|e| refused(409, "Could not resume this transfer", &e))?;
                 Ok(TransferReply::Done)
             }
             TransferCommand::PauseAll => {
                 self.session
                     .pause_all()
                     .await
-                    .map_err(|e| refused(409, "Could not pause every transfer", e))?;
+                    .map_err(|e| refused(409, "Could not pause every transfer", &e))?;
                 Ok(TransferReply::Done)
             }
             TransferCommand::ResumeAll => {
                 self.session
                     .resume_all(self.initial_peers.clone())
                     .await
-                    .map_err(|e| refused(409, "Could not resume every transfer", e))?;
+                    .map_err(|e| refused(409, "Could not resume every transfer", &e))?;
                 Ok(TransferReply::Done)
             }
             TransferCommand::Remove {
@@ -1459,7 +1688,7 @@ impl Headless {
                     .session
                     .share(&source, Vec::new())
                     .await
-                    .map_err(|e| refused(409, "Could not share this folder", e))?;
+                    .map_err(|e| refused(409, "Could not share this folder", &e))?;
                 Ok(TransferReply::Shared(ShareResult {
                     infohash: shared.infohash,
                     magnet: shared.magnet,
@@ -1478,7 +1707,7 @@ impl Headless {
                     .open_stream(&id, file_index)
                     .await
                     .map(TransferReply::Stream)
-                    .map_err(|e| refused(409, "Could not open this file while it downloads", e))
+                    .map_err(|e| refused(409, "Could not open this file while it downloads", &e))
             }
         }
     }
@@ -1510,7 +1739,7 @@ impl Headless {
     fn list(&self) -> Result<Vec<TransferRow>, TransferError> {
         self.rows
             .rows(&self.session)
-            .map_err(|e| refused(503, "Transfers are not available", e))
+            .map_err(|e| refused(503, "Transfers are not available", &e))
     }
 
     /// A cached resolution of this input or infohash, or a new one bounded
@@ -1518,7 +1747,7 @@ impl Headless {
     async fn resolve(&self, input: &str) -> Result<ResolvedTorrent, TransferError> {
         let input = input.trim();
         let parsed = parse_input(input)?;
-        let key = cache_key(&parsed);
+        let key = input_key(&parsed);
         if let Some(resolved) = self.cached(&key) {
             return Ok(resolved);
         }
@@ -1541,7 +1770,7 @@ impl Headless {
                         "No peers supplied this torrent's details in time. Try a torrent with active seeders, or send the .torrent file.",
                     )
                 } else {
-                    refused(502, "Could not get this torrent's details", error)
+                    refused(502, "Could not get this torrent's details", &error)
                 }
             })?;
         let mut cache = self
@@ -1585,7 +1814,7 @@ impl Headless {
                 .all(|index| *index < resolved.files.len() && seen.insert(*index))
             {
                 return Err(TransferError::new(
-                    400,
+                    422,
                     "A chosen file is not in this torrent",
                 ));
             }
@@ -1595,7 +1824,7 @@ impl Headless {
             .session
             .download(&resolved, selection)
             .await
-            .map_err(|e| refused(409, "Could not start this download", e))?;
+            .map_err(|e| refused(409, "Could not start this download", &e))?;
         Ok(TransferReply::Started(Started { id }))
     }
 
@@ -1606,23 +1835,36 @@ impl Headless {
         confirm: &[String],
     ) -> Result<TransferReply, TransferError> {
         self.known(id)?;
+        // The rules are the route's (see `remove_transfer`). Every transfer
+        // this backend starts goes to `<download_dir>/<infohash>`, so the
+        // download folder alone decides which ones a paired Flick may empty.
         if delete_files {
+            if self.session.is_explicit_share(id) {
+                return Err(TransferError::share_files_kept());
+            }
+            let snapshot = self
+                .session
+                .snapshot(id)
+                .map_err(|_| TransferError::unknown_transfer())?;
+            if !lives_under(&snapshot.files, &self.download_dir) {
+                return Err(TransferError::owner_files_kept());
+            }
+            if snapshot.state == TransferState::Checking {
+                return Err(TransferError::new(409, STILL_CHECKING));
+            }
             let row = self
                 .list()?
                 .into_iter()
                 .find(|row| row.id == id)
                 .ok_or_else(TransferError::unknown_transfer)?;
             if !confirm_matches(&row, confirm) {
-                return Err(TransferError::new(
-                    409,
-                    "The files to delete have changed. Check the list and confirm again.",
-                ));
+                return Err(TransferError::files_changed(deletion_paths(&row)));
             }
         }
         self.session
             .remove(id, delete_files)
             .await
-            .map_err(|e| refused(409, "Could not remove this transfer", e))?;
+            .map_err(|e| refused(409, "Could not remove this transfer", &e))?;
         self.record_completed();
         Ok(TransferReply::Done)
     }
@@ -1659,7 +1901,7 @@ impl Headless {
             let update = match result {
                 Ok(_) => FetchUpdate::Done,
                 Err(_) if cancel.is_cancelled() => FetchUpdate::Cancelled,
-                Err(error) => FetchUpdate::Failed(format!("{error:#}")),
+                Err(error) => FetchUpdate::Failed(public_fetch_error(&error)),
             };
             if let Some(list) = list {
                 let saved = saved
@@ -1753,23 +1995,6 @@ impl Headless {
     }
 }
 
-/// What a resolution is cached under: the infohash when the input names
-/// one, so a large `.torrent` is never kept as text, else the URL.
-fn cache_key(input: &TorrentInput) -> String {
-    match input {
-        TorrentInput::Magnet(value) => librqbit::Magnet::parse(value)
-            .ok()
-            .and_then(|magnet| magnet.as_id20())
-            .map(|id| id.as_string())
-            .unwrap_or_else(|| value.clone()),
-        TorrentInput::Bytes(bytes) => librqbit::torrent_from_bytes(bytes)
-            .map(|torrent| torrent.info_hash.as_string())
-            .unwrap_or_default(),
-        TorrentInput::Url(url) => url.clone(),
-        TorrentInput::File(path) => path.display().to_string(),
-    }
-}
-
 /// Adds saved link-download videos under `root` to a download list.
 fn append_downloads(list: &Path, root: &Path, saved: &[PathBuf]) -> anyhow::Result<()> {
     let mut paths: BTreeSet<PathBuf> = crate::remote::library::read_path_list(list)?
@@ -1790,10 +2015,10 @@ fn append_downloads(list: &Path, root: &Path, saved: &[PathBuf]) -> anyhow::Resu
     Ok(())
 }
 
-/// An adapter failure as a refusal with `status`. The adapter's messages
-/// are written for people and name no paths a client did not send.
-fn refused(status: u16, what: &str, error: anyhow::Error) -> TransferError {
-    TransferError::new(status, format!("{what}: {error:#}"))
+/// An adapter failure as a refusal with `status`, without any path on
+/// this machine; the full error goes to the log.
+fn refused(status: u16, what: &str, error: &anyhow::Error) -> TransferError {
+    TransferError::new(status, public_error(what, error))
 }
 
 #[cfg(test)]
@@ -1816,7 +2041,14 @@ mod tests {
     #[test]
     fn inputs_are_magnets_hashes_https_or_torrent_bytes_only() {
         let hash = "0123456789abcdef0123456789abcdef01234567";
-        assert!(matches!(parse_input(hash), Ok(TorrentInput::Magnet(_))));
+        assert!(matches!(
+            parse_input(&hash.to_ascii_uppercase()),
+            Ok(TorrentInput::Magnet(m)) if m == format!("magnet:?xt=urn:btih:{hash}")
+        ));
+        assert_eq!(
+            input_key(&parse_input(&format!("magnet:?dn=x&xt=urn:btih:{hash}")).unwrap()),
+            hash
+        );
         assert!(matches!(
             parse_input(&format!("magnet:?xt=urn:btih:{hash}")),
             Ok(TorrentInput::Magnet(_))
@@ -1838,7 +2070,7 @@ mod tests {
             "magnet:?xt=urn:btih:nothex",
         ] {
             let error = parse_input(bad).err().unwrap_or_else(|| panic!("{bad}"));
-            assert_eq!(error.status, 400, "{bad}");
+            assert_eq!(error.status, 422, "{bad}");
         }
     }
 
@@ -1873,40 +2105,179 @@ mod tests {
     }
 
     #[test]
-    fn confirm_lists_must_match_selected_files_exactly() {
+    fn confirm_lists_must_match_the_files_that_will_be_deleted_exactly() {
         let row = TransferRow {
             files: vec![
                 TransferFileRow {
                     index: 0,
                     path: "a.mp4".into(),
                     selected: true,
+                    will_delete: true,
                     ..Default::default()
                 },
                 TransferFileRow {
                     index: 1,
                     path: "b.txt".into(),
                     selected: false,
+                    will_delete: false,
                     ..Default::default()
                 },
                 TransferFileRow {
                     index: 2,
                     path: "dir/c.mkv".into(),
                     selected: true,
+                    will_delete: true,
+                    ..Default::default()
+                },
+                // Unselected, but a boundary piece wrote into it.
+                TransferFileRow {
+                    index: 3,
+                    path: "d.nfo".into(),
+                    selected: false,
+                    will_delete: true,
                     ..Default::default()
                 },
             ],
             ..Default::default()
         };
-        assert!(confirm_matches(&row, &["dir/c.mkv".into(), "a.mp4".into()]));
-        assert!(!confirm_matches(&row, &["a.mp4".into()]));
-        assert!(!confirm_matches(
+        assert_eq!(deletion_paths(&row), ["a.mp4", "dir/c.mkv", "d.nfo"]);
+        assert!(confirm_matches(
             &row,
-            &["a.mp4".into(), "dir/c.mkv".into(), "b.txt".into()]
+            &["d.nfo".into(), "dir/c.mkv".into(), "a.mp4".into()]
         ));
         assert!(!confirm_matches(
             &row,
-            &["a.mp4".into(), "a.mp4".into(), "dir/c.mkv".into()]
+            &["dir/c.mkv".into(), "a.mp4".into()]
         ));
+        assert!(!confirm_matches(
+            &row,
+            &[
+                "a.mp4".into(),
+                "dir/c.mkv".into(),
+                "d.nfo".into(),
+                "b.txt".into()
+            ]
+        ));
+        assert!(!confirm_matches(
+            &row,
+            &[
+                "a.mp4".into(),
+                "a.mp4".into(),
+                "dir/c.mkv".into(),
+                "d.nfo".into()
+            ]
+        ));
+    }
+
+    #[test]
+    fn will_delete_covers_selected_files_and_unselected_data_but_never_a_share() {
+        let dir = tempfile::tempdir().unwrap();
+        let on_disk = dir.path().join("written.txt");
+        std::fs::write(&on_disk, b"boundary piece").unwrap();
+        let file = |path: PathBuf, selected| FileProgress {
+            index: 0,
+            path,
+            length: 1,
+            verified_bytes: 0,
+            selected,
+        };
+        assert!(will_delete(
+            &file(dir.path().join("absent.mp4"), true),
+            false
+        ));
+        assert!(will_delete(&file(on_disk.clone(), false), false));
+        assert!(!will_delete(
+            &file(dir.path().join("absent.txt"), false),
+            false
+        ));
+        assert!(!will_delete(&file(on_disk.clone(), true), true));
+
+        // The adapter reports canonical paths; the folder is canonicalized.
+        let inside = dir.path().join("downloads").join("abc");
+        std::fs::create_dir_all(&inside).unwrap();
+        let inside = inside.canonicalize().unwrap();
+        let files = [
+            file(inside.join("a.mp4"), true),
+            file(inside.join("b/c.mp4"), false),
+        ];
+        assert!(lives_under(&files, &dir.path().join("downloads")));
+        assert!(!lives_under(&files, &dir.path().join("elsewhere")));
+        assert!(!lives_under(&[], &dir.path().join("downloads")));
+        let escaping = [file(inside.join("../../x.mp4"), true)];
+        assert!(!lives_under(&escaping, &dir.path().join("downloads")));
+    }
+
+    #[test]
+    fn public_messages_never_name_paths() {
+        assert_eq!(
+            public_text("Torrent is already managed by this session").as_deref(),
+            Some("Torrent is already managed by this session")
+        );
+        assert_eq!(
+            public_text("Enter a full web address, starting with https://").as_deref(),
+            Some("Enter a full web address, starting with https://")
+        );
+        for leaky in [
+            "Could not create /Users/owner/Movies/x: Permission denied",
+            "Could not write to ~/Downloads",
+            "Could not open C:\\Users\\owner",
+            "Could not open \"/Volumes/Media/a.mp4\"",
+            "D:/media/x.mkv is missing",
+        ] {
+            assert_eq!(public_text(leaky), None, "{leaky}");
+        }
+        assert_eq!(public_text("first\nsecond").as_deref(), Some("first"));
+        assert_eq!(public_text(&"x".repeat(400)).unwrap().chars().count(), 301);
+
+        let error = anyhow::anyhow!("Permission denied (os error 13)")
+            .context("Could not create /Users/owner/Downloads/Flick");
+        assert_eq!(public_error("Could not start", &error), "Could not start.");
+        let error = anyhow::anyhow!("Torrent is already managed by this session");
+        assert_eq!(
+            public_error("Could not share", &error),
+            "Could not share: Torrent is already managed by this session"
+        );
+        let ytdlp = anyhow::anyhow!(
+            "yt-dlp: [generic] Unable to read /home/owner/.cache/x. This site is not supported by yt-dlp."
+        );
+        let message = public_fetch_error(&ytdlp);
+        assert_eq!(
+            message,
+            "yt-dlp could not download this link. This site is not supported by yt-dlp."
+        );
+        let disk = anyhow::anyhow!("No space left").context("Could not write /srv/media/a.mp4");
+        assert_eq!(
+            public_fetch_error(&disk),
+            "The link could not be downloaded on the server."
+        );
+        assert_eq!(
+            public_transfer_error("error opening /srv/x"),
+            "This transfer stopped with an error. Its owner can see why on the server."
+        );
+    }
+
+    #[test]
+    fn a_mismatch_carries_files_and_other_refusals_do_not() {
+        let mismatch = TransferError::files_changed(vec!["a.mp4".into()]);
+        assert_eq!(mismatch.status, 409);
+        assert_eq!(mismatch.files.as_deref(), Some(&["a.mp4".to_owned()][..]));
+        assert_eq!(TransferError::new(409, STILL_CHECKING).files, None);
+        assert_eq!(TransferError::share_files_kept().status, 403);
+        assert_eq!(TransferError::owner_files_kept().status, 403);
+        assert_eq!(TransferError::busy("x").status, 503);
+    }
+
+    #[test]
+    fn live_capabilities_follow_their_publisher() {
+        let (publish, capabilities) = watch::channel(vec![Capability::Downloads]);
+        let (sender, _requests) = mpsc::channel(1);
+        let backend = TransferBackend::live(capabilities, sender.clone());
+        assert!(backend.allows(Capability::Downloads));
+        publish.send_replace(Vec::new());
+        assert!(!backend.allows(Capability::Downloads));
+        assert!(backend.capabilities().is_empty());
+        let fixed = TransferBackend::new(vec![Capability::Shares], sender);
+        assert_eq!(fixed.capabilities(), [Capability::Shares]);
     }
 
     #[test]
