@@ -838,10 +838,20 @@ impl Flick {
     }
 
     /// Tiers the quality picker offers: those the playing video's server
-    /// lists, or every tier before its first listing.
+    /// lists, or every tier before its first listing. A video still
+    /// downloading on the server plays only at Original.
     pub(crate) fn quality_choices(&self) -> Vec<Quality> {
-        self.remote_source()
-            .and_then(|remote| self.remote_server(&remote.server_id))
+        let Some(remote) = self.remote_source() else {
+            return Quality::ALL.to_vec();
+        };
+        if self
+            .remote
+            .video_complete(&remote.server_id, &remote.video_id)
+            == Some(false)
+        {
+            return vec![Quality::Original];
+        }
+        self.remote_server(&remote.server_id)
             .map_or_else(|| Quality::ALL.to_vec(), |server| server.qualities())
     }
 
@@ -1043,7 +1053,17 @@ impl Flick {
         cx: &mut Context<Self>,
     ) {
         self.remote_ui.checking = None;
-        if !remote.quality.is_transcode() {
+        // An unfinished file on a server that cannot stream one is checked
+        // first, so its reason is shown instead of a generic failure.
+        let unplayable = self
+            .remote
+            .video_complete(&remote.server_id, &remote.video_id)
+            == Some(false)
+            && !self.remote.server_allows(
+                &remote.server_id,
+                flick::remote::protocol::Capability::StreamIncomplete,
+            );
+        if !remote.quality.is_transcode() && !unplayable {
             self.load_remote(remote, resume, window, cx);
             return;
         }
@@ -1386,6 +1406,11 @@ impl Flick {
             return Duration::from_millis(500);
         }
         self.poll_library_files(window, cx);
+        self.remote.set_local_folder(&self.download_folder);
+        self.remote.poll_transfers(
+            &self.store.data,
+            self.view == View::Library && self.page == Page::Downloads,
+        );
         if self.remote.drain() {
             cx.notify();
         }
@@ -1731,7 +1756,7 @@ impl Flick {
             }
             Control::AddVideos => self.pick_library(false, false, window, cx),
             Control::AddFolder => self.pick_library(true, false, window, cx),
-            Control::Share => self.pick_library(true, true, window, cx),
+            Control::Share => self.open_share(window, cx),
             Control::PasteMagnet => self.paste_link(cx),
             Control::Open => self.pick(false, window, cx),
             Control::Subtitle => self.pick(true, window, cx),

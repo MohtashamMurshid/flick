@@ -19,9 +19,23 @@
 //!
 //! The token is never logged or put in a URL. `FLICK_REMOTE_TOKEN`
 //! overrides every saved token for development and is never saved.
+//!
+//! Downloads on another machine (`docs/REMOTE_DOWNLOADS_PLAN.md`):
+//! - [`RemoteState::destinations`] lists this Mac and every paired server
+//!   with what its listing allows, for the Save to pickers.
+//! - [`RemoteState::poll_transfers`] asks servers that accept downloads for
+//!   `GET /v1/transfers` and `GET /v1/fetches`, once a second while
+//!   Downloads is open and once a minute otherwise;
+//!   [`RemoteState::machine_transfers`] returns the last rows of each.
+//! - [`RemoteState::command`] and its wrappers send resolve, start, pause,
+//!   remove, link, browse, and share commands; answers arrive in
+//!   [`Ready::Command`].
 
 use crate::store::{Settings, remote::RemoteServer};
-use flick::remote::protocol::{self, ErrorBody, Library, Pairing, Progress, Quality};
+use flick::remote::protocol::{
+    self, BrowseListing, Capability, ErrorBody, FetchPhase, FetchRow, Library, Pairing, Progress,
+    Quality, ShareResult, TorrentInfo, TransferPhase, TransferRow,
+};
 use std::{
     cell::{Cell, OnceCell, RefCell},
     collections::{HashMap, HashSet, VecDeque},
@@ -29,7 +43,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{Arc, OnceLock, mpsc},
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 /// Overrides every saved pairing token, like `FLICK_OPENSUBTITLES_KEY`.
@@ -211,6 +225,13 @@ pub enum Ready {
         /// Why the server will not play it, in words for the user.
         result: Result<(), String>,
     },
+    /// The answer to a [`RemoteState::command`]. Errors are the server's
+    /// message, or a sentence for a server that did not answer.
+    Command {
+        server_id: String,
+        command: Command,
+        result: Result<Outcome, String>,
+    },
 }
 
 /// Text fields of the Remote libraries settings rows. They are GPUI entities,
@@ -238,6 +259,18 @@ pub struct RemoteState {
     /// The last number [`Self::check_playback`] handed out.
     checks: Cell<u64>,
     inner: RefCell<Inner>,
+    /// The last Save to choice per sheet: a server id, or None for this Mac.
+    choices: RefCell<HashMap<Sheet, Option<String>>>,
+    /// This Mac's download folder and its free space, read at most every
+    /// [`FREE_SPACE_TTL`].
+    local: RefCell<LocalDisk>,
+}
+
+#[derive(Default)]
+struct LocalDisk {
+    folder: Option<PathBuf>,
+    free: Option<u64>,
+    read: Option<Instant>,
 }
 
 impl RemoteState {
@@ -262,6 +295,19 @@ impl RemoteState {
         }
         if changed {
             inner.posters.pump(worker);
+            // A download that finished on a server joins its listing.
+            let cache = cache_dir(inner.data_dir());
+            for id in std::mem::take(&mut inner.relist) {
+                let request = inner
+                    .servers
+                    .get_mut(&id)
+                    .and_then(|remote| remote.begin_refresh(&id, &cache));
+                if let Some(request) = request
+                    && let Err(request) = worker.send(request)
+                {
+                    inner.apply((*request).unavailable());
+                }
+            }
         }
         changed
     }
@@ -277,7 +323,7 @@ impl RemoteState {
         for server in &settings.remote.servers {
             let remote = inner.sync(server);
             if !remote.requested {
-                let request = remote.begin_refresh(server, &cache);
+                let request = remote.begin_refresh(&server.id, &cache);
                 self.send(&mut inner, request);
             }
             let remote = &inner.servers[&server.id];
@@ -315,6 +361,7 @@ impl RemoteState {
         settings.remote.progress.retain(|entry| entry.server != id);
         let inner = self.inner.get_mut();
         inner.servers.remove(id);
+        inner.machines.remove(id);
         let dropped = inner.posters.remove_server(id);
         inner.dropped.extend(dropped);
         if let Some(fields) = &self.fields.renaming
@@ -361,7 +408,7 @@ impl RemoteState {
         inner.load_cache_once();
         inner.posters.failed.retain(|(server, _)| server != id);
         let cache = cache_dir(inner.data_dir());
-        let request = inner.sync(server).begin_refresh(server, &cache);
+        let request = inner.sync(server).begin_refresh(&server.id, &cache);
         self.send(&mut inner, request);
     }
 
@@ -418,7 +465,12 @@ impl RemoteState {
                 video.title.clone()
             },
             duration: video.duration,
-            quality: playable_quality(server.quality, &listing.library),
+            // Transcode tiers of an unfinished file are not offered.
+            quality: if video.complete {
+                playable_quality(server.quality, &listing.library)
+            } else {
+                Quality::Original
+            },
             base_url: base_url(server),
             token: effective_token(&server.token),
         })
@@ -611,6 +663,11 @@ struct Inner {
     posters: Posters,
     ready: Vec<Ready>,
     dropped: Vec<Arc<gpui::RenderImage>>,
+    /// Transfers and link downloads on each server, by server id.
+    machines: HashMap<String, Machine>,
+    /// Servers whose listing is asked for again on the next drain, because
+    /// a download there finished.
+    relist: HashSet<String>,
 }
 
 impl Inner {
@@ -690,6 +747,54 @@ impl Inner {
                 }
             }
             Reply::Ready(ready) => self.ready.push(ready),
+            Reply::Transfers { server_id, result } => {
+                let machine = self.machines.entry(server_id.clone()).or_default();
+                machine.polling_transfers = false;
+                match result {
+                    Ok(rows) => {
+                        if machine.transfers_loaded && transfers_finished(&machine.transfers, &rows)
+                        {
+                            self.relist.insert(server_id);
+                        }
+                        machine.transfers = rows;
+                        machine.transfers_loaded = true;
+                        machine.transfers_problem = None;
+                    }
+                    Err(message) => machine.transfers_problem = Some(message),
+                }
+            }
+            Reply::Fetches { server_id, result } => {
+                let machine = self.machines.entry(server_id.clone()).or_default();
+                machine.polling_fetches = false;
+                match result {
+                    Ok(rows) => {
+                        if machine.fetches_loaded && fetches_finished(&machine.fetches, &rows) {
+                            self.relist.insert(server_id);
+                        }
+                        machine.fetches = rows;
+                        machine.fetches_loaded = true;
+                        machine.fetches_problem = None;
+                    }
+                    Err(message) => machine.fetches_problem = Some(message),
+                }
+            }
+            Reply::Command {
+                server_id,
+                command,
+                result,
+            } => {
+                // Whatever the answer, the rows may have changed.
+                if !matches!(command, Command::Browse { .. } | Command::Resolve { .. }) {
+                    let machine = self.machines.entry(server_id.clone()).or_default();
+                    machine.last_transfers = None;
+                    machine.last_fetches = None;
+                }
+                self.ready.push(Ready::Command {
+                    server_id,
+                    command,
+                    result,
+                });
+            }
             Reply::None => {}
         }
     }
@@ -709,14 +814,14 @@ struct Remote {
 }
 
 impl Remote {
-    fn begin_refresh(&mut self, server: &RemoteServer, cache: &Path) -> Option<Request> {
+    fn begin_refresh(&mut self, server_id: &str, cache: &Path) -> Option<Request> {
         let endpoint = self.endpoint.clone()?;
         self.requested = true;
         self.refreshing = true;
         self.generation += 1;
         Some(Request::Library {
             endpoint,
-            server_id: server.id.clone(),
+            server_id: server_id.to_owned(),
             generation: self.generation,
             cache: cache.to_owned(),
         })
@@ -925,6 +1030,17 @@ enum Request {
         video_id: String,
         quality: Quality,
     },
+    /// `GET /v1/transfers`, or `GET /v1/fetches` when `fetches` is set.
+    Poll {
+        endpoint: Endpoint,
+        server_id: String,
+        fetches: bool,
+    },
+    Command {
+        endpoint: Endpoint,
+        server_id: String,
+        command: Command,
+    },
 }
 
 impl Request {
@@ -984,6 +1100,29 @@ impl Request {
                 quality,
                 result: Err(error),
             }),
+            Request::Poll {
+                server_id,
+                fetches: false,
+                ..
+            } => Reply::Transfers {
+                server_id,
+                result: Err(error),
+            },
+            Request::Poll {
+                server_id,
+                fetches: true,
+                ..
+            } => Reply::Fetches {
+                server_id,
+                result: Err(error),
+            },
+            Request::Command {
+                server_id, command, ..
+            } => Reply::Command {
+                server_id,
+                command,
+                result: Err(error),
+            },
         }
     }
 }
@@ -1001,6 +1140,19 @@ enum Reply {
         result: Result<image::RgbaImage, String>,
     },
     Ready(Ready),
+    Transfers {
+        server_id: String,
+        result: Result<Vec<TransferRow>, String>,
+    },
+    Fetches {
+        server_id: String,
+        result: Result<Vec<FetchRow>, String>,
+    },
+    Command {
+        server_id: String,
+        command: Command,
+        result: Result<Outcome, String>,
+    },
     None,
 }
 
@@ -1231,6 +1383,43 @@ async fn handle(http: &reqwest::Client, request: Request) -> Reply {
                 quality,
                 result: result.map_err(|status| playback_error(&status)),
             })
+        }
+        Request::Poll {
+            endpoint,
+            server_id,
+            fetches,
+        } => {
+            let path = if fetches {
+                protocol::paths::fetches()
+            } else {
+                protocol::paths::transfers()
+            };
+            let body = call(http, &endpoint, Call::get(path, MAX_TRANSFERS_BYTES))
+                .await
+                .map_err(|failure| failure.message());
+            if fetches {
+                Reply::Fetches {
+                    server_id,
+                    result: body.and_then(|body| parse_rows(&body)),
+                }
+            } else {
+                Reply::Transfers {
+                    server_id,
+                    result: body.and_then(|body| parse_rows(&body)),
+                }
+            }
+        }
+        Request::Command {
+            endpoint,
+            server_id,
+            command,
+        } => {
+            let result = run_command(http, &endpoint, &command).await;
+            Reply::Command {
+                server_id,
+                command,
+                result,
+            }
         }
     }
 }
@@ -1624,6 +1813,1042 @@ fn subtitle_extension(file_name: &str) -> String {
         .map(str::to_ascii_lowercase)
         .filter(|e| !e.is_empty() && e.len() <= 5 && e.bytes().all(|b| b.is_ascii_alphanumeric()))
         .unwrap_or_else(|| "srt".into())
+}
+
+// Downloads on paired servers: Save to destinations, polled rows, commands.
+
+/// Downloads polls each server this often while it is open, and otherwise.
+const POLL_OPEN: Duration = Duration::from_secs(1);
+const POLL_IDLE: Duration = Duration::from_secs(60);
+/// The server waits up to five minutes for peers when resolving.
+const RESOLVE_TIMEOUT: Duration = Duration::from_secs(5 * 60 + 30);
+/// Starting, pausing, removing, and link downloads.
+const COMMAND_TIMEOUT: Duration = Duration::from_secs(60);
+/// A share hashes the whole folder before it answers.
+const SHARE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+const MAX_TRANSFERS_BYTES: usize = 16 * 1024 * 1024;
+const MAX_COMMAND_BYTES: usize = 8 * 1024 * 1024;
+/// A `.torrent` file sent to a server to resolve.
+const MAX_TORRENT_FILE_BYTES: u64 = 16 * 1024 * 1024;
+/// How long this Mac's free space is reused before it is read again.
+const FREE_SPACE_TTL: Duration = Duration::from_secs(10);
+
+/// A place a download starts. Each remembers its own Save to choice.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Sheet {
+    /// The torrent file-selection sheet.
+    Torrent,
+    /// The paste-link sheet.
+    Link,
+    /// The Share sheet, as Seed from.
+    Share,
+}
+
+/// A machine a download can go to: this Mac, or a paired server.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Destination {
+    /// The paired server's id; None for this Mac.
+    pub id: Option<String>,
+    pub name: String,
+    /// This Mac's download folder, or the server's advertised storage.
+    pub free_bytes: Option<u64>,
+    /// This Mac, or a server whose last listing request answered.
+    pub online: bool,
+    pub allows_downloads: bool,
+    pub allows_links: bool,
+    pub allows_shares: bool,
+    /// The server's status from its last reply; Online for this Mac.
+    pub status: Status,
+}
+
+impl Destination {
+    pub fn is_local(&self) -> bool {
+        self.id.is_none()
+    }
+
+    pub fn allows(&self, sheet: Sheet) -> bool {
+        match sheet {
+            Sheet::Torrent => self.allows_downloads,
+            Sheet::Link => self.allows_links,
+            Sheet::Share => self.allows_shares,
+        }
+    }
+
+    /// Whether the picker lets this be chosen for `sheet`.
+    pub fn selectable(&self, sheet: Sheet) -> bool {
+        self.online && self.allows(sheet)
+    }
+
+    /// The line under its segment: free space, or why it cannot be chosen.
+    pub fn detail(&self, sheet: Sheet) -> String {
+        if !self.online {
+            return match &self.status {
+                Status::Connecting => "Connecting…".into(),
+                Status::WrongToken => "Pair again".into(),
+                Status::Offline => "Offline".into(),
+                _ => "Unavailable".into(),
+            };
+        }
+        if !self.allows(sheet) {
+            return match sheet {
+                Sheet::Torrent => "Not accepting downloads",
+                Sheet::Link => "Not accepting links",
+                Sheet::Share => "Not sharing folders",
+            }
+            .into();
+        }
+        self.free_bytes
+            .map(|free| format!("{} free", flick::library::format_bytes(free)))
+            .unwrap_or_default()
+    }
+}
+
+/// What the picker calls this machine.
+pub fn this_machine_name() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "This Mac"
+    } else if cfg!(windows) {
+        "This PC"
+    } else {
+        "This Computer"
+    }
+}
+
+/// A paired server as [`destinations_from`] needs it.
+pub struct ServerFacts<'a> {
+    pub id: &'a str,
+    pub name: &'a str,
+    pub listing: Option<&'a Library>,
+    /// From the last reply, not "Connecting" during a refresh.
+    pub status: &'a Status,
+}
+
+/// This Mac first, then every paired server, with what each allows from
+/// its last listing (possibly the cached one).
+pub fn destinations_from(local_free: Option<u64>, servers: &[ServerFacts<'_>]) -> Vec<Destination> {
+    let mut destinations = vec![Destination {
+        id: None,
+        name: this_machine_name().into(),
+        free_bytes: local_free,
+        online: true,
+        allows_downloads: true,
+        allows_links: true,
+        allows_shares: true,
+        status: Status::Online,
+    }];
+    for server in servers {
+        let allows = |capability| {
+            server
+                .listing
+                .is_some_and(|listing| listing.capabilities.contains(&capability))
+        };
+        destinations.push(Destination {
+            id: Some(server.id.to_owned()),
+            name: server.name.to_owned(),
+            free_bytes: server
+                .listing
+                .and_then(|listing| listing.storage.as_ref())
+                .map(|storage| storage.free_bytes),
+            online: server.status.is_online(),
+            allows_downloads: allows(Capability::Downloads),
+            allows_links: allows(Capability::Links),
+            allows_shares: allows(Capability::Shares),
+            status: server.status.clone(),
+        });
+    }
+    destinations
+}
+
+/// The Save to choice for a sheet: its last choice, else the default from
+/// onboarding (`settings.remote.default_destination`), else this Mac, each
+/// only while it can be chosen.
+pub fn choose_destination(
+    destinations: &[Destination],
+    sheet: Sheet,
+    remembered: Option<&Option<String>>,
+    default: &str,
+) -> Option<String> {
+    let usable = |id: &Option<String>| {
+        destinations
+            .iter()
+            .any(|destination| &destination.id == id && destination.selectable(sheet))
+    };
+    if let Some(remembered) = remembered
+        && usable(remembered)
+    {
+        return remembered.clone();
+    }
+    let default = (!default.is_empty()).then(|| default.to_owned());
+    if default.is_some() && usable(&default) {
+        return default;
+    }
+    None
+}
+
+/// Whether a picker is worth showing for a sheet: some server allows it.
+pub fn offers_remote(destinations: &[Destination], sheet: Sheet) -> bool {
+    destinations
+        .iter()
+        .any(|destination| !destination.is_local() && destination.allows(sheet))
+}
+
+/// A command for a paired server.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Command {
+    /// `input` is what [`wire_input`] makes.
+    Resolve {
+        input: String,
+    },
+    CancelResolve,
+    Start {
+        input: String,
+        files: Vec<usize>,
+    },
+    Pause {
+        id: String,
+    },
+    Resume {
+        id: String,
+    },
+    PauseAll,
+    ResumeAll,
+    /// `confirm` comes from [`confirm_list`] when deleting files.
+    Remove {
+        id: String,
+        delete_files: bool,
+        confirm: Vec<String>,
+    },
+    FetchStart {
+        url: String,
+    },
+    FetchCancel {
+        id: u64,
+    },
+    Browse {
+        dir: String,
+    },
+    Share {
+        dir: String,
+    },
+}
+
+/// A command's successful answer.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Outcome {
+    Resolved(TorrentInfo),
+    Started {
+        id: String,
+    },
+    Done,
+    /// The server refused a deletion because its file list is not the one
+    /// confirmed; nothing was deleted. `current` is what it would delete now.
+    ListChanged {
+        message: String,
+        current: Vec<String>,
+    },
+    FetchStarted {
+        id: u64,
+    },
+    Browsed(BrowseListing),
+    Shared(ShareResult),
+}
+
+/// One server's section in Downloads.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct MachineTransfers {
+    pub server_id: String,
+    pub name: String,
+    pub transfers: Vec<TransferRow>,
+    pub fetches: Vec<FetchRow>,
+    /// Every list this server offers has answered at least once.
+    pub loaded: bool,
+    /// One line when the last poll failed; the rows are the last known ones.
+    pub problem: Option<String>,
+    pub allows_links: bool,
+    /// The server plays a torrent file before it has finished.
+    pub stream_incomplete: bool,
+}
+
+/// Polled state of one server's transfers and link downloads.
+#[derive(Default)]
+struct Machine {
+    transfers: Vec<TransferRow>,
+    fetches: Vec<FetchRow>,
+    transfers_loaded: bool,
+    fetches_loaded: bool,
+    transfers_problem: Option<String>,
+    fetches_problem: Option<String>,
+    polling_transfers: bool,
+    polling_fetches: bool,
+    /// When each poll last started; None asks at once.
+    last_transfers: Option<Instant>,
+    last_fetches: Option<Instant>,
+}
+
+/// Whether a list last asked for at `last` is due again.
+pub fn poll_due(last: Option<Instant>, now: Instant, downloads_open: bool) -> bool {
+    let interval = if downloads_open { POLL_OPEN } else { POLL_IDLE };
+    last.is_none_or(|last| now.saturating_duration_since(last) >= interval)
+}
+
+/// Every selected file's path, in the server's order: what a deletion must
+/// echo in `RemoveTransfer::confirm`.
+pub fn confirm_list(row: &TransferRow) -> Vec<String> {
+    row.files
+        .iter()
+        .filter(|file| file.selected)
+        .map(|file| file.path.clone())
+        .collect()
+}
+
+fn file_complete(file: &protocol::TransferFileRow) -> bool {
+    file.verified_bytes >= file.size
+}
+
+/// Whether a selected file finished, or a transfer started seeding, since
+/// the previous poll: the server's listing has a new video.
+pub fn transfers_finished(old: &[TransferRow], new: &[TransferRow]) -> bool {
+    new.iter().any(|row| {
+        let before = old.iter().find(|old| old.id == row.id);
+        let file_done =
+            row.files
+                .iter()
+                .filter(|file| file.selected && file_complete(file))
+                .any(|file| {
+                    !before.is_some_and(|before| {
+                        before.files.iter().any(|old| {
+                            old.index == file.index && old.selected && file_complete(old)
+                        })
+                    })
+                });
+        let seeding = row.phase == TransferPhase::Seeding
+            && before.is_some_and(|before| {
+                matches!(
+                    before.phase,
+                    TransferPhase::Downloading | TransferPhase::Checking
+                )
+            });
+        file_done || seeding
+    })
+}
+
+/// Whether a link download finished or saved another file since the
+/// previous poll.
+pub fn fetches_finished(old: &[FetchRow], new: &[FetchRow]) -> bool {
+    new.iter().any(|row| {
+        let before = old.iter().find(|old| old.id == row.id);
+        let done = row.phase == FetchPhase::Done
+            && !before.is_some_and(|before| before.phase == FetchPhase::Done);
+        let saved = row.saved.len() > before.map_or(0, |before| before.saved.len());
+        done || saved
+    })
+}
+
+/// What a command's error answer means, in words for the user: the
+/// server's message when it sent one (403 names the owner's switch), else
+/// a sentence for the status. 401 means the token changed.
+pub fn command_error(code: u16, body: &[u8]) -> String {
+    if code == 401 {
+        return Status::WrongToken.label();
+    }
+    let message = serde_json::from_slice::<ErrorBody>(body)
+        .ok()
+        .map(|body| short(body.message.trim()))
+        .filter(|message| !message.is_empty());
+    message.unwrap_or_else(|| match code {
+        403 => "This Flick's owner has not allowed that from other Flicks".into(),
+        404 => "The server no longer has this. Refresh and try again".into(),
+        409 => "The server already has this".into(),
+        504 => "The server took too long to answer. Try again".into(),
+        _ => status_for_http(code, body).label(),
+    })
+}
+
+/// What a server is sent for a torrent: a magnet link or URL as it is, a
+/// `.torrent` file as `base64:` and its bytes.
+pub fn wire_input(input: &flick::torrent::TorrentInput) -> Result<String, String> {
+    use flick::torrent::TorrentInput;
+    match input {
+        TorrentInput::Magnet(text) | TorrentInput::Url(text) => Ok(text.trim().to_owned()),
+        TorrentInput::Bytes(bytes) => Ok(format!("base64:{}", base64(bytes))),
+        TorrentInput::File(path) => {
+            let too_large = || "This .torrent file is too large to send".to_owned();
+            let size = std::fs::metadata(path)
+                .map_err(|_| "Could not read this .torrent file".to_owned())?
+                .len();
+            if size > MAX_TORRENT_FILE_BYTES {
+                return Err(too_large());
+            }
+            let bytes =
+                std::fs::read(path).map_err(|_| "Could not read this .torrent file".to_owned())?;
+            Ok(format!("base64:{}", base64(&bytes)))
+        }
+    }
+}
+
+/// Standard base64 with padding.
+pub fn base64(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut text = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let value = (u32::from(chunk[0]) << 16)
+            | (u32::from(*chunk.get(1).unwrap_or(&0)) << 8)
+            | u32::from(*chunk.get(2).unwrap_or(&0));
+        for position in 0..4 {
+            if position <= chunk.len() {
+                text.push(ALPHABET[(value >> (18 - 6 * position) & 63) as usize] as char);
+            } else {
+                text.push('=');
+            }
+        }
+    }
+    text
+}
+
+/// A list body: a JSON array, or an object holding one array.
+fn parse_rows<T: serde::de::DeserializeOwned>(body: &[u8]) -> Result<Vec<T>, String> {
+    let unreadable = || "The server sent an unreadable list".to_owned();
+    let value: serde_json::Value = serde_json::from_slice(body).map_err(|_| unreadable())?;
+    let list = match value {
+        serde_json::Value::Array(_) => value,
+        serde_json::Value::Object(object) => object
+            .into_iter()
+            .map(|(_, value)| value)
+            .find(serde_json::Value::is_array)
+            .ok_or_else(unreadable)?,
+        _ => return Err(unreadable()),
+    };
+    serde_json::from_value(list).map_err(|_| unreadable())
+}
+
+/// The id in `POST /v1/fetches`' answer: `{"id": 7}`, `{"id": "7"}`, or `7`.
+fn parse_fetch_id(body: &[u8]) -> Option<u64> {
+    let value: serde_json::Value = serde_json::from_slice(body).ok()?;
+    let id = match &value {
+        serde_json::Value::Object(object) => object.get("id")?,
+        value => value,
+    };
+    id.as_u64().or_else(|| id.as_str()?.trim().parse().ok())
+}
+
+/// The file list a 409 to a deletion carries, under `confirm`, `files`,
+/// `current`, or `paths`, as strings or objects with a `path`.
+pub fn parse_current_list(body: &[u8]) -> Option<Vec<String>> {
+    let value: serde_json::Value = serde_json::from_slice(body).ok()?;
+    let object = value.as_object()?;
+    let list = ["confirm", "current", "files", "paths"]
+        .iter()
+        .find_map(|key| object.get(*key)?.as_array())?;
+    list.iter()
+        .map(|entry| match entry {
+            serde_json::Value::String(path) => Some(path.clone()),
+            serde_json::Value::Object(file) => {
+                if file.get("selected").and_then(serde_json::Value::as_bool) == Some(false) {
+                    return Some(String::new());
+                }
+                file.get("path")?.as_str().map(str::to_owned)
+            }
+            _ => None,
+        })
+        .collect::<Option<Vec<_>>>()
+        .map(|paths| paths.into_iter().filter(|p| !p.is_empty()).collect())
+}
+
+/// A failed request: no answer, too large, or an HTTP error with its body.
+enum Failure {
+    Offline,
+    TooLarge,
+    Http { code: u16, body: Vec<u8> },
+}
+
+impl Failure {
+    fn message(&self) -> String {
+        match self {
+            Failure::Offline => "The server did not answer".into(),
+            Failure::TooLarge => "The server's reply is too large".into(),
+            Failure::Http { code, body } => command_error(*code, body),
+        }
+    }
+}
+
+/// One request for [`call`].
+struct Call<'a> {
+    method: reqwest::Method,
+    path: String,
+    query: &'a [(&'a str, &'a str)],
+    body: Option<serde_json::Value>,
+    limit: usize,
+    timeout: Duration,
+}
+
+impl Call<'_> {
+    fn get(path: String, limit: usize) -> Self {
+        Call {
+            method: reqwest::Method::GET,
+            path,
+            query: &[],
+            body: None,
+            limit,
+            timeout: REQUEST_TIMEOUT,
+        }
+    }
+}
+
+/// A request with the bearer header, an optional JSON body, and a size cap.
+async fn call(
+    http: &reqwest::Client,
+    endpoint: &Endpoint,
+    Call {
+        method,
+        path,
+        query,
+        body,
+        limit,
+        timeout,
+    }: Call<'_>,
+) -> Result<Vec<u8>, Failure> {
+    let mut url = reqwest::Url::parse(&endpoint.url(&path)).map_err(|_| Failure::Offline)?;
+    if !query.is_empty() {
+        url.query_pairs_mut().extend_pairs(query);
+    }
+    let mut request = http
+        .request(method, url)
+        .header(
+            reqwest::header::AUTHORIZATION,
+            protocol::bearer(&endpoint.token),
+        )
+        .timeout(timeout);
+    if let Some(body) = body {
+        request = request.json(&body);
+    }
+    let mut response = request.send().await.map_err(|_| Failure::Offline)?;
+    let code = response.status().as_u16();
+    let success = (200..300).contains(&code);
+    if response
+        .content_length()
+        .is_some_and(|length| length > limit as u64)
+    {
+        return Err(if success {
+            Failure::TooLarge
+        } else {
+            Failure::Http {
+                code,
+                body: Vec::new(),
+            }
+        });
+    }
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(|_| Failure::Offline)? {
+        if bytes.len() + chunk.len() > limit {
+            return Err(Failure::TooLarge);
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    if success {
+        Ok(bytes)
+    } else {
+        Err(Failure::Http { code, body: bytes })
+    }
+}
+
+async fn run_command(
+    http: &reqwest::Client,
+    endpoint: &Endpoint,
+    command: &Command,
+) -> Result<Outcome, String> {
+    use protocol::paths;
+    use reqwest::Method;
+    let json = |value: &dyn erased::Json| Some(value.json());
+    let (method, path, query, body, timeout) = match command {
+        Command::Resolve { input } => (
+            Method::POST,
+            paths::transfers_resolve(),
+            Vec::new(),
+            json(&protocol::ResolveRequest {
+                input: input.clone(),
+            }),
+            RESOLVE_TIMEOUT,
+        ),
+        Command::CancelResolve => (
+            Method::DELETE,
+            paths::transfers_resolve(),
+            Vec::new(),
+            None,
+            REQUEST_TIMEOUT,
+        ),
+        Command::Start { input, files } => (
+            Method::POST,
+            paths::transfers(),
+            Vec::new(),
+            json(&protocol::StartTransfer {
+                input: input.clone(),
+                files: files.clone(),
+            }),
+            COMMAND_TIMEOUT,
+        ),
+        Command::Pause { id } => (
+            Method::POST,
+            paths::transfer_pause(id),
+            Vec::new(),
+            None,
+            COMMAND_TIMEOUT,
+        ),
+        Command::Resume { id } => (
+            Method::POST,
+            paths::transfer_resume(id),
+            Vec::new(),
+            None,
+            COMMAND_TIMEOUT,
+        ),
+        Command::PauseAll => (
+            Method::POST,
+            paths::transfers_pause_all(),
+            Vec::new(),
+            None,
+            COMMAND_TIMEOUT,
+        ),
+        Command::ResumeAll => (
+            Method::POST,
+            paths::transfers_resume_all(),
+            Vec::new(),
+            None,
+            COMMAND_TIMEOUT,
+        ),
+        Command::Remove {
+            id,
+            delete_files,
+            confirm,
+        } => (
+            Method::DELETE,
+            paths::transfer(id),
+            Vec::new(),
+            json(&protocol::RemoveTransfer {
+                delete_files: *delete_files,
+                confirm: if *delete_files {
+                    confirm.clone()
+                } else {
+                    Vec::new()
+                },
+            }),
+            COMMAND_TIMEOUT,
+        ),
+        Command::FetchStart { url } => (
+            Method::POST,
+            paths::fetches(),
+            Vec::new(),
+            json(&protocol::StartFetch { url: url.clone() }),
+            COMMAND_TIMEOUT,
+        ),
+        Command::FetchCancel { id } => (
+            Method::DELETE,
+            paths::fetch(*id),
+            Vec::new(),
+            None,
+            COMMAND_TIMEOUT,
+        ),
+        Command::Browse { dir } => (
+            Method::GET,
+            paths::browse(),
+            vec![("dir", dir.as_str())],
+            None,
+            REQUEST_TIMEOUT,
+        ),
+        Command::Share { dir } => (
+            Method::POST,
+            paths::shares(),
+            Vec::new(),
+            json(&protocol::StartShare { dir: dir.clone() }),
+            SHARE_TIMEOUT,
+        ),
+    };
+    let answer = call(
+        http,
+        endpoint,
+        Call {
+            method,
+            path,
+            query: &query,
+            body,
+            limit: MAX_COMMAND_BYTES,
+            timeout,
+        },
+    )
+    .await;
+    let unreadable = |what: &str| format!("The server sent an unreadable {what}");
+    match (command, answer) {
+        (
+            Command::Remove {
+                id,
+                delete_files: true,
+                ..
+            },
+            Err(Failure::Http { code: 409, body }),
+        ) => {
+            let message = command_error(409, &body);
+            let current = match parse_current_list(&body) {
+                Some(current) => current,
+                // Without a list in the answer, the current snapshot has it.
+                None => call(
+                    http,
+                    endpoint,
+                    Call::get(paths::transfers(), MAX_TRANSFERS_BYTES),
+                )
+                .await
+                .ok()
+                .and_then(|body| parse_rows::<TransferRow>(&body).ok())
+                .and_then(|rows| rows.into_iter().find(|row| &row.id == id))
+                .map(|row| confirm_list(&row))
+                .unwrap_or_default(),
+            };
+            Ok(Outcome::ListChanged { message, current })
+        }
+        (_, Err(failure)) => Err(failure.message()),
+        (Command::Resolve { .. }, Ok(body)) => serde_json::from_slice(&body)
+            .map(Outcome::Resolved)
+            .map_err(|_| unreadable("file list")),
+        (Command::Start { .. }, Ok(body)) => Ok(Outcome::Started {
+            id: serde_json::from_slice::<protocol::Started>(&body)
+                .map(|started| started.id)
+                .unwrap_or_default(),
+        }),
+        (Command::FetchStart { .. }, Ok(body)) => parse_fetch_id(&body)
+            .map(|id| Outcome::FetchStarted { id })
+            .ok_or_else(|| unreadable("answer")),
+        (Command::Browse { .. }, Ok(body)) => serde_json::from_slice(&body)
+            .map(Outcome::Browsed)
+            .map_err(|_| unreadable("folder list")),
+        (Command::Share { .. }, Ok(body)) => serde_json::from_slice(&body)
+            .map(Outcome::Shared)
+            .map_err(|_| unreadable("share link")),
+        (_, Ok(_)) => Ok(Outcome::Done),
+    }
+}
+
+/// Request bodies as JSON values, so one table can build every command.
+mod erased {
+    pub trait Json {
+        fn json(&self) -> serde_json::Value;
+    }
+
+    impl<T: serde::Serialize> Json for T {
+        fn json(&self) -> serde_json::Value {
+            serde_json::to_value(self).unwrap_or(serde_json::Value::Null)
+        }
+    }
+}
+
+impl RemoteState {
+    /// This Mac's download folder, for its free space in [`Self::destinations`].
+    pub fn set_local_folder(&self, folder: &Path) {
+        let mut local = self.local.borrow_mut();
+        if local.folder.as_deref() != Some(folder) {
+            local.folder = Some(folder.to_owned());
+            local.read = None;
+        }
+    }
+
+    fn local_free(&self) -> Option<u64> {
+        let mut local = self.local.borrow_mut();
+        let folder = local.folder.clone()?;
+        if local
+            .read
+            .is_none_or(|read| read.elapsed() >= FREE_SPACE_TTL)
+        {
+            local.free = folder
+                .ancestors()
+                .find(|path| path.exists())
+                .and_then(|path| fs2::available_space(path).ok());
+            local.read = Some(Instant::now());
+        }
+        local.free
+    }
+
+    /// This Mac first, then every paired server with what its listing
+    /// allows. Offline servers keep their last known capabilities but are
+    /// not [`Destination::selectable`].
+    pub fn destinations(&self, settings: &Settings) -> Vec<Destination> {
+        let local_free = self.local_free();
+        let mut inner = self.inner.borrow_mut();
+        inner.load_cache_once();
+        let cache = cache_dir(inner.data_dir());
+        for server in &settings.remote.servers {
+            let remote = inner.sync(server);
+            if !remote.requested {
+                let request = remote.begin_refresh(&server.id, &cache);
+                self.send(&mut inner, request);
+            }
+        }
+        let facts = settings
+            .remote
+            .servers
+            .iter()
+            .filter_map(|server| {
+                let remote = inner.servers.get(&server.id)?;
+                Some(ServerFacts {
+                    id: &server.id,
+                    name: &server.name,
+                    listing: remote.listing.as_ref().map(|l| &*l.library),
+                    status: &remote.status,
+                })
+            })
+            .collect::<Vec<_>>();
+        destinations_from(local_free, &facts)
+    }
+
+    /// The Save to choice a sheet opens with: a server id, or None for
+    /// this Mac.
+    pub fn destination(&self, settings: &Settings, sheet: Sheet) -> Option<String> {
+        let destinations = self.destinations(settings);
+        choose_destination(
+            &destinations,
+            sheet,
+            self.choices.borrow().get(&sheet),
+            &settings.remote.default_destination,
+        )
+    }
+
+    /// Remembers a sheet's Save to choice for this session.
+    pub fn remember_destination(&self, sheet: Sheet, id: Option<String>) {
+        self.choices.borrow_mut().insert(sheet, id);
+    }
+
+    /// Asks servers that accept downloads for their transfers and link
+    /// downloads when due: every second while Downloads is open, every
+    /// minute otherwise. Call it on the view's tick.
+    pub fn poll_transfers(&self, settings: &Settings, downloads_open: bool) {
+        let now = Instant::now();
+        let mut inner = self.inner.borrow_mut();
+        for server in &settings.remote.servers {
+            let remote = inner.sync(server);
+            let Some(endpoint) = remote.endpoint.clone() else {
+                continue;
+            };
+            let capabilities = remote
+                .listing
+                .as_ref()
+                .map(|listing| listing.library.capabilities.clone())
+                .unwrap_or_default();
+            let mut requests = Vec::new();
+            let machine = inner.machines.entry(server.id.clone()).or_default();
+            if capabilities.contains(&Capability::Downloads)
+                && !machine.polling_transfers
+                && poll_due(machine.last_transfers, now, downloads_open)
+            {
+                machine.polling_transfers = true;
+                machine.last_transfers = Some(now);
+                requests.push(false);
+            }
+            if capabilities.contains(&Capability::Links)
+                && !machine.polling_fetches
+                && poll_due(machine.last_fetches, now, downloads_open)
+            {
+                machine.polling_fetches = true;
+                machine.last_fetches = Some(now);
+                requests.push(true);
+            }
+            for fetches in requests {
+                let request = Request::Poll {
+                    endpoint: endpoint.clone(),
+                    server_id: server.id.clone(),
+                    fetches,
+                };
+                self.send(&mut inner, Some(request));
+            }
+        }
+    }
+
+    /// One section per server that accepts downloads or links, or still
+    /// has rows from before, in pairing order.
+    pub fn machine_transfers(&self, settings: &Settings) -> Vec<MachineTransfers> {
+        let inner = self.inner.borrow();
+        settings
+            .remote
+            .servers
+            .iter()
+            .filter_map(|server| {
+                let capabilities = inner
+                    .servers
+                    .get(&server.id)
+                    .and_then(|remote| remote.listing.as_ref())
+                    .map(|listing| listing.library.capabilities.as_slice())
+                    .unwrap_or_default();
+                let machine = inner.machines.get(&server.id);
+                let downloads = capabilities.contains(&Capability::Downloads);
+                let links = capabilities.contains(&Capability::Links);
+                let has_rows =
+                    machine.is_some_and(|m| !m.transfers.is_empty() || !m.fetches.is_empty());
+                if !downloads && !links && !has_rows {
+                    return None;
+                }
+                let machine =
+                    machine.map_or_else(MachineTransfers::default, |machine| MachineTransfers {
+                        transfers: machine.transfers.clone(),
+                        fetches: machine.fetches.clone(),
+                        loaded: (!downloads || machine.transfers_loaded)
+                            && (!links || machine.fetches_loaded),
+                        problem: machine
+                            .transfers_problem
+                            .clone()
+                            .or_else(|| machine.fetches_problem.clone()),
+                        ..Default::default()
+                    });
+                Some(MachineTransfers {
+                    server_id: server.id.clone(),
+                    name: server.name.clone(),
+                    allows_links: links,
+                    stream_incomplete: capabilities.contains(&Capability::StreamIncomplete),
+                    ..machine
+                })
+            })
+            .collect()
+    }
+
+    /// What the player needs for a file of a remote download, at Original
+    /// while it is unfinished. Works before the listing has the video.
+    pub fn transfer_playback(
+        &self,
+        settings: &Settings,
+        server_id: &str,
+        video_id: &str,
+        title: &str,
+    ) -> Option<RemotePlayback> {
+        if let Some(playback) = self.playback(settings, server_id, video_id) {
+            return Some(playback);
+        }
+        let server = settings.remote.servers.iter().find(|s| s.id == server_id)?;
+        Some(RemotePlayback {
+            server_id: server.id.clone(),
+            server_name: server.name.clone(),
+            video_id: video_id.to_owned(),
+            title: title.to_owned(),
+            duration: 0.,
+            quality: Quality::Original,
+            base_url: base_url(server),
+            token: effective_token(&server.token),
+        })
+    }
+
+    /// Whether a remote video has finished downloading: None before the
+    /// server's first listing, false while it downloads or when the
+    /// listing does not have it yet (a download started from Downloads).
+    pub fn video_complete(&self, server_id: &str, video_id: &str) -> Option<bool> {
+        let inner = self.inner.borrow();
+        let listing = inner.servers.get(server_id)?.listing.as_ref()?;
+        Some(listing.video(video_id).is_some_and(|video| video.complete))
+    }
+
+    /// Whether a server's last listing advertises a capability.
+    pub fn server_allows(&self, server_id: &str, capability: Capability) -> bool {
+        self.inner
+            .borrow()
+            .servers
+            .get(server_id)
+            .and_then(|remote| remote.listing.as_ref())
+            .is_some_and(|listing| listing.library.capabilities.contains(&capability))
+    }
+
+    /// Sends a command to a paired server; the answer arrives in
+    /// [`Ready::Command`] after a [`Self::drain`]. Rows are asked for again
+    /// after every answer.
+    pub fn command(&mut self, settings: &Settings, server_id: &str, command: Command) {
+        let Some(server) = settings.remote.servers.iter().find(|s| s.id == server_id) else {
+            self.inner.get_mut().ready.push(Ready::Command {
+                server_id: server_id.to_owned(),
+                command,
+                result: Err("This server is not paired".into()),
+            });
+            return;
+        };
+        let request = Request::Command {
+            endpoint: Endpoint::of(server),
+            server_id: server_id.to_owned(),
+            command,
+        };
+        self.send(&mut self.inner.borrow_mut(), Some(request));
+    }
+
+    /// Asks a server for a torrent's file list. `input` is from [`wire_input`].
+    pub fn resolve(&mut self, settings: &Settings, server_id: &str, input: String) {
+        self.command(settings, server_id, Command::Resolve { input });
+    }
+
+    pub fn cancel_resolve(&mut self, settings: &Settings, server_id: &str) {
+        self.command(settings, server_id, Command::CancelResolve);
+    }
+
+    /// Starts a torrent on a server with the chosen file indices.
+    pub fn start(
+        &mut self,
+        settings: &Settings,
+        server_id: &str,
+        input: String,
+        files: Vec<usize>,
+    ) {
+        self.command(settings, server_id, Command::Start { input, files });
+    }
+
+    pub fn pause(&mut self, settings: &Settings, server_id: &str, id: &str) {
+        self.command(settings, server_id, Command::Pause { id: id.into() });
+    }
+
+    pub fn resume(&mut self, settings: &Settings, server_id: &str, id: &str) {
+        self.command(settings, server_id, Command::Resume { id: id.into() });
+    }
+
+    pub fn pause_all(&mut self, settings: &Settings, server_id: &str) {
+        self.command(settings, server_id, Command::PauseAll);
+    }
+
+    pub fn resume_all(&mut self, settings: &Settings, server_id: &str) {
+        self.command(settings, server_id, Command::ResumeAll);
+    }
+
+    /// Removes a transfer. With `delete_files`, `confirm` must be the
+    /// [`confirm_list`] the user saw; a changed list answers
+    /// [`Outcome::ListChanged`] and nothing is deleted.
+    pub fn remove(
+        &mut self,
+        settings: &Settings,
+        server_id: &str,
+        id: &str,
+        delete_files: bool,
+        confirm: Vec<String>,
+    ) {
+        self.command(
+            settings,
+            server_id,
+            Command::Remove {
+                id: id.into(),
+                delete_files,
+                confirm,
+            },
+        );
+    }
+
+    pub fn fetch_start(&mut self, settings: &Settings, server_id: &str, url: &str) {
+        self.command(
+            settings,
+            server_id,
+            Command::FetchStart {
+                url: url.trim().into(),
+            },
+        );
+    }
+
+    pub fn fetch_cancel(&mut self, settings: &Settings, server_id: &str, id: u64) {
+        self.command(settings, server_id, Command::FetchCancel { id });
+    }
+
+    /// Lists a folder under the server's allowed share roots; empty lists
+    /// the roots.
+    pub fn browse(&mut self, settings: &Settings, server_id: &str, dir: &str) {
+        self.command(settings, server_id, Command::Browse { dir: dir.into() });
+    }
+
+    /// Seeds a folder or file from [`Self::browse`] on the server.
+    pub fn share(&mut self, settings: &Settings, server_id: &str, dir: &str) {
+        self.command(settings, server_id, Command::Share { dir: dir.into() });
+    }
 }
 
 #[cfg(test)]
@@ -2169,6 +3394,7 @@ mod tests {
             Ready::Subtitle { result, .. } => result.is_err(),
             Ready::Hash { result, .. } => result.is_err(),
             Ready::Playback { result, .. } => result.is_err(),
+            Ready::Command { result, .. } => result.is_err(),
         }));
         assert!(!state.servers(&settings)[0].status.is_online());
 
@@ -2177,5 +3403,752 @@ mod tests {
         fresh.shutdown();
         fresh.servers(&settings);
         assert!(fresh.worker.get().is_none());
+    }
+
+    // Downloads on another machine.
+
+    use flick::remote::protocol::{BrowseEntry, Storage, TorrentFileInfo, TransferFileRow};
+    use std::{
+        io::Read,
+        sync::{
+            Mutex,
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+        },
+    };
+
+    fn facts<'a>(id: &'a str, listing: Option<&'a Library>, status: &'a Status) -> ServerFacts<'a> {
+        ServerFacts {
+            id,
+            name: id,
+            listing,
+            status,
+        }
+    }
+
+    fn capable(capabilities: &[Capability], free: u64) -> Library {
+        Library {
+            capabilities: capabilities.to_vec(),
+            storage: Some(Storage {
+                free_bytes: free,
+                download_folder_name: "Downloads".into(),
+            }),
+            ..library(0)
+        }
+    }
+
+    #[test]
+    fn destinations_list_this_mac_first_with_what_each_server_allows() {
+        let all = capable(
+            &[Capability::Downloads, Capability::Links, Capability::Shares],
+            5_000_000_000,
+        );
+        let read_only = library(1);
+        let (online, offline) = (Status::Online, Status::Offline);
+        let destinations = destinations_from(
+            Some(42),
+            &[
+                facts("mini", Some(&all), &online),
+                facts("box", Some(&read_only), &online),
+                facts("asleep", Some(&all), &offline),
+                facts("new", None, &Status::Connecting),
+            ],
+        );
+        let ids: Vec<_> = destinations.iter().map(|d| d.id.as_deref()).collect();
+        assert_eq!(
+            ids,
+            [None, Some("mini"), Some("box"), Some("asleep"), Some("new")]
+        );
+        let local = &destinations[0];
+        assert!(local.is_local() && local.online && local.selectable(Sheet::Share));
+        assert_eq!(
+            (local.name.as_str(), local.free_bytes),
+            (this_machine_name(), Some(42))
+        );
+
+        let mini = &destinations[1];
+        assert!(mini.allows_downloads && mini.allows_links && mini.allows_shares);
+        assert_eq!(mini.free_bytes, Some(5_000_000_000));
+        assert_eq!(
+            mini.detail(Sheet::Torrent),
+            format!("{} free", flick::library::format_bytes(5_000_000_000))
+        );
+        let read_only = &destinations[2];
+        assert!(!read_only.selectable(Sheet::Torrent) && read_only.online);
+        assert_eq!(read_only.detail(Sheet::Torrent), "Not accepting downloads");
+        assert_eq!(read_only.detail(Sheet::Share), "Not sharing folders");
+        // Offline keeps its last known capabilities but cannot be chosen.
+        let asleep = &destinations[3];
+        assert!(asleep.allows_downloads && !asleep.selectable(Sheet::Torrent));
+        assert_eq!(asleep.detail(Sheet::Torrent), "Offline");
+        assert_eq!(destinations[4].detail(Sheet::Link), "Connecting…");
+        assert!(!destinations[4].allows_links);
+
+        assert!(offers_remote(&destinations, Sheet::Torrent));
+        assert!(!offers_remote(&destinations[..1], Sheet::Torrent));
+        assert!(!offers_remote(
+            &destinations_from(None, &[facts("box", Some(&library(0)), &online)]),
+            Sheet::Link
+        ));
+    }
+
+    #[test]
+    fn save_to_defaults_and_remembers_per_sheet_while_choosable() {
+        let downloads = capable(&[Capability::Downloads], 1);
+        let (online, offline) = (Status::Online, Status::Offline);
+        let destinations = destinations_from(
+            None,
+            &[
+                facts("mini", Some(&downloads), &online),
+                facts("asleep", Some(&downloads), &offline),
+            ],
+        );
+        let mini = Some("mini".to_owned());
+        // No memory: the onboarding default, else this Mac.
+        assert_eq!(
+            choose_destination(&destinations, Sheet::Torrent, None, "mini"),
+            mini
+        );
+        assert_eq!(
+            choose_destination(&destinations, Sheet::Torrent, None, ""),
+            None
+        );
+        // A default that is offline, unknown, or not allowed falls back.
+        assert_eq!(
+            choose_destination(&destinations, Sheet::Torrent, None, "asleep"),
+            None
+        );
+        assert_eq!(
+            choose_destination(&destinations, Sheet::Torrent, None, "gone"),
+            None
+        );
+        assert_eq!(
+            choose_destination(&destinations, Sheet::Link, None, "mini"),
+            None
+        );
+        // The last choice wins over the default, this Mac included.
+        assert_eq!(
+            choose_destination(&destinations, Sheet::Torrent, Some(&None), "mini"),
+            None
+        );
+        assert_eq!(
+            choose_destination(&destinations, Sheet::Torrent, Some(&mini), ""),
+            mini
+        );
+        // A remembered machine that went offline gives way to the default.
+        assert_eq!(
+            choose_destination(
+                &destinations,
+                Sheet::Torrent,
+                Some(&Some("asleep".into())),
+                "mini"
+            ),
+            mini
+        );
+    }
+
+    fn file_row(
+        index: usize,
+        path: &str,
+        size: u64,
+        verified: u64,
+        selected: bool,
+    ) -> TransferFileRow {
+        TransferFileRow {
+            index,
+            path: path.into(),
+            size,
+            verified_bytes: verified,
+            selected,
+            video_id: selected.then(|| format!("vid{index}")),
+        }
+    }
+
+    fn transfer(id: &str, phase: TransferPhase, verified: u64) -> TransferRow {
+        TransferRow {
+            id: id.into(),
+            name: "Show".into(),
+            phase,
+            verified_bytes: verified,
+            total_bytes: 200,
+            files: vec![
+                file_row(0, "Show/E01.mkv", 100, verified.min(100), true),
+                file_row(1, "Show/notes.txt", 10, 0, false),
+                file_row(2, "Show/E02.mkv", 100, verified.saturating_sub(100), true),
+            ],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn deletion_confirms_exactly_the_selected_paths() {
+        assert_eq!(
+            confirm_list(&transfer("a", TransferPhase::Downloading, 0)),
+            ["Show/E01.mkv", "Show/E02.mkv"]
+        );
+        assert!(confirm_list(&TransferRow::default()).is_empty());
+        assert_eq!(
+            parse_current_list(br#"{"message":"changed","files":["a","b"]}"#),
+            Some(vec!["a".into(), "b".into()])
+        );
+        assert_eq!(
+            parse_current_list(
+                br#"{"message":"x","current":[{"path":"a","selected":true},{"path":"b","selected":false}]}"#
+            ),
+            Some(vec!["a".into()])
+        );
+        assert_eq!(parse_current_list(br#"{"message":"no list"}"#), None);
+        assert_eq!(parse_current_list(b"<html>"), None);
+    }
+
+    #[test]
+    fn command_errors_carry_the_servers_message() {
+        const OFF: &str = "This Flick does not accept downloads from other Flicks. Its owner can allow it in Appearance → Remote Libraries.";
+        let body = |message: &str| error_body(message);
+        assert_eq!(command_error(403, &body(OFF)), OFF);
+        assert_eq!(
+            command_error(403, b""),
+            "This Flick's owner has not allowed that from other Flicks"
+        );
+        assert_eq!(command_error(401, &body("no")), Status::WrongToken.label());
+        for code in [404, 409, 422, 503, 504] {
+            assert_eq!(
+                command_error(code, &body("Server says")),
+                "Server says",
+                "{code}"
+            );
+        }
+        assert_eq!(
+            command_error(404, b""),
+            "The server no longer has this. Refresh and try again"
+        );
+        assert_eq!(command_error(409, b""), "The server already has this");
+        assert_eq!(
+            command_error(503, b""),
+            "The server is busy. Try again shortly"
+        );
+        assert_eq!(
+            command_error(504, b""),
+            "The server took too long to answer. Try again"
+        );
+        assert_eq!(command_error(422, b"<html>"), "Unexpected reply (422)");
+        assert_eq!(command_error(500, b""), "Server error (500)");
+        assert_eq!(Failure::Offline.message(), "The server did not answer");
+    }
+
+    #[test]
+    fn wire_inputs_and_answers_parse() {
+        use flick::torrent::TorrentInput;
+        assert_eq!(base64(b""), "");
+        assert_eq!(base64(b"f"), "Zg==");
+        assert_eq!(base64(b"fo"), "Zm8=");
+        assert_eq!(base64(b"foo"), "Zm9v");
+        assert_eq!(base64(b"foobar"), "Zm9vYmFy");
+        assert_eq!(base64(&[0xff, 0xfe, 0xfd]), "//79");
+        assert_eq!(
+            wire_input(&TorrentInput::Magnet(" magnet:?xt=urn:btih:abc ".into())).unwrap(),
+            "magnet:?xt=urn:btih:abc"
+        );
+        assert_eq!(
+            wire_input(&TorrentInput::Bytes(b"d4:infoe".to_vec())).unwrap(),
+            "base64:ZDQ6aW5mb2U="
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("a.torrent");
+        std::fs::write(&file, b"foo").unwrap();
+        assert_eq!(
+            wire_input(&TorrentInput::File(file)).unwrap(),
+            "base64:Zm9v"
+        );
+        assert!(wire_input(&TorrentInput::File(dir.path().join("missing"))).is_err());
+
+        assert_eq!(parse_fetch_id(br#"{"id":7}"#), Some(7));
+        assert_eq!(parse_fetch_id(br#"{"id":"8"}"#), Some(8));
+        assert_eq!(parse_fetch_id(b"9"), Some(9));
+        assert_eq!(parse_fetch_id(b"{}"), None);
+        let rows = serde_json::to_vec(&vec![transfer("a", TransferPhase::Paused, 1)]).unwrap();
+        assert_eq!(parse_rows::<TransferRow>(&rows).unwrap()[0].id, "a");
+        let wrapped = format!(r#"{{"transfers":{}}}"#, String::from_utf8(rows).unwrap());
+        assert_eq!(
+            parse_rows::<TransferRow>(wrapped.as_bytes()).unwrap().len(),
+            1
+        );
+        assert!(parse_rows::<TransferRow>(b"{}").is_err());
+        assert!(parse_rows::<FetchRow>(b"[1]").is_err());
+    }
+
+    #[test]
+    fn finished_downloads_and_polling_intervals() {
+        use std::slice::from_ref as one;
+        let downloading = transfer("a", TransferPhase::Downloading, 50);
+        let first_file = transfer("a", TransferPhase::Downloading, 120);
+        let seeding = transfer("a", TransferPhase::Seeding, 200);
+        assert!(!transfers_finished(one(&downloading), one(&downloading)));
+        assert!(transfers_finished(one(&downloading), one(&first_file)));
+        assert!(transfers_finished(one(&first_file), one(&seeding)));
+        assert!(!transfers_finished(one(&seeding), one(&seeding)));
+        // A new transfer that already has a file counts; one without does not.
+        assert!(transfers_finished(&[], one(&first_file)));
+        assert!(!transfers_finished(&[], one(&downloading)));
+
+        let running = FetchRow {
+            id: 1,
+            phase: FetchPhase::Downloading,
+            ..Default::default()
+        };
+        let done = FetchRow {
+            phase: FetchPhase::Done,
+            saved: vec!["v".into()],
+            ..running.clone()
+        };
+        assert!(fetches_finished(one(&running), one(&done)));
+        assert!(!fetches_finished(one(&done), one(&done)));
+        assert!(!fetches_finished(one(&running), one(&running)));
+
+        let now = Instant::now();
+        assert!(poll_due(None, now, false));
+        assert!(!poll_due(Some(now), now, true));
+        let earlier = now - Duration::from_secs(2);
+        assert!(poll_due(Some(earlier), now, true));
+        assert!(!poll_due(Some(earlier), now, false));
+        assert!(poll_due(Some(now - POLL_IDLE), now, false));
+    }
+
+    #[test]
+    fn unfinished_videos_play_at_original() {
+        let mut listing = Library {
+            qualities: vec![Quality::Original, Quality::Low720],
+            ..library(2)
+        };
+        listing.videos[1].complete = false;
+        let port = fake_server(listing, Vec::new());
+        let data = tempfile::tempdir().unwrap();
+        let mut state = RemoteState::with_data_dir(data.path());
+        let mut settings = Settings::default();
+        let id = state
+            .add_pairing(
+                &mut settings,
+                &format!("flick-remote://127.0.0.1:{port}/#{TOKEN}"),
+            )
+            .unwrap();
+        settings.remote.servers[0].quality = Quality::Low720;
+        wait_until(&mut state, |state| {
+            state.servers(&settings)[0].status == Status::Online
+        });
+        assert_eq!(
+            state.playback(&settings, &id, "v0").unwrap().quality,
+            Quality::Low720
+        );
+        assert_eq!(
+            state.playback(&settings, &id, "v1").unwrap().quality,
+            Quality::Original
+        );
+        assert_eq!(state.video_complete(&id, "v0"), Some(true));
+        assert_eq!(state.video_complete(&id, "v1"), Some(false));
+        assert_eq!(state.video_complete(&id, "new"), Some(false));
+        assert_eq!(state.video_complete("other", "v0"), None);
+        // A file the listing does not have yet plays at Original.
+        let unlisted = state
+            .transfer_playback(&settings, &id, "new", "New.mkv")
+            .unwrap();
+        assert_eq!(
+            (unlisted.quality, unlisted.title.as_str(), unlisted.url()),
+            (
+                Quality::Original,
+                "New.mkv",
+                format!("http://127.0.0.1:{port}/v1/media/new")
+            )
+        );
+    }
+
+    /// What the fake server with downloads saw and decides.
+    #[derive(Default)]
+    struct Fake {
+        /// Each `GET /v1/transfers` moves the download forward.
+        polls: AtomicUsize,
+        listings: AtomicUsize,
+        /// Drops `/v1/transfers` connections without answering.
+        down: AtomicBool,
+        started: Mutex<Vec<StartTransferBody>>,
+        removed: Mutex<Vec<protocol::RemoveTransfer>>,
+    }
+
+    type StartTransferBody = protocol::StartTransfer;
+
+    const OWNER_OFF: &str = "This Flick does not accept downloads from other Flicks. Its owner can allow it in Appearance → Remote Libraries.";
+
+    /// A loopback Flick that answers the command routes. `writes` is false
+    /// for a server whose owner has not allowed downloads: its listing has
+    /// no capabilities and every command answers 403.
+    fn transfers_server(fake: Arc<Fake>, writes: bool) -> u16 {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut line = String::new();
+                if reader.read_line(&mut line).is_err() {
+                    continue;
+                }
+                let mut words = line.split_whitespace();
+                let method = words.next().unwrap_or("").to_owned();
+                let path = words.next().unwrap_or("").to_owned();
+                let (mut authorized, mut length) = (false, 0usize);
+                loop {
+                    let mut header = String::new();
+                    reader.read_line(&mut header).unwrap();
+                    if header.trim().is_empty() {
+                        break;
+                    }
+                    if let Some((name, value)) = header.split_once(':') {
+                        if name.eq_ignore_ascii_case("authorization") {
+                            authorized = value.trim() == protocol::bearer(TOKEN);
+                        } else if name.eq_ignore_ascii_case("content-length") {
+                            length = value.trim().parse().unwrap();
+                        }
+                    }
+                }
+                let mut body = vec![0; length];
+                reader.read_exact(&mut body).unwrap();
+                if path == protocol::paths::transfers() && fake.down.load(Ordering::SeqCst) {
+                    continue;
+                }
+                let (code, reply) = if !authorized {
+                    (401, error_body("no"))
+                } else {
+                    answer(&fake, writes, &method, &path, &body)
+                };
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 {code} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    reply.len()
+                );
+                let _ = stream.write_all(&reply);
+            }
+        });
+        port
+    }
+
+    fn answer(fake: &Fake, writes: bool, method: &str, path: &str, body: &[u8]) -> (u16, Vec<u8>) {
+        let json = |value: &dyn erased::Json| serde_json::to_vec(&value.json()).unwrap();
+        if path == protocol::paths::library() {
+            fake.listings.fetch_add(1, Ordering::SeqCst);
+            let listing = if writes {
+                capable(
+                    &[
+                        Capability::Downloads,
+                        Capability::Links,
+                        Capability::Shares,
+                        Capability::StreamIncomplete,
+                    ],
+                    7_000_000_000,
+                )
+            } else {
+                library(1)
+            };
+            return (200, json(&listing));
+        }
+        if !writes {
+            return (403, error_body(OWNER_OFF));
+        }
+        let id = "c".repeat(40);
+        match (method, path) {
+            ("GET", "/v1/transfers") => {
+                let step = fake.polls.fetch_add(1, Ordering::SeqCst) as u64;
+                let row = if step >= 2 {
+                    transfer(&id, TransferPhase::Seeding, 200)
+                } else {
+                    transfer(&id, TransferPhase::Downloading, 40 * step)
+                };
+                (200, json(&vec![row]))
+            }
+            ("GET", "/v1/fetches") => (200, b"[]".to_vec()),
+            ("POST", "/v1/transfers/resolve") => (
+                200,
+                json(&TorrentInfo {
+                    infohash: id,
+                    name: "Show".into(),
+                    files: vec![
+                        TorrentFileInfo {
+                            index: 0,
+                            path: "Show/E01.mkv".into(),
+                            size: 100,
+                        },
+                        TorrentFileInfo {
+                            index: 1,
+                            path: "Show/notes.txt".into(),
+                            size: 10,
+                        },
+                    ],
+                }),
+            ),
+            ("POST", "/v1/transfers") => {
+                let start: protocol::StartTransfer = serde_json::from_slice(body).unwrap();
+                let duplicate = fake.started.lock().unwrap().contains(&start);
+                fake.started.lock().unwrap().push(start);
+                if duplicate {
+                    (409, error_body("This download is already on the Mac mini"))
+                } else {
+                    (200, json(&protocol::Started { id }))
+                }
+            }
+            ("POST", path) if path.ends_with("/pause") || path.ends_with("/resume") => {
+                (204, Vec::new())
+            }
+            ("DELETE", path) if path == protocol::paths::transfer(&id) => {
+                let remove: protocol::RemoveTransfer = serde_json::from_slice(body).unwrap();
+                fake.removed.lock().unwrap().push(remove.clone());
+                let current = confirm_list(&transfer(&id, TransferPhase::Seeding, 200));
+                if remove.delete_files && remove.confirm.is_empty() {
+                    // No list in the answer: the client reads the snapshot.
+                    (409, error_body("Confirm the files to delete"))
+                } else if remove.delete_files && remove.confirm != current {
+                    let reply = serde_json::json!({
+                        "message": "The files changed since you looked",
+                        "files": current,
+                    });
+                    (409, serde_json::to_vec(&reply).unwrap())
+                } else {
+                    (204, Vec::new())
+                }
+            }
+            ("POST", "/v1/fetches") => (200, br#"{"id":3}"#.to_vec()),
+            ("GET", path) if path.starts_with("/v1/browse") => {
+                let dir = path
+                    .split_once("dir=")
+                    .map_or("", |(_, dir)| dir)
+                    .to_owned();
+                (
+                    200,
+                    json(&BrowseListing {
+                        dir,
+                        entries: vec![BrowseEntry {
+                            name: "Films".into(),
+                            dir: true,
+                            size: 0,
+                        }],
+                    }),
+                )
+            }
+            ("POST", "/v1/shares") => {
+                let share: protocol::StartShare = serde_json::from_slice(body).unwrap();
+                (
+                    200,
+                    json(&ShareResult {
+                        infohash: "d".repeat(40),
+                        magnet: format!("magnet:?dn={}", share.dir),
+                    }),
+                )
+            }
+            _ => (404, error_body("gone")),
+        }
+    }
+
+    fn command_answer(state: &mut RemoteState) -> (String, Command, Result<Outcome, String>) {
+        let started = Instant::now();
+        loop {
+            state.drain();
+            if let Some(Ready::Command {
+                server_id,
+                command,
+                result,
+            }) = state.take_ready().pop()
+            {
+                return (server_id, command, result);
+            }
+            assert!(started.elapsed() < Duration::from_secs(10), "timed out");
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn downloads_on_a_loopback_server_poll_command_and_refresh_its_listing() {
+        let fake = Arc::new(Fake::default());
+        let closed = Arc::new(Fake::default());
+        let port = transfers_server(fake.clone(), true);
+        let closed_port = transfers_server(closed.clone(), false);
+        let data = tempfile::tempdir().unwrap();
+        let mut state = RemoteState::with_data_dir(data.path());
+        state.set_local_folder(data.path());
+        let mut settings = Settings::default();
+        let mini = state
+            .add_pairing(
+                &mut settings,
+                &format!("flick-remote://127.0.0.1:{port}/#{TOKEN}"),
+            )
+            .unwrap();
+        let other = state
+            .add_pairing(
+                &mut settings,
+                &format!("flick-remote://127.0.0.1:{closed_port}/#{TOKEN}"),
+            )
+            .unwrap();
+        wait_until(&mut state, |state| {
+            state
+                .servers(&settings)
+                .iter()
+                .all(|s| s.status == Status::Online)
+        });
+
+        // Save to: this Mac, the server that allows it, the one that does not.
+        let destinations = state.destinations(&settings);
+        assert_eq!(destinations.len(), 3);
+        assert!(destinations[0].free_bytes.is_some());
+        assert!(destinations[1].selectable(Sheet::Torrent));
+        assert_eq!(destinations[1].free_bytes, Some(7_000_000_000));
+        assert!(!destinations[2].selectable(Sheet::Torrent));
+        assert_eq!(state.destination(&settings, Sheet::Torrent), None);
+        settings.remote.default_destination = mini.clone();
+        assert_eq!(
+            state.destination(&settings, Sheet::Torrent),
+            Some(mini.clone())
+        );
+        assert_eq!(
+            state.destination(&settings, Sheet::Share),
+            Some(mini.clone())
+        );
+        state.remember_destination(Sheet::Torrent, None);
+        assert_eq!(state.destination(&settings, Sheet::Torrent), None);
+        assert_eq!(
+            state.destination(&settings, Sheet::Link),
+            Some(mini.clone())
+        );
+        settings.remote.default_destination = other.clone();
+        assert_eq!(state.destination(&settings, Sheet::Link), None);
+
+        // Rows advance once a second while Downloads is open; reaching
+        // Seeding asks for the listing again.
+        let listings = fake.listings.load(Ordering::SeqCst);
+        let started = Instant::now();
+        loop {
+            state.poll_transfers(&settings, true);
+            state.drain();
+            let machines = state.machine_transfers(&settings);
+            assert_eq!(machines.len(), 1, "only the server that takes downloads");
+            let machine = &machines[0];
+            if machine.transfers.first().map(|row| row.phase) == Some(TransferPhase::Seeding)
+                && fake.listings.load(Ordering::SeqCst) > listings
+            {
+                assert!(machine.loaded && machine.problem.is_none());
+                assert!(machine.allows_links && machine.stream_incomplete);
+                assert_eq!(machine.name, "127.0.0.1");
+                break;
+            }
+            assert!(started.elapsed() < Duration::from_secs(15), "timed out");
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(fake.polls.load(Ordering::SeqCst) >= 3);
+        // Closed, it asks once a minute: nothing new right away.
+        let polls = fake.polls.load(Ordering::SeqCst);
+        state.poll_transfers(&settings, false);
+        thread::sleep(Duration::from_millis(100));
+        state.drain();
+        assert_eq!(fake.polls.load(Ordering::SeqCst), polls);
+
+        // Resolve and start on the server.
+        state.resolve(&settings, &mini, "magnet:?xt=urn:btih:abc".into());
+        let (server, command, result) = command_answer(&mut state);
+        assert_eq!(server, mini);
+        assert!(matches!(command, Command::Resolve { .. }));
+        let Ok(Outcome::Resolved(info)) = result else {
+            panic!("expected a file list: {result:?}");
+        };
+        assert_eq!(info.files.len(), 2);
+        state.start(&settings, &mini, "magnet:?xt=urn:btih:abc".into(), vec![0]);
+        let (_, _, result) = command_answer(&mut state);
+        assert_eq!(result, Ok(Outcome::Started { id: "c".repeat(40) }));
+        assert_eq!(
+            fake.started.lock().unwrap()[0],
+            protocol::StartTransfer {
+                input: "magnet:?xt=urn:btih:abc".into(),
+                files: vec![0],
+            }
+        );
+        state.start(&settings, &mini, "magnet:?xt=urn:btih:abc".into(), vec![0]);
+        let (_, _, result) = command_answer(&mut state);
+        assert_eq!(
+            result,
+            Err("This download is already on the Mac mini".into())
+        );
+
+        // Deleting with an outdated list shows the server's list and asks again.
+        let id = "c".repeat(40);
+        state.remove(&settings, &mini, &id, true, vec!["Show/E01.mkv".into()]);
+        let (_, _, result) = command_answer(&mut state);
+        let Ok(Outcome::ListChanged { message, current }) = result else {
+            panic!("expected the current list: {result:?}");
+        };
+        assert_eq!(message, "The files changed since you looked");
+        assert_eq!(current, ["Show/E01.mkv", "Show/E02.mkv"]);
+        state.remove(&settings, &mini, &id, true, Vec::new());
+        assert_eq!(
+            command_answer(&mut state).2,
+            Ok(Outcome::ListChanged {
+                message: "Confirm the files to delete".into(),
+                current: current.clone(),
+            })
+        );
+        state.remove(&settings, &mini, &id, true, current.clone());
+        assert_eq!(command_answer(&mut state).2, Ok(Outcome::Done));
+        state.remove(&settings, &mini, &id, false, current);
+        assert_eq!(command_answer(&mut state).2, Ok(Outcome::Done));
+        let removed = fake.removed.lock().unwrap().clone();
+        assert_eq!(removed.len(), 4);
+        // Keep Files never sends a list.
+        assert!(!removed[3].delete_files && removed[3].confirm.is_empty());
+
+        state.pause(&settings, &mini, &id);
+        assert_eq!(command_answer(&mut state).2, Ok(Outcome::Done));
+        state.fetch_start(&settings, &mini, " https://example.com/watch ");
+        assert_eq!(
+            command_answer(&mut state).2,
+            Ok(Outcome::FetchStarted { id: 3 })
+        );
+        state.browse(&settings, &mini, "Media");
+        let Ok(Outcome::Browsed(listing)) = command_answer(&mut state).2 else {
+            panic!("expected a folder list");
+        };
+        assert_eq!((listing.dir.as_str(), listing.entries.len()), ("Media", 1));
+        state.share(&settings, &mini, "Media/Films");
+        let Ok(Outcome::Shared(shared)) = command_answer(&mut state).2 else {
+            panic!("expected a share link");
+        };
+        assert!(shared.magnet.ends_with("Media/Films"));
+
+        // The owner of the other server has not allowed downloads.
+        state.pause_all(&settings, &other);
+        let (server, command, result) = command_answer(&mut state);
+        assert_eq!(
+            (server.as_str(), command),
+            (other.as_str(), Command::PauseAll)
+        );
+        assert_eq!(result, Err(OWNER_OFF.into()));
+        state.fetch_start(&settings, &other, "https://example.com");
+        assert_eq!(command_answer(&mut state).2, Err(OWNER_OFF.into()));
+        assert_eq!(closed.polls.load(Ordering::SeqCst), 0);
+        state.command(&settings, "nobody", Command::PauseAll);
+        assert_eq!(
+            command_answer(&mut state).2,
+            Err("This server is not paired".into())
+        );
+
+        // A server that stops answering keeps its rows with one status line.
+        fake.down.store(true, Ordering::SeqCst);
+        let started = Instant::now();
+        loop {
+            state.poll_transfers(&settings, true);
+            state.drain();
+            let machine = state.machine_transfers(&settings).remove(0);
+            if let Some(problem) = machine.problem {
+                assert_eq!(problem, "The server did not answer");
+                assert_eq!(machine.transfers.len(), 1);
+                break;
+            }
+            assert!(started.elapsed() < Duration::from_secs(20), "timed out");
+            thread::sleep(Duration::from_millis(20));
+        }
+
+        state.remove_server(&mut settings, &mini);
+        assert!(state.machine_transfers(&settings).is_empty());
     }
 }
