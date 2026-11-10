@@ -47,8 +47,8 @@ async fn within<T>(seconds: u64, body: impl Future<Output = Result<T>>) -> Resul
 mod stand_in {
     use super::*;
     use flick::remote::{
-        hls::{HlsLimits, Resolver, playlist},
-        protocol::ErrorBody,
+        hls::{HlsLimits, Resolver, playlist, playlist_with_audio},
+        protocol::{AudioTrack, ErrorBody},
         transcode::MediaInfo,
     };
     use std::{os::unix::fs::PermissionsExt, path::PathBuf};
@@ -96,23 +96,25 @@ mod stand_in {
     /// Writes the stand-in. Like FFmpeg with `-f hls -hls_flags temp_file`,
     /// it reads `-ss`, `-start_number`, and `-hls_segment_filename`, writes
     /// `init.mp4`, then writes each `{n}.m4s` under a temporary name and
-    /// renames it when complete. It logs one line per run.
+    /// renames it when complete. It logs one line per run, with the last
+    /// `-map` (the audio map) as `audio=`.
     fn write_script(dir: &Path, script: &Script) -> PathBuf {
         let path = dir.join("ffmpeg");
         std::fs::write(dir.join("delay"), script.delay).unwrap();
         let text = format!(
             r#"#!/bin/sh
-start=0; ss=''; pattern=''; prev=''
+start=0; ss=''; pattern=''; prev=''; audio=''
 for arg in "$@"; do
   case "$prev" in
     -start_number) start="$arg" ;;
     -ss) ss="$arg" ;;
     -hls_segment_filename) pattern="$arg" ;;
+    -map) audio="$arg" ;;
   esac
   prev="$arg"
 done
 out="${{pattern%/*}}"
-printf 'start=%s ss=%s pid=%s\n' "$start" "$ss" "$$" >> '{log}'
+printf 'start=%s ss=%s pid=%s audio=%s\n' "$start" "$ss" "$$" "$audio" >> '{log}'
 printf 'init from %s\n' "$start" > "$out/init.mp4"
 n=$start
 while [ "$n" -lt {total} ]; do
@@ -158,6 +160,14 @@ exit 0
                     width: 1920,
                     height: 1080,
                     frame_rate: 24.0,
+                    audio: (0..2)
+                        .map(|track| AudioTrack {
+                            track,
+                            language: Some(["eng", "jpn"][track as usize].into()),
+                            title: None,
+                            channels: 2,
+                        })
+                        .collect(),
                     ..Default::default()
                 },
                 complete: id != "partial",
@@ -228,6 +238,16 @@ exit 0
                         field("pid").parse().unwrap(),
                     )
                 })
+                .collect()
+        }
+
+        /// The audio map of every stand-in run so far.
+        fn audio_maps(&self) -> Vec<String> {
+            std::fs::read_to_string(self.root.path().join("runs.log"))
+                .unwrap_or_default()
+                .lines()
+                .filter_map(|line| line.split(' ').find_map(|f| f.strip_prefix("audio=")))
+                .map(str::to_owned)
                 .collect()
         }
 
@@ -396,6 +416,70 @@ exit 0
             assert_eq!(runs.len(), 1, "{runs:?}");
             assert_eq!((runs[0].0, runs[0].1.as_str()), (0, "0"));
             assert_eq!(f.state.job_count(), 1);
+            f.shutdown().await;
+            Ok(())
+        })
+        .await
+    }
+
+    /// `?audio=<track>` maps that track, gets its own job and folder, and
+    /// keeps the query on every URI of its playlist. Track 0 is the default
+    /// job. These jobs count toward the cap like any other.
+    #[tokio::test]
+    async fn audio_tracks_get_their_own_jobs() -> Result<()> {
+        within(30, async {
+            let f = fixture(Script::default(), 2, limits()).await?;
+            let q = Quality::Low720;
+            let body = f.text(&paths::hls_playlist_audio("film", q, 1)).await?;
+            assert_eq!(body, playlist_with_audio(400.0, q, Some(1)));
+            assert!(
+                body.contains("#EXT-X-MAP:URI=\"init.mp4?audio=1\""),
+                "{body}"
+            );
+            assert!(body.contains("\n0.m4s?audio=1\n"), "{body}");
+            assert_eq!(f.state.job_count(), 0, "a playlist starts nothing");
+
+            let segment = format!("{}?audio=1", paths::hls_segment("film", q, 0));
+            assert_eq!(f.text(&segment).await?, "segment 0 from 0\n");
+            let init = format!("{}?audio=1", paths::hls_init("film", q));
+            assert_eq!(f.text(&init).await?, "init from 0\n");
+            assert_eq!(f.audio_maps(), ["0:a:1"]);
+            assert_eq!(f.state.job_count(), 1);
+
+            // The default track is another job, mapped as optional.
+            assert_eq!(f.segment("film", q, 0).await?, "segment 0 from 0\n");
+            assert_eq!(f.state.job_count(), 2);
+            let zero = format!("{}?audio=0", paths::hls_segment("film", q, 0));
+            assert_eq!(f.text(&zero).await?, "segment 0 from 0\n");
+            assert_eq!(f.state.job_count(), 2, "track 0 is the default job");
+            assert_eq!(f.audio_maps(), ["0:a:1", "0:a:0?"]);
+            assert_eq!(f.job_folders().len(), 2);
+
+            // Both slots are taken by this video's audio jobs, used just now.
+            let response = f.get(&paths::hls_segment("other", q, 0)).await?;
+            assert_eq!(response.status(), 503);
+            assert!(
+                error_message(response)
+                    .await?
+                    .contains("already making 2 transcodes")
+            );
+
+            for (query, status) in [
+                ("audio=2", 404),
+                ("audio=x", 400),
+                ("audio=01", 400),
+                ("audio=-1", 400),
+            ] {
+                for path in [
+                    paths::hls_playlist("film", q),
+                    paths::hls_segment("film", q, 0),
+                ] {
+                    let response = f.get(&format!("{path}?{query}")).await?;
+                    assert_eq!(response.status(), status, "{path}?{query}");
+                    error_message(response).await?;
+                }
+            }
+            assert_eq!(f.audio_maps().len(), 2, "a refused track starts nothing");
             f.shutdown().await;
             Ok(())
         })
@@ -1091,9 +1175,95 @@ async fn real_ffmpeg_makes_playable_segments() -> Result<()> {
             println!("no sidecar .srt next to the clip; skipped the subtitle check");
         }
 
+        second_audio_track(&encoder, &video, root.path()).await?;
         hdr_tone_maps(&encoder, root.path()).await
     })
     .await
+}
+
+/// Muxes a second audio track (a 880 Hz tone, tagged Japanese) into the
+/// clip, then checks ffprobe lists both and `?audio=1` transcodes the
+/// second one: its segment decodes, with AAC audio, from its own job.
+async fn second_audio_track(encoder: &Encoder, video: &Path, dir: &Path) -> Result<()> {
+    let dual = dir.join("two-audio.mp4");
+    let status = std::process::Command::new(&encoder.ffmpeg)
+        .args(["-nostdin", "-hide_banner", "-loglevel", "error", "-i"])
+        .arg(video)
+        .args(["-f", "lavfi", "-i", "sine=frequency=880:sample_rate=48000"])
+        .args([
+            "-map",
+            "0:v:0",
+            "-map",
+            "0:a:0",
+            "-map",
+            "1:a:0",
+            "-shortest",
+        ])
+        .args(["-c:v", "copy", "-c:a", "aac", "-b:a", "96k"])
+        .args([
+            "-metadata:s:a:0",
+            "language=eng",
+            "-metadata:s:a:1",
+            "language=jpn",
+        ])
+        .arg(&dual)
+        .status()?;
+    ensure!(status.success(), "could not mux the two-audio fixture");
+    let info = transcode::inspect(encoder, &dual).await?;
+    println!("two-audio source: {:?}", info.audio);
+    ensure!(info.audio.len() == 2, "{:?}", info.audio);
+    ensure!(info.audio[1].language.as_deref() == Some("jpn"));
+    ensure!(info.audio[1].channels == 1, "the sine tone is mono");
+    let resolved = ResolvedVideo {
+        path: dual.clone(),
+        info,
+        complete: true,
+    };
+    let state = Arc::new(HlsState::new(
+        Some(encoder.clone()),
+        2,
+        dir.join("hls-audio"),
+        Arc::new(move |id: &str| (id == "dual").then(|| resolved.clone())),
+    ));
+    let (base, server) = serve(state.clone()).await?;
+    let http = client();
+    let q = Quality::Data480;
+    let playlist = http
+        .get(format!("{base}{}", paths::hls_playlist_audio("dual", q, 1)))
+        .send()
+        .await?
+        .text()
+        .await?;
+    ensure!(playlist.contains("0.m4s?audio=1"), "{playlist}");
+    let mut parts = Vec::new();
+    for path in [
+        format!("{}?audio=1", paths::hls_init("dual", q)),
+        format!("{}?audio=1", paths::hls_segment("dual", q, 0)),
+    ] {
+        let response = http.get(format!("{base}{path}")).send().await?;
+        ensure!(response.status() == 200, "{path}: {}", response.status());
+        parts.push(response.bytes().await?.to_vec());
+    }
+    let joined = dir.join("audio-1.mp4");
+    std::fs::write(&joined, parts.concat())?;
+    let output = std::process::Command::new(&encoder.ffprobe)
+        .args([
+            "-v",
+            "error",
+            "-show_entries",
+            "stream=codec_name,channels",
+            "-of",
+            "compact",
+        ])
+        .arg(&joined)
+        .output()?;
+    let streams = String::from_utf8(output.stdout)?;
+    println!("init + 0.m4s with ?audio=1: {}", streams.trim());
+    ensure!(streams.contains("codec_name=aac|channels=2"), "{streams}");
+    ensure!(state.job_count() == 1);
+    state.shutdown().await;
+    server.abort();
+    Ok(())
 }
 
 /// Generates a short PQ clip with x265 (skipped when FFmpeg lacks it) and
@@ -1131,7 +1301,7 @@ async fn hdr_tone_maps(encoder: &Encoder, dir: &Path) -> Result<()> {
     assert!(info.hdr, "{info:?}");
     let out = dir.join("hdr-out");
     std::fs::create_dir_all(&out)?;
-    let args = transcode::job_args(encoder, &hdr, &info, Quality::Low720, 0, &out);
+    let args = transcode::job_args(encoder, &hdr, &info, Quality::Low720, None, 0, &out);
     let status = std::process::Command::new(&encoder.ffmpeg)
         .args(&args)
         .status()?;

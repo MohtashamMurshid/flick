@@ -70,6 +70,21 @@ pub fn load_or_create_token(state_dir: &Path, replace: bool) -> Result<String> {
     Ok(token)
 }
 
+/// The token saved in `<state_dir>/token`, without making one. For tools
+/// that talk to a running server, such as `flick-serve status`.
+pub fn saved_token(state_dir: &Path) -> Result<String> {
+    let path = state_dir.join(TOKEN_FILE);
+    let text =
+        std::fs::read_to_string(&path).with_context(|| format!("Read {}", path.display()))?;
+    let token = text.trim().to_owned();
+    anyhow::ensure!(
+        is_valid_token(&token),
+        "{} is not a valid token",
+        path.display()
+    );
+    Ok(token)
+}
+
 /// Writes a secret through a temporary file and a rename, readable only by
 /// this user on Unix.
 pub(crate) fn write_private(path: &Path, contents: &[u8]) -> Result<()> {
@@ -156,11 +171,14 @@ mod tests {
                 .mode();
             assert_eq!(mode & 0o777, 0o600);
         }
+        assert_eq!(saved_token(dir.path())?, first);
         let second = load_or_create_token(dir.path(), true)?;
         assert_ne!(second, first);
         assert_eq!(load_or_create_token(dir.path(), false)?, second);
         std::fs::write(dir.path().join(TOKEN_FILE), "short")?;
         assert!(load_or_create_token(dir.path(), false).is_err());
+        assert!(saved_token(dir.path()).is_err());
+        assert!(saved_token(&dir.path().join("none")).is_err());
         Ok(())
     }
 }
