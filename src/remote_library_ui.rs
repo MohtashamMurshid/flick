@@ -2603,6 +2603,10 @@ impl Flick {
                     .remote_torrent
                     .as_ref()
                     .is_some_and(|sheet| sheet.server_id == server_id && sheet.input == input);
+                let queued = match &result {
+                    Ok(Outcome::Queued { message }) => Some(message.clone()),
+                    _ => None,
+                };
                 match result {
                     Ok(_) if open => {
                         save_to.remote_torrent = None;
@@ -2615,6 +2619,11 @@ impl Flick {
                         }
                         self.error = Some(format!("{name}: {}", sentence(&message)));
                     }
+                }
+                // The machine is asleep: say so, and Downloads shows the
+                // waiting row until it answers.
+                if let Some(message) = queued {
+                    self.show_status_for(message, std::time::Duration::from_secs(6));
                 }
             }
             (
