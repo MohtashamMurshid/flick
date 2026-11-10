@@ -3,8 +3,6 @@
 //! desktop-modules agent; callers pass plain text only (no paths, no
 //! tokens), and failures are logged, never shown.
 
-#![allow(dead_code)]
-
 /// Longest title shown, in characters.
 const TITLE_LIMIT: usize = 80;
 /// Longest body shown, in characters.

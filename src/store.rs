@@ -525,6 +525,68 @@ impl Settings {
         });
     }
 
+    /// Folds the positions a server's listing carries into saved progress,
+    /// so Continue Watching follows the person between machines. For each
+    /// video with `resume`, the newer of the saved entry and the server's
+    /// wins (a tie keeps the saved one); an entry taken from the server
+    /// gets the listing's title. True when anything changed.
+    pub fn merge_remote_resume(
+        &mut self,
+        server: &str,
+        videos: &[flick::remote::protocol::Video],
+    ) -> bool {
+        if server.is_empty() {
+            return false;
+        }
+        let mut changed = false;
+        for video in videos {
+            let Some(resume) = &video.resume else {
+                continue;
+            };
+            if video.id.is_empty() {
+                continue;
+            }
+            if self
+                .remote_progress(server, &video.id)
+                .is_some_and(|saved| saved.updated >= resume.updated)
+            {
+                continue;
+            }
+            let duration = non_negative_finite(resume.duration);
+            let mut position = non_negative_finite(resume.position);
+            if duration > 0.0 {
+                position = position.min(duration);
+            }
+            let title = if video.title.trim().is_empty() {
+                video.file_name.clone()
+            } else {
+                video.title.clone()
+            };
+            let entry = remote::RemoteProgress {
+                server: server.to_owned(),
+                video: video.id.clone(),
+                title,
+                position,
+                duration,
+                finished: resume.finished,
+                updated: resume.updated,
+            };
+            self.remote
+                .progress
+                .retain(|p| p.server != entry.server || p.video != entry.video);
+            // Newest first, like entries saved here.
+            let at = self
+                .remote
+                .progress
+                .iter()
+                .position(|p| p.updated < entry.updated)
+                .unwrap_or(self.remote.progress.len());
+            self.remote.progress.insert(at, entry);
+            changed = true;
+        }
+        changed
+    }
+
     fn put_remote_progress(&mut self, entry: remote::RemoteProgress) {
         self.remote
             .progress
@@ -1839,6 +1901,65 @@ mod tests {
             settings.remote_progress("mini", "abc").unwrap().position,
             100.0
         );
+    }
+
+    #[test]
+    fn listing_positions_merge_when_newer_and_take_the_listing_title() {
+        use flick::remote::protocol::{Progress, Video};
+        let video = |id: &str, title: &str, resume: Option<Progress>| Video {
+            id: id.into(),
+            title: title.into(),
+            file_name: format!("{id}.mkv"),
+            resume,
+            ..Default::default()
+        };
+        let at = |position: f64, updated: u64| {
+            Some(Progress {
+                position,
+                duration: 100.0,
+                finished: false,
+                updated,
+            })
+        };
+        let mut settings = Settings::default();
+        settings.remember_remote("mini", "abc", "Old title", 30.0, 100.0);
+        let saved = settings.remote_progress("mini", "abc").unwrap().updated;
+        settings.remember_remote("laptop", "abc", "Elsewhere", 10.0, 100.0);
+
+        // Older or equal: the saved entry stays as it is.
+        let listing = [video("abc", "Sintel", at(70.0, saved))];
+        assert!(!settings.merge_remote_resume("mini", &listing));
+        assert_eq!(settings.remote_resume_position("mini", "abc"), 30.0);
+        assert_eq!(
+            settings.remote_progress("mini", "abc").unwrap().title,
+            "Old title"
+        );
+
+        // Newer: the server's position wins, with the listing's title.
+        let listing = [
+            video("abc", "Sintel", at(70.0, saved + 5)),
+            video("new", "", at(500.0, 3)),
+            video("none", "Never played", None),
+        ];
+        assert!(settings.merge_remote_resume("mini", &listing));
+        let merged = settings.remote_progress("mini", "abc").unwrap();
+        assert_eq!(
+            (merged.position, merged.updated, merged.title.as_str()),
+            (70.0, saved + 5, "Sintel")
+        );
+        assert_eq!(settings.remote_resume_position("mini", "abc"), 70.0);
+        // A video with no saved entry joins, clamped, titled by file name.
+        let new = settings.remote_progress("mini", "new").unwrap();
+        assert_eq!((new.position, new.title.as_str()), (100.0, "new.mkv"));
+        assert!(settings.remote_progress("mini", "none").is_none());
+        // Other servers' entries are never touched.
+        assert_eq!(settings.remote_resume_position("laptop", "abc"), 10.0);
+        // Newest first: the very old entry sorts last.
+        assert_eq!(settings.remote.progress[0].video, "abc");
+        assert_eq!(settings.remote.progress.last().unwrap().video, "new");
+        // The same listing again changes nothing.
+        assert!(!settings.merge_remote_resume("mini", &listing));
+        assert!(!settings.merge_remote_resume("", &listing));
     }
 
     #[test]

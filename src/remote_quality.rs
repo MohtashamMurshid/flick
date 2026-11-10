@@ -1,8 +1,7 @@
 //! Automatic quality: drop a tier when playback keeps stalling early on, and
-//! say so. Pure state machine with no GPUI, owned by the desktop-modules
-//! agent; the player calls it on every tick.
-
-#![allow(dead_code)]
+//! say so. Pure state machine with no GPUI; the player starts one with
+//! [`AutoQuality::for_open`] when a remote video opens and calls
+//! [`AutoQuality::observe`] on every tick while it plays.
 
 use flick::remote::protocol::Quality;
 use std::time::{Duration, Instant};
@@ -54,6 +53,21 @@ impl AutoQuality {
             last_seek: None,
             by_hand: false,
         }
+    }
+
+    /// The watcher for a remote video opening at `current`, or None when
+    /// automatic quality does not apply: the server's switch is off, or the
+    /// player offers a single tier (a server that cannot transcode, or a
+    /// file still downloading). `choices` are the tiers the player's picker
+    /// offers, Original first; they are the ladder.
+    pub fn for_open(
+        enabled: bool,
+        current: Quality,
+        choices: &[Quality],
+        now: Instant,
+    ) -> Option<Self> {
+        let ladder = choices.iter().any(|quality| quality.is_transcode());
+        (enabled && ladder).then(|| Self::new(current, choices.to_vec(), now))
     }
 
     /// Called every tick with libmpv's `paused-for-cache` flag and the
@@ -108,6 +122,7 @@ impl AutoQuality {
         self.by_hand = true;
     }
 
+    #[cfg_attr(not(test), allow(dead_code))] // The player keeps its own tier.
     pub fn current(&self) -> Quality {
         self.current
     }
@@ -227,6 +242,21 @@ mod tests {
             to,
             reason: reason.into(),
         }
+    }
+
+    #[test]
+    fn only_servers_with_a_ladder_and_the_switch_on_get_a_watcher() {
+        let now = Instant::now();
+        let ladder = [Quality::Original, Quality::Low720];
+        assert!(AutoQuality::for_open(true, Quality::Original, &ladder, now).is_some());
+        assert!(AutoQuality::for_open(false, Quality::Original, &ladder, now).is_none());
+        // No FFmpeg on the server, or a file still downloading there.
+        assert!(
+            AutoQuality::for_open(true, Quality::Original, &[Quality::Original], now).is_none()
+        );
+        assert!(AutoQuality::for_open(true, Quality::Original, &[], now).is_none());
+        let auto = AutoQuality::for_open(true, Quality::Low720, &ladder, now).unwrap();
+        assert_eq!(auto.current(), Quality::Low720);
     }
 
     #[test]
