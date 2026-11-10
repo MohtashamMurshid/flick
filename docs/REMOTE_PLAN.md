@@ -1,6 +1,6 @@
 # Remote library over Tailscale
 
-**Status: proposed on 2026-11-10; implemented through phase 2 and the in-app switch, playback from a second machine not yet verified.** The ticked items under [Delivery order](#delivery-order) are delivered at `7148f60`; see [validation](VALIDATION.md#remote-library-integration-and-quality-tiers-on-2026-11-10). This plan adds a second machine to Flick: one Flick keeps the library and the files, another Flick on the same tailnet browses that library and plays from it at source quality. It does not change local playback, transfers, or link downloads.
+**Status: proposed on 2026-11-10; implemented through phase 2 and the in-app switch, playback from a second machine not yet verified.** The ticked items under [Delivery order](#delivery-order) are delivered and reviewed at `3905fac`; see [validation](VALIDATION.md#remote-library-review-fixes-on-2026-11-10). This plan adds a second machine to Flick: one Flick keeps the library and the files, another Flick on the same tailnet browses that library and plays from it at source quality. It does not change local playback, transfers, or link downloads.
 
 ## Outcome
 
