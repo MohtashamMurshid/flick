@@ -188,24 +188,33 @@ fn random_code() -> String {
 }
 
 /// Requests per client address and route in a fixed window. Bounded: when
-/// it tracks many addresses, those whose window has ended are forgotten.
+/// it tracks [`TRACKED_ADDRESSES`], those whose window has ended are
+/// forgotten, and while all of them are still live a new address is refused
+/// until the oldest window ends.
 pub(crate) struct RateLimiter {
     limit: u32,
     window: Duration,
+    capacity: usize,
     seen: Mutex<HashMap<(IpAddr, &'static str), Window>>,
 }
 
 /// When a client's window started, and its requests in it.
 type Window = (Instant, u32);
 
-/// Addresses tracked before ended windows are swept.
-const TRACKED_ADDRESSES: usize = 4096;
+/// Address and route pairs tracked at most.
+pub(crate) const TRACKED_ADDRESSES: usize = 4096;
 
 impl RateLimiter {
     pub(crate) fn new(limit: u32, window: Duration) -> Self {
+        Self::with_capacity(limit, window, TRACKED_ADDRESSES)
+    }
+
+    /// Tracks at most `capacity` address and route pairs instead.
+    pub(crate) fn with_capacity(limit: u32, window: Duration, capacity: usize) -> Self {
         Self {
             limit,
             window,
+            capacity,
             seen: Mutex::new(HashMap::new()),
         }
     }
@@ -217,9 +226,21 @@ impl RateLimiter {
             .seen
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
-        if seen.len() >= TRACKED_ADDRESSES {
-            let window = self.window;
+        let window = self.window;
+        if seen.len() >= self.capacity && !seen.contains_key(&(ip, route)) {
             seen.retain(|_, (start, _)| now.duration_since(*start) < window);
+            if seen.len() >= self.capacity {
+                let wait = seen
+                    .values()
+                    .map(|(start, _)| window.saturating_sub(now.duration_since(*start)))
+                    .min()
+                    .unwrap_or(window);
+                tracing::warn!(
+                    tracked = seen.len(),
+                    "Refused a request: too many addresses are being rate-limited"
+                );
+                return Err(wait);
+            }
         }
         let (start, count) = seen.entry((ip, route)).or_insert((now, 0));
         if now.duration_since(*start) >= self.window {
@@ -317,5 +338,41 @@ mod tests {
         assert!(limiter.check(b, "hello").is_ok());
         std::thread::sleep(Duration::from_millis(70));
         assert!(limiter.check(a, "hello").is_ok());
+    }
+
+    /// With every tracked address still in its window, a new one is
+    /// refused instead of growing the map; known ones keep their count, and
+    /// room returns once windows end.
+    #[test]
+    fn a_full_limiter_refuses_new_addresses() {
+        let window = Duration::from_millis(200);
+        let limiter = RateLimiter::with_capacity(2, window, 3);
+        let ip = |n: u8| IpAddr::from([100, 64, 0, n]);
+        for n in 1..=3 {
+            assert!(limiter.check(ip(n), "hello").is_ok());
+        }
+        let wait = limiter.check(ip(4), "hello").unwrap_err();
+        assert!(!wait.is_zero() && wait <= window, "{wait:?}");
+        assert!(limiter.check(ip(1), "pair").is_err());
+        assert!(limiter.check(ip(1), "hello").is_ok());
+        assert!(limiter.check(ip(1), "hello").is_err());
+        assert_eq!(limiter.seen.lock().unwrap().len(), 3);
+        std::thread::sleep(window + Duration::from_millis(50));
+        assert!(limiter.check(ip(4), "hello").is_ok());
+        assert_eq!(limiter.seen.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn the_default_limiter_holds_4096_addresses() {
+        let limiter = RateLimiter::new(1, Duration::from_secs(60));
+        for n in 0..TRACKED_ADDRESSES as u32 {
+            assert!(
+                limiter
+                    .check(IpAddr::from((0x6440_0000 + n).to_be_bytes()), "hello")
+                    .is_ok()
+            );
+        }
+        assert!(limiter.check("10.0.0.1".parse().unwrap(), "hello").is_err());
+        assert_eq!(limiter.seen.lock().unwrap().len(), TRACKED_ADDRESSES);
     }
 }
