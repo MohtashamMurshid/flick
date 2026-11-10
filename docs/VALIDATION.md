@@ -16,6 +16,42 @@ The earlier macOS build/playback entries later in this log describe pre-PR revis
 
 The presentation adapter transfers decoded BGRA frames through CPU memory into GPUI images. It sizes frames to physical video bounds without a fixed resolution, axis, or pixel-budget cap. Checked native dimensions and allocation failures produce explicit errors. GPU rendering of those images does not establish hardware video decoding or zero-copy presentation. Treat this as a functional prototype. Hardware decoding, efficient GPU surface sharing, HDR correctness, battery use, and claims of being faster than VLC remain unverified.
 
+### Remote playback from the MacBook Pro on 2026-11-10
+
+The first check from a second machine, at commit `3fe67b6`. Server: Mohtasham's Mac Mini on Wi-Fi (`en1`, 192.168.0.47; its Ethernet port `en0` was inactive), Tailscale 1.104.5, `flick-serve --folder ~/Movies/flick-test` with FFmpeg 7.0 and `h264_videotoolbox`, serving two generated clips: a 3840×2160 H.264 clip at 49 Mbit/s and a 1920×1080 clip at 12 Mbit/s, 90 s each, plus an SRT sidecar. Client: Mohtasham's MacBook Pro, macOS 27.0, Apple Silicon, Command Line Tools only (no Metal compiler), on the same Wi-Fi (192.168.0.49). `tailscale ping` from the MacBook: direct, 6 ms. Homebrew mpv 0.40 with libmpv and FFmpeg was installed on the MacBook for this check; Flick was built there with `cargo build --locked --release --features runtime-shaders --bin flick` (2 min 2 s), the dev-only shader configuration, not a shipping bundle.
+
+#### Transport (curl on the MacBook)
+
+| Measurement | Result |
+| --- | --- |
+| 553 MB 4K original over Tailscale | 112.3 s, 4.93 MB/s (39 Mbit/s) |
+| Same file over plain LAN HTTP, no Tailscale (control) | 93.1 s, 5.94 MB/s (47 Mbit/s) |
+| 137 MB 1080p original over Tailscale | 30.4 s, 4.50 MB/s (36 Mbit/s) |
+| Range request for the last 1 MiB | 206 in 0.30 s |
+| 720p HLS playlist, init, segment 0, segment 1 (cold start) | 200; init 0.53 s, segment 0 0.13 s, segment 1 0.30 s |
+| 720p HLS segment 20 (a seek to 80 s; FFmpeg restarts there) | 200 in 0.66 s |
+
+The Wi-Fi hop is the limit, not Tailscale: the tunnel costs about a fifth of a link that is already below the 4K clip's bit rate. Without the token every route answered 401.
+
+#### Stock mpv on the MacBook, headless (`--vo=null --ao=null`, Flick's cache settings)
+
+| Run | Wall time |
+| --- | --- |
+| 1080p Original, first 20 s | 24.7 s on the first attempt, 20.6 s on the second |
+| 1080p Original, seek to 60 s then play 10 s | 10.6 s |
+| 1080p Original, from 75 s to the natural end (15 s) | 15.5 s |
+| 4K Original, first 20 s | 28.4 s (bandwidth-bound; 20 s of video is 125 MB) |
+| 4K through the 1080p High tier, first 20 s | 21.6 s |
+| 4K through the 720p tier, seek to 60 s then play 10 s | 12.0 s |
+| 4K through the 480p tier, all 90 s | 91.2 s |
+| Control: the 1080p file from a plain Python HTTP server, first 20 s | 20.4 s |
+
+Runs cut off with `--end` print two FFmpeg "Invalid NAL unit size / missing picture" lines; the control run from the plain server prints the same, so they come from mpv stopping mid-packet and not from the Flick server. Runs that play to the end or seek print nothing. After the runs the server's transcode folder was empty and its log had no warnings.
+
+#### Flick on the MacBook
+
+Flick was launched on the MacBook over SSH with `FLICK_SETTINGS_PATH` pointing at a settings file containing the Mac mini pairing, `FLICK_DATA_DIR` at a temporary folder, and `FLICK_MPV_LIBRARY=/opt/homebrew/lib/libmpv.2.dylib`. It came up as the foreground app with an empty log. Interactive playback inside Flick (clicking a remote card, seeking, switching tiers, subtitles) needs a person at the MacBook; its result is recorded separately below when it is done. `screencapture` over SSH is refused on this macOS, so no capture was taken from the MacBook.
+
 ### Remote library review fixes on 2026-11-10
 
 Tested commit `3905fac`. An independent review of the whole remote-library change set (auth and exposure, id and path handling, byte ranges, the HLS job manager, the desktop client, protocol drift, and test isolation) found one high-severity problem and ten smaller ones; all were fixed except the subtitle cache having no pruning. The review confirmed, with `curl` against a running `flick-serve`, that every route including HLS, `HEAD`, `PUT`, `DELETE`, `OPTIONS`, unknown paths, and the fallbacks answers 401 without a token; that `0.0.0.0`, `::`, LAN, public, and IPv4-mapped addresses are refused; that the token appears in no log, URL, or error; and that ids, HLS file names, and sidecar lookups accept nothing outside the expected shapes.
