@@ -109,7 +109,8 @@ pub struct PlayerPreferences {
     pub video_filters: String,
     /// Added to mpv's `af` after the equalizer.
     pub audio_filters: String,
-    /// More mpv options as `name=value`, separated by semicolons or lines.
+    /// More mpv options as `name=value`, separated by semicolons or lines;
+    /// a value in double quotes may contain semicolons.
     pub mpv_options: String,
 }
 
@@ -141,7 +142,11 @@ impl PlayerPreferences {
         if !SEEK_STEPS.contains(&self.seek_step) {
             self.seek_step = 10;
         }
-        self.max_volume = self.max_volume.clamp(MAX_VOLUMES[0], MAX_VOLUMES[2]);
+        // The nearest choice Settings offers.
+        self.max_volume = MAX_VOLUMES
+            .into_iter()
+            .min_by_key(|choice| choice.abs_diff(self.max_volume))
+            .unwrap_or(100);
         for gain in &mut self.equalizer {
             *gain = (*gain).clamp(-EQ_LIMIT, EQ_LIMIT);
         }
@@ -224,7 +229,7 @@ impl PlayerPreferences {
     pub fn extra_options(&self) -> (Vec<(String, String)>, Vec<String>) {
         let mut options = Vec::new();
         let mut errors = Vec::new();
-        for line in self.mpv_options.split(['\n', ';']) {
+        for line in split_options(&self.mpv_options) {
             let line = line.trim();
             if line.is_empty() || line.starts_with('#') {
                 continue;
@@ -232,6 +237,11 @@ impl PlayerPreferences {
             let line = line.strip_prefix("--").unwrap_or(line);
             let (name, value) = line.split_once('=').unwrap_or((line, "yes"));
             let name = name.trim();
+            let value = value.trim();
+            let value = value
+                .strip_prefix('"')
+                .and_then(|value| value.strip_suffix('"'))
+                .unwrap_or(value);
             if name.is_empty()
                 || !name
                     .chars()
@@ -239,11 +249,37 @@ impl PlayerPreferences {
             {
                 errors.push(line.to_owned());
             } else {
-                options.push((name.to_owned(), value.trim().to_owned()));
+                options.push((name.to_owned(), value.to_owned()));
             }
         }
         (options, errors)
     }
+}
+
+/// Splits at line breaks, and at semicolons outside double quotes and
+/// brackets, so `af=lavfi=[a;b]` and `sub-file-paths="a;b"` stay whole.
+fn split_options(text: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let (mut start, mut depth, mut quoted) = (0, 0usize, false);
+    for (index, c) in text.char_indices() {
+        match c {
+            '"' => quoted = !quoted,
+            '[' if !quoted => depth += 1,
+            ']' if !quoted => depth = depth.saturating_sub(1),
+            '\n' => {
+                parts.push(&text[start..index]);
+                start = index + 1;
+                (depth, quoted) = (0, false);
+            }
+            ';' if !quoted && depth == 0 => {
+                parts.push(&text[start..index]);
+                start = index + 1;
+            }
+            _ => {}
+        }
+    }
+    parts.push(&text[start..]);
+    parts
 }
 
 #[cfg(test)]
@@ -274,6 +310,9 @@ mod tests {
         preferences.sanitize();
         assert_eq!(preferences.seek_step, 10);
         assert_eq!(preferences.max_volume, 200);
+        let mut between: PlayerPreferences = serde_json::from_str(r#"{"max_volume":120}"#).unwrap();
+        between.sanitize();
+        assert_eq!(between.max_volume, 100);
         assert_eq!(preferences.equalizer[0], EQ_LIMIT);
         assert_eq!(preferences.equalizer[9], -EQ_LIMIT);
     }
@@ -320,5 +359,18 @@ mod tests {
             ]
         );
         assert_eq!(errors, ["bad name=1", "=x"]);
+        let quoted = PlayerPreferences {
+            mpv_options: r#"sub-file-paths="subs;Subs"; af=lavfi=[aformat=s16;anull]; pause"#
+                .into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            quoted.extra_options().0,
+            [
+                ("sub-file-paths".to_owned(), "subs;Subs".to_owned()),
+                ("af".to_owned(), "lavfi=[aformat=s16;anull]".to_owned()),
+                ("pause".to_owned(), "yes".to_owned()),
+            ]
+        );
     }
 }

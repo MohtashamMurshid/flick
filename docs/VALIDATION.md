@@ -6,6 +6,17 @@ The audit and implementation artifacts from 2026-10-25 (screenshots, measurement
 
 ## Evidence by revision
 
+### IINA parity review fixes on 2026-11-28
+
+A code review of the merged IINA parity work (`0ded892`) found ten problems, fixed on `t3/iina-parity-review-fixes`. Same machine and the same temporary IINA 1.5.1 libmpv as the entry below.
+
+- Reproduced, then fixed: the subtitle **Shadow** switch drew a transparent shadow. The new `playback::tests::real_subtitle_shadow_is_visible` holds one subtitled frame and compares screenshots with the shadow off and on: 0 pixels changed with the old `sub-back-color` of `#00000000`, and 5,731 with `#99000000`.
+- Reproduced, then fixed: `flick --help` (and `--smoke-test` and `--benchmark`) moved a running Flick's `flick.log` to `flick.previous.log` and emptied it. With the merged `main.rs`, a temporary `FLICK_DATA_DIR` holding a `flick.log` was left with an empty `flick.log` and a `flick.previous.log`; with the fix, the file was untouched and no previous log was made.
+- Reproduced, then fixed: a key a user chose before this work, such as Mute on `s`, was unset when a new shortcut took that key as its default. `shortcuts::tests::keys_chosen_before_a_shortcut_existed_stay_the_users` fails on the merged rule and passes now: shortcuts added in this work take their defaults after the user's own keys.
+- Fixed with unit tests: extra mpv options keep semicolons inside double quotes and brackets; a hand-edited maximum volume rounds to an offered value; the dropped-frames row reads "at output" and "in decoding".
+- Fixed, checked by the typecheck only: floating is not retried after it fails, and Float on top while playing is not offered on Linux; a streamed link cancels opens still in progress; extra mpv options go to libmpv only when their field changes; scroll seeking follows Exact seeking.
+- `cargo fmt --all -- --check` and both `cargo clippy` configurations passed. `cargo test --locked --no-default-features --all-targets` and `--features runtime-shaders --all-targets` passed: 141 library and 327 desktop unit tests (17 ignored), and the integration tests as below. All 12 real libmpv tests passed. The Linux and Windows harness lints passed again.
+
 ### IINA parity player features on 2026-11-28
 
 Tested the `t3/iina-feature-parity` branch, based on `12b5cb7`: plan items 38–43, described in [IINA parity](IINA_PARITY.md). Same Mac mini as the entries below: Apple Silicon, macOS 27.2, Command Line Tools only (no Xcode), no installed mpv. For playback, the libmpv bundled in IINA 1.5.1 (`IINA.v1.5.1.dmg`, SHA-256 `f414507e…598cd`, signature verified as Developer ID Application: Hechen Li) was copied to a temporary folder and used through `FLICK_MPV_LIBRARY` and `DYLD_LIBRARY_PATH`, without installing anything. The test clip came from `scripts/make-test-video.sh --with-subtitles`, and a rotated copy from `ffmpeg -display_rotation:v:0 90 -i clip.mp4 -c copy rotated.mp4`.

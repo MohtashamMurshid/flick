@@ -144,7 +144,15 @@ impl SubtitleStyle {
             ),
             (
                 "sub-back-color",
-                if boxed { "#B3000000" } else { "#00000000" }.into(),
+                // With an outline, libass draws the shadow in this color.
+                if boxed {
+                    "#B3000000"
+                } else if self.shadow {
+                    "#99000000"
+                } else {
+                    "#00000000"
+                }
+                .into(),
             ),
             (
                 "sub-shadow-offset",
@@ -998,6 +1006,7 @@ mod tests {
         assert!(properties.contains(&("sub-font", "Avenir Next".into())));
         assert!(properties.contains(&("sub-outline-size", "3".into())));
         assert!(properties.contains(&("sub-shadow-offset", "2".into())));
+        assert!(properties.contains(&("sub-back-color", "#99000000".into())));
         assert!(properties.contains(&("sub-ass-override", "force".into())));
         assert!(properties.contains(&("sub-codepage", "cp1256".into())));
     }

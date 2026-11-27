@@ -602,7 +602,7 @@ pub fn media_rows(get: impl Fn(&str) -> Option<String>) -> Vec<(&'static str, St
     let rate = number("audio-params/samplerate").map(|hz| format!("{} kHz", hz / 1000.));
     let dropped = number("frame-drop-count")
         .zip(number("decoder-frame-drop-count"))
-        .map(|(output, decoder)| format!("{output} shown, {decoder} decoded"));
+        .map(|(output, decoder)| format!("{output} at output, {decoder} in decoding"));
     let rows = [
         ("Container", join(vec![get("file-format"), size])),
         (
@@ -2309,7 +2309,7 @@ mod tests {
                 ),
                 ("Decoder", "Software".to_owned()),
                 ("Audio", "aac · stereo · 48 kHz · 128 kb/s".to_owned()),
-                ("Dropped frames", "0 shown, 2 decoded".to_owned()),
+                ("Dropped frames", "0 at output, 2 in decoding".to_owned()),
                 ("A/V sync", "-4 ms".to_owned()),
             ]
         );
@@ -2857,6 +2857,59 @@ mod tests {
             lines.iter().any(|line| line.contains("00:00")),
             "No timestamp among {lines:?}"
         );
+        Ok(())
+    }
+
+    /// The subtitle Shadow setting draws a shadow: screenshots of the same
+    /// subtitled frame differ with it on and off. Needs a clip with
+    /// `--with-subtitles`, whose first line shows from 1 to 4 seconds.
+    #[test]
+    #[ignore = "requires native libmpv and a subtitled FLICK_TEST_VIDEO"]
+    fn real_subtitle_shadow_is_visible() -> Result<()> {
+        use crate::theme::SubtitleStyle;
+        let clip = std::env::var("FLICK_TEST_VIDEO")?;
+        let player = Player::new()?;
+        player.load(&clip)?;
+        let deadline = Instant::now() + Duration::from_millis(500);
+        while Instant::now() < deadline {
+            player.poll_events();
+            player.render(640, 360)?;
+            thread::sleep(Duration::from_millis(16));
+        }
+        // Loading plays; hold one subtitled frame for both screenshots.
+        player.set_property("pause", "yes")?;
+        player.command(&["seek", "2", "absolute+exact"])?;
+        let folder = tempfile::tempdir()?;
+        let mut shots = Vec::new();
+        for shadow in [false, true] {
+            let style = SubtitleStyle {
+                shadow,
+                ..Default::default()
+            };
+            for (name, value) in style.properties() {
+                let _ = player.set_property(name, &value);
+            }
+            let deadline = Instant::now() + Duration::from_millis(800);
+            while Instant::now() < deadline {
+                player.poll_events();
+                player.render(640, 360)?;
+                thread::sleep(Duration::from_millis(16));
+            }
+            let shot = folder.path().join(format!("shadow-{shadow}.png"));
+            player.command(&[
+                "screenshot-to-file",
+                shot.to_str().context("Temporary path is not UTF-8")?,
+                "subtitles",
+            ])?;
+            shots.push(image::open(&shot)?.to_rgba8());
+        }
+        let changed = shots[0]
+            .pixels()
+            .zip(shots[1].pixels())
+            .filter(|(a, b)| a != b)
+            .count();
+        println!("pixels changed by the shadow: {changed}");
+        ensure!(changed > 100, "The shadow changed only {changed} pixels");
         Ok(())
     }
 

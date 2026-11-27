@@ -243,7 +243,7 @@ Flick draws its interface in a macOS, Windows 11, or GNOME style and matches the
 
 Preferences are saved to `settings.json` in the operating system's per-user application configuration directory. If the file can't be read or parsed, Flick starts with default settings.
 
-Besides appearance, playback, subtitles, transfers, and remote libraries, Settings has **Audio** (maximum volume up to 200%, ReplayGain, and Spatial Audio on macOS), **Screenshots**, and **Advanced**: video and audio filters in mpv's syntax, extra mpv options as `name=value` separated by semicolons, and **Show Log**, which opens `flick.log` and libmpv's `mpv.log`. Each launch starts both logs again and keeps the previous Flick log as `flick.previous.log`.
+Besides appearance, playback, subtitles, transfers, and remote libraries, Settings has **Audio** (maximum volume up to 200%, ReplayGain, and Spatial Audio on macOS), **Screenshots**, and **Advanced**: video and audio filters in mpv's syntax, extra mpv options as `name=value` separated by semicolons (put a value that contains one in double quotes), and **Show Log**, which opens `flick.log` and libmpv's `mpv.log`. Each launch starts both logs again and keeps the previous Flick log as `flick.previous.log`.
 
 | Variable | Effect |
 | --- | --- |
