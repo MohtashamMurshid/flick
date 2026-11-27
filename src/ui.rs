@@ -460,6 +460,11 @@ pub struct Flick {
     /// Whether the window floats now: Float on Top, or Settings' float
     /// while playing.
     floated: bool,
+    /// This system cannot float the window; set once asking fails.
+    float_unsupported: bool,
+    /// The extra mpv options last applied, so they are sent only when the
+    /// field changes.
+    mpv_options_applied: Option<String>,
     /// Media keys and the system's Now Playing controls.
     now_playing: crate::now_playing::NowPlaying,
     /// Scrolling on the video not yet turned into volume or seeking: whether
@@ -754,6 +759,8 @@ impl Flick {
             queue: Default::default(),
             floating: false,
             floated: false,
+            float_unsupported: false,
+            mpv_options_applied: None,
             now_playing: crate::now_playing::NowPlaying::new(crate::window_ext::win32_handle(
                 window,
             )),
@@ -1211,6 +1218,8 @@ impl Flick {
         if self.quitting {
             return;
         }
+        // Opens still on their way, local or remote, must not replace this.
+        self.open_generation = self.open_generation.wrapping_add(1);
         let title = match flick::fetch::web_link(&url) {
             Some(Ok(link)) => format!("{} video", link.site()),
             _ => url.clone(),
@@ -1598,15 +1607,15 @@ impl Flick {
             || (self.store.data.player.float_while_playing
                 && self.view == View::Player
                 && self.playing());
-        if wanted == self.floated {
+        if wanted == self.floated || self.float_unsupported {
             return;
         }
         match crate::window_ext::set_floating(window, wanted) {
             Ok(()) => self.floated = wanted,
             Err(error) => {
-                // Unsupported here; stop asking.
+                // Unsupported here: say so once and stop asking.
+                self.float_unsupported = true;
                 self.floating = false;
-                self.floated = wanted;
                 self.error = Some(format!("{error:#}"));
             }
         }
@@ -1843,6 +1852,14 @@ impl Flick {
         }
         self.apply_audio_output(cx);
         self.apply_picture(cx);
+        // Extra options go to mpv only when the field changed, so other
+        // settings never repeat their errors. One taken out keeps its value
+        // until Flick starts again.
+        if self.mpv_options_applied.as_deref() == Some(preferences.mpv_options.as_str()) {
+            cx.notify();
+            return;
+        }
+        self.mpv_options_applied = Some(preferences.mpv_options.clone());
         let (options, errors) = preferences.extra_options();
         if let Some(player) = &self.player {
             for (name, value) in &options {
@@ -2064,7 +2081,8 @@ impl Flick {
                 -f64::from(units),
                 self.snapshot.duration,
             );
-            self.command(&["seek", &target.to_string(), "absolute+exact"], cx);
+            let flags = self.store.data.player.seek_flags();
+            self.command(&["seek", &target.to_string(), flags], cx);
             self.snapshot.position = target;
             self.show_status(format!(
                 "{} / {}",
@@ -2789,6 +2807,12 @@ impl Flick {
             }
             Control::Fullscreen => window.toggle_fullscreen(),
             Control::FloatOnTop => {
+                if self.float_unsupported {
+                    self.error =
+                        Some("This system does not let Flick keep its window on top.".into());
+                    cx.notify();
+                    return;
+                }
                 self.floating = !self.floating;
                 self.float_window(window);
                 if self.error.is_none() {

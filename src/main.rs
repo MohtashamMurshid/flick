@@ -44,8 +44,16 @@ fn main() -> anyhow::Result<()> {
         tracing_subscriber::EnvFilter::try_from_default_env()
             .unwrap_or_else(|_| "flick=info".into())
     };
-    // Messages go to stderr and, for reporting problems, to a log file.
-    match logs::open() {
+    let first = std::env::args_os().nth(1);
+    // The window's messages go to stderr and, for reporting problems, to a
+    // log file. Command-line runs leave a running Flick's logs alone.
+    let command_line = first.as_deref().is_some_and(|s| {
+        matches!(
+            s.to_str(),
+            Some("--help" | "-h" | "--smoke-test" | "--benchmark")
+        )
+    });
+    match (!command_line).then(logs::open).flatten() {
         Some(file) => {
             use tracing_subscriber::fmt::writer::MakeWriterExt;
             tracing_subscriber::fmt()

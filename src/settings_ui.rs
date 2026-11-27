@@ -514,7 +514,7 @@ impl Flick {
             cx,
             |this, controls, _, cx| this.set_player(|p| p.controls = controls, cx),
         );
-        vec![
+        let mut rows = vec![
             row(
                 &t,
                 Some("film"),
@@ -532,14 +532,21 @@ impl Flick {
                 exact,
             )
             .into_any_element(),
-            row(
-                &t,
-                Some("picture-in-picture"),
-                "Float on top while playing",
-                Some("The window stays above others until the video pauses or ends".into()),
-                float,
-            )
-            .into_any_element(),
+        ];
+        // Linux window managers offer no portable way to float.
+        if !cfg!(target_os = "linux") {
+            rows.push(
+                row(
+                    &t,
+                    Some("picture-in-picture"),
+                    "Float on top while playing",
+                    Some("The window stays above others until the video pauses or ends".into()),
+                    float,
+                )
+                .into_any_element(),
+            );
+        }
+        rows.push(
             row(
                 &t,
                 Some("sliders"),
@@ -548,7 +555,8 @@ impl Flick {
                 controls,
             )
             .into_any_element(),
-        ]
+        );
+        rows
     }
 
     fn audio_settings(&self, cx: &Context<Self>) -> Div {

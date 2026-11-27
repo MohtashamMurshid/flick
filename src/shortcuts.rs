@@ -153,6 +153,21 @@ impl Shortcut {
     }
 }
 
+/// Shortcuts added after rebindable keys shipped, whose default keys someone
+/// may already use for something else.
+const ADDED_LATER: [Shortcut; 10] = [
+    Shortcut::SubtitleDelayDown,
+    Shortcut::SubtitleDelayUp,
+    Shortcut::LoopFile,
+    Shortcut::Screenshot,
+    Shortcut::CopyScreenshot,
+    Shortcut::CopyText,
+    Shortcut::SpeedDown,
+    Shortcut::SpeedUp,
+    Shortcut::SpeedReset,
+    Shortcut::MediaInfo,
+];
+
 /// Whether Flick handles `binding` itself before looking up shortcuts, so a
 /// shortcut bound to it would never run. That covers Tab and Escape with
 /// any modifiers, Enter, number keys, and the fixed Ctrl or ⌘ commands:
@@ -246,13 +261,23 @@ impl Bindings {
     }
 
     /// Unsets duplicated bindings from hand-edited settings. Shortcuts on
-    /// their default keys keep them; a changed binding that collides loses.
+    /// their default keys keep them, and a changed binding that collides
+    /// loses, except against shortcuts added later: a key the user chose
+    /// before a shortcut existed stays theirs, and the new one starts unset.
     pub fn sanitize(&mut self) {
         let mut seen = std::collections::HashSet::new();
-        let (defaults, changed): (Vec<_>, Vec<_>) = Shortcut::ALL
+        let changed = |shortcut: &Shortcut| self.0.contains_key(shortcut);
+        let order: Vec<Shortcut> = Shortcut::ALL
             .into_iter()
-            .partition(|shortcut| !self.0.contains_key(shortcut));
-        for shortcut in defaults.into_iter().chain(changed) {
+            .filter(|s| !changed(s) && !ADDED_LATER.contains(s))
+            .chain(Shortcut::ALL.into_iter().filter(|s| changed(s)))
+            .chain(
+                Shortcut::ALL
+                    .into_iter()
+                    .filter(|s| !changed(s) && ADDED_LATER.contains(s)),
+            )
+            .collect();
+        for shortcut in order {
             let binding = self.binding(shortcut).to_owned();
             if !binding.is_empty() && (reserved(&binding) || !seen.insert(binding)) {
                 self.0.insert(shortcut, String::new());
@@ -518,6 +543,19 @@ mod tests {
         assert_eq!(bindings.binding(Shortcut::Mute), "");
         assert_eq!(bindings.lookup("f"), Some(Shortcut::Fullscreen));
         assert!(serde_json::from_str::<Bindings>(r#"{"unknown":"x"}"#).is_err());
+    }
+
+    #[test]
+    fn keys_chosen_before_a_shortcut_existed_stay_the_users() {
+        // Mute moved to `s` before Screenshot took it as its default.
+        let mut bindings: Bindings = serde_json::from_str(r#"{"mute":"s"}"#).unwrap();
+        bindings.sanitize();
+        assert_eq!(bindings.lookup("s"), Some(Shortcut::Mute));
+        assert_eq!(bindings.binding(Shortcut::Screenshot), "");
+        // Shortcuts that were there before keep winning.
+        let mut bindings: Bindings = serde_json::from_str(r#"{"mute":"f"}"#).unwrap();
+        bindings.sanitize();
+        assert_eq!(bindings.lookup("f"), Some(Shortcut::Fullscreen));
     }
 
     #[test]
