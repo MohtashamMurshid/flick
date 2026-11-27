@@ -68,6 +68,17 @@ pub struct SubtitleStyle {
     pub background: SubtitleBackground,
     /// mpv `sub-pos`: 100 is the bottom of the video, lower is higher.
     pub position: u32,
+    /// A font family for plain subtitles; empty is mpv's default.
+    pub font: String,
+    /// Outline thickness in mpv's scaled pixels; 3 is mpv's default.
+    pub outline: f32,
+    /// A drop shadow under outlined text.
+    pub shadow: bool,
+    /// Draw styled (ASS) subtitles in these settings too, not their own.
+    pub override_styled: bool,
+    /// Text encoding for subtitle files that are not UTF-8, such as
+    /// `cp1256`; empty detects it.
+    pub encoding: String,
 }
 
 impl Default for SubtitleStyle {
@@ -77,9 +88,18 @@ impl Default for SubtitleStyle {
             color: 0xffffff,
             background: SubtitleBackground::Outline,
             position: 100,
+            font: String::new(),
+            outline: 3.,
+            shadow: false,
+            override_styled: false,
+            encoding: String::new(),
         }
     }
 }
+
+/// Outline thicknesses offered, in mpv's scaled pixels.
+pub const SUBTITLE_OUTLINES: [(f32, &str); 4] =
+    [(0., "None"), (1.5, "Thin"), (3., "Normal"), (5., "Thick")];
 
 /// Subtitle colors offered in Settings → Subtitles.
 pub const SUBTITLE_COLORS: [(&str, u32); 4] = [
@@ -100,6 +120,9 @@ impl SubtitleStyle {
         self.position = self
             .position
             .clamp(SUBTITLE_POSITION.0, SUBTITLE_POSITION.1);
+        self.outline = finite_clamp(self.outline, (0., 10.), 3.);
+        self.font = self.font.trim().to_owned();
+        self.encoding = self.encoding.trim().to_owned();
     }
 
     /// mpv properties for this style. `sub-border-style` exists from mpv
@@ -123,7 +146,47 @@ impl SubtitleStyle {
                 "sub-back-color",
                 if boxed { "#B3000000" } else { "#00000000" }.into(),
             ),
-            ("sub-shadow-offset", if boxed { "4" } else { "0" }.into()),
+            (
+                "sub-shadow-offset",
+                if boxed {
+                    "4"
+                } else if self.shadow {
+                    "2"
+                } else {
+                    "0"
+                }
+                .into(),
+            ),
+            (
+                "sub-font",
+                if self.font.is_empty() {
+                    "sans-serif"
+                } else {
+                    &self.font
+                }
+                .into(),
+            ),
+            // mpv 0.38 renamed sub-border-size; set whichever exists.
+            ("sub-outline-size", format!("{}", self.outline)),
+            ("sub-border-size", format!("{}", self.outline)),
+            (
+                "sub-ass-override",
+                if self.override_styled {
+                    "force"
+                } else {
+                    "scale"
+                }
+                .into(),
+            ),
+            (
+                "sub-codepage",
+                if self.encoding.is_empty() {
+                    "auto"
+                } else {
+                    &self.encoding
+                }
+                .into(),
+            ),
         ]
     }
 }
@@ -816,6 +879,11 @@ mod tests {
                 color: 0xffe14d,
                 background: SubtitleBackground::Box,
                 position: 90,
+                font: "Avenir Next".into(),
+                outline: 1.5,
+                shadow: true,
+                override_styled: true,
+                encoding: "cp1256".into(),
             },
         };
         let json = serde_json::to_string(&appearance).unwrap();
@@ -907,12 +975,31 @@ mod tests {
             color: 0xffe14d,
             background: SubtitleBackground::Box,
             position: 90,
+            ..Default::default()
         };
         let properties = style.properties();
         assert!(properties.contains(&("sub-scale", "1.50".into())));
         assert!(properties.contains(&("sub-color", "#FFE14D".into())));
         assert!(properties.contains(&("sub-border-style", "background-box".into())));
         assert!(properties.contains(&("sub-back-color", "#B3000000".into())));
+        assert!(properties.contains(&("sub-font", "sans-serif".into())));
+        assert!(properties.contains(&("sub-ass-override", "scale".into())));
+        assert!(properties.contains(&("sub-codepage", "auto".into())));
+        let mut custom = SubtitleStyle {
+            font: " Avenir Next ".into(),
+            outline: f32::NAN,
+            shadow: true,
+            override_styled: true,
+            encoding: "cp1256".into(),
+            ..Default::default()
+        };
+        custom.sanitize();
+        let properties = custom.properties();
+        assert!(properties.contains(&("sub-font", "Avenir Next".into())));
+        assert!(properties.contains(&("sub-outline-size", "3".into())));
+        assert!(properties.contains(&("sub-shadow-offset", "2".into())));
+        assert!(properties.contains(&("sub-ass-override", "force".into())));
+        assert!(properties.contains(&("sub-codepage", "cp1256".into())));
     }
 
     #[test]

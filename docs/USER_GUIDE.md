@@ -29,11 +29,39 @@ The Linux file picker uses the desktop portal. Drag and drop and command-line pa
 
 ## Playback
 
-Flick plays video inside its window with libmpv: play and pause, seeking, volume and mute, playback speed, frame stepping, chapters, an A–B loop, fullscreen, picture in picture, audio and subtitle track selection with audio delay, external subtitle loading, recent files, and resume positions. Playback controls appear after media loads. While a video plays, its controls hide after 2.5 seconds without pointer movement, and subtitles move above the controls whenever they show. Turn hiding off in **Settings → Playback**.
+Flick plays video inside its window with libmpv: play and pause, seeking, volume and mute, playback speed, frame stepping, chapters, an A–B loop, repeat, a queue, screenshots, fullscreen, picture in picture, audio and subtitle tracks with their delays, external subtitle and audio files, and resume positions. Playback controls appear after media loads. While a video plays, its controls hide after 2.5 seconds without pointer movement, and subtitles move above the controls whenever they show. Turn hiding off in **Settings → Playback**. [IINA parity](IINA_PARITY.md) compares the player with IINA's.
 
 libmpv uses the platform's hardware decoder when available (`hwdec=auto-copy`). Set `FLICK_HWDEC=no` to compare against software decoding. libmpv renders into the frame GPUI uploads. This frame transfer follows the display's physical video bounds with no fixed resolution or pixel-budget cap, and native dimension or allocation failures are reported instead of silently lowering resolution. Efficient native GPU video presentation is a separate milestone; this version makes no claim of being faster than VLC.
 
-The captions icon opens **Audio & subtitles** to select tracks, adjust audio delay, load a subtitle file, or find subtitles on OpenSubtitles.com. Finding subtitles needs a free personal API key from OpenSubtitles, entered in **Settings → Subtitles** or set with `FLICK_OPENSUBTITLES_KEY`. A key entered in Settings is stored in `settings.json`; the environment variable overrides it and is never stored.
+The display stays awake while a video plays, and may sleep once it pauses or ends. Media keys, headphone buttons, and the system's Now Playing controls play, pause, seek, and move through the queue: Control Center on macOS, the media overlay on Windows, and MPRIS on Linux desktops. On macOS the menu bar has Playback, Video, Audio, and Subtitles menus with the player's commands.
+
+### Panels
+
+The buttons above and beside the timeline open panels:
+
+- **Audio & subtitles** (captions icon) selects audio and subtitle tracks, a second subtitle track shown with the first, and the audio output; adjusts the audio and subtitle delays; loads subtitle and audio files; finds subtitles on OpenSubtitles.com; and opens the **Equalizer**, ten bands with presets, which stays set from one video to the next. Subtitle files named like the video, such as `Film.en.srt` beside `Film.mkv`, load on their own, as do those in a `Subs` or `Subtitles` folder beside it.
+- **Video** (sliders icon) sets the aspect ratio, a crop, a quarter turn, flip upside down, mirror, deinterlace, and brightness, contrast, saturation, gamma, and hue, with **Reset All**. Crop, flip, mirror, rotation, and the color settings are FFmpeg filters, which use more CPU on large videos while they are on.
+- **Speed** (the speed button) chooses from 0.25× to 16×.
+- **Queue** (list icon, in the title bar) lists the video's chapters and the queue. Opening a video queues its show's episodes, or else the rest of its folder; turn that off in **Settings → Playback**. Choose a video to play it, move it up or down, or remove it, and turn on **Shuffle** or **Repeat all**. While a video plays, a library video's menu has **Play Next** and **Add to Queue**.
+- **Media information** (info icon, in the title bar, or I) shows the container, codecs, size, frame rate, bitrates, decoder, dropped frames, buffered time, and A/V sync.
+
+Repeat, the subtitle delays, the second subtitle track, and the Video panel last until another video opens; reopening the same video, or a quality switch on a remote video, keeps them. Videos with rotation metadata, such as phone recordings, play upright.
+
+### Screenshots, repeat, and going to a time
+
+**S** saves a screenshot of the frame on screen, at the video's own size and with its subtitles, in **Pictures/Flick**, named after the video and the time, such as `Sintel at 12.34.png`. **Settings → Screenshots** chooses PNG or JPEG, whether subtitles are included, and the folder. **Shift+S** copies the frame instead, and **Shift+T** copies the text in it, subtitles included, using macOS's text recognition.
+
+**Shift+L** repeats the video until pressed again. To go to a time, open the command center and type it, such as `12:34` or `1:02:03`.
+
+### Streaming links
+
+Paste a YouTube, X, or other video link into the command center and choose **Play without downloading** to stream it; pages need [yt-dlp](https://github.com/yt-dlp/yt-dlp), found as link downloads find it. A `flick://open?url=` link does the same from a browser bookmarklet or another app, for `http` and `https` links only.
+
+### Window
+
+The Video menu has **Float on Top**, and **Half Size**, **Actual Size**, **Double Size**, and **Fit to Screen**, which size the window to the video. **Settings → Playback → Float on top while playing** floats the window only while a video plays. Floating works on macOS and Windows.
+
+Finding subtitles needs a free personal API key from OpenSubtitles, entered in **Settings → Subtitles** or set with `FLICK_OPENSUBTITLES_KEY`. A key entered in Settings is stored in `settings.json`; the environment variable overrides it and is never stored.
 
 ## Torrents and Watch Now
 
@@ -164,11 +192,11 @@ Limits:
 
 ## Command center
 
-Press ⌘K on macOS or Ctrl+K elsewhere, from the library or the player. One large field finds library videos and plays them, searches online and lists the results, offers to download a pasted YouTube, X, web, or magnet link, and runs commands such as Open Video, Add Folder, Downloads, Open Settings, Fullscreen, Picture in Picture, and Quit. Arrow keys choose a row, Enter runs it, and Escape or a click outside closes it. The library's search field shows the shortcut; clicking it opens the command center too.
+Press ⌘K on macOS or Ctrl+K elsewhere, from the library or the player. One large field finds library videos and plays them, searches online and lists the results, offers to download a pasted YouTube, X, web, or magnet link, and runs commands such as Open Video, Add Folder, Downloads, Open Settings, Fullscreen, Picture in Picture, Video Adjustments, Queue and Chapters, Media Information, Audio Equalizer, Playback Speed, Save a Screenshot, Copy the Frame, Repeat This Video, Load Audio File, and Quit. In the player, type a time such as `12:34` to go there. A pasted web link also offers **Play without downloading**. Arrow keys choose a row, Enter runs it, and Escape or a click outside closes it. The library's search field shows the shortcut; clicking it opens the command center too.
 
 ## Keyboard and mouse
 
-Player keys can be changed on the **Keyboard Shortcuts** page, which also lists them. Press `?` to show them in the player, or open the page from the library. Tab, Escape, Enter, number keys, and Ctrl or ⌘ with O, K, comma, L, or Q keep their fixed jobs and can't be reassigned.
+Player keys can be changed on the **Keyboard Shortcuts** page, which also lists them. **Keys like** there switches every player key to mpv's and IINA's, or VLC's, as a starting point. Press `?` to show them in the player, or open the page from the library. Tab, Escape, Enter, number keys, and Ctrl or ⌘ with O, K, comma, L, or Q keep their fixed jobs and can't be reassigned.
 
 | Key | Action |
 | --- | --- |
@@ -184,6 +212,13 @@ Player keys can be changed on the **Keyboard Shortcuts** page, which also lists 
 | Page Up / Page Down | Previous or next chapter |
 | B | Set the A–B loop start, then its end, then clear it |
 | [ / ] | Move audio 50 ms earlier or later |
+| Z / X | Move subtitles 100 ms earlier or later |
+| - / = / Backspace | Slower, faster, normal speed |
+| Shift+L | Repeat this video, or stop repeating |
+| S | Save a screenshot to Pictures/Flick |
+| Shift+S | Copy the frame |
+| Shift+T | Copy the text in the frame (macOS) |
+| I | Media information |
 | Shift+N / Shift+P | Next or previous episode |
 | Escape | Exit fullscreen or close a menu |
 | Ctrl+O / Cmd+O | Add videos in the library or open a video in the player |
@@ -196,7 +231,7 @@ Player keys can be changed on the **Keyboard Shortcuts** page, which also lists 
 
 Tab and Shift+Tab move between controls, with a focus ring and the control's tooltip. Enter or Space activates the focused control. Arrow keys move between video cards and list rows, and Shift+F10 or the Menu key opens a video's menu: Play, Show in Folder, Mark as Watched or Unwatched, and Remove from Continue Watching. Right-click opens the same menu. Icon controls have descriptive tooltips.
 
-Click or drag the timeline to seek, or the volume slider to adjust sound. Hover the timeline to preview that moment. Double-click the video to toggle fullscreen. Chapters and an A–B loop are marked on the timeline.
+Click or drag the timeline to seek, or the volume slider to adjust sound. Hover the timeline to preview that moment. Scroll up or down on the video to change the volume, or left or right to seek, as in IINA. **Settings → Playback** sets how far the arrow keys seek and whether seeking is exact, and **Player controls** chooses floating, bar, or compact controls in any style. Double-click the video to toggle fullscreen. Chapters and an A–B loop are marked on the timeline.
 
 ## Appearance
 
@@ -208,10 +243,12 @@ Flick draws its interface in a macOS, Windows 11, or GNOME style and matches the
 
 Preferences are saved to `settings.json` in the operating system's per-user application configuration directory. If the file can't be read or parsed, Flick starts with default settings.
 
+Besides appearance, playback, subtitles, transfers, and remote libraries, Settings has **Audio** (maximum volume up to 200%, ReplayGain, and Spatial Audio on macOS), **Screenshots**, and **Advanced**: video and audio filters in mpv's syntax, extra mpv options as `name=value` separated by semicolons, and **Show Log**, which opens `flick.log` and libmpv's `mpv.log`. Each launch starts both logs again and keeps the previous Flick log as `flick.previous.log`.
+
 | Variable | Effect |
 | --- | --- |
 | `FLICK_SETTINGS_PATH` | Full path to a settings file to use instead of `settings.json` in the configuration directory. |
-| `FLICK_DATA_DIR` | Base folder for torrent state (in `transfers`), remote library listings and subtitles (in `remote`), and cached posters (in `thumbnails`). By default, torrent state and remote library files go in the platform's data directory and posters in its cache directory. `flick-serve` also keeps its token in `remote` here unless given `--state-dir`. |
+| `FLICK_DATA_DIR` | Base folder for torrent state (in `transfers`), remote library listings and subtitles (in `remote`), log files (in `logs`), and cached posters (in `thumbnails`). By default, torrent state and remote library files go in the platform's data directory and posters in its cache directory. `flick-serve` also keeps its token in `remote` here unless given `--state-dir`. |
 | `FLICK_DOWNLOAD_DIR` | Folder for link downloads. Default: `Downloads/Flick` in your home folder. |
 | `FLICK_YTDLP` | Full path to yt-dlp, checked before `PATH`. |
 | `FLICK_OPENSUBTITLES_KEY` | OpenSubtitles API key. It overrides a key entered in Settings and is never written to `settings.json`. |

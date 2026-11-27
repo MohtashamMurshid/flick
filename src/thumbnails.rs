@@ -536,12 +536,13 @@ fn preview(
             ensure!(Instant::now() < deadline, "Timed out opening the video");
             thread::sleep(Duration::from_millis(5));
         }
+        turn_upright(player)?;
         *open = Some(request.video.clone());
     }
     loop {
         check_cancel(cancel)?;
         check_events(player)?;
-        if let Some((width, height)) = player.video_size() {
+        if let Some((width, height)) = upright_size(player) {
             let (w, h) = preview_size(width, height);
             if let Some(frame) = player.render(w, h)? {
                 check_cancel(cancel)?;
@@ -643,6 +644,7 @@ fn capture(
     player.set_property("pause", "yes")?;
     let deadline = Instant::now() + POSTER_DEADLINE;
     let mut loaded_at = None;
+    let mut turned = false;
     loop {
         check_cancel(cancel)?;
         for event in player.poll_events() {
@@ -655,8 +657,12 @@ fn capture(
                 PlayerEvent::EndFile | PlayerEvent::OperationCompleted { .. } => {}
             }
         }
+        if loaded_at.is_some() && !turned {
+            turn_upright(player)?;
+            turned = true;
+        }
         if let Some(loaded_at) = loaded_at
-            && let Some((width, height)) = player.video_size()
+            && let Some((width, height)) = upright_size(player)
         {
             let size = poster_size(width, height);
             // A render at a new size can precede the first decoded frame
@@ -681,6 +687,28 @@ fn capture(
         ensure!(Instant::now() < deadline, "Timed out reading a video frame");
         thread::sleep(Duration::from_millis(10));
     }
+}
+
+/// Turns a file with rotation metadata, such as a phone video, upright with
+/// a filter. Players run with `video-rotate=no`; see `video_adjust`. The
+/// player is reused, so an unrotated file clears the last one's filter.
+fn turn_upright(player: &Player) -> Result<()> {
+    let filter = crate::video_adjust::rotation_filter(player.file_rotation()).unwrap_or("");
+    player.set_property("vf", filter)
+}
+
+/// The video's size as shown, once a turn has reached the filter output.
+/// None until then, so no frame from before the turn is kept.
+fn upright_size(player: &Player) -> Option<(u32, u32)> {
+    let (width, height) = player.video_size()?;
+    let turned = player.file_rotation() % 180 == 90;
+    let shown = player.display_size()?;
+    let expected = if turned {
+        (height, width)
+    } else {
+        (width, height)
+    };
+    (shown == expected).then_some(shown)
 }
 
 /// A poster [`POSTER_WIDTH`] wide with the video's aspect ratio. Very tall

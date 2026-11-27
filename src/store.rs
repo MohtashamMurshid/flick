@@ -25,6 +25,10 @@ pub use torrent_integrity::UnverifiedTorrentFile;
 
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
+/// Playback speed limits, as in IINA.
+pub const MIN_SPEED: f64 = 0.25;
+pub const MAX_SPEED: f64 = 16.;
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default)]
 pub struct Settings {
@@ -34,6 +38,8 @@ pub struct Settings {
     pub recent: Vec<RecentFile>,
     pub library: Vec<LibraryVideo>,
     pub appearance: crate::theme::Appearance,
+    /// Seeking, volume, the equalizer, screenshots, and other player choices.
+    pub player: crate::player_prefs::PlayerPreferences,
     pub shortcuts: crate::shortcuts::Bindings,
     pub library_view: LibraryView,
     /// A personal OpenSubtitles API key, stored with other settings.
@@ -124,6 +130,7 @@ impl Default for Settings {
             recent: Vec::new(),
             library: Vec::new(),
             appearance: crate::theme::Appearance::default(),
+            player: crate::player_prefs::PlayerPreferences::default(),
             shortcuts: crate::shortcuts::Bindings::default(),
             library_view: LibraryView::default(),
             opensubtitles_key: String::new(),
@@ -881,8 +888,9 @@ impl Settings {
         });
         self.shortcuts.sanitize();
         self.appearance.sanitize();
-        self.volume = finite_or(self.volume, 80.0).clamp(0.0, 100.0);
-        self.speed = finite_or(self.speed, 1.0).clamp(0.25, 4.0);
+        self.player.sanitize();
+        self.volume = finite_or(self.volume, 80.0).clamp(0.0, f64::from(self.player.max_volume));
+        self.speed = finite_or(self.speed, 1.0).clamp(MIN_SPEED, MAX_SPEED);
         let mut seen = std::collections::HashSet::new();
         self.recent.retain_mut(|file| {
             file.sanitize();

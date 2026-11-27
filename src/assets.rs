@@ -46,6 +46,14 @@ embedded_icons!(
     "eye-off",
     "magnet",
     "picture-in-picture",
+    "sliders",
+    "camera",
+    "repeat",
+    "seek-back",
+    "seek-forward",
+    "list",
+    "chevron-up",
+    "chevron-down",
 );
 
 pub struct Assets;

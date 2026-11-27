@@ -1,16 +1,24 @@
 mod assets;
+mod awake;
 mod benchmark;
 mod input;
 mod library_files;
+mod live_text;
+mod logs;
+mod menus;
 mod model;
 mod notify;
+mod now_playing;
 mod playback;
 mod playback_actor;
+mod player_prefs;
+mod queue;
 mod remote_client;
 mod remote_discovery;
 mod remote_keep;
 mod remote_quality;
 mod remote_serve;
+mod screenshot;
 mod services;
 mod shortcuts;
 mod shutdown;
@@ -20,24 +28,37 @@ mod store;
 mod theme;
 mod thumbnails;
 mod ui;
+mod video_adjust;
 mod video_frame_ui;
+mod window_ext;
 
 use gpui::{
-    App, AppContext, Application, Bounds, KeyBinding, Menu, MenuItem, WindowBackgroundAppearance,
-    WindowBounds, WindowDecorations, WindowOptions, actions, point, px, size,
+    App, AppContext, Application, Bounds, KeyBinding, WindowBackgroundAppearance, WindowBounds,
+    WindowDecorations, WindowOptions, point, px, size,
 };
-
-actions!(flick, [Quit]);
+use menus::Quit;
 use std::path::PathBuf;
 
 fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_writer(std::io::stderr)
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "flick=info".into()),
-        )
-        .init();
+    let filter = || {
+        tracing_subscriber::EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| "flick=info".into())
+    };
+    // Messages go to stderr and, for reporting problems, to a log file.
+    match logs::open() {
+        Some(file) => {
+            use tracing_subscriber::fmt::writer::MakeWriterExt;
+            tracing_subscriber::fmt()
+                .with_ansi(false)
+                .with_writer(std::io::stderr.and(std::sync::Mutex::new(file)))
+                .with_env_filter(filter())
+                .init()
+        }
+        None => tracing_subscriber::fmt()
+            .with_writer(std::io::stderr)
+            .with_env_filter(filter())
+            .init(),
+    }
     let mut args = std::env::args_os().skip(1);
     let first = args.next();
     if first.as_deref().is_some_and(|s| s == "--help" || s == "-h") {
@@ -65,11 +86,9 @@ fn main() -> anyhow::Result<()> {
         // before native quit closes the window and saves playback position.
         cx.on_action(|_: &Quit, cx| shutdown::request(cx));
         cx.bind_keys([KeyBinding::new("secondary-q", Quit, None)]);
-        // macOS shows Quit in the app menu, where people look for it.
-        cx.set_menus(vec![Menu {
-            name: "Flick".into(),
-            items: vec![MenuItem::action("Quit Flick", Quit)],
-        }]);
+        // macOS shows Quit in the app menu, where people look for it, beside
+        // the player's own menus.
+        menus::init(cx);
         if let Err(error) =
             cx.text_system()
                 .add_fonts(vec![std::borrow::Cow::Borrowed(include_bytes!(
@@ -123,6 +142,7 @@ fn main() -> anyhow::Result<()> {
         match cx.open_window(options, |window, cx| {
             let root = cx.new(|cx| ui::Flick::new(path, window, cx));
             shutdown::set_root(root.downgrade(), cx);
+            menus::set_target(root.downgrade(), window.window_handle(), cx);
             root
         }) {
             Ok(_) => cx.activate(true),

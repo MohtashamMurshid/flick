@@ -31,12 +31,22 @@ pub enum Shortcut {
     LoopAb,
     AudioDelayDown,
     AudioDelayUp,
+    SubtitleDelayDown,
+    SubtitleDelayUp,
+    LoopFile,
+    Screenshot,
+    CopyScreenshot,
+    CopyText,
+    SpeedDown,
+    SpeedUp,
+    SpeedReset,
+    MediaInfo,
     ShowShortcuts,
 }
 
 impl Shortcut {
     /// Every shortcut, in the order the shortcuts page lists them.
-    pub const ALL: [Self; 21] = [
+    pub const ALL: [Self; 31] = [
         Self::PlayPause,
         Self::SeekBack,
         Self::SeekForward,
@@ -57,14 +67,24 @@ impl Shortcut {
         Self::LoopAb,
         Self::AudioDelayDown,
         Self::AudioDelayUp,
+        Self::SubtitleDelayDown,
+        Self::SubtitleDelayUp,
+        Self::LoopFile,
+        Self::Screenshot,
+        Self::CopyScreenshot,
+        Self::CopyText,
+        Self::SpeedDown,
+        Self::SpeedUp,
+        Self::SpeedReset,
+        Self::MediaInfo,
         Self::ShowShortcuts,
     ];
 
     pub fn label(self) -> &'static str {
         match self {
             Self::PlayPause => "Play / pause",
-            Self::SeekBack => "Back 10 seconds",
-            Self::SeekForward => "Forward 10 seconds",
+            Self::SeekBack => "Seek back",
+            Self::SeekForward => "Seek forward",
             Self::VolumeUp => "Volume up",
             Self::VolumeDown => "Volume down",
             Self::Mute => "Mute",
@@ -82,6 +102,16 @@ impl Shortcut {
             Self::LoopAb => "A–B loop: start, end, clear",
             Self::AudioDelayDown => "Audio earlier by 50 ms",
             Self::AudioDelayUp => "Audio later by 50 ms",
+            Self::SubtitleDelayDown => "Subtitles earlier by 100 ms",
+            Self::SubtitleDelayUp => "Subtitles later by 100 ms",
+            Self::LoopFile => "Repeat this video",
+            Self::Screenshot => "Save a screenshot",
+            Self::CopyScreenshot => "Copy the frame",
+            Self::CopyText => "Copy text in the frame",
+            Self::SpeedDown => "Slower",
+            Self::SpeedUp => "Faster",
+            Self::SpeedReset => "Normal speed",
+            Self::MediaInfo => "Media information",
             Self::ShowShortcuts => "Show shortcuts",
         }
     }
@@ -108,6 +138,16 @@ impl Shortcut {
             Self::LoopAb => "b",
             Self::AudioDelayDown => "[",
             Self::AudioDelayUp => "]",
+            Self::SubtitleDelayDown => "z",
+            Self::SubtitleDelayUp => "x",
+            Self::LoopFile => "shift-l",
+            Self::Screenshot => "s",
+            Self::CopyScreenshot => "shift-s",
+            Self::CopyText => "shift-t",
+            Self::SpeedDown => "-",
+            Self::SpeedUp => "=",
+            Self::SpeedReset => "backspace",
+            Self::MediaInfo => "i",
             Self::ShowShortcuts => "?",
         }
     }
@@ -218,6 +258,80 @@ impl Bindings {
                 self.0.insert(shortcut, String::new());
             }
         }
+    }
+}
+
+/// Starting keymaps, as IINA offers mpv's and other players' keys. A preset
+/// replaces every binding; changes after that are the user's own.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Preset {
+    Flick,
+    /// mpv's own keys, which IINA's default keymap follows.
+    Mpv,
+    /// Keys familiar from VLC.
+    Vlc,
+    /// Bindings that match no preset.
+    Custom,
+}
+
+impl Preset {
+    fn changes(self) -> &'static [(Shortcut, &'static str)] {
+        use Shortcut::*;
+        match self {
+            Self::Flick | Self::Custom => &[],
+            Self::Mpv => &[
+                (ShuttleBack, ""),
+                (ShuttlePause, ""),
+                (ShuttleForward, ""),
+                (PreviousEpisode, "<"),
+                (NextEpisode, ">"),
+                (LoopAb, "l"),
+                (AudioDelayDown, "ctrl--"),
+                (AudioDelayUp, "ctrl-="),
+                (SpeedDown, "["),
+                (SpeedUp, "]"),
+            ],
+            Self::Vlc => &[
+                (VolumeUp, "ctrl-up"),
+                (VolumeDown, "ctrl-down"),
+                (PictureInPicture, ""),
+                (FrameBack, ""),
+                (FrameForward, "e"),
+                (ShuttleBack, ""),
+                (ShuttlePause, ""),
+                (ShuttleForward, ""),
+                (PreviousEpisode, "p"),
+                (NextEpisode, "n"),
+                (LoopFile, "l"),
+                (LoopAb, "shift-l"),
+                (AudioDelayDown, "j"),
+                (AudioDelayUp, "k"),
+                (SubtitleDelayDown, "g"),
+                (SubtitleDelayUp, "h"),
+                (Screenshot, "shift-s"),
+                (CopyScreenshot, ""),
+                (SpeedDown, "-"),
+                (SpeedUp, "+"),
+                (SpeedReset, "="),
+                (MediaInfo, "ctrl-i"),
+            ],
+        }
+    }
+
+    pub fn bindings(self) -> Bindings {
+        let mut bindings = Bindings::default();
+        for (shortcut, key) in self.changes() {
+            bindings.set(*shortcut, key);
+        }
+        bindings
+    }
+
+    /// The preset `bindings` are, or Custom.
+    pub fn of(bindings: &Bindings) -> Self {
+        [Self::Flick, Self::Mpv, Self::Vlc]
+            .into_iter()
+            .find(|preset| preset.bindings() == *bindings)
+            .unwrap_or(Self::Custom)
     }
 }
 
@@ -426,6 +540,34 @@ mod tests {
         assert_eq!(display("pagedown"), "Page Down");
         assert_eq!(display(""), "Not set");
         assert_eq!(display("-"), "-");
+    }
+
+    #[test]
+    fn presets_have_one_key_per_action_and_no_reserved_keys() {
+        for preset in [Preset::Flick, Preset::Mpv, Preset::Vlc] {
+            let bindings = preset.bindings();
+            let mut seen = std::collections::HashSet::new();
+            for shortcut in Shortcut::ALL {
+                let key = bindings.binding(shortcut);
+                if key.is_empty() {
+                    continue;
+                }
+                assert!(seen.insert(key.to_owned()), "{preset:?} binds {key} twice");
+                assert!(!reserved(key), "{preset:?} binds reserved {key}");
+            }
+            let mut sanitized = bindings.clone();
+            sanitized.sanitize();
+            assert_eq!(sanitized, bindings, "{preset:?}");
+            assert_eq!(Preset::of(&bindings), preset);
+        }
+        assert_eq!(Preset::Mpv.bindings().lookup("l"), Some(Shortcut::LoopAb));
+        assert_eq!(
+            Preset::Vlc.bindings().lookup("n"),
+            Some(Shortcut::NextEpisode)
+        );
+        let mut custom = Preset::Mpv.bindings();
+        custom.assign(Shortcut::Mute, "shift-m").unwrap();
+        assert_eq!(Preset::of(&custom), Preset::Custom);
     }
 
     #[test]

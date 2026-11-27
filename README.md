@@ -31,13 +31,13 @@ Flick is built in Rust with [GPUI](https://crates.io/crates/gpui) for the interf
 - **Watch Now.** Start a torrent and watch it while it downloads. Flick plays only verified pieces and fetches the ones near the playhead first.
 - **Torrents built in.** Pick the files you want, pause and resume, set bandwidth limits, export `.torrent` files, and share a file or folder as a magnet link.
 - **Downloads from links.** Paste a YouTube, X, or other video page and Flick saves it with [yt-dlp](https://github.com/yt-dlp/yt-dlp). Direct HTTPS video links and Internet Archive items download without it, and Archive files are checked against their published SHA-1.
-- **A full player.** Hardware decoding, subtitle files and OpenSubtitles search, audio and subtitle tracks with audio delay, playback speed, frame stepping, chapters, an A–B loop, picture in picture, and resume positions.
+- **A full player, on a par with IINA.** Hardware decoding; a queue of the show or folder with shuffle and repeat; chapters; speed from 0.25× to 16×; an A–B loop; subtitles that load on their own, OpenSubtitles search, a second subtitle track, and subtitle styling; audio and subtitle delays, output devices, an equalizer, and volume up to 200%; a Video panel for aspect ratio, crop, rotation, flip, deinterlacing, and color; screenshots, copying the frame or its text; media information; streaming web links; picture in picture and float on top; media keys and Now Playing; and resume positions. The display stays awake while a video plays, and phone videos play upright. [IINA parity](docs/IINA_PARITY.md) compares the two feature by feature.
 - **Watch from another machine.** `flick-serve`, or Flick's "Share my library on Tailscale" switch, serves a Mac mini's library over Tailscale. Flick on another Mac finds it on the tailnet and pairs with a six-digit code, lists its videos in the library, and plays them at full quality or a lighter tier, dropping a tier on its own when playback keeps buffering. Continue Watching follows you between machines, Keep on this Mac copies a video for travel, and Wake wakes a sleeping server from the same network. Those additions are tested on loopback and with `curl` over Tailscale, not yet from a second machine. See the [user guide](docs/USER_GUIDE.md#remote-libraries) and [Serving a Flick library](docs/REMOTE.md).
 - **Download to another machine.** Choose Mac mini under Save to, and the torrent or link download runs there, on its disk and connection, once the Mac mini's owner allows it. Downloads shows each machine's transfers, and Watch Now streams one before it finishes. Tested on loopback and with `curl` over Tailscale, not yet from a second machine. See the [user guide](docs/USER_GUIDE.md#downloading-to-another-machine).
 - **Guided setup.** A first launch asks where your videos are, whether to share this library, and where downloads go.
 - **Command center.** Press ⌘K or Ctrl+K to find a video, search online, paste a link, or run any command.
 - **Native look on every platform.** macOS, Windows 11, and GNOME styles, each with its own chrome and player controls. Light and dark schemes, accent colors, and WCAG AA contrast in every combination.
-- **Keyboard first.** Tab and the arrow keys move through the library and controls, and player shortcuts can be rebound.
+- **Keyboard first.** Tab and the arrow keys move through the library and controls, and player shortcuts can be rebound or switched to mpv's or VLC's keys. On macOS the menu bar has the player's commands too.
 
 <table>
   <tr>
@@ -99,6 +99,11 @@ The [user guide](docs/USER_GUIDE.md) covers every screen, the full keyboard shor
 | Page Up / Page Down | Previous or next chapter |
 | B | Set the A–B loop start, then its end, then clear it |
 | [ / ] | Move audio 50 ms earlier or later |
+| Z / X | Move subtitles 100 ms earlier or later |
+| - / = / Backspace | Slower, faster, normal speed |
+| Shift+L | Repeat this video, or stop repeating |
+| S / Shift+S / Shift+T | Save a screenshot, copy the frame, copy its text |
+| I | Media information |
 | Shift+N / Shift+P | Next or previous episode |
 | Ctrl+K / Cmd+K | Open the command center |
 | Ctrl+O / Cmd+O | Add videos in the library or open a video in the player |
@@ -131,6 +136,7 @@ See [Packaging for macOS](docs/PACKAGING.md) for signing, notarization, and lice
 | [Transfers](docs/TRANSFERS.md) | How torrent transfers work, and the command-line transfer diagnostic |
 | [Packaging for macOS](docs/PACKAGING.md) | Building, signing, and notarizing `Flick.app`, and what it bundles |
 | [Plan](docs/PLAN.md) | What's built and what's next |
+| [IINA parity](docs/IINA_PARITY.md) | How Flick's player compares with IINA, and which gaps to close next |
 | [Playback and sharing design](docs/SHARING_PLAN.md) | Design and acceptance criteria for playback and sharing |
 | [Remote library polish](docs/REMOTE_POLISH_PLAN.md) | Discovery and pairing codes, automatic quality, Continue Watching across machines, kept copies, wake, audio tracks, queueing |
 | [Download to another machine](docs/REMOTE_DOWNLOADS_PLAN.md) | Design for starting downloads and shares on a paired machine, and first-launch onboarding, and its delivery state |

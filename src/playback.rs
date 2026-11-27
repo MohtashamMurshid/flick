@@ -44,6 +44,12 @@ pub struct PlaybackSnapshot {
     pub loop_end: Option<f64>,
     /// Seconds; positive delays audio relative to video.
     pub audio_delay: f64,
+    /// Seconds; positive shows subtitles later.
+    pub sub_delay: f64,
+    /// The video repeats from the start when it ends.
+    pub loop_file: bool,
+    /// The second subtitle track shown with the first, by track id.
+    pub secondary_sid: Option<i64>,
     /// Waiting for stream data, such as torrent pieces.
     pub buffering: bool,
 }
@@ -69,6 +75,9 @@ impl Default for PlaybackSnapshot {
             loop_start: None,
             loop_end: None,
             audio_delay: 0.0,
+            sub_delay: 0.0,
+            loop_file: false,
+            secondary_sid: None,
             buffering: false,
         }
     }
@@ -82,6 +91,9 @@ pub struct Track {
     pub title: String,
     pub language: String,
     pub selected: bool,
+    /// Clockwise rotation in a video track's metadata, which Flick applies
+    /// itself; see `video_adjust`.
+    pub rotation: u16,
 }
 
 #[derive(Clone, Debug)]
@@ -526,6 +538,140 @@ fn parse_chapters(json: &str) -> Vec<Chapter> {
     chapters
 }
 
+/// An audio output mpv can play to.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct AudioDevice {
+    /// mpv's `audio-device` value; `auto` follows the system's choice.
+    pub name: String,
+    pub description: String,
+}
+
+/// mpv's `audio-device-list` JSON.
+pub fn parse_audio_devices(json: &str) -> Vec<AudioDevice> {
+    serde_json::from_str::<Vec<Value>>(json)
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|device| {
+            let name = device["name"].as_str()?.to_owned();
+            let description = device["description"]
+                .as_str()
+                .filter(|text| !text.is_empty())
+                .unwrap_or(&name)
+                .to_owned();
+            Some(AudioDevice { name, description })
+        })
+        .collect()
+}
+
+/// Rows of the media information panel, such as ("Video", "h264 · 1920×1080
+/// · 23.976 fps · 4.2 Mb/s"), from mpv property values. Missing values
+/// leave out their part, and a row with nothing is left out.
+pub fn media_rows(get: impl Fn(&str) -> Option<String>) -> Vec<(&'static str, String)> {
+    let get = |name: &str| get(name).filter(|value| !value.is_empty() && value != "no");
+    let number = |name: &str| get(name).and_then(|value| value.parse::<f64>().ok());
+    let bitrate = |name: &str| {
+        number(name).filter(|bits| *bits > 0.).map(|bits| {
+            if bits >= 1e6 {
+                format!("{:.1} Mb/s", bits / 1e6)
+            } else {
+                format!("{:.0} kb/s", bits / 1e3)
+            }
+        })
+    };
+    let join =
+        |parts: Vec<Option<String>>| parts.into_iter().flatten().collect::<Vec<_>>().join(" · ");
+    let size = number("file-size").map(|bytes| {
+        if bytes >= 1e9 {
+            format!("{:.2} GB", bytes / 1e9)
+        } else {
+            format!("{:.1} MB", bytes / 1e6)
+        }
+    });
+    let fps = number("container-fps")
+        .or_else(|| number("estimated-vf-fps"))
+        .filter(|fps| *fps > 0.)
+        .map(|fps| format!("{} fps", (fps * 1000.).round() / 1000.));
+    let dimensions = get("video-params/w")
+        .zip(get("video-params/h"))
+        .map(|(w, h)| format!("{w}×{h}"));
+    let channels = get("audio-params/channel-count").map(|count| match count.as_str() {
+        "1" => "mono".to_owned(),
+        "2" => "stereo".to_owned(),
+        count => format!("{count} channels"),
+    });
+    let rate = number("audio-params/samplerate").map(|hz| format!("{} kHz", hz / 1000.));
+    let dropped = number("frame-drop-count")
+        .zip(number("decoder-frame-drop-count"))
+        .map(|(output, decoder)| format!("{output} shown, {decoder} decoded"));
+    let rows = [
+        ("Container", join(vec![get("file-format"), size])),
+        (
+            "Video",
+            join(vec![
+                get("video-format"),
+                dimensions,
+                fps,
+                bitrate("video-bitrate"),
+            ]),
+        ),
+        (
+            "Color",
+            join(vec![
+                get("video-params/pixelformat"),
+                get("video-params/colormatrix"),
+                get("video-params/gamma"),
+            ]),
+        ),
+        (
+            "Decoder",
+            if get("video-format").is_some() {
+                get("hwdec-current")
+                    .map(|hwdec| format!("Hardware ({hwdec})"))
+                    .unwrap_or_else(|| "Software".to_owned())
+            } else {
+                String::new()
+            },
+        ),
+        (
+            "Audio",
+            join(vec![
+                get("audio-codec-name"),
+                channels,
+                rate,
+                bitrate("audio-bitrate"),
+            ]),
+        ),
+        ("Dropped frames", dropped.unwrap_or_default()),
+        (
+            "Buffered",
+            number("demuxer-cache-duration")
+                .map(|seconds| format!("{seconds:.1} s"))
+                .unwrap_or_default(),
+        ),
+        (
+            "A/V sync",
+            number("avsync")
+                .map(|seconds| format!("{:+.0} ms", seconds * 1000.))
+                .unwrap_or_default(),
+        ),
+    ];
+    rows.into_iter()
+        .filter(|(_, value)| !value.is_empty())
+        .collect()
+}
+
+/// Folders beside a video searched for its subtitles, in mpv's path-list
+/// form, which separates entries with `;` on Windows and `:` elsewhere.
+#[cfg(windows)]
+const SUBTITLE_FOLDERS: &str = "subs;Subs;subtitles;Subtitles;sub;Sub";
+#[cfg(not(windows))]
+const SUBTITLE_FOLDERS: &str = "subs:Subs:subtitles:Subtitles:sub:Sub";
+
+/// Whether an mpv `loop-file` value repeats: `inf`, `yes`, or a count.
+pub fn looping(value: Option<&str>) -> bool {
+    value.is_some_and(|value| !matches!(value, "" | "no" | "0" | "false"))
+}
+
 const OBSERVED_PROPERTIES: &[&str] = &[
     "pause",
     "time-pos",
@@ -537,6 +683,9 @@ const OBSERVED_PROPERTIES: &[&str] = &[
     "ab-loop-a",
     "ab-loop-b",
     "audio-delay",
+    "sub-delay",
+    "loop-file",
+    "secondary-sid",
     "paused-for-cache",
     "track-list",
     "chapter-list",
@@ -566,6 +715,9 @@ fn update_cached_property(cache: &mut PlaybackSnapshot, name: &str, value: Optio
         "ab-loop-a" => cache.loop_start = point(),
         "ab-loop-b" => cache.loop_end = point(),
         "audio-delay" => cache.audio_delay = number(0.),
+        "sub-delay" => cache.sub_delay = number(0.),
+        "loop-file" => cache.loop_file = looping(value),
+        "secondary-sid" => cache.secondary_sid = value.and_then(|id| id.parse().ok()),
         "paused-for-cache" => cache.buffering = flag,
         "track-list" => cache.tracks = parse_tracks(value.unwrap_or_default()),
         "chapter-list" => cache.chapters = parse_chapters(value.unwrap_or_default()),
@@ -583,6 +735,9 @@ fn parse_tracks(json: &str) -> Vec<Track> {
             title: track["title"].as_str().unwrap_or_default().to_owned(),
             language: track["lang"].as_str().unwrap_or_default().to_owned(),
             selected: track["selected"].as_bool().unwrap_or(false),
+            rotation: track["demux-rotation"]
+                .as_u64()
+                .map_or(0, |degrees| (degrees % 360) as u16),
         })
         .collect()
 }
@@ -693,7 +848,14 @@ pub struct Player {
 
 impl Player {
     pub fn new() -> Result<Self> {
-        Self::create(&[])
+        // The playing video's libmpv messages, for reporting problems.
+        match crate::logs::mpv_log()
+            .as_deref()
+            .and_then(std::path::Path::to_str)
+        {
+            Some(log) => Self::create(&[("log-file", log)]),
+            None => Self::create(&[]),
+        }
     }
 
     /// A silent player for poster frames and previews: no audio output,
@@ -703,6 +865,7 @@ impl Player {
             ("ao", "null"),
             ("aid", "no"),
             ("sid", "no"),
+            ("sub-auto", "no"),
             ("mute", "yes"),
         ])
     }
@@ -748,6 +911,13 @@ impl Player {
             ("idle", "yes"),
             ("osd-level", "0"),
             ("video-timing-offset", "0"),
+            // The software renderer aborts on a rotated frame; Flick turns
+            // the picture with filters instead. See `video_adjust`.
+            ("video-rotate", "no"),
+            // Load subtitles named like the video, such as `Film.en.srt`
+            // beside `Film.mkv`, and those in a Subs folder, as IINA does.
+            ("sub-auto", "fuzzy"),
+            ("sub-file-paths", SUBTITLE_FOLDERS),
         ] {
             player.option(name, value)?;
         }
@@ -956,6 +1126,11 @@ impl Player {
             loop_start: point("ab-loop-a"),
             loop_end: point("ab-loop-b"),
             audio_delay: number("audio-delay", 0.0),
+            sub_delay: number("sub-delay", 0.0),
+            loop_file: looping(self.property("loop-file").as_deref()),
+            secondary_sid: self
+                .property("secondary-sid")
+                .and_then(|id| id.parse().ok()),
             buffering: flag("paused-for-cache"),
         }
     }
@@ -1107,6 +1282,41 @@ impl Player {
                 .filter(|value| *value > 0)
         };
         Some((dimension("video-params/dw")?, dimension("video-params/dh")?))
+    }
+
+    /// The media information panel's rows for the playing video.
+    pub fn media_rows(&self) -> Vec<(&'static str, String)> {
+        media_rows(|name| self.property(name))
+    }
+
+    /// Audio outputs, and the one in use.
+    pub fn audio_devices(&self) -> (Vec<AudioDevice>, String) {
+        (
+            self.property("audio-device-list")
+                .map(|json| parse_audio_devices(&json))
+                .unwrap_or_default(),
+            self.property("audio-device").unwrap_or_default(),
+        )
+    }
+
+    /// The clockwise rotation in the playing video's metadata.
+    pub fn file_rotation(&self) -> u16 {
+        self.property("current-tracks/video/demux-rotation")
+            .and_then(|value| value.parse::<u16>().ok())
+            .map_or(0, |degrees| degrees % 360)
+    }
+
+    /// The size of the picture after filters, such as a turn.
+    pub fn display_size(&self) -> Option<(u32, u32)> {
+        let dimension = |name| {
+            self.property(name)
+                .and_then(|value| value.parse::<u32>().ok())
+                .filter(|value| *value > 0)
+        };
+        Some((
+            dimension("video-out-params/dw")?,
+            dimension("video-out-params/dh")?,
+        ))
     }
 
     /// The video codec's short name, such as `h264`.
@@ -2069,6 +2279,49 @@ mod tests {
     }
 
     #[test]
+    fn media_rows_join_what_is_known() {
+        let values: std::collections::HashMap<&str, &str> = [
+            ("file-format", "mp4"),
+            ("file-size", "4900410"),
+            ("video-format", "h264"),
+            ("video-params/w", "1280"),
+            ("video-params/h", "720"),
+            ("container-fps", "23.976023"),
+            ("video-bitrate", "4200000"),
+            ("hwdec-current", "no"),
+            ("audio-codec-name", "aac"),
+            ("audio-params/channel-count", "2"),
+            ("audio-params/samplerate", "48000"),
+            ("audio-bitrate", "128000"),
+            ("frame-drop-count", "0"),
+            ("decoder-frame-drop-count", "2"),
+            ("avsync", "-0.004"),
+        ]
+        .into();
+        let rows = media_rows(|name| values.get(name).map(|value| (*value).to_owned()));
+        assert_eq!(
+            rows,
+            [
+                ("Container", "mp4 · 4.9 MB".to_owned()),
+                (
+                    "Video",
+                    "h264 · 1280×720 · 23.976 fps · 4.2 Mb/s".to_owned()
+                ),
+                ("Decoder", "Software".to_owned()),
+                ("Audio", "aac · stereo · 48 kHz · 128 kb/s".to_owned()),
+                ("Dropped frames", "0 shown, 2 decoded".to_owned()),
+                ("A/V sync", "-4 ms".to_owned()),
+            ]
+        );
+        assert!(media_rows(|_| None).is_empty());
+        let devices = parse_audio_devices(
+            r#"[{"name":"auto","description":"Autoselect device"},{"name":"coreaudio/BuiltIn","description":""},{"description":"no name"}]"#,
+        );
+        assert_eq!(devices.len(), 2);
+        assert_eq!(devices[1].description, "coreaudio/BuiltIn");
+    }
+
+    #[test]
     fn observed_snapshot_updates_scalars_tracks_and_chapters_without_polling_properties() {
         let mut snapshot = PlaybackSnapshot::default();
         update_cached_property(&mut snapshot, "time-pos", Some("12.5"));
@@ -2088,6 +2341,17 @@ mod tests {
         assert_eq!(snapshot.tracks[0].id, 4);
         assert!(snapshot.tracks[0].selected);
         assert_eq!(snapshot.chapters[0].time, 3.);
+        update_cached_property(&mut snapshot, "sub-delay", Some("-0.300000"));
+        update_cached_property(&mut snapshot, "loop-file", Some("inf"));
+        assert_eq!(snapshot.sub_delay, -0.3);
+        assert!(snapshot.loop_file);
+        update_cached_property(&mut snapshot, "loop-file", Some("no"));
+        assert!(!snapshot.loop_file);
+        assert!(looping(Some("3")) && !looping(Some("0")) && !looping(None));
+        update_cached_property(&mut snapshot, "secondary-sid", Some("3"));
+        assert_eq!(snapshot.secondary_sid, Some(3));
+        update_cached_property(&mut snapshot, "secondary-sid", Some("no"));
+        assert_eq!(snapshot.secondary_sid, None);
         update_cached_property(&mut snapshot, "time-pos", Some("NaN"));
         update_cached_property(&mut snapshot, "track-list", None);
         update_cached_property(&mut snapshot, "ab-loop-a", Some("no"));
@@ -2478,6 +2742,174 @@ mod tests {
             );
             thread::sleep(Duration::from_millis(150));
         }
+        Ok(())
+    }
+
+    /// Flick's picture adjustments, subtitle delay, repeat, and screenshots
+    /// against real libmpv: every filter chain is accepted, and a quarter
+    /// turn swaps the saved screenshot's sides. The software renderer does
+    /// not rotate, so this also shows the turn comes from the filters.
+    #[test]
+    #[ignore = "requires native libmpv and FLICK_TEST_VIDEO"]
+    fn real_picture_adjustments_repeat_and_screenshot() -> Result<()> {
+        use crate::video_adjust::{ASPECTS, CROPS, Color, VideoAdjust};
+        let clip = std::env::var("FLICK_TEST_VIDEO")?;
+        let player = Player::new()?;
+        player.load(&clip)?;
+        let render_for = |duration: Duration| -> Result<bool> {
+            let deadline = Instant::now() + duration;
+            let mut rendered = false;
+            while Instant::now() < deadline {
+                for event in player.poll_events() {
+                    if let PlayerEvent::Error(error) = event {
+                        bail!("{error}");
+                    }
+                }
+                rendered |= player.render(320, 180)?.is_some();
+                thread::sleep(Duration::from_millis(16));
+            }
+            Ok(rendered)
+        };
+        ensure!(render_for(Duration::from_secs(2))?, "No initial frame");
+        let (width, height) = player.video_size().context("No video size")?;
+        // Every setting at once, then each rotation, must be accepted.
+        let mut adjust = VideoAdjust::default();
+        adjust.aspect = ASPECTS.len() - 1;
+        adjust.crop = CROPS.len() - 1;
+        adjust.flip = true;
+        adjust.mirror = true;
+        adjust.deinterlace = true;
+        for color in Color::ALL {
+            adjust.step_color(color, 3);
+        }
+        for _ in 0..4 {
+            adjust.rotate();
+            for (name, value) in adjust.properties(0) {
+                player.set_property(name, &value)?;
+            }
+            ensure!(
+                render_for(Duration::from_millis(400))?,
+                "No frame with {:?}",
+                adjust.filters(0)
+            );
+        }
+        // A quarter turn with nothing else.
+        let mut turned = VideoAdjust::default();
+        turned.rotate();
+        for (name, value) in turned.properties(0) {
+            player.set_property(name, &value)?;
+        }
+        player.set_property("sub-delay", "0.3")?;
+        player.set_property("loop-file", "inf")?;
+        render_for(Duration::from_millis(600))?;
+        let snapshot = player.snapshot();
+        ensure!(
+            (snapshot.sub_delay - 0.3).abs() < 1e-6,
+            "Subtitle delay not set"
+        );
+        ensure!(snapshot.loop_file, "Repeat not set");
+        let folder = tempfile::tempdir()?;
+        let shot =
+            crate::screenshot::path(folder.path(), "Flick test", snapshot.position, "png", |p| {
+                p.exists()
+            });
+        player.command(&[
+            "screenshot-to-file",
+            shot.to_str().context("Temporary path is not UTF-8")?,
+            "subtitles",
+        ])?;
+        let png = std::fs::read(&shot)?;
+        ensure!(png.starts_with(b"\x89PNG\r\n\x1a\n"), "Not a PNG");
+        let side = |at: usize| u32::from_be_bytes([png[at], png[at + 1], png[at + 2], png[at + 3]]);
+        assert_eq!(
+            (side(16), side(20)),
+            (height, width),
+            "Screenshot not turned"
+        );
+        Ok(())
+    }
+
+    /// Live Text: Vision reads the burned-in timestamp of the generated
+    /// clip from a screenshot of the frame on screen.
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "requires native libmpv and FLICK_TEST_VIDEO"]
+    fn real_live_text_reads_the_frame() -> Result<()> {
+        let clip = std::env::var("FLICK_TEST_VIDEO")?;
+        let player = Player::new()?;
+        player.load(&clip)?;
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline {
+            player.poll_events();
+            player.render(640, 360)?;
+            thread::sleep(Duration::from_millis(16));
+        }
+        let folder = tempfile::tempdir()?;
+        let shot = folder.path().join("frame.png");
+        player.command(&[
+            "screenshot-to-file",
+            shot.to_str().context("Temporary path is not UTF-8")?,
+            "subtitles",
+        ])?;
+        let lines = crate::live_text::recognize(&shot)?;
+        println!("recognized: {lines:?}");
+        ensure!(
+            lines.iter().any(|line| line.contains("00:00")),
+            "No timestamp among {lines:?}"
+        );
+        Ok(())
+    }
+
+    /// A file with rotation metadata, such as a phone video, made by
+    /// `ffmpeg -display_rotation:v:0 90 -i clip.mp4 -c copy rotated.mp4`.
+    /// The software renderer used to abort the process in `mp_image_crop`
+    /// on its first frame. Now it renders, and the turn comes from the
+    /// filter: a screenshot of the 1280×720 clip is 720×1280.
+    #[test]
+    #[ignore = "requires native libmpv and a rotated FLICK_ROTATED_VIDEO"]
+    fn real_rotated_files_render_upright() -> Result<()> {
+        let clip = std::env::var("FLICK_ROTATED_VIDEO")?;
+        let player = Player::new()?;
+        player.load(&clip)?;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut rotation = 0;
+        let mut rendered = 0;
+        while rendered < 10 {
+            for event in player.poll_events() {
+                if let PlayerEvent::Error(error) = event {
+                    bail!("{error}");
+                }
+            }
+            let tracks = player.snapshot().tracks;
+            let file = tracks
+                .iter()
+                .find(|track| track.kind == "video" && track.selected)
+                .map_or(0, |track| track.rotation);
+            if file != rotation {
+                rotation = file;
+                let filter = crate::video_adjust::rotation_filter(rotation).unwrap_or("");
+                player.set_property("vf", filter)?;
+            }
+            if player.render(320, 320)?.is_some() {
+                rendered += 1;
+            }
+            ensure!(Instant::now() < deadline, "Too few frames rendered");
+            thread::sleep(Duration::from_millis(16));
+        }
+        assert_eq!(rotation, player.file_rotation());
+        assert!(rotation == 90 || rotation == 270, "No rotation metadata");
+        let (width, height) = player.video_size().context("No video size")?;
+        assert_eq!(player.display_size(), Some((height, width)));
+        let folder = tempfile::tempdir()?;
+        let shot = folder.path().join("turned.png");
+        player.command(&[
+            "screenshot-to-file",
+            shot.to_str().context("Temporary path is not UTF-8")?,
+            "video",
+        ])?;
+        let png = std::fs::read(&shot)?;
+        let side = |at: usize| u32::from_be_bytes([png[at], png[at + 1], png[at + 2], png[at + 3]]);
+        assert_eq!((side(16), side(20)), (height, width));
         Ok(())
     }
 

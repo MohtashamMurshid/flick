@@ -28,6 +28,8 @@ pub(super) struct Palette {
 #[derive(Clone)]
 enum Action {
     Play(PathBuf),
+    /// Play the typed web link without downloading it.
+    Stream,
     Player,
     Link,
     /// The typed link, on this paired server.
@@ -121,6 +123,17 @@ impl Flick {
         }
         if let Some(link) = flick::fetch::web_link(&query) {
             let page = matches!(link, Ok(flick::fetch::WebLink::Page(_)));
+            if let Ok(link) = &link {
+                items.push(Item {
+                    section: "Play",
+                    icon: "play",
+                    title: "Play without downloading".into(),
+                    detail: Some(format!("Stream from {}", link.site()).into()),
+                    keys: None,
+                    verb: "Play",
+                    action: Action::Stream,
+                });
+            }
             let (title, detail) = match link {
                 Ok(link @ flick::fetch::WebLink::Archive(_)) => (
                     format!("Download from {}", link.site()),
@@ -145,6 +158,22 @@ impl Flick {
                 items.extend(self.download_to_items(Sheet::Link));
             }
             return items;
+        }
+        // A time such as 12:34 goes there in the playing video.
+        if self.view == View::Player
+            && self.file_loaded
+            && let Some(seconds) = crate::model::parse_time(&query)
+        {
+            items.push(Item {
+                section: "Player",
+                icon: "history",
+                title: format!("Go to {}", format_time(seconds)).into(),
+                detail: (self.snapshot.duration > 0.)
+                    .then(|| format!("of {}", format_time(self.snapshot.duration)).into()),
+                keys: None,
+                verb: "Go",
+                action: Action::Control(Control::SeekTo(seconds)),
+            });
         }
         let words = query
             .to_lowercase()
@@ -295,6 +324,70 @@ impl Flick {
                     key("l"),
                     Action::Control(Control::Subtitle),
                 ),
+                command(
+                    "audio-lines",
+                    "Load Audio File…",
+                    None,
+                    Action::Control(Control::AudioFile),
+                ),
+                command(
+                    "sliders",
+                    "Video Adjustments",
+                    None,
+                    Action::Control(Control::Video),
+                ),
+                command(
+                    "list",
+                    "Queue and Chapters",
+                    None,
+                    Action::Control(Control::Queue),
+                ),
+                command(
+                    "info",
+                    "Media Information",
+                    shortcut(Shortcut::MediaInfo),
+                    Action::Control(Control::Info),
+                ),
+                command(
+                    "audio-lines",
+                    "Audio Equalizer",
+                    None,
+                    Action::Control(Control::Equalizer),
+                ),
+                command(
+                    "play",
+                    "Playback Speed",
+                    None,
+                    Action::Control(Control::Speed),
+                ),
+                command(
+                    "camera",
+                    "Save a Screenshot",
+                    shortcut(Shortcut::Screenshot),
+                    Action::Control(Control::Shortcut(Shortcut::Screenshot)),
+                ),
+                command(
+                    "copy",
+                    "Copy the Frame",
+                    shortcut(Shortcut::CopyScreenshot),
+                    Action::Control(Control::Shortcut(Shortcut::CopyScreenshot)),
+                ),
+                command(
+                    "copy",
+                    "Copy Text in the Frame",
+                    shortcut(Shortcut::CopyText),
+                    Action::Control(Control::Shortcut(Shortcut::CopyText)),
+                ),
+                command(
+                    "repeat",
+                    if self.snapshot.loop_file {
+                        "Stop Repeating"
+                    } else {
+                        "Repeat This Video"
+                    },
+                    shortcut(Shortcut::LoopFile),
+                    Action::Control(Control::Shortcut(Shortcut::LoopFile)),
+                ),
             ]);
         }
         items.extend([
@@ -399,6 +492,7 @@ impl Flick {
         self.close_palette(window, cx);
         match item.action {
             Action::Play(path) => self.open(path, window, cx),
+            Action::Stream => self.open_stream(query.clone(), window, cx),
             Action::Player => {
                 if self.source().is_some() {
                     self.entered_player = Instant::now();

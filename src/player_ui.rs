@@ -4,6 +4,8 @@ use super::{
     chrome_ui::{notice, thumbnail, traffic_light_space},
     *,
 };
+use crate::player_prefs::{ControlsChoice, EQ_BANDS, EQ_PRESETS};
+use crate::video_adjust::{ASPECTS, CROPS, Color};
 use gpui::{AnyElement, FontWeight, Rgba, linear_color_stop, linear_gradient};
 
 /// Fraction of the video's duration at `time`, for timeline markers.
@@ -35,7 +37,7 @@ impl Flick {
     ) -> AnyElement {
         let t = cx.theme().clone();
         let show = self.controls_shown || self.controls_fading(cx);
-        let controls_height = controls_height(t.style);
+        let controls_height = controls_height(self.controls_style(cx));
         let menu = self.menu_panel(cx);
         div()
             .relative()
@@ -177,6 +179,9 @@ impl Flick {
                 .absolute()
                 .size_full(),
             )
+            .on_scroll_wheel(cx.listener(|this, event: &gpui::ScrollWheelEvent, _, cx| {
+                this.scroll_video(event, cx)
+            }))
             .on_click(cx.listener(|this, event: &ClickEvent, window, cx| {
                 this.focus.focus(window);
                 if event.click_count() == 2 {
@@ -249,6 +254,17 @@ impl Flick {
                         .when(t.style == Style::Gnome, |d| d.font_weight(FontWeight::BOLD)),
                 )
             })
+    }
+
+    /// The layout of the player controls: the interface style's own, or
+    /// the one chosen in Settings › Playback.
+    pub(super) fn controls_style(&self, cx: &App) -> Style {
+        match self.store.data.player.controls {
+            ControlsChoice::Style => cx.theme().style,
+            ControlsChoice::Floating => Style::Mac,
+            ControlsChoice::Bar => Style::Windows,
+            ControlsChoice::Compact => Style::Gnome,
+        }
     }
 
     fn overlay_button(
@@ -334,6 +350,21 @@ impl Flick {
                 cx,
             )
         };
+        let info = self.overlay_button(
+            "player-info",
+            "info",
+            "Media information (I)",
+            Control::Info,
+            cx,
+        );
+        let queue = self.overlay_button(
+            "player-queue",
+            "list",
+            "Queue and chapters",
+            Control::Queue,
+            cx,
+        );
+        let keys = h_flex().gap_1().child(queue).child(info).child(keys);
         let controls = self.window_controls(window, true, cx);
         let bar = div()
             .id("player-titlebar")
@@ -399,13 +430,14 @@ impl Flick {
 
     fn play_button(&self, cx: &Context<Self>) -> Stateful<Div> {
         let t = cx.theme();
+        let style = self.controls_style(cx);
         let playing = self.playing();
         let (name, tip) = if playing {
             ("pause", "Pause (Space)")
         } else {
             ("play", "Play (Space)")
         };
-        let (size, bg, fg): (f32, Rgba, Rgba) = match t.style {
+        let (size, bg, fg): (f32, Rgba, Rgba) = match style {
             Style::Mac => (40., rgba(0x00000000), rgb(ON_VIDEO)),
             Style::Windows => (44., t.accent, t.on_accent),
             Style::Gnome => (38., rgba(0xffffff26), rgb(ON_VIDEO)),
@@ -427,11 +459,7 @@ impl Flick {
                 cx.stop_propagation();
                 this.handle(Control::Play, window, cx);
             }))
-            .child(icon(
-                name,
-                if t.style == Style::Mac { 26. } else { 20. },
-                fg,
-            ));
+            .child(icon(name, if style == Style::Mac { 26. } else { 20. }, fg));
         self.focusable(
             el,
             &"play".into(),
@@ -444,18 +472,19 @@ impl Flick {
 
     fn timeline_bar(&self, cx: &Context<Self>) -> Stateful<Div> {
         let t = cx.theme();
+        let style = self.controls_style(cx);
         let timeline = self.timeline.clone();
         let progress = if self.snapshot.duration > 0. {
             (self.snapshot.position / self.snapshot.duration).clamp(0., 1.) as f32
         } else {
             0.
         };
-        let fill = if t.style == Style::Mac {
+        let fill = if style == Style::Mac {
             rgb(ON_VIDEO)
         } else {
             t.accent
         };
-        let knob = match t.style {
+        let knob = match style {
             Style::Mac => self.scrubbing.then(|| {
                 div()
                     .size(px(12.))
@@ -483,7 +512,7 @@ impl Flick {
                     .into_any_element(),
             ),
         };
-        let knob_size = match t.style {
+        let knob_size = match style {
             Style::Mac => 12.,
             Style::Windows => 18.,
             Style::Gnome => 14.,
@@ -650,7 +679,8 @@ impl Flick {
     fn volume_slider(&self, width: f32, cx: &Context<Self>) -> Stateful<Div> {
         let t = cx.theme();
         let volume_bounds = self.volume_bounds.clone();
-        let volume = (self.snapshot.volume / 100.).clamp(0., 1.) as f32;
+        let max = f64::from(self.store.data.player.max_volume);
+        let volume = (self.snapshot.volume / max).clamp(0., 1.) as f32;
         let fill = if self.snapshot.muted {
             rgba(0xffffff66)
         } else if t.style == Style::Mac {
@@ -718,10 +748,7 @@ impl Flick {
             .text_size(t.font(12.))
             .text_color(rgb(ON_VIDEO))
             .hover(|s| s.bg(rgba(ON_VIDEO_HOVER)))
-            .tooltip(|_, cx| {
-                cx.new(|_| Hint("Playback speed · click to cycle".into()))
-                    .into()
-            })
+            .tooltip(|_, cx| cx.new(|_| Hint("Playback speed".into())).into())
             .child(format!("{}×", self.snapshot.speed))
             .on_click(cx.listener(|this, _, window, cx| this.handle(Control::Speed, window, cx)));
         self.focusable(
@@ -736,6 +763,7 @@ impl Flick {
 
     fn player_controls(&self, window: &Window, cx: &Context<Self>) -> AnyElement {
         let t = cx.theme();
+        let style = self.controls_style(cx);
         let fullscreen = window.is_fullscreen();
         let position = format_time(self.snapshot.position);
         let duration = format_time(self.snapshot.duration);
@@ -766,17 +794,24 @@ impl Flick {
             Control::Mute,
             cx,
         );
+        // The arrow icons show 10; other steps use plain arrows.
+        let step = self.store.data.player.seek_step;
+        let (back_icon, forward_icon) = if step == 10 {
+            ("rotate-ccw", "rotate-cw")
+        } else {
+            ("seek-back", "seek-forward")
+        };
         let back = self.overlay_button(
             "back",
-            "rotate-ccw",
-            "Back 10 seconds (←)",
+            back_icon,
+            format!("Back {step} seconds (←)"),
             Control::Back,
             cx,
         );
         let forward = self.overlay_button(
             "forward",
-            "rotate-cw",
-            "Forward 10 seconds (→)",
+            forward_icon,
+            format!("Forward {step} seconds (→)"),
             Control::Forward,
             cx,
         );
@@ -787,6 +822,8 @@ impl Flick {
             Control::Tracks,
             cx,
         );
+        let video =
+            self.overlay_button("video", "sliders", "Video adjustments", Control::Video, cx);
         let pip = self.overlay_button(
             "pip",
             "picture-in-picture",
@@ -807,7 +844,7 @@ impl Flick {
         );
         let swallow =
             cx.listener(|this, _: &gpui::MouseDownEvent, _, _| this.control_pressed = true);
-        match t.style {
+        match style {
             Style::Mac => h_flex()
                 .absolute()
                 .bottom(px(24.))
@@ -834,7 +871,7 @@ impl Flick {
                             h_flex()
                                 .child(
                                     h_flex()
-                                        .w(px(164.))
+                                        .w(px(192.))
                                         .gap_1()
                                         .child(mute)
                                         .child(self.volume_slider(72., cx)),
@@ -850,11 +887,12 @@ impl Flick {
                                 )
                                 .child(
                                     h_flex()
-                                        .w(px(164.))
+                                        .w(px(192.))
                                         .justify_end()
                                         .gap_1()
                                         .child(self.speed_button(cx))
                                         .child(tracks)
+                                        .child(video)
                                         .child(pip)
                                         .child(full),
                                 ),
@@ -935,6 +973,7 @@ impl Flick {
                                     .gap_1()
                                     .child(self.speed_button(cx))
                                     .child(tracks)
+                                    .child(video)
                                     .child(pip)
                                     .child(mute)
                                     .child(self.volume_slider(88., cx))
@@ -966,6 +1005,7 @@ impl Flick {
                 .child(mute)
                 .child(self.volume_slider(72., cx))
                 .child(tracks)
+                .child(video)
                 .child(pip)
                 .child(full)
                 .into_any_element(),
@@ -1153,10 +1193,27 @@ impl Flick {
         )
     }
 
-    /// Audio delay, adjustable in 50 ms steps, with a reset.
-    fn audio_delay_row(&self, cx: &Context<Self>) -> Div {
+    /// Audio delay in 50 ms steps, or subtitle delay in 100 ms steps, with
+    /// a reset.
+    fn delay_row(&self, subtitles: bool, cx: &Context<Self>) -> Div {
         let t = cx.theme();
-        let delay = self.snapshot.audio_delay;
+        let (delay, label, property, earlier, later) = if subtitles {
+            (
+                self.snapshot.sub_delay,
+                "Subtitle delay",
+                "sub-delay",
+                Shortcut::SubtitleDelayDown,
+                Shortcut::SubtitleDelayUp,
+            )
+        } else {
+            (
+                self.snapshot.audio_delay,
+                "Audio delay",
+                "audio-delay",
+                Shortcut::AudioDelayDown,
+                Shortcut::AudioDelayUp,
+            )
+        };
         h_flex()
             .gap_1()
             .px_2()
@@ -1164,31 +1221,62 @@ impl Flick {
             .child(
                 div()
                     .flex_1()
-                    .child(format!("Audio delay {:+.0} ms", delay * 1000.)),
+                    .child(format!("{label} {:+.0} ms", delay * 1000.)),
             )
             .child(self.icon_button(
-                "audio-earlier",
+                (property, 0usize),
                 "minus",
-                "Audio earlier by 50 ms",
+                earlier.label(),
                 cx,
-                |this, w, cx| this.shortcut(Shortcut::AudioDelayDown, w, cx),
+                move |this, w, cx| this.shortcut(earlier, w, cx),
             ))
             .child(self.icon_button(
-                "audio-later",
+                (property, 1usize),
                 "plus",
-                "Audio later by 50 ms",
+                later.label(),
                 cx,
-                |this, w, cx| this.shortcut(Shortcut::AudioDelayUp, w, cx),
+                move |this, w, cx| this.shortcut(later, w, cx),
             ))
             .when(delay.abs() > 0.0005, |d| {
                 d.child(self.icon_button(
-                    "audio-delay-reset",
+                    (property, 2usize),
                     "rotate-ccw",
-                    "Reset audio delay",
+                    format!("Reset {}", label.to_lowercase()),
                     cx,
-                    |this, _, cx| this.property("audio-delay", "0", cx),
+                    move |this, _, cx| this.property(property, "0", cx),
                 ))
             })
+            .text_color(t.text)
+    }
+
+    /// A color setting with a stepper, such as "Brightness +10".
+    fn color_row(&self, index: usize, color: Color, cx: &Context<Self>) -> Div {
+        let t = cx.theme();
+        let value = self.video_adjust.color(color);
+        let name = color.label();
+        h_flex()
+            .gap_1()
+            .px_2()
+            .py_1()
+            .child(div().flex_1().child(if value == 0 {
+                format!("{name} 0")
+            } else {
+                format!("{name} {value:+}")
+            }))
+            .child(self.icon_button(
+                ("color-less", index),
+                "minus",
+                format!("Less {}", name.to_lowercase()),
+                cx,
+                move |this, _, cx| this.adjust_video(|v| v.step_color(color, -1), cx),
+            ))
+            .child(self.icon_button(
+                ("color-more", index),
+                "plus",
+                format!("More {}", name.to_lowercase()),
+                cx,
+                move |this, _, cx| this.adjust_video(|v| v.step_color(color, 1), cx),
+            ))
             .text_color(t.text)
     }
 
@@ -1197,6 +1285,11 @@ impl Flick {
         let t = cx.theme().clone();
         let title = match menu {
             Menu::Tracks => "Audio & subtitles",
+            Menu::Speed => "Speed",
+            Menu::Info => "Media information",
+            Menu::Queue => "Queue",
+            Menu::Equalizer => "Equalizer",
+            Menu::Video => "Video",
             Menu::Keys => "Keyboard shortcuts",
             Menu::FindSubtitles => "Find subtitles",
         };
@@ -1305,22 +1398,48 @@ impl Flick {
                     {
                         let id = track.id.to_string();
                         let property = if kind == "audio" { "aid" } else { "sid" };
-                        let label = if !track.title.is_empty() {
-                            track.title.clone()
-                        } else if !track.language.is_empty() {
-                            track.language.clone()
-                        } else {
-                            format!("Track {}", track.id)
-                        };
+                        let selected =
+                            track.selected && Some(track.id) != self.snapshot.secondary_sid;
                         panel = panel.child(
-                            option(format!("{property}-{id}").into(), label, track.selected)
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.property(property, &id, cx)
-                                })),
+                            option(
+                                format!("{property}-{id}").into(),
+                                track_label(track),
+                                selected,
+                            )
+                            .on_click(
+                                cx.listener(move |this, _, _, cx| this.property(property, &id, cx)),
+                            ),
                         );
                     }
                     if kind == "audio" {
-                        panel = panel.child(self.audio_delay_row(cx));
+                        panel = panel.child(self.delay_row(false, cx));
+                        let (devices, current) = self.player_audio_devices();
+                        if devices.len() > 1 {
+                            panel = panel.child(
+                                div()
+                                    .px_2()
+                                    .pt_2()
+                                    .pb_1()
+                                    .text_size(t.font(11.))
+                                    .text_color(t.muted)
+                                    .child("Output"),
+                            );
+                            for (index, device) in devices.into_iter().enumerate() {
+                                let name = device.name.clone();
+                                panel = panel.child(
+                                    option(
+                                        format!("audio-device-{index}").into(),
+                                        device.description,
+                                        device.name == current,
+                                    )
+                                    .on_click(cx.listener(
+                                        move |this, _, _, cx| {
+                                            this.property("audio-device", &name, cx)
+                                        },
+                                    )),
+                                );
+                            }
+                        }
                     }
                     if kind == "sub" {
                         // Subtitles kept on the remote library's server.
@@ -1349,14 +1468,56 @@ impl Flick {
                                     move |this, _, _, cx| this.load_remote_subtitle(which, cx),
                                 )));
                         }
+                        let secondary = self.snapshot.secondary_sid;
                         let off = !self
                             .snapshot
                             .tracks
                             .iter()
-                            .any(|t| t.kind == "sub" && t.selected);
+                            .any(|t| t.kind == "sub" && t.selected && Some(t.id) != secondary);
                         panel = panel.child(option("subs-off".into(), "Off".into(), off).on_click(
                             cx.listener(|this, _, _, cx| this.property("sid", "no", cx)),
                         ));
+                        panel = panel.child(self.delay_row(true, cx));
+                        // A second track shown with the first, as IINA does.
+                        let subs: Vec<_> = self
+                            .snapshot
+                            .tracks
+                            .iter()
+                            .filter(|track| track.kind == "sub")
+                            .cloned()
+                            .collect();
+                        if !subs.is_empty() {
+                            panel = panel.child(
+                                div()
+                                    .px_2()
+                                    .pt_2()
+                                    .pb_1()
+                                    .text_size(t.font(11.))
+                                    .text_color(t.muted)
+                                    .child("Second subtitles"),
+                            );
+                            for track in subs {
+                                let id = track.id.to_string();
+                                panel = panel.child(
+                                    option(
+                                        format!("secondary-sid-{id}").into(),
+                                        track_label(&track),
+                                        secondary == Some(track.id),
+                                    )
+                                    .on_click(cx.listener(
+                                        move |this, _, _, cx| {
+                                            this.property("secondary-sid", &id, cx)
+                                        },
+                                    )),
+                                );
+                            }
+                            panel = panel.child(
+                                option("secondary-off".into(), "Off".into(), secondary.is_none())
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.property("secondary-sid", "no", cx)
+                                    })),
+                            );
+                        }
                     }
                 }
                 panel = panel.child(
@@ -1373,10 +1534,18 @@ impl Flick {
                         .child(self.button(
                             "load-subtitle",
                             Some("captions"),
-                            "Load File…",
+                            "Load Subtitles…",
                             false,
                             cx,
                             |this, w, cx| this.handle(Control::Subtitle, w, cx),
+                        ))
+                        .child(self.button(
+                            "load-audio",
+                            Some("audio-lines"),
+                            "Load Audio…",
+                            false,
+                            cx,
+                            |this, w, cx| this.handle(Control::AudioFile, w, cx),
                         ))
                         .child(self.button(
                             "find-subtitles",
@@ -1385,11 +1554,362 @@ impl Flick {
                             false,
                             cx,
                             |this, w, cx| this.find_subtitles(w, cx),
+                        ))
+                        .child(self.button(
+                            "open-equalizer",
+                            Some("sliders"),
+                            "Equalizer…",
+                            false,
+                            cx,
+                            |this, w, cx| this.handle(Control::Equalizer, w, cx),
                         )),
                 );
             }
             Menu::FindSubtitles => {
                 panel = panel.child(self.subtitle_search_view(cx));
+            }
+            Menu::Queue => {
+                let heading = |text: &'static str| {
+                    div()
+                        .px_2()
+                        .pt_2()
+                        .pb_1()
+                        .text_size(t.font(11.))
+                        .text_color(t.muted)
+                        .child(text)
+                };
+                let chapters = self.snapshot.chapters.clone();
+                if !chapters.is_empty() {
+                    let position = self.snapshot.position;
+                    let current = chapters
+                        .iter()
+                        .rposition(|chapter| chapter.time <= position + 0.25);
+                    panel = panel.child(heading("Chapters"));
+                    for (index, chapter) in chapters.into_iter().enumerate() {
+                        let title = if chapter.title.is_empty() {
+                            format!("Chapter {}", index + 1)
+                        } else {
+                            chapter.title
+                        };
+                        let time = chapter.time;
+                        panel = panel.child(
+                            option(
+                                format!("chapter-{index}").into(),
+                                format!("{title} · {}", format_time(time)),
+                                current == Some(index),
+                            )
+                            .on_click(cx.listener(
+                                move |this, _, window, cx| {
+                                    this.handle(Control::SeekTo(time), window, cx)
+                                },
+                            )),
+                        );
+                    }
+                }
+                let items = self.queue.items().to_vec();
+                let playing = self.queue.current();
+                if !items.is_empty() {
+                    panel = panel.child(heading("Videos"));
+                }
+                let count = items.len();
+                for (index, path) in items.into_iter().enumerate().take(200) {
+                    let current = playing == Some(index);
+                    let open = path.clone();
+                    let mut row = h_flex().child(
+                        option(format!("queue-{index}").into(), file_title(&path), current)
+                            .flex_1()
+                            .min_w(px(0.))
+                            .overflow_hidden()
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                if this.path.as_deref() != Some(open.as_path()) {
+                                    this.persist();
+                                    this.open(open.clone(), window, cx);
+                                }
+                            })),
+                    );
+                    if !current {
+                        row = row
+                            .when(index > 0, |row| {
+                                row.child(self.icon_button(
+                                    ("queue-up", index),
+                                    "chevron-up",
+                                    "Move up",
+                                    cx,
+                                    move |this, _, cx| {
+                                        this.queue.move_item(index, -1);
+                                        cx.notify();
+                                    },
+                                ))
+                            })
+                            .when(index + 1 < count, |row| {
+                                row.child(self.icon_button(
+                                    ("queue-down", index),
+                                    "chevron-down",
+                                    "Move down",
+                                    cx,
+                                    move |this, _, cx| {
+                                        this.queue.move_item(index, 1);
+                                        cx.notify();
+                                    },
+                                ))
+                            })
+                            .child(self.icon_button(
+                                ("queue-remove", index),
+                                "x",
+                                "Remove from the queue",
+                                cx,
+                                move |this, _, cx| {
+                                    this.queue.remove(index);
+                                    cx.notify();
+                                },
+                            ));
+                    }
+                    panel = panel.child(row);
+                }
+                if count > 1 {
+                    panel = panel
+                        .child(div().mt_1().border_t_1().border_color(t.border))
+                        .child(
+                            option(
+                                "queue-shuffle".into(),
+                                "Shuffle".into(),
+                                self.queue.shuffled(),
+                            )
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                let on = !this.queue.shuffled();
+                                let seed = getrandom::u64().unwrap_or(0x2545_f491_4f6c_dd1d);
+                                this.queue.set_shuffle(on, seed);
+                                cx.notify();
+                            })),
+                        )
+                        .child(
+                            option(
+                                "queue-repeat".into(),
+                                "Repeat all".into(),
+                                self.queue.repeat,
+                            )
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.queue.repeat = !this.queue.repeat;
+                                cx.notify();
+                            })),
+                        );
+                }
+                if count == 0 && self.snapshot.chapters.is_empty() {
+                    panel = panel.child(
+                        div()
+                            .px_2()
+                            .pb_2()
+                            .text_color(t.muted)
+                            .child("Nothing is queued after this video."),
+                    );
+                }
+            }
+            Menu::Info => {
+                let rows = self.player_media_rows();
+                if rows.is_empty() {
+                    panel = panel.child(
+                        div()
+                            .px_2()
+                            .pb_2()
+                            .text_color(t.muted)
+                            .child("Reading the video…"),
+                    );
+                }
+                for (label, value) in rows {
+                    panel = panel.child(
+                        v_flex()
+                            .px_2()
+                            .py_1()
+                            .child(
+                                div()
+                                    .text_size(t.font(11.))
+                                    .text_color(t.muted)
+                                    .child(label),
+                            )
+                            .child(value),
+                    );
+                }
+            }
+            Menu::Equalizer => {
+                let preferences = self.store.data.player.clone();
+                let mut presets = div().px_1().pb_1().flex().flex_wrap().gap_1();
+                for (index, (name, gains)) in EQ_PRESETS.into_iter().enumerate() {
+                    presets = presets.child(self.button(
+                        ("eq-preset", index),
+                        None,
+                        name,
+                        preferences.equalizer == gains,
+                        cx,
+                        move |this, _, cx| this.set_player(|p| p.equalizer = gains, cx),
+                    ));
+                }
+                panel = panel.child(presets);
+                for (band, frequency) in EQ_BANDS.into_iter().enumerate() {
+                    let gain = preferences.equalizer[band];
+                    let label = if frequency >= 1000 {
+                        format!("{} kHz", frequency / 1000)
+                    } else {
+                        format!("{frequency} Hz")
+                    };
+                    panel = panel.child(
+                        h_flex()
+                            .gap_1()
+                            .px_2()
+                            .py_0p5()
+                            .child(div().flex_1().child(format!("{label}  {gain:+} dB")))
+                            .child(self.icon_button(
+                                ("eq-less", band),
+                                "minus",
+                                format!("Lower {label}"),
+                                cx,
+                                move |this, _, cx| this.set_player(|p| p.step_band(band, -1), cx),
+                            ))
+                            .child(self.icon_button(
+                                ("eq-more", band),
+                                "plus",
+                                format!("Raise {label}"),
+                                cx,
+                                move |this, _, cx| this.set_player(|p| p.step_band(band, 1), cx),
+                            )),
+                    );
+                }
+                panel = panel.child(h_flex().pt_1().child(self.button(
+                    "equalizer-back",
+                    Some("arrow-left"),
+                    "Back",
+                    false,
+                    cx,
+                    |this, _, cx| {
+                        this.menu = Some(Menu::Tracks);
+                        cx.notify();
+                    },
+                )));
+            }
+            Menu::Speed => {
+                let current = self.snapshot.speed;
+                for (index, speed) in super::SPEEDS.into_iter().enumerate() {
+                    panel = panel.child(
+                        option(
+                            format!("speed-{index}").into(),
+                            if speed == 1. {
+                                "Normal".to_owned()
+                            } else {
+                                format!("{speed}×")
+                            },
+                            (current - speed).abs() < 0.01,
+                        )
+                        .on_click(cx.listener(
+                            move |this, _, window, cx| {
+                                this.handle(Control::SetSpeed(speed), window, cx)
+                            },
+                        )),
+                    );
+                }
+            }
+            Menu::Video => {
+                let adjust = self.video_adjust.clone();
+                let heading = |text: &'static str| {
+                    div()
+                        .px_2()
+                        .pt_2()
+                        .pb_1()
+                        .text_size(t.font(11.))
+                        .text_color(t.muted)
+                        .child(text)
+                };
+                let mut aspects = div().px_1().pb_1().flex().flex_wrap().gap_1();
+                for (index, (label, _)) in ASPECTS.iter().enumerate() {
+                    aspects = aspects.child(self.button(
+                        ("aspect", index),
+                        None,
+                        *label,
+                        adjust.aspect == index,
+                        cx,
+                        move |this, _, cx| this.adjust_video(|v| v.aspect = index, cx),
+                    ));
+                }
+                let mut crops = div().px_1().pb_1().flex().flex_wrap().gap_1();
+                for (index, (label, _)) in CROPS.iter().enumerate() {
+                    crops = crops.child(self.button(
+                        ("crop", index),
+                        None,
+                        *label,
+                        adjust.crop == index,
+                        cx,
+                        move |this, _, cx| this.adjust_video(|v| v.crop = index, cx),
+                    ));
+                }
+                panel = panel
+                    .child(heading("Aspect ratio"))
+                    .child(aspects)
+                    .child(heading("Crop"))
+                    .child(crops)
+                    .child(heading("Orientation"))
+                    .child(
+                        h_flex()
+                            .gap_1()
+                            .px_2()
+                            .py_1()
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .child(format!("Rotation {}°", adjust.rotation)),
+                            )
+                            .child(self.button(
+                                "video-rotate",
+                                None,
+                                "Rotate 90°",
+                                false,
+                                cx,
+                                |this, _, cx| this.adjust_video(|v| v.rotate(), cx),
+                            )),
+                    )
+                    .child(
+                        option("video-flip".into(), "Flip upside down".into(), adjust.flip)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.adjust_video(|v| v.flip = !v.flip, cx)
+                            })),
+                    )
+                    .child(
+                        option("video-mirror".into(), "Mirror".into(), adjust.mirror).on_click(
+                            cx.listener(|this, _, _, cx| {
+                                this.adjust_video(|v| v.mirror = !v.mirror, cx)
+                            }),
+                        ),
+                    )
+                    .child(heading("Picture"))
+                    .child(
+                        option(
+                            "video-deinterlace".into(),
+                            "Deinterlace".into(),
+                            adjust.deinterlace,
+                        )
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.adjust_video(|v| v.deinterlace = !v.deinterlace, cx)
+                        })),
+                    );
+                for (index, color) in Color::ALL.into_iter().enumerate() {
+                    panel = panel.child(self.color_row(index, color, cx));
+                }
+                if !adjust.is_default() {
+                    panel = panel.child(
+                        div()
+                            .mt_2()
+                            .pt_2()
+                            .px_1()
+                            .pb_1()
+                            .border_t_1()
+                            .border_color(t.border)
+                            .child(self.button(
+                                "video-reset",
+                                Some("rotate-ccw"),
+                                "Reset All",
+                                false,
+                                cx,
+                                |this, _, cx| this.adjust_video(|v| *v = Default::default(), cx),
+                            )),
+                    );
+                }
             }
             Menu::Keys => {
                 let bindings = &self.store.data.shortcuts;
@@ -1425,5 +1945,16 @@ impl Flick {
             }
         }
         Some(panel.into_any_element())
+    }
+}
+
+/// A track's title, its language, or its number.
+fn track_label(track: &crate::playback::Track) -> String {
+    if !track.title.is_empty() {
+        track.title.clone()
+    } else if !track.language.is_empty() {
+        track.language.clone()
+    } else {
+        format!("Track {}", track.id)
     }
 }

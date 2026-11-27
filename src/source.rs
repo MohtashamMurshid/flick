@@ -1,5 +1,5 @@
-//! What the player is playing: a file on this machine, or a video on a paired
-//! remote library streamed over HTTP.
+//! What the player is playing: a file on this machine, a video on a paired
+//! remote library streamed over HTTP, or a web video streamed from its link.
 
 use flick::remote::protocol::{self, AudioTrack, Quality};
 use std::{
@@ -12,13 +12,18 @@ pub enum Source {
     /// A local file, or a torrent file still downloading at this path.
     Local(PathBuf),
     Remote(RemoteSource),
+    /// A web link played without downloading, through libmpv and yt-dlp.
+    Stream {
+        url: String,
+        title: String,
+    },
 }
 
 impl Source {
     pub fn local_path(&self) -> Option<&Path> {
         match self {
             Source::Local(path) => Some(path),
-            Source::Remote(_) => None,
+            Source::Remote(_) | Source::Stream { .. } => None,
         }
     }
 
@@ -28,6 +33,7 @@ impl Source {
             Source::Local(path) => crate::model::file_title(path),
             Source::Remote(remote) if remote.title.trim().is_empty() => "Untitled video".into(),
             Source::Remote(remote) => remote.title.clone(),
+            Source::Stream { title, .. } => title.clone(),
         }
     }
 }

@@ -92,6 +92,9 @@ impl Queue {
 struct Facts {
     hardware_decoder: Option<String>,
     dropped_frames: Option<u64>,
+    media: Vec<(&'static str, String)>,
+    audio_devices: (Vec<crate::playback::AudioDevice>, String),
+    display_size: Option<(u32, u32)>,
 }
 
 struct Event {
@@ -166,7 +169,38 @@ impl State {
             Work::Command(args) if args == &["cycle", "pause"] => {
                 self.snapshot.paused = !self.snapshot.paused;
             }
+            // Delay steps add to the shown value, so repeated keys before
+            // the next native observation each count.
+            Work::Command(args)
+                if args.len() == 3
+                    && args[0] == "add"
+                    && matches!(args[1].as_str(), "audio-delay" | "sub-delay") =>
+            {
+                if let Ok(step) = args[2].parse::<f64>()
+                    && step.is_finite()
+                {
+                    let delay = if args[1] == "audio-delay" {
+                        &mut self.snapshot.audio_delay
+                    } else {
+                        &mut self.snapshot.sub_delay
+                    };
+                    *delay += step;
+                }
+            }
             Work::Property(name, value, _) => match name.as_str() {
+                "audio-delay" | "sub-delay" => {
+                    if let Ok(value) = value.parse::<f64>()
+                        && value.is_finite()
+                    {
+                        if name == "audio-delay" {
+                            self.snapshot.audio_delay = value;
+                        } else {
+                            self.snapshot.sub_delay = value;
+                        }
+                    }
+                }
+                "loop-file" => self.snapshot.loop_file = crate::playback::looping(Some(value)),
+                "secondary-sid" => self.snapshot.secondary_sid = value.parse().ok(),
                 "pause" if matches!(value.as_str(), "yes" | "no") => {
                     self.snapshot.paused = value == "yes"
                 }
@@ -365,6 +399,21 @@ impl PlayerProxy {
 
     pub fn dropped_frames(&self) -> Option<u64> {
         self.shared.lock().facts.dropped_frames
+    }
+
+    /// The media information panel's rows, read once a second.
+    pub fn media_rows(&self) -> Vec<(&'static str, String)> {
+        self.shared.lock().facts.media.clone()
+    }
+
+    /// The picture's size after filters, read once a second.
+    pub fn display_size(&self) -> Option<(u32, u32)> {
+        self.shared.lock().facts.display_size
+    }
+
+    /// Audio outputs and the one in use, read once a second.
+    pub fn audio_devices(&self) -> (Vec<crate::playback::AudioDevice>, String) {
+        self.shared.lock().facts.audio_devices.clone()
     }
 
     /// An ordered barrier: acknowledge only once mpv has unloaded its file.
@@ -928,6 +977,9 @@ fn run(
             let facts = Facts {
                 hardware_decoder: player.hardware_decoder(),
                 dropped_frames: player.dropped_frames(),
+                media: player.media_rows(),
+                audio_devices: player.audio_devices(),
+                display_size: player.display_size(),
             };
             let mut state = shared.lock();
             if !state.queue.stopped && active_request == state.requested {
@@ -1111,6 +1163,37 @@ mod tests {
         state.queue.work.clear();
         state.publish(state.requested, revision, PlaybackSnapshot::default());
         assert_eq!(state.snapshot.position, 5.);
+    }
+
+    #[test]
+    fn delay_and_repeat_changes_show_before_native_observation() {
+        let mut state = State::default();
+        let command = |args: &[&str]| Work::Command(args.iter().map(|a| (*a).to_owned()).collect());
+        // Two quick steps both count, as the native `add` commands do.
+        state.send(command(&["add", "sub-delay", "0.1"])).unwrap();
+        state.send(command(&["add", "sub-delay", "0.1"])).unwrap();
+        state
+            .send(command(&["add", "audio-delay", "-0.05"]))
+            .unwrap();
+        assert!((state.snapshot.sub_delay - 0.2).abs() < 1e-9);
+        assert!((state.snapshot.audio_delay + 0.05).abs() < 1e-9);
+        state
+            .send(Work::Property("sub-delay".into(), "0".into(), false))
+            .unwrap();
+        assert_eq!(state.snapshot.sub_delay, 0.);
+        // Invalid steps and other `add` targets change nothing here.
+        state.send(command(&["add", "sub-delay", "NaN"])).unwrap();
+        state.send(command(&["add", "volume", "5"])).unwrap();
+        assert_eq!(state.snapshot.sub_delay, 0.);
+        assert_eq!(state.snapshot.volume, 100.);
+        state
+            .send(Work::Property("loop-file".into(), "inf".into(), false))
+            .unwrap();
+        assert!(state.snapshot.loop_file);
+        state
+            .send(Work::Property("loop-file".into(), "no".into(), false))
+            .unwrap();
+        assert!(!state.snapshot.loop_file);
     }
 
     #[test]

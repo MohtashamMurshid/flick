@@ -5,11 +5,13 @@ use super::{
     chrome_ui::{group, notice, row, section_title},
     *,
 };
+use crate::player_prefs::{ControlsChoice, MAX_VOLUMES, ReplayGain, SEEK_STEPS, ScreenshotFormat};
 use crate::{
-    shortcuts::{Shortcut, display},
+    shortcuts::{Preset, Shortcut, display},
     theme::{
-        ACCENTS, ContrastChoice, Fonts, MotionChoice, SUBTITLE_COLORS, SUBTITLE_POSITION,
-        SUBTITLE_SCALE, SchemeChoice, StyleChoice, SubtitleBackground, TEXT_SCALE,
+        ACCENTS, ContrastChoice, Fonts, MotionChoice, SUBTITLE_COLORS, SUBTITLE_OUTLINES,
+        SUBTITLE_POSITION, SUBTITLE_SCALE, SchemeChoice, StyleChoice, SubtitleBackground,
+        TEXT_SCALE,
     },
 };
 use gpui::{AnyElement, FontWeight, hsla, linear_color_stop, linear_gradient};
@@ -226,6 +228,35 @@ impl Flick {
                 this.set_appearance(|a| a.subtitles.background = background, window, cx)
             },
         );
+        let subtitle_outline = self.segmented(
+            "subtitle-outline",
+            &SUBTITLE_OUTLINES,
+            subtitles.outline,
+            cx,
+            |this, outline, window, cx| {
+                this.set_appearance(|a| a.subtitles.outline = outline, window, cx)
+            },
+        );
+        let subtitle_shadow = self.switch(
+            "subtitle-shadow",
+            subtitles.shadow,
+            cx,
+            |this, window, cx| {
+                this.set_appearance(|a| a.subtitles.shadow = !a.subtitles.shadow, window, cx)
+            },
+        );
+        let subtitle_override = self.switch(
+            "subtitle-override",
+            subtitles.override_styled,
+            cx,
+            |this, window, cx| {
+                this.set_appearance(
+                    |a| a.subtitles.override_styled = !a.subtitles.override_styled,
+                    window,
+                    cx,
+                )
+            },
+        );
         let raised = SUBTITLE_POSITION.1 - subtitles.position;
         let subtitle_position = h_flex()
             .gap_3()
@@ -317,7 +348,7 @@ impl Flick {
             .child(section_title(&t, "Playback"))
             .child(group(
                 &t,
-                vec![
+                [
                     row(
                         &t,
                         Some("eye-off"),
@@ -329,13 +360,20 @@ impl Flick {
                     row(
                         &t,
                         Some("play"),
-                        "Play next episode automatically",
-                        Some("Shows in your library continue after an 8-second countdown".into()),
+                        "Play the next video automatically",
+                        Some("The next episode or queued video starts after an 8-second countdown".into()),
                         autoplay,
                     )
                     .into_any_element(),
-                ],
+                ]
+                .into_iter()
+                .chain(self.playback_rows(cx))
+                .collect(),
             ))
+            .child(div().h(px(24.)))
+            .child(self.audio_settings(cx))
+            .child(div().h(px(24.)))
+            .child(self.screenshot_settings(cx))
             .child(div().h(px(24.)))
             .child(self.transfer_settings(cx))
             .child(div().h(px(24.)))
@@ -367,6 +405,36 @@ impl Flick {
                     .into_any_element(),
                     row(
                         &t,
+                        Some("captions"),
+                        "Font",
+                        Some("A font family for plain subtitles; press Return to apply".into()),
+                        div()
+                            .w(px(240.))
+                            .child(self.text_field(&self.preference_fields.subtitle_font, cx)),
+                    )
+                    .into_any_element(),
+                    row(&t, Some("captions"), "Outline", None, subtitle_outline).into_any_element(),
+                    row(&t, Some("captions"), "Shadow", None, subtitle_shadow).into_any_element(),
+                    row(
+                        &t,
+                        Some("captions"),
+                        "Restyle styled subtitles",
+                        Some("Use these settings for ASS subtitles with their own fonts and colors".into()),
+                        subtitle_override,
+                    )
+                    .into_any_element(),
+                    row(
+                        &t,
+                        Some("captions"),
+                        "Text encoding",
+                        Some("For older subtitle files, such as cp1256 or big5; empty detects it".into()),
+                        div()
+                            .w(px(240.))
+                            .child(self.text_field(&self.preference_fields.subtitle_encoding, cx)),
+                    )
+                    .into_any_element(),
+                    row(
+                        &t,
                         Some("search"),
                         "OpenSubtitles API key",
                         Some("Create a free key at opensubtitles.com to search from the player".into()),
@@ -386,6 +454,8 @@ impl Flick {
                 ],
             ))
             .child(div().h(px(24.)))
+            .child(self.advanced_settings(cx))
+            .child(div().h(px(24.)))
             .child(section_title(&t, "Setup"))
             .child(group(
                 &t,
@@ -402,6 +472,287 @@ impl Flick {
                     .into_any_element(),
                 ],
             ))
+    }
+
+    /// Playback rows from the player preferences: seeking, the queue, and
+    /// the controls' layout.
+    fn playback_rows(&self, cx: &Context<Self>) -> Vec<AnyElement> {
+        let t = cx.theme().clone();
+        let player = self.store.data.player.clone();
+        let queue = self.switch("queue-folder", player.queue_folder, cx, |this, _, cx| {
+            this.set_player(|p| p.queue_folder = !p.queue_folder, cx)
+        });
+        let steps: Vec<(u32, &'static str)> = SEEK_STEPS
+            .into_iter()
+            .zip(["5 s", "10 s", "15 s", "30 s"])
+            .collect();
+        let step = self.segmented(
+            "seek-step",
+            &steps,
+            player.seek_step,
+            cx,
+            |this, step, _, cx| this.set_player(|p| p.seek_step = step, cx),
+        );
+        let exact = self.switch("exact-seek", player.exact_seek, cx, |this, _, cx| {
+            this.set_player(|p| p.exact_seek = !p.exact_seek, cx)
+        });
+        let float = self.switch(
+            "float-while-playing",
+            player.float_while_playing,
+            cx,
+            |this, _, cx| this.set_player(|p| p.float_while_playing = !p.float_while_playing, cx),
+        );
+        let controls = self.segmented(
+            "controls-layout",
+            &[
+                (ControlsChoice::Style, "Match Style"),
+                (ControlsChoice::Floating, "Floating"),
+                (ControlsChoice::Bar, "Bar"),
+                (ControlsChoice::Compact, "Compact"),
+            ],
+            player.controls,
+            cx,
+            |this, controls, _, cx| this.set_player(|p| p.controls = controls, cx),
+        );
+        vec![
+            row(
+                &t,
+                Some("film"),
+                "Queue the rest of the folder",
+                Some("A video outside a show plays on into the next one in its folder".into()),
+                queue,
+            )
+            .into_any_element(),
+            row(&t, Some("rotate-cw"), "Arrow keys seek", None, step).into_any_element(),
+            row(
+                &t,
+                Some("rotate-cw"),
+                "Exact seeking",
+                Some("Off jumps to the nearest keyframe, which is faster on large files".into()),
+                exact,
+            )
+            .into_any_element(),
+            row(
+                &t,
+                Some("picture-in-picture"),
+                "Float on top while playing",
+                Some("The window stays above others until the video pauses or ends".into()),
+                float,
+            )
+            .into_any_element(),
+            row(
+                &t,
+                Some("sliders"),
+                "Player controls",
+                Some("Match Style uses the controls of the interface style".into()),
+                controls,
+            )
+            .into_any_element(),
+        ]
+    }
+
+    fn audio_settings(&self, cx: &Context<Self>) -> Div {
+        let t = cx.theme().clone();
+        let player = self.store.data.player.clone();
+        let volumes: Vec<(u32, &'static str)> = MAX_VOLUMES
+            .into_iter()
+            .zip(["100%", "150%", "200%"])
+            .collect();
+        let max_volume = self.segmented(
+            "max-volume",
+            &volumes,
+            player.max_volume,
+            cx,
+            |this, max, _, cx| this.set_player(|p| p.max_volume = max, cx),
+        );
+        let replaygain = self.segmented(
+            "replaygain",
+            &[
+                (ReplayGain::Off, "Off"),
+                (ReplayGain::Track, "Track"),
+                (ReplayGain::Album, "Album"),
+            ],
+            player.replaygain,
+            cx,
+            |this, gain, _, cx| this.set_player(|p| p.replaygain = gain, cx),
+        );
+        let mut rows = vec![
+            row(
+                &t,
+                Some("volume-2"),
+                "Maximum volume",
+                Some("Above 100% amplifies quiet videos and can distort loud ones".into()),
+                max_volume,
+            )
+            .into_any_element(),
+            row(
+                &t,
+                Some("audio-lines"),
+                "ReplayGain",
+                Some("Evens out loudness using the file's ReplayGain tags".into()),
+                replaygain,
+            )
+            .into_any_element(),
+            row(
+                &t,
+                Some("audio-lines"),
+                "Equalizer",
+                Some(
+                    format!(
+                        "{} · Change it in the player's audio menu",
+                        player.equalizer_preset().unwrap_or("Custom")
+                    )
+                    .into(),
+                ),
+                div(),
+            )
+            .into_any_element(),
+        ];
+        if cfg!(target_os = "macos") {
+            let spatial = self.switch("spatial-audio", player.spatial_audio, cx, |this, _, cx| {
+                this.set_player(|p| p.spatial_audio = !p.spatial_audio, cx)
+            });
+            rows.push(
+                row(
+                    &t,
+                    Some("audio-lines"),
+                    "Spatial Audio",
+                    Some("Plays through AVFoundation, for Spatial Audio with AirPods".into()),
+                    spatial,
+                )
+                .into_any_element(),
+            );
+        }
+        v_flex()
+            .child(section_title(&t, "Audio"))
+            .child(group(&t, rows))
+    }
+
+    fn screenshot_settings(&self, cx: &Context<Self>) -> Div {
+        let t = cx.theme().clone();
+        let player = self.store.data.player.clone();
+        let format = self.segmented(
+            "screenshot-format",
+            &[
+                (ScreenshotFormat::Png, "PNG"),
+                (ScreenshotFormat::Jpeg, "JPEG"),
+            ],
+            player.screenshot_format,
+            cx,
+            |this, format, _, cx| this.set_player(|p| p.screenshot_format = format, cx),
+        );
+        let subtitles = self.switch(
+            "screenshot-subtitles",
+            player.screenshot_subtitles,
+            cx,
+            |this, _, cx| this.set_player(|p| p.screenshot_subtitles = !p.screenshot_subtitles, cx),
+        );
+        let folder = player
+            .screenshot_folder
+            .clone()
+            .or_else(crate::screenshot::folder)
+            .map(|path| path.display().to_string())
+            .unwrap_or_default();
+        let custom = player.screenshot_folder.is_some();
+        let chooser = h_flex()
+            .gap_2()
+            .child(self.button(
+                "screenshot-folder",
+                Some("folder-open"),
+                "Choose…",
+                false,
+                cx,
+                |this, window, cx| this.choose_screenshot_folder(window, cx),
+            ))
+            .when(custom, |d| {
+                d.child(self.button(
+                    "screenshot-folder-default",
+                    None,
+                    "Use Default",
+                    false,
+                    cx,
+                    |this, _, cx| this.set_player(|p| p.screenshot_folder = None, cx),
+                ))
+            });
+        v_flex()
+            .child(section_title(&t, "Screenshots"))
+            .child(group(
+                &t,
+                vec![
+                    row(&t, Some("camera"), "Format", None, format).into_any_element(),
+                    row(&t, Some("captions"), "Include subtitles", None, subtitles)
+                        .into_any_element(),
+                    row(
+                        &t,
+                        Some("folder-open"),
+                        "Folder",
+                        Some(folder.into()),
+                        chooser,
+                    )
+                    .into_any_element(),
+                ],
+            ))
+    }
+
+    fn advanced_settings(&self, cx: &Context<Self>) -> Div {
+        let t = cx.theme().clone();
+        let field = |input| div().w(px(280.)).child(self.text_field(input, cx));
+        let fields = &self.preference_fields;
+        v_flex()
+            .child(section_title(&t, "Advanced"))
+            .child(
+                div()
+                    .mb_2()
+                    .text_size(t.font(t.text_size - 1.))
+                    .text_color(t.muted)
+                    .child("Filters use mpv's syntax and apply to every video. Press Return in a field to apply it."),
+            )
+            .child(group(
+                &t,
+                vec![
+                    row(&t, Some("sliders"), "Video filters", None, field(&fields.video_filters))
+                        .into_any_element(),
+                    row(&t, Some("audio-lines"), "Audio filters", None, field(&fields.audio_filters))
+                        .into_any_element(),
+                    row(
+                        &t,
+                        Some("keyboard"),
+                        "mpv options",
+                        Some("Set after Flick's own, such as interpolation=yes; video-sync=display-resample".into()),
+                        field(&fields.mpv_options),
+                    )
+                    .into_any_element(),
+                    row(
+                        &t,
+                        Some("info"),
+                        "Log file",
+                        Some("Flick's and libmpv's messages, for reporting a problem".into()),
+                        self.button("show-log", Some("folder-open"), "Show Log", false, cx, |this, _, cx| {
+                            this.show_log(cx)
+                        }),
+                    )
+                    .into_any_element(),
+                ],
+            ))
+    }
+
+    fn choose_screenshot_folder(&mut self, window: &Window, cx: &mut Context<Self>) {
+        let receiver = cx.prompt_for_paths(PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some("Save screenshots here".into()),
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            if let Ok(Ok(Some(paths))) = receiver.await
+                && let Some(path) = paths.into_iter().next()
+            {
+                let _ = this.update_in(cx, |this, _, cx| {
+                    this.set_player(|p| p.screenshot_folder = Some(path), cx)
+                });
+            }
+        })
+        .detach();
     }
 
     fn transfer_settings(&self, cx: &Context<Self>) -> Div {
@@ -1287,6 +1638,38 @@ impl Flick {
                         ))
                     }),
             )
+            .child(group(
+                &t,
+                vec![
+                    row(
+                        &t,
+                        Some("keyboard"),
+                        "Keys like",
+                        Some(
+                            "Replaces every player key with that player's; change any afterwards"
+                                .into(),
+                        ),
+                        self.segmented(
+                            "key-preset",
+                            &[
+                                (Preset::Flick, "Flick"),
+                                (Preset::Mpv, "mpv and IINA"),
+                                (Preset::Vlc, "VLC"),
+                            ],
+                            Preset::of(bindings),
+                            cx,
+                            |this, preset, _, cx| {
+                                this.store.data.shortcuts = preset.bindings();
+                                this.capturing = None;
+                                this.persist();
+                                cx.notify();
+                            },
+                        ),
+                    )
+                    .into_any_element(),
+                ],
+            ))
+            .child(div().h(px(16.)))
             .child(section_title(&t, "Player"))
             .child(group(&t, rows))
             .child(div().h(px(24.)))

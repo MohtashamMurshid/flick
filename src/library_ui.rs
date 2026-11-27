@@ -1973,6 +1973,29 @@ impl Flick {
             "Play",
             Rc::new(move |this, w, cx| this.open(p.clone(), w, cx)),
         ));
+        // While a local video plays, this one can follow it.
+        if self.path.as_ref().is_some_and(|playing| *playing != path) {
+            let p = path.clone();
+            items.push((
+                "list",
+                "Play Next",
+                Rc::new(move |this, _, cx| {
+                    this.queue.play_next(&p);
+                    this.show_status("Plays next");
+                    cx.notify();
+                }),
+            ));
+            let p = path.clone();
+            items.push((
+                "list",
+                "Add to Queue",
+                Rc::new(move |this, _, cx| {
+                    this.queue.add(&p);
+                    this.show_status("Added to the queue");
+                    cx.notify();
+                }),
+            ));
+        }
         let p = path.clone();
         items.push((
             "folder-open",

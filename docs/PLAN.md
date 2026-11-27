@@ -154,6 +154,20 @@ The design and checkboxes are in [the remote library polish plan](REMOTE_POLISH_
 
 State on 2026-11-11 at `981d26a`: implemented. Loopback tests, the desktop typecheck and unit tests, and `curl` against the launchd server on a real Tailscale address pass. Review fixes are in flight, and nothing has been used from a second machine. See [validation](VALIDATION.md#remote-library-polish-on-2026-11-11).
 
+### 11. IINA parity
+
+[IINA parity](IINA_PARITY.md) compares Flick's player with IINA 1.5.1 area by area.
+
+- [x] 38. Keep the display awake while a video plays. libmpv's render API leaves this to the application, and nothing did it. macOS holds an IOKit assertion, Windows sets the thread execution state, and Linux asks `org.freedesktop.ScreenSaver`.
+- [x] 39. Fix the abort on videos with rotation metadata, in libmpv's `mp_image_crop`, which also hit the poster worker. Players run with `video-rotate=no`, and a `transpose` filter from `demux-rotation` turns the picture.
+- [x] 40. Subtitles: delay, automatic loading of matching files, a second track, font, outline, shadow, ASS override, and encoding. Audio: external files, output devices, a 10-band equalizer with presets, ReplayGain, volume up to 200%, and Spatial Audio output on macOS.
+- [x] 41. Video: a panel for aspect ratio, crop presets, rotation, flip, mirror, deinterlace, and color, as FFmpeg filters because the software renderer has no equalizer or rotation; custom video and audio filters; screenshots to a file or the clipboard; Live Text on macOS; and media information.
+- [x] 42. Playback: repeat, a speed menu to 16×, the seek step and exact seeking, going to a typed time, scrolling for volume and seeking, and a queue of the show or folder with chapters, Play Next, Add to Queue, reordering, shuffle, and repeat all.
+- [x] 43. System: media keys and Now Playing (MediaPlayer, the System Media Transport Controls, MPRIS), the macOS menu bar, float on top and float while playing, window sizes, streaming web links and `flick://open?url=` links, mpv and VLC keymaps, a choice of controls, extra mpv options, and log files.
+- [ ] 44. Not planned, with reasons in [IINA parity](IINA_PARITY.md): HDR until native GPU presentation (item 13), several player windows, pinch gestures (GPUI has none), plugins, translations, gapless audio, a music library, and the Touch Bar.
+
+State on 2026-11-28: items 38 to 43 pass the `runtime-shaders` typecheck and unit tests, and their libmpv parts pass real libmpv tests; the display hold, float while playing, the queue, subtitle loading, and the rotated-video fix were also seen in the running app. The panels were not seen on screen. See [validation](VALIDATION.md#iina-parity-player-features-on-2026-11-28).
+
 Watch folders, remote control of the player, accounts, cloud storage, casting, and a general NDJSON agent interface are outside the first release. Search belongs in the library workflow.
 
 ## Existing prototype
