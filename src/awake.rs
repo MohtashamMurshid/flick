@@ -9,9 +9,10 @@
 //!
 //! macOS uses an IOKit power assertion, shown by `pmset -g assertions`.
 //! Windows sets the UI thread's execution state, so [`DisplayAwake`] must
-//! stay on the thread that created it. Linux has no implementation yet:
-//! its screensaver inhibitors are D-Bus calls that last only while the
-//! connection that made them stays open.
+//! stay on the thread that created it. Linux asks the desktop's
+//! `org.freedesktop.ScreenSaver` service, which GNOME, KDE, and Xfce
+//! provide, and keeps the D-Bus connection open, because an inhibition ends
+//! with the connection that made it.
 
 /// What the assertion is called where the system lists it.
 const REASON: &str = "Flick is playing a video";
@@ -158,13 +159,54 @@ mod platform {
     }
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+#[cfg(target_os = "linux")]
+mod platform {
+    use anyhow::Result;
+    use zbus::blocking::Connection;
+
+    const SERVICE: &str = "org.freedesktop.ScreenSaver";
+    const PATH: &str = "/org/freedesktop/ScreenSaver";
+
+    pub struct Hold {
+        connection: Connection,
+        cookie: u32,
+    }
+
+    impl Hold {
+        pub fn acquire(reason: &str) -> Result<Self> {
+            let connection = Connection::session()?;
+            let reply = connection.call_method(
+                Some(SERVICE),
+                PATH,
+                Some(SERVICE),
+                "Inhibit",
+                &("Flick", reason),
+            )?;
+            let cookie: u32 = reply.body().deserialize()?;
+            Ok(Self { connection, cookie })
+        }
+    }
+
+    impl Drop for Hold {
+        fn drop(&mut self) {
+            let _ = self.connection.call_method(
+                Some(SERVICE),
+                PATH,
+                Some(SERVICE),
+                "UnInhibit",
+                &(self.cookie,),
+            );
+        }
+    }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
 mod platform {
     pub struct Hold;
 
     impl Hold {
         pub fn acquire(_reason: &str) -> anyhow::Result<Self> {
-            anyhow::bail!("not supported on this platform yet")
+            anyhow::bail!("not supported on this platform")
         }
     }
 }
@@ -213,7 +255,21 @@ mod tests {
         assert!(!awake.holding());
     }
 
-    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    /// Without a session bus or screensaver service, as in CI and in
+    /// containers, it tries once and plays on.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_without_a_screensaver_service_tries_once() {
+        if std::env::var_os("DBUS_SESSION_BUS_ADDRESS").is_some() {
+            return;
+        }
+        let mut awake = DisplayAwake::default();
+        awake.set(true);
+        assert!(!awake.holding());
+        assert!(awake.failed);
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
     #[test]
     fn unsupported_platforms_try_once() {
         let mut awake = DisplayAwake::default();

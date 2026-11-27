@@ -7,7 +7,7 @@ use super::{
 };
 use crate::player_prefs::{ControlsChoice, MAX_VOLUMES, ReplayGain, SEEK_STEPS, ScreenshotFormat};
 use crate::{
-    shortcuts::{Shortcut, display},
+    shortcuts::{Preset, Shortcut, display},
     theme::{
         ACCENTS, ContrastChoice, Fonts, MotionChoice, SUBTITLE_COLORS, SUBTITLE_OUTLINES,
         SUBTITLE_POSITION, SUBTITLE_SCALE, SchemeChoice, StyleChoice, SubtitleBackground,
@@ -1624,6 +1624,38 @@ impl Flick {
                         ))
                     }),
             )
+            .child(group(
+                &t,
+                vec![
+                    row(
+                        &t,
+                        Some("keyboard"),
+                        "Keys like",
+                        Some(
+                            "Replaces every player key with that player's; change any afterwards"
+                                .into(),
+                        ),
+                        self.segmented(
+                            "key-preset",
+                            &[
+                                (Preset::Flick, "Flick"),
+                                (Preset::Mpv, "mpv and IINA"),
+                                (Preset::Vlc, "VLC"),
+                            ],
+                            Preset::of(bindings),
+                            cx,
+                            |this, preset, _, cx| {
+                                this.store.data.shortcuts = preset.bindings();
+                                this.capturing = None;
+                                this.persist();
+                                cx.notify();
+                            },
+                        ),
+                    )
+                    .into_any_element(),
+                ],
+            ))
+            .child(div().h(px(16.)))
             .child(section_title(&t, "Player"))
             .child(group(&t, rows))
             .child(div().h(px(24.)))

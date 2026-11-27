@@ -28,6 +28,8 @@ pub(super) struct Palette {
 #[derive(Clone)]
 enum Action {
     Play(PathBuf),
+    /// Play the typed web link without downloading it.
+    Stream,
     Player,
     Link,
     /// The typed link, on this paired server.
@@ -121,6 +123,17 @@ impl Flick {
         }
         if let Some(link) = flick::fetch::web_link(&query) {
             let page = matches!(link, Ok(flick::fetch::WebLink::Page(_)));
+            if let Ok(link) = &link {
+                items.push(Item {
+                    section: "Play",
+                    icon: "play",
+                    title: "Play without downloading".into(),
+                    detail: Some(format!("Stream from {}", link.site()).into()),
+                    keys: None,
+                    verb: "Play",
+                    action: Action::Stream,
+                });
+            }
             let (title, detail) = match link {
                 Ok(link @ flick::fetch::WebLink::Archive(_)) => (
                     format!("Download from {}", link.site()),
@@ -473,6 +486,7 @@ impl Flick {
         self.close_palette(window, cx);
         match item.action {
             Action::Play(path) => self.open(path, window, cx),
+            Action::Stream => self.open_stream(query.clone(), window, cx),
             Action::Player => {
                 if self.source().is_some() {
                     self.entered_player = Instant::now();

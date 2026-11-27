@@ -456,6 +456,17 @@ write_info_plist() {
 	<string>Flick plays and shares the videos you choose.</string>
 	<key>NSLocalNetworkUsageDescription</key>
 	<string>Flick connects to peers and forwards its sharing port on your local network.</string>
+	<key>CFBundleURLTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleURLName</key>
+			<string>Flick link</string>
+			<key>CFBundleURLSchemes</key>
+			<array>
+				<string>flick</string>
+			</array>
+		</dict>
+	</array>
 	<key>CFBundleDocumentTypes</key>
 	<array>
 		<dict>

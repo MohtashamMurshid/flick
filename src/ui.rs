@@ -287,6 +287,10 @@ enum Control {
     Mute,
     Quieter,
     Louder,
+    /// Keep the window above others.
+    FloatOnTop,
+    /// Size the window to this multiple of the video; 0 fits the screen.
+    WindowSize(f32),
     /// Open the speed menu.
     Speed,
     Info,
@@ -442,6 +446,10 @@ pub struct Flick {
     audio_output: Option<&'static str>,
     /// What plays next.
     queue: crate::queue::Queue,
+    /// The window floats above others.
+    floating: bool,
+    /// Media keys and the system's Now Playing controls.
+    now_playing: crate::now_playing::NowPlaying,
     /// Scrolling on the video not yet turned into volume or seeking: whether
     /// it was horizontal, and its pixels.
     scroll_pending: (bool, f32),
@@ -732,6 +740,10 @@ impl Flick {
             audio_output: None,
             scroll_pending: (false, 0.),
             queue: Default::default(),
+            floating: false,
+            now_playing: crate::now_playing::NowPlaying::new(crate::window_ext::win32_handle(
+                window,
+            )),
             slider_bounds: RefCell::default(),
             dragging_slider: None,
             card_menu: None,
@@ -1179,6 +1191,38 @@ impl Flick {
         cx.notify();
     }
 
+    /// Plays a web link without downloading it: libmpv opens direct video
+    /// links itself and pages through yt-dlp, found where link downloads
+    /// look for it.
+    pub(crate) fn open_stream(&mut self, url: String, window: &mut Window, cx: &mut Context<Self>) {
+        if self.quitting {
+            return;
+        }
+        let title = match flick::fetch::web_link(&url) {
+            Some(Ok(link)) => format!("{} video", link.site()),
+            _ => url.clone(),
+        };
+        self.persist();
+        let Some(player) = &self.player else {
+            return;
+        };
+        set_network_profile(player, None);
+        if let Ok(tools) = flick::fetch::ytdlp::Tools::discover()
+            && let Some(path) = tools.ytdlp.to_str()
+        {
+            let _ =
+                player.set_optional_property("script-opts", &format!("ytdl_hook-ytdl_path={path}"));
+        }
+        match player.load(&url) {
+            Ok(()) => {
+                self.begin_playback(Source::Stream { url, title }, 0., true, window, cx);
+                self.show_status("Streaming; nothing is saved");
+            }
+            Err(error) => self.error = Some(format!("Could not play this link. {error:#}")),
+        }
+        cx.notify();
+    }
+
     /// Plays a video from a paired remote library. Resumes where it was
     /// left, under the same rules as local files.
     pub(crate) fn open_remote(
@@ -1532,6 +1576,167 @@ impl Flick {
             .as_ref()
             .map(|player| player.audio_devices())
             .unwrap_or_default()
+    }
+
+    /// Runs media key and Now Playing commands, and shows the playing video
+    /// there.
+    fn follow_media_keys(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        use crate::now_playing::RemoteCommand as R;
+        let watching = self.file_loaded && (self.view == View::Player || self.pip.is_some());
+        for command in self.now_playing.take() {
+            if !watching {
+                break;
+            }
+            match command {
+                R::Play if !self.playing() => self.handle(Control::Play, window, cx),
+                R::Pause if self.playing() => self.handle(Control::Play, window, cx),
+                R::Play | R::Pause => {}
+                R::TogglePlayPause => self.handle(Control::Play, window, cx),
+                R::Next => self.shortcut(Shortcut::NextEpisode, window, cx),
+                R::Previous => self.shortcut(Shortcut::PreviousEpisode, window, cx),
+                R::SeekTo(seconds) => self.handle(Control::SeekTo(seconds), window, cx),
+                R::SeekBy(delta) => {
+                    let target = seek_target(self.snapshot.position, delta, self.snapshot.duration);
+                    self.handle(Control::SeekTo(target), window, cx);
+                }
+            }
+        }
+        let info = (watching && self.source().is_some()).then(|| crate::now_playing::Info {
+            title: self.source().map(Source::title).unwrap_or_default(),
+            duration: self.snapshot.duration,
+            position: self.snapshot.position,
+            speed: self.snapshot.speed,
+            playing: self.playing(),
+        });
+        self.now_playing.update(info);
+    }
+
+    /// Sizes the window to `factor` of the video's own size, or to fit the
+    /// screen with 0, as IINA's Half, Actual, and Double Size do.
+    fn size_window(&mut self, factor: f32, window: &mut Window, cx: &mut Context<Self>) {
+        if window.is_fullscreen() {
+            self.show_status("Leave fullscreen to resize the window");
+            cx.notify();
+            return;
+        }
+        let Some(video) = self
+            .player
+            .as_ref()
+            .and_then(|player| player.display_size())
+        else {
+            self.show_status("Play a video to size the window to it");
+            cx.notify();
+            return;
+        };
+        let room = window
+            .display(cx)
+            .map(|display| {
+                let size = display.bounds().size;
+                (f32::from(size.width) * 0.9, f32::from(size.height) * 0.85)
+            })
+            .unwrap_or((1280., 720.));
+        let (width, height) = crate::window_ext::window_size(
+            video,
+            factor,
+            window.scale_factor(),
+            room,
+            (760., 500.),
+        );
+        window.resize(gpui::size(px(width), px(height)));
+        cx.notify();
+    }
+
+    /// A menu bar command. Panels open in the player, returning to it from
+    /// the library while a video is loaded.
+    pub(crate) fn menu_command(
+        &mut self,
+        command: crate::menus::Command,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        use crate::menus::Command as M;
+        if self.quitting {
+            return;
+        }
+        let panel = matches!(
+            command,
+            M::ShowQueue
+                | M::VideoAdjustments
+                | M::MediaInfo
+                | M::Equalizer
+                | M::AudioTracks
+                | M::SubtitleTracks
+        );
+        if panel && self.view != View::Player && self.source().is_some() {
+            self.entered_player = Instant::now();
+            self.view = View::Player;
+        }
+        let control = match command {
+            M::OpenVideo => Control::Open,
+            M::AddVideos => Control::AddVideos,
+            M::AddFolder => Control::AddFolder,
+            M::PasteLink => Control::PasteMagnet,
+            M::PlayPause => Control::Play,
+            M::SeekBack => Control::Back,
+            M::SeekForward => Control::Forward,
+            M::Slower => Control::Shortcut(Shortcut::SpeedDown),
+            M::Faster => Control::Shortcut(Shortcut::SpeedUp),
+            M::NormalSpeed => Control::Shortcut(Shortcut::SpeedReset),
+            M::PreviousChapter => Control::Shortcut(Shortcut::PreviousChapter),
+            M::NextChapter => Control::Shortcut(Shortcut::NextChapter),
+            M::PreviousVideo => Control::Shortcut(Shortcut::PreviousEpisode),
+            M::NextVideo => Control::Shortcut(Shortcut::NextEpisode),
+            M::Repeat => Control::Shortcut(Shortcut::LoopFile),
+            M::AbLoop => Control::Shortcut(Shortcut::LoopAb),
+            M::ShowQueue => Control::Queue,
+            M::Fullscreen => Control::Fullscreen,
+            M::PictureInPicture => Control::Pip,
+            M::FloatOnTop => Control::FloatOnTop,
+            M::HalfSize => Control::WindowSize(0.5),
+            M::ActualSize => Control::WindowSize(1.),
+            M::DoubleSize => Control::WindowSize(2.),
+            M::FitToScreen => Control::WindowSize(0.),
+            M::VideoAdjustments => Control::Video,
+            M::Screenshot => Control::Shortcut(Shortcut::Screenshot),
+            M::CopyFrame => Control::Shortcut(Shortcut::CopyScreenshot),
+            M::MediaInfo => Control::Info,
+            M::PreviousFrame => Control::Shortcut(Shortcut::FrameBack),
+            M::NextFrame => Control::Shortcut(Shortcut::FrameForward),
+            M::Mute => Control::Mute,
+            M::VolumeUp => Control::Louder,
+            M::VolumeDown => Control::Quieter,
+            M::AudioEarlier => Control::Shortcut(Shortcut::AudioDelayDown),
+            M::AudioLater => Control::Shortcut(Shortcut::AudioDelayUp),
+            M::LoadAudio => Control::AudioFile,
+            M::Equalizer => Control::Equalizer,
+            M::AudioTracks | M::SubtitleTracks => Control::Tracks,
+            M::LoadSubtitles => Control::Subtitle,
+            M::SubtitlesEarlier => Control::Shortcut(Shortcut::SubtitleDelayDown),
+            M::SubtitlesLater => Control::Shortcut(Shortcut::SubtitleDelayUp),
+            M::Settings => return self.show_page(Page::Settings, window, cx),
+            M::FindSubtitles => {
+                if self.view != View::Player && self.source().is_some() {
+                    self.view = View::Player;
+                }
+                return self.find_subtitles(window, cx);
+            }
+            M::OpenUrl | M::GoToTime => {
+                if self.palette.is_none() {
+                    self.toggle_palette(window, cx);
+                }
+                self.show_status(if command == M::GoToTime {
+                    "Type a time, such as 12:34"
+                } else {
+                    "Paste a video link to play or download it"
+                });
+                return;
+            }
+            M::KeyboardShortcuts if self.view != View::Player => {
+                return self.show_page(Page::Shortcuts, window, cx);
+            }
+            M::KeyboardShortcuts => Control::Keys,
+        };
+        self.handle(control, window, cx);
     }
 
     /// Shows Flick's log file in the file manager.
@@ -2088,6 +2293,11 @@ impl Flick {
             self.remote_ui.copied = None;
             cx.notify();
         }
+        let streams =
+            std::mem::take(&mut *STREAM_REQUESTS.lock().unwrap_or_else(|e| e.into_inner()));
+        if let Some(url) = streams.into_iter().last() {
+            self.open_stream(url, window, cx);
+        }
         let requested =
             std::mem::take(&mut *OPEN_REQUESTS.lock().unwrap_or_else(|e| e.into_inner()));
         let mut requested = requested.into_iter();
@@ -2239,6 +2449,7 @@ impl Flick {
             self.file_rotation = rotation;
             self.apply_picture(cx);
         }
+        self.follow_media_keys(window, cx);
         let ended = self.snapshot.eof && self.file_loaded;
         if ended && !self.was_eof {
             self.up_next = self
@@ -2518,6 +2729,22 @@ impl Flick {
                 self.show_status(format!("{speed}×"));
             }
             Control::Fullscreen => window.toggle_fullscreen(),
+            Control::FloatOnTop => {
+                let on = !self.floating;
+                match crate::window_ext::set_floating(window, on) {
+                    Ok(()) => {
+                        self.floating = on;
+                        self.show_status(if on {
+                            "Floating on top"
+                        } else {
+                            "Not floating"
+                        });
+                    }
+                    Err(error) => self.error = Some(format!("{error:#}")),
+                }
+                cx.notify();
+            }
+            Control::WindowSize(factor) => self.size_window(factor, window, cx),
             Control::Pip => self.toggle_pip(window, cx),
             Control::DismissError => {
                 self.error = None;
@@ -2732,6 +2959,7 @@ impl Flick {
                     .unwrap_or_else(|| "subtitles".into()),
             ),
             Some(Source::Remote(remote)) => (fallback.clone(), remote.video_id.clone()),
+            Some(Source::Stream { .. }) => (fallback.clone(), "stream".to_owned()),
             None => return,
         };
         self.subtitle_search.downloading = Some(result.file_id);
@@ -3111,13 +3339,35 @@ fn visible_poster_candidates(
 /// Open With, waiting for the window.
 static OPEN_REQUESTS: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
 
-/// Queues `file://` URLs (and magnet links) from the platform.
+static STREAM_REQUESTS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+/// Queues `file://` URLs (and magnet links) from the platform, and web
+/// links to play from `flick://open?url=` links.
 pub fn queue_open_urls(urls: Vec<String>) {
-    let paths = urls.into_iter().filter_map(|url| url_path(&url));
+    let (streams, files): (Vec<_>, Vec<_>) = urls
+        .into_iter()
+        .partition(|url| url.to_ascii_lowercase().starts_with("flick:"));
+    STREAM_REQUESTS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .extend(streams.iter().filter_map(|url| stream_url(url)));
     OPEN_REQUESTS
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .extend(paths);
+        .extend(files.iter().filter_map(|url| url_path(url)));
+}
+
+/// The web link in `flick://open?url=<link>`, from a browser bookmarklet or
+/// another app, as IINA's `iina://` links work. Only `http` and `https`
+/// links are played, and only by loading them; nothing else is accepted.
+fn stream_url(url: &str) -> Option<String> {
+    let url = reqwest::Url::parse(url).ok()?;
+    if url.scheme() != "flick" || url.host_str() != Some("open") {
+        return None;
+    }
+    let (_, link) = url.query_pairs().find(|(key, _)| key == "url")?;
+    let link = reqwest::Url::parse(&link).ok()?;
+    matches!(link.scheme(), "http" | "https").then(|| link.to_string())
 }
 
 fn url_path(url: &str) -> Option<PathBuf> {
@@ -3169,6 +3419,7 @@ fn same_video(a: &Source, b: &Source) -> bool {
         (Source::Remote(a), Source::Remote(b)) => {
             a.server_id == b.server_id && a.video_id == b.video_id
         }
+        (Source::Stream { url: a, .. }, Source::Stream { url: b, .. }) => a == b,
         _ => false,
     }
 }
@@ -3383,6 +3634,29 @@ mod tests {
         );
         assert_eq!(url_path("https://example.com/a.mp4"), None);
         assert_eq!(url_path("file:///bad%2"), None);
+    }
+
+    #[test]
+    fn flick_links_play_only_web_links() {
+        assert_eq!(
+            stream_url("flick://open?url=https%3A%2F%2Fwww.youtube.com%2Fwatch%3Fv%3Dabc"),
+            Some("https://www.youtube.com/watch?v=abc".to_owned())
+        );
+        assert_eq!(
+            stream_url("flick://open?url=http://example.com/a.mp4"),
+            Some("http://example.com/a.mp4".to_owned())
+        );
+        for refused in [
+            "flick://open?url=file:///etc/passwd",
+            "flick://open?url=av://lavfi:anullsrc",
+            "flick://open?url=",
+            "flick://open",
+            "flick://delete?url=https://example.com",
+            "https://example.com",
+            "flick://open?url=not a url",
+        ] {
+            assert_eq!(stream_url(refused), None, "{refused}");
+        }
     }
 
     #[test]

@@ -4,8 +4,10 @@ mod benchmark;
 mod input;
 mod library_files;
 mod logs;
+mod menus;
 mod model;
 mod notify;
+mod now_playing;
 mod playback;
 mod playback_actor;
 mod player_prefs;
@@ -27,13 +29,13 @@ mod thumbnails;
 mod ui;
 mod video_adjust;
 mod video_frame_ui;
+mod window_ext;
 
 use gpui::{
-    App, AppContext, Application, Bounds, KeyBinding, Menu, MenuItem, WindowBackgroundAppearance,
-    WindowBounds, WindowDecorations, WindowOptions, actions, point, px, size,
+    App, AppContext, Application, Bounds, KeyBinding, WindowBackgroundAppearance, WindowBounds,
+    WindowDecorations, WindowOptions, point, px, size,
 };
-
-actions!(flick, [Quit]);
+use menus::Quit;
 use std::path::PathBuf;
 
 fn main() -> anyhow::Result<()> {
@@ -83,11 +85,9 @@ fn main() -> anyhow::Result<()> {
         // before native quit closes the window and saves playback position.
         cx.on_action(|_: &Quit, cx| shutdown::request(cx));
         cx.bind_keys([KeyBinding::new("secondary-q", Quit, None)]);
-        // macOS shows Quit in the app menu, where people look for it.
-        cx.set_menus(vec![Menu {
-            name: "Flick".into(),
-            items: vec![MenuItem::action("Quit Flick", Quit)],
-        }]);
+        // macOS shows Quit in the app menu, where people look for it, beside
+        // the player's own menus.
+        menus::init(cx);
         if let Err(error) =
             cx.text_system()
                 .add_fonts(vec![std::borrow::Cow::Borrowed(include_bytes!(
@@ -141,6 +141,7 @@ fn main() -> anyhow::Result<()> {
         match cx.open_window(options, |window, cx| {
             let root = cx.new(|cx| ui::Flick::new(path, window, cx));
             shutdown::set_root(root.downgrade(), cx);
+            menus::set_target(root.downgrade(), window.window_handle(), cx);
             root
         }) {
             Ok(_) => cx.activate(true),

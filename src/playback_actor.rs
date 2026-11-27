@@ -94,6 +94,7 @@ struct Facts {
     dropped_frames: Option<u64>,
     media: Vec<(&'static str, String)>,
     audio_devices: (Vec<crate::playback::AudioDevice>, String),
+    display_size: Option<(u32, u32)>,
 }
 
 struct Event {
@@ -403,6 +404,11 @@ impl PlayerProxy {
     /// The media information panel's rows, read once a second.
     pub fn media_rows(&self) -> Vec<(&'static str, String)> {
         self.shared.lock().facts.media.clone()
+    }
+
+    /// The picture's size after filters, read once a second.
+    pub fn display_size(&self) -> Option<(u32, u32)> {
+        self.shared.lock().facts.display_size
     }
 
     /// Audio outputs and the one in use, read once a second.
@@ -973,6 +979,7 @@ fn run(
                 dropped_frames: player.dropped_frames(),
                 media: player.media_rows(),
                 audio_devices: player.audio_devices(),
+                display_size: player.display_size(),
             };
             let mut state = shared.lock();
             if !state.queue.stopped && active_request == state.requested {

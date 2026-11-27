@@ -2147,6 +2147,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
+ "block2",
  "clap",
  "directories",
  "fs2",
@@ -2159,6 +2160,8 @@ dependencies = [
  "librqbit",
  "librqbit-bencode",
  "notify",
+ "objc2",
+ "raw-window-handle",
  "reqwest",
  "serde",
  "serde_json",
@@ -2172,6 +2175,7 @@ dependencies = [
  "unicode-segmentation",
  "windows 0.61.3",
  "windows-core 0.61.2",
+ "zbus",
 ]
 
 [[package]]

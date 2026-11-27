@@ -257,6 +257,80 @@ impl Bindings {
     }
 }
 
+/// Starting keymaps, as IINA offers mpv's and other players' keys. A preset
+/// replaces every binding; changes after that are the user's own.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Preset {
+    Flick,
+    /// mpv's own keys, which IINA's default keymap follows.
+    Mpv,
+    /// Keys familiar from VLC.
+    Vlc,
+    /// Bindings that match no preset.
+    Custom,
+}
+
+impl Preset {
+    fn changes(self) -> &'static [(Shortcut, &'static str)] {
+        use Shortcut::*;
+        match self {
+            Self::Flick | Self::Custom => &[],
+            Self::Mpv => &[
+                (ShuttleBack, ""),
+                (ShuttlePause, ""),
+                (ShuttleForward, ""),
+                (PreviousEpisode, "<"),
+                (NextEpisode, ">"),
+                (LoopAb, "l"),
+                (AudioDelayDown, "ctrl--"),
+                (AudioDelayUp, "ctrl-="),
+                (SpeedDown, "["),
+                (SpeedUp, "]"),
+            ],
+            Self::Vlc => &[
+                (VolumeUp, "ctrl-up"),
+                (VolumeDown, "ctrl-down"),
+                (PictureInPicture, ""),
+                (FrameBack, ""),
+                (FrameForward, "e"),
+                (ShuttleBack, ""),
+                (ShuttlePause, ""),
+                (ShuttleForward, ""),
+                (PreviousEpisode, "p"),
+                (NextEpisode, "n"),
+                (LoopFile, "l"),
+                (LoopAb, "shift-l"),
+                (AudioDelayDown, "j"),
+                (AudioDelayUp, "k"),
+                (SubtitleDelayDown, "g"),
+                (SubtitleDelayUp, "h"),
+                (Screenshot, "shift-s"),
+                (CopyScreenshot, ""),
+                (SpeedDown, "-"),
+                (SpeedUp, "+"),
+                (SpeedReset, "="),
+                (MediaInfo, "ctrl-i"),
+            ],
+        }
+    }
+
+    pub fn bindings(self) -> Bindings {
+        let mut bindings = Bindings::default();
+        for (shortcut, key) in self.changes() {
+            bindings.set(*shortcut, key);
+        }
+        bindings
+    }
+
+    /// The preset `bindings` are, or Custom.
+    pub fn of(bindings: &Bindings) -> Self {
+        [Self::Flick, Self::Mpv, Self::Vlc]
+            .into_iter()
+            .find(|preset| preset.bindings() == *bindings)
+            .unwrap_or(Self::Custom)
+    }
+}
+
 /// A keystroke in binding form: modifiers then key, joined by `-`.
 pub fn normalize(keystroke: &Keystroke) -> String {
     let key = keystroke.key.as_str();
@@ -462,6 +536,34 @@ mod tests {
         assert_eq!(display("pagedown"), "Page Down");
         assert_eq!(display(""), "Not set");
         assert_eq!(display("-"), "-");
+    }
+
+    #[test]
+    fn presets_have_one_key_per_action_and_no_reserved_keys() {
+        for preset in [Preset::Flick, Preset::Mpv, Preset::Vlc] {
+            let bindings = preset.bindings();
+            let mut seen = std::collections::HashSet::new();
+            for shortcut in Shortcut::ALL {
+                let key = bindings.binding(shortcut);
+                if key.is_empty() {
+                    continue;
+                }
+                assert!(seen.insert(key.to_owned()), "{preset:?} binds {key} twice");
+                assert!(!reserved(key), "{preset:?} binds reserved {key}");
+            }
+            let mut sanitized = bindings.clone();
+            sanitized.sanitize();
+            assert_eq!(sanitized, bindings, "{preset:?}");
+            assert_eq!(Preset::of(&bindings), preset);
+        }
+        assert_eq!(Preset::Mpv.bindings().lookup("l"), Some(Shortcut::LoopAb));
+        assert_eq!(
+            Preset::Vlc.bindings().lookup("n"),
+            Some(Shortcut::NextEpisode)
+        );
+        let mut custom = Preset::Mpv.bindings();
+        custom.assign(Shortcut::Mute, "shift-m").unwrap();
+        assert_eq!(Preset::of(&custom), Preset::Custom);
     }
 
     #[test]
