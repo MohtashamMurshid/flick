@@ -46,6 +46,9 @@ embedded_icons!(
     "eye-off",
     "magnet",
     "picture-in-picture",
+    "sliders",
+    "camera",
+    "repeat",
 );
 
 pub struct Assets;

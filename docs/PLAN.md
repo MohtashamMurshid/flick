@@ -154,6 +154,20 @@ The design and checkboxes are in [the remote library polish plan](REMOTE_POLISH_
 
 State on 2026-11-11 at `981d26a`: implemented. Loopback tests, the desktop typecheck and unit tests, and `curl` against the launchd server on a real Tailscale address pass. Review fixes are in flight, and nothing has been used from a second machine. See [validation](VALIDATION.md#remote-library-polish-on-2026-11-11).
 
+### 11. IINA parity
+
+[IINA parity](IINA_PARITY.md) compares Flick's player with IINA 1.5.1 area by area and orders the remaining gaps.
+
+- [x] 38. Keep the display awake while a video plays. libmpv's render API leaves this to the application, and nothing did it. macOS holds an IOKit assertion and Windows sets the thread execution state; Linux still lets the display sleep.
+- [x] 39. Subtitle delay with Z and X and in Audio & subtitles; load subtitles named like the video automatically; load an external audio file.
+- [x] 40. A Video panel: aspect ratio, rotation, flip, mirror, deinterlace, and a color equalizer. Rotation and the equalizer are FFmpeg filters because the software renderer has neither.
+- [x] 41. Repeat this video (Shift+L), screenshots (S), go to a typed time from the command center, and scrolling on the video for volume and seeking.
+- [ ] 42. Check portrait phone videos: the software renderer ignores rotation metadata, so they probably show sideways. Fix with `demux-rotation` and a `transpose` filter once confirmed.
+- [ ] 43. Media keys and Now Playing on each platform.
+- [ ] 44. A queue for videos outside Shows, the macOS menu bar's player menus, an inspector, audio output and loudness, a second subtitle track, finer speed and seek steps, crop, Linux display inhibition, and window sizing. See [IINA parity](IINA_PARITY.md#what-to-add-next) for the order.
+
+State on 2026-11-28: items 38 to 41 pass the `runtime-shaders` typecheck and unit tests, and the macOS display assertion was observed in `pmset`. Nothing in them has played in libmpv yet. See [validation](VALIDATION.md#iina-parity-player-features-on-2026-11-28).
+
 Watch folders, remote control of the player, accounts, cloud storage, casting, and a general NDJSON agent interface are outside the first release. Search belongs in the library workflow.
 
 ## Existing prototype

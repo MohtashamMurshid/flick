@@ -146,6 +146,22 @@ impl Flick {
             }
             return items;
         }
+        // A time such as 12:34 goes there in the playing video.
+        if self.view == View::Player
+            && self.file_loaded
+            && let Some(seconds) = crate::model::parse_time(&query)
+        {
+            items.push(Item {
+                section: "Player",
+                icon: "history",
+                title: format!("Go to {}", format_time(seconds)).into(),
+                detail: (self.snapshot.duration > 0.)
+                    .then(|| format!("of {}", format_time(self.snapshot.duration)).into()),
+                keys: None,
+                verb: "Go",
+                action: Action::Control(Control::SeekTo(seconds)),
+            });
+        }
         let words = query
             .to_lowercase()
             .split_whitespace()
@@ -294,6 +310,34 @@ impl Flick {
                     "Load Subtitle File…",
                     key("l"),
                     Action::Control(Control::Subtitle),
+                ),
+                command(
+                    "audio-lines",
+                    "Load Audio File…",
+                    None,
+                    Action::Control(Control::AudioFile),
+                ),
+                command(
+                    "sliders",
+                    "Video Adjustments",
+                    None,
+                    Action::Control(Control::Video),
+                ),
+                command(
+                    "camera",
+                    "Save a Screenshot",
+                    shortcut(Shortcut::Screenshot),
+                    Action::Control(Control::Shortcut(Shortcut::Screenshot)),
+                ),
+                command(
+                    "repeat",
+                    if self.snapshot.loop_file {
+                        "Stop Repeating"
+                    } else {
+                        "Repeat This Video"
+                    },
+                    shortcut(Shortcut::LoopFile),
+                    Action::Control(Control::Shortcut(Shortcut::LoopFile)),
                 ),
             ]);
         }

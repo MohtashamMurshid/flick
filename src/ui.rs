@@ -149,6 +149,8 @@ struct CardMenu {
 #[derive(Clone, Copy, PartialEq)]
 enum Menu {
     Tracks,
+    /// Picture adjustments: aspect ratio, rotation, color.
+    Video,
     Keys,
     /// OpenSubtitles search, reached from Tracks.
     FindSubtitles,
@@ -162,6 +164,14 @@ struct SubtitleSearch {
     results: Option<Result<Vec<flick::subtitles::SubtitleResult>, String>>,
     /// The file being downloaded.
     downloading: Option<u64>,
+}
+
+/// What a file picker in the player is for.
+#[derive(Clone, Copy)]
+enum Pick {
+    Video,
+    Subtitles,
+    Audio,
 }
 
 #[derive(Clone, Copy)]
@@ -181,7 +191,12 @@ enum Control {
     Fullscreen,
     Pip,
     Tracks,
+    Video,
     Subtitle,
+    /// Load an audio file as another audio track.
+    AudioFile,
+    /// Go to this many seconds into the video.
+    SeekTo(f64),
     Keys,
     DismissError,
     Library,
@@ -306,6 +321,13 @@ pub struct Flick {
     remote_audio: RemoteAudio,
     /// The speed before shuttling faster, restored by shuttle-pause.
     shuttle_base: Option<f64>,
+    /// Picture adjustments for the playing video.
+    video_adjust: crate::video_adjust::VideoAdjust,
+    /// Holds the display awake while a video plays.
+    awake: crate::awake::DisplayAwake,
+    /// Scrolling on the video not yet turned into volume or seeking: whether
+    /// it was horizontal, and its pixels.
+    scroll_pending: (bool, f32),
     /// Measured slider tracks, keyed by slider ID.
     slider_bounds: RefCell<HashMap<&'static str, Rc<Cell<Bounds<Pixels>>>>>,
     /// The slider being dragged.
@@ -387,6 +409,7 @@ impl Flick {
             player.set_render_target(0, 0);
         }
         self.snapshot.paused = true;
+        self.awake.set(false);
     }
 
     pub fn new(path: Option<PathBuf>, window: &mut Window, cx: &mut Context<Self>) -> Self {
@@ -579,6 +602,9 @@ impl Flick {
             auto_quality: None,
             remote_audio: RemoteAudio::default(),
             shuttle_base: None,
+            video_adjust: Default::default(),
+            awake: Default::default(),
+            scroll_pending: (false, 0.),
             slider_bounds: RefCell::default(),
             dragging_slider: None,
             card_menu: None,
@@ -1288,6 +1314,14 @@ impl Flick {
             self.auto_quality = None;
             self.remote_audio = RemoteAudio::default();
         }
+        // Repeat, subtitle timing, and picture adjustments belong to one
+        // video. Reloading the same one, as a quality switch does, keeps them.
+        if !self
+            .source()
+            .is_some_and(|playing| same_video(playing, &source))
+        {
+            self.reset_video_settings();
+        }
         let title = source.title();
         let local = source.local_path().map(PathBuf::from);
         self.set_source(Some(source));
@@ -1319,6 +1353,140 @@ impl Flick {
         window.set_window_title(&format!("{title} — Flick"));
         if let Some(path) = &local {
             tracing::info!(path = %path.display(), "Opening video");
+        }
+    }
+
+    /// Turns off repeat, subtitle delay, and picture adjustments for the
+    /// next video. mpv keeps them from one file to the next otherwise.
+    fn reset_video_settings(&mut self) {
+        let before = std::mem::take(&mut self.video_adjust);
+        let Some(player) = &self.player else {
+            return;
+        };
+        let mut properties = vec![
+            ("loop-file", "no".to_owned()),
+            ("sub-delay", "0".to_owned()),
+        ];
+        properties.extend(self.video_adjust.changes_from(&before));
+        for (name, value) in properties {
+            if let Err(error) = player.set_optional_property(name, &value) {
+                tracing::debug!(%error, name, "Could not reset a playback setting");
+            }
+        }
+    }
+
+    /// Changes the picture adjustments and sends mpv what changed.
+    fn adjust_video(
+        &mut self,
+        change: impl FnOnce(&mut crate::video_adjust::VideoAdjust),
+        cx: &mut Context<Self>,
+    ) {
+        let before = self.video_adjust.clone();
+        change(&mut self.video_adjust);
+        for (name, value) in self.video_adjust.changes_from(&before) {
+            self.property(name, &value, cx);
+        }
+        cx.notify();
+    }
+
+    /// Saves the frame on screen, with its subtitles and at the video's own
+    /// size, to Pictures/Flick. The folder is made off the UI thread.
+    fn screenshot(&mut self, cx: &mut Context<Self>) {
+        let Some(folder) = crate::screenshot::folder() else {
+            self.error = Some("There is no Pictures or home folder to save screenshots in.".into());
+            return;
+        };
+        // A file name's extension is not part of the title.
+        let title = match self.source() {
+            Some(Source::Local(path)) => path
+                .file_stem()
+                .map(|stem| stem.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+            Some(source) => source.title(),
+            None => return,
+        };
+        let position = self.snapshot.position;
+        let generation = self.open_generation;
+        cx.spawn(async move |this, cx| {
+            let saved = cx
+                .background_executor()
+                .spawn(async move {
+                    std::fs::create_dir_all(&folder).map_err(|error| {
+                        format!("Could not create {}: {error}", folder.display())
+                    })?;
+                    let path = crate::screenshot::path(&folder, &title, position, |p| p.exists());
+                    path.to_str().map(str::to_owned).ok_or_else(|| {
+                        "The screenshot folder's path contains unsupported characters.".to_owned()
+                    })
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                if generation != this.open_generation {
+                    return;
+                }
+                match saved {
+                    Ok(path) => {
+                        this.command(&["screenshot-to-file", &path, "subtitles"], cx);
+                        // "Pictures/Flick/Sintel at 12.34.png"
+                        let shown = std::path::Path::new(&path)
+                            .iter()
+                            .rev()
+                            .take(3)
+                            .collect::<Vec<_>>()
+                            .into_iter()
+                            .rev()
+                            .collect::<PathBuf>();
+                        this.show_status_for(
+                            format!("Saved {}", shown.display()),
+                            Duration::from_secs(3),
+                        );
+                    }
+                    Err(error) => this.error = Some(error),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Scrolling on the video: up and down change the volume, left and right
+    /// seek, one percent or second for every few pixels, as in IINA.
+    fn scroll_video(&mut self, event: &gpui::ScrollWheelEvent, cx: &mut Context<Self>) {
+        if self.source().is_none() || !self.file_loaded || self.pip.is_some() {
+            return;
+        }
+        let delta = event.delta.pixel_delta(px(crate::model::SCROLL_LINE));
+        let (x, y) = (f32::from(delta.x), f32::from(delta.y));
+        let horizontal = x.abs() > y.abs();
+        if horizontal != self.scroll_pending.0
+            || matches!(event.touch_phase, gpui::TouchPhase::Started)
+        {
+            self.scroll_pending = (horizontal, 0.);
+        }
+        let (units, rest) =
+            crate::model::scroll_units(self.scroll_pending.1, if horizontal { x } else { y });
+        self.scroll_pending.1 = rest;
+        if units == 0 {
+            return;
+        }
+        if horizontal {
+            // Content moving left reveals what comes later.
+            let target = seek_target(
+                self.snapshot.position,
+                -f64::from(units),
+                self.snapshot.duration,
+            );
+            self.command(&["seek", &target.to_string(), "absolute+exact"], cx);
+            self.snapshot.position = target;
+            self.show_status(format!(
+                "{} / {}",
+                format_time(target),
+                format_time(self.snapshot.duration)
+            ));
+        } else {
+            let volume = (self.snapshot.volume + f64::from(units)).clamp(0., 100.);
+            self.property("volume", &volume.to_string(), cx);
+            self.show_status(format!("Volume {volume:.0}%"));
         }
     }
 
@@ -1710,6 +1878,10 @@ impl Flick {
             self.snapshot = next;
             self.last_snapshot = Instant::now();
         }
+        // The display stays awake while a video plays, here or in picture
+        // in picture, and may sleep once it pauses or ends.
+        let watching = self.file_loaded && (self.view == View::Player || self.pip.is_some());
+        self.awake.set(watching && self.playing());
         let pip_target = self.pip_target(cx);
         if self.pip.is_some() && pip_target.is_none() {
             // The window was closed some other way.
@@ -1859,16 +2031,16 @@ impl Flick {
         cx.notify();
     }
 
-    fn pick(&mut self, subtitle: bool, window: &Window, cx: &mut Context<Self>) {
+    fn pick(&mut self, kind: Pick, window: &Window, cx: &mut Context<Self>) {
         let receiver = cx.prompt_for_paths(PathPromptOptions {
             files: true,
             directories: false,
             multiple: false,
             prompt: Some(
-                if subtitle {
-                    "Load subtitles"
-                } else {
-                    "Open video"
+                match kind {
+                    Pick::Video => "Open video",
+                    Pick::Subtitles => "Load subtitles",
+                    Pick::Audio => "Load audio track",
                 }
                 .into(),
             ),
@@ -1878,9 +2050,11 @@ impl Flick {
             let _ = this.update_in(cx, |this, window, cx| {
                 match result {
                     Ok(Ok(Some(paths))) => if let Some(path) = paths.into_iter().next() {
-                        if subtitle {
-                            if let Some(s) = path.to_str() { this.command(&["sub-add", s, "select"], cx); }
-                        } else { this.open(path, window, cx); }
+                        match kind {
+                            Pick::Video => this.open(path, window, cx),
+                            Pick::Subtitles => if let Some(s) = path.to_str() { this.command(&["sub-add", s, "select"], cx); },
+                            Pick::Audio => if let Some(s) = path.to_str() { this.command(&["audio-add", s, "select"], cx); },
+                        }
                     },
                     Ok(Ok(None)) => {},
                     _ => { this.error = Some("The file picker could not open. Drop a file into Flick or launch it with a video path.".into()); cx.notify(); }
@@ -1961,8 +2135,9 @@ impl Flick {
             Control::AddFolder => self.pick_library(true, false, window, cx),
             Control::Share => self.open_share(window, cx),
             Control::PasteMagnet => self.paste_link(cx),
-            Control::Open => self.pick(false, window, cx),
-            Control::Subtitle => self.pick(true, window, cx),
+            Control::Open => self.pick(Pick::Video, window, cx),
+            Control::Subtitle => self.pick(Pick::Subtitles, window, cx),
+            Control::AudioFile => self.pick(Pick::Audio, window, cx),
             Control::Play if self.source().is_some() => {
                 if self.snapshot.eof {
                     self.command(&["seek", "0", "absolute+exact"], cx);
@@ -2009,11 +2184,11 @@ impl Flick {
                 self.error = None;
                 cx.notify();
             }
-            Control::Tracks | Control::Keys => {
-                let menu = if matches!(control, Control::Tracks) {
-                    Menu::Tracks
-                } else {
-                    Menu::Keys
+            Control::Tracks | Control::Video | Control::Keys => {
+                let menu = match control {
+                    Control::Tracks => Menu::Tracks,
+                    Control::Video => Menu::Video,
+                    _ => Menu::Keys,
                 };
                 self.menu = if self.menu == Some(menu) {
                     None
@@ -2026,6 +2201,11 @@ impl Flick {
                 let target = fraction * self.snapshot.duration;
                 self.command(&["seek", &target.to_string(), "absolute+exact"], cx);
                 self.show_status(format!("{}%", (fraction * 100.).round()));
+            }
+            Control::SeekTo(seconds) if self.source().is_some() && self.file_loaded => {
+                let target = seek_target(seconds, 0., self.snapshot.duration);
+                self.command(&["seek", &target.to_string(), "absolute+exact"], cx);
+                self.show_status(format_time(target));
             }
             Control::Shortcut(shortcut) => self.shortcut(shortcut, window, cx),
             _ => {}
@@ -2267,6 +2447,32 @@ impl Flick {
                     self.snapshot.audio_delay * 1000.
                 ));
             }
+            Shortcut::SubtitleDelayDown | Shortcut::SubtitleDelayUp => {
+                let step = if shortcut == Shortcut::SubtitleDelayUp {
+                    "0.1"
+                } else {
+                    "-0.1"
+                };
+                self.command(&["add", "sub-delay", step], cx);
+                self.show_status(format!(
+                    "Subtitle delay {:+.0} ms",
+                    self.snapshot.sub_delay * 1000.
+                ));
+            }
+            Shortcut::LoopFile => {
+                let repeat = !self.snapshot.loop_file;
+                self.property("loop-file", if repeat { "inf" } else { "no" }, cx);
+                // A repeating video never ends, so nothing is up next.
+                if repeat {
+                    self.up_next = None;
+                }
+                self.show_status(if repeat {
+                    "Repeating this video"
+                } else {
+                    "Repeat off"
+                });
+            }
+            Shortcut::Screenshot => self.screenshot(cx),
         }
         cx.notify();
     }
@@ -2503,6 +2709,18 @@ enum LoopStep {
     /// Start and end, in order.
     Span(f64, f64),
     Clear,
+}
+
+/// Whether two sources are one video, such as a remote video at two
+/// quality tiers.
+fn same_video(a: &Source, b: &Source) -> bool {
+    match (a, b) {
+        (Source::Local(a), Source::Local(b)) => a == b,
+        (Source::Remote(a), Source::Remote(b)) => {
+            a.server_id == b.server_id && a.video_id == b.video_id
+        }
+        _ => false,
+    }
 }
 
 /// Sets the loop start, then the end (swapping so the loop runs forward),

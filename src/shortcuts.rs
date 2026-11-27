@@ -31,12 +31,16 @@ pub enum Shortcut {
     LoopAb,
     AudioDelayDown,
     AudioDelayUp,
+    SubtitleDelayDown,
+    SubtitleDelayUp,
+    LoopFile,
+    Screenshot,
     ShowShortcuts,
 }
 
 impl Shortcut {
     /// Every shortcut, in the order the shortcuts page lists them.
-    pub const ALL: [Self; 21] = [
+    pub const ALL: [Self; 25] = [
         Self::PlayPause,
         Self::SeekBack,
         Self::SeekForward,
@@ -57,6 +61,10 @@ impl Shortcut {
         Self::LoopAb,
         Self::AudioDelayDown,
         Self::AudioDelayUp,
+        Self::SubtitleDelayDown,
+        Self::SubtitleDelayUp,
+        Self::LoopFile,
+        Self::Screenshot,
         Self::ShowShortcuts,
     ];
 
@@ -82,6 +90,10 @@ impl Shortcut {
             Self::LoopAb => "A–B loop: start, end, clear",
             Self::AudioDelayDown => "Audio earlier by 50 ms",
             Self::AudioDelayUp => "Audio later by 50 ms",
+            Self::SubtitleDelayDown => "Subtitles earlier by 100 ms",
+            Self::SubtitleDelayUp => "Subtitles later by 100 ms",
+            Self::LoopFile => "Repeat this video",
+            Self::Screenshot => "Save a screenshot",
             Self::ShowShortcuts => "Show shortcuts",
         }
     }
@@ -108,6 +120,10 @@ impl Shortcut {
             Self::LoopAb => "b",
             Self::AudioDelayDown => "[",
             Self::AudioDelayUp => "]",
+            Self::SubtitleDelayDown => "z",
+            Self::SubtitleDelayUp => "x",
+            Self::LoopFile => "shift-l",
+            Self::Screenshot => "s",
             Self::ShowShortcuts => "?",
         }
     }

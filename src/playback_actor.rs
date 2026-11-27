@@ -166,7 +166,37 @@ impl State {
             Work::Command(args) if args == &["cycle", "pause"] => {
                 self.snapshot.paused = !self.snapshot.paused;
             }
+            // Delay steps add to the shown value, so repeated keys before
+            // the next native observation each count.
+            Work::Command(args)
+                if args.len() == 3
+                    && args[0] == "add"
+                    && matches!(args[1].as_str(), "audio-delay" | "sub-delay") =>
+            {
+                if let Ok(step) = args[2].parse::<f64>()
+                    && step.is_finite()
+                {
+                    let delay = if args[1] == "audio-delay" {
+                        &mut self.snapshot.audio_delay
+                    } else {
+                        &mut self.snapshot.sub_delay
+                    };
+                    *delay += step;
+                }
+            }
             Work::Property(name, value, _) => match name.as_str() {
+                "audio-delay" | "sub-delay" => {
+                    if let Ok(value) = value.parse::<f64>()
+                        && value.is_finite()
+                    {
+                        if name == "audio-delay" {
+                            self.snapshot.audio_delay = value;
+                        } else {
+                            self.snapshot.sub_delay = value;
+                        }
+                    }
+                }
+                "loop-file" => self.snapshot.loop_file = crate::playback::looping(Some(value)),
                 "pause" if matches!(value.as_str(), "yes" | "no") => {
                     self.snapshot.paused = value == "yes"
                 }
@@ -1111,6 +1141,37 @@ mod tests {
         state.queue.work.clear();
         state.publish(state.requested, revision, PlaybackSnapshot::default());
         assert_eq!(state.snapshot.position, 5.);
+    }
+
+    #[test]
+    fn delay_and_repeat_changes_show_before_native_observation() {
+        let mut state = State::default();
+        let command = |args: &[&str]| Work::Command(args.iter().map(|a| (*a).to_owned()).collect());
+        // Two quick steps both count, as the native `add` commands do.
+        state.send(command(&["add", "sub-delay", "0.1"])).unwrap();
+        state.send(command(&["add", "sub-delay", "0.1"])).unwrap();
+        state
+            .send(command(&["add", "audio-delay", "-0.05"]))
+            .unwrap();
+        assert!((state.snapshot.sub_delay - 0.2).abs() < 1e-9);
+        assert!((state.snapshot.audio_delay + 0.05).abs() < 1e-9);
+        state
+            .send(Work::Property("sub-delay".into(), "0".into(), false))
+            .unwrap();
+        assert_eq!(state.snapshot.sub_delay, 0.);
+        // Invalid steps and other `add` targets change nothing here.
+        state.send(command(&["add", "sub-delay", "NaN"])).unwrap();
+        state.send(command(&["add", "volume", "5"])).unwrap();
+        assert_eq!(state.snapshot.sub_delay, 0.);
+        assert_eq!(state.snapshot.volume, 100.);
+        state
+            .send(Work::Property("loop-file".into(), "inf".into(), false))
+            .unwrap();
+        assert!(state.snapshot.loop_file);
+        state
+            .send(Work::Property("loop-file".into(), "no".into(), false))
+            .unwrap();
+        assert!(!state.snapshot.loop_file);
     }
 
     #[test]

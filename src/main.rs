@@ -1,4 +1,5 @@
 mod assets;
+mod awake;
 mod benchmark;
 mod input;
 mod library_files;
@@ -11,6 +12,7 @@ mod remote_discovery;
 mod remote_keep;
 mod remote_quality;
 mod remote_serve;
+mod screenshot;
 mod services;
 mod shortcuts;
 mod shutdown;
@@ -20,6 +22,7 @@ mod store;
 mod theme;
 mod thumbnails;
 mod ui;
+mod video_adjust;
 mod video_frame_ui;
 
 use gpui::{

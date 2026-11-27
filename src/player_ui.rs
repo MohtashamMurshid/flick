@@ -4,6 +4,7 @@ use super::{
     chrome_ui::{notice, thumbnail, traffic_light_space},
     *,
 };
+use crate::video_adjust::{ASPECTS, Color};
 use gpui::{AnyElement, FontWeight, Rgba, linear_color_stop, linear_gradient};
 
 /// Fraction of the video's duration at `time`, for timeline markers.
@@ -177,6 +178,9 @@ impl Flick {
                 .absolute()
                 .size_full(),
             )
+            .on_scroll_wheel(cx.listener(|this, event: &gpui::ScrollWheelEvent, _, cx| {
+                this.scroll_video(event, cx)
+            }))
             .on_click(cx.listener(|this, event: &ClickEvent, window, cx| {
                 this.focus.focus(window);
                 if event.click_count() == 2 {
@@ -787,6 +791,8 @@ impl Flick {
             Control::Tracks,
             cx,
         );
+        let video =
+            self.overlay_button("video", "sliders", "Video adjustments", Control::Video, cx);
         let pip = self.overlay_button(
             "pip",
             "picture-in-picture",
@@ -834,7 +840,7 @@ impl Flick {
                             h_flex()
                                 .child(
                                     h_flex()
-                                        .w(px(164.))
+                                        .w(px(192.))
                                         .gap_1()
                                         .child(mute)
                                         .child(self.volume_slider(72., cx)),
@@ -850,11 +856,12 @@ impl Flick {
                                 )
                                 .child(
                                     h_flex()
-                                        .w(px(164.))
+                                        .w(px(192.))
                                         .justify_end()
                                         .gap_1()
                                         .child(self.speed_button(cx))
                                         .child(tracks)
+                                        .child(video)
                                         .child(pip)
                                         .child(full),
                                 ),
@@ -935,6 +942,7 @@ impl Flick {
                                     .gap_1()
                                     .child(self.speed_button(cx))
                                     .child(tracks)
+                                    .child(video)
                                     .child(pip)
                                     .child(mute)
                                     .child(self.volume_slider(88., cx))
@@ -966,6 +974,7 @@ impl Flick {
                 .child(mute)
                 .child(self.volume_slider(72., cx))
                 .child(tracks)
+                .child(video)
                 .child(pip)
                 .child(full)
                 .into_any_element(),
@@ -1153,10 +1162,27 @@ impl Flick {
         )
     }
 
-    /// Audio delay, adjustable in 50 ms steps, with a reset.
-    fn audio_delay_row(&self, cx: &Context<Self>) -> Div {
+    /// Audio delay in 50 ms steps, or subtitle delay in 100 ms steps, with
+    /// a reset.
+    fn delay_row(&self, subtitles: bool, cx: &Context<Self>) -> Div {
         let t = cx.theme();
-        let delay = self.snapshot.audio_delay;
+        let (delay, label, property, earlier, later) = if subtitles {
+            (
+                self.snapshot.sub_delay,
+                "Subtitle delay",
+                "sub-delay",
+                Shortcut::SubtitleDelayDown,
+                Shortcut::SubtitleDelayUp,
+            )
+        } else {
+            (
+                self.snapshot.audio_delay,
+                "Audio delay",
+                "audio-delay",
+                Shortcut::AudioDelayDown,
+                Shortcut::AudioDelayUp,
+            )
+        };
         h_flex()
             .gap_1()
             .px_2()
@@ -1164,31 +1190,62 @@ impl Flick {
             .child(
                 div()
                     .flex_1()
-                    .child(format!("Audio delay {:+.0} ms", delay * 1000.)),
+                    .child(format!("{label} {:+.0} ms", delay * 1000.)),
             )
             .child(self.icon_button(
-                "audio-earlier",
+                (property, 0usize),
                 "minus",
-                "Audio earlier by 50 ms",
+                earlier.label(),
                 cx,
-                |this, w, cx| this.shortcut(Shortcut::AudioDelayDown, w, cx),
+                move |this, w, cx| this.shortcut(earlier, w, cx),
             ))
             .child(self.icon_button(
-                "audio-later",
+                (property, 1usize),
                 "plus",
-                "Audio later by 50 ms",
+                later.label(),
                 cx,
-                |this, w, cx| this.shortcut(Shortcut::AudioDelayUp, w, cx),
+                move |this, w, cx| this.shortcut(later, w, cx),
             ))
             .when(delay.abs() > 0.0005, |d| {
                 d.child(self.icon_button(
-                    "audio-delay-reset",
+                    (property, 2usize),
                     "rotate-ccw",
-                    "Reset audio delay",
+                    format!("Reset {}", label.to_lowercase()),
                     cx,
-                    |this, _, cx| this.property("audio-delay", "0", cx),
+                    move |this, _, cx| this.property(property, "0", cx),
                 ))
             })
+            .text_color(t.text)
+    }
+
+    /// A color setting with a stepper, such as "Brightness +10".
+    fn color_row(&self, index: usize, color: Color, cx: &Context<Self>) -> Div {
+        let t = cx.theme();
+        let value = self.video_adjust.color(color);
+        let name = color.label();
+        h_flex()
+            .gap_1()
+            .px_2()
+            .py_1()
+            .child(div().flex_1().child(if value == 0 {
+                format!("{name} 0")
+            } else {
+                format!("{name} {value:+}")
+            }))
+            .child(self.icon_button(
+                ("color-less", index),
+                "minus",
+                format!("Less {}", name.to_lowercase()),
+                cx,
+                move |this, _, cx| this.adjust_video(|v| v.step_color(color, -1), cx),
+            ))
+            .child(self.icon_button(
+                ("color-more", index),
+                "plus",
+                format!("More {}", name.to_lowercase()),
+                cx,
+                move |this, _, cx| this.adjust_video(|v| v.step_color(color, 1), cx),
+            ))
             .text_color(t.text)
     }
 
@@ -1197,6 +1254,7 @@ impl Flick {
         let t = cx.theme().clone();
         let title = match menu {
             Menu::Tracks => "Audio & subtitles",
+            Menu::Video => "Video",
             Menu::Keys => "Keyboard shortcuts",
             Menu::FindSubtitles => "Find subtitles",
         };
@@ -1320,7 +1378,7 @@ impl Flick {
                         );
                     }
                     if kind == "audio" {
-                        panel = panel.child(self.audio_delay_row(cx));
+                        panel = panel.child(self.delay_row(false, cx));
                     }
                     if kind == "sub" {
                         // Subtitles kept on the remote library's server.
@@ -1357,6 +1415,7 @@ impl Flick {
                         panel = panel.child(option("subs-off".into(), "Off".into(), off).on_click(
                             cx.listener(|this, _, _, cx| this.property("sid", "no", cx)),
                         ));
+                        panel = panel.child(self.delay_row(true, cx));
                     }
                 }
                 panel = panel.child(
@@ -1373,10 +1432,18 @@ impl Flick {
                         .child(self.button(
                             "load-subtitle",
                             Some("captions"),
-                            "Load File…",
+                            "Load Subtitles…",
                             false,
                             cx,
                             |this, w, cx| this.handle(Control::Subtitle, w, cx),
+                        ))
+                        .child(self.button(
+                            "load-audio",
+                            Some("audio-lines"),
+                            "Load Audio…",
+                            false,
+                            cx,
+                            |this, w, cx| this.handle(Control::AudioFile, w, cx),
                         ))
                         .child(self.button(
                             "find-subtitles",
@@ -1390,6 +1457,98 @@ impl Flick {
             }
             Menu::FindSubtitles => {
                 panel = panel.child(self.subtitle_search_view(cx));
+            }
+            Menu::Video => {
+                let adjust = self.video_adjust.clone();
+                let heading = |text: &'static str| {
+                    div()
+                        .px_2()
+                        .pt_2()
+                        .pb_1()
+                        .text_size(t.font(11.))
+                        .text_color(t.muted)
+                        .child(text)
+                };
+                let mut aspects = div().px_1().pb_1().flex().flex_wrap().gap_1();
+                for (index, (label, _)) in ASPECTS.iter().enumerate() {
+                    aspects = aspects.child(self.button(
+                        ("aspect", index),
+                        None,
+                        *label,
+                        adjust.aspect == index,
+                        cx,
+                        move |this, _, cx| this.adjust_video(|v| v.aspect = index, cx),
+                    ));
+                }
+                panel = panel
+                    .child(heading("Aspect ratio"))
+                    .child(aspects)
+                    .child(heading("Orientation"))
+                    .child(
+                        h_flex()
+                            .gap_1()
+                            .px_2()
+                            .py_1()
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .child(format!("Rotation {}°", adjust.rotation)),
+                            )
+                            .child(self.button(
+                                "video-rotate",
+                                None,
+                                "Rotate 90°",
+                                false,
+                                cx,
+                                |this, _, cx| this.adjust_video(|v| v.rotate(), cx),
+                            )),
+                    )
+                    .child(
+                        option("video-flip".into(), "Flip upside down".into(), adjust.flip)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.adjust_video(|v| v.flip = !v.flip, cx)
+                            })),
+                    )
+                    .child(
+                        option("video-mirror".into(), "Mirror".into(), adjust.mirror).on_click(
+                            cx.listener(|this, _, _, cx| {
+                                this.adjust_video(|v| v.mirror = !v.mirror, cx)
+                            }),
+                        ),
+                    )
+                    .child(heading("Picture"))
+                    .child(
+                        option(
+                            "video-deinterlace".into(),
+                            "Deinterlace".into(),
+                            adjust.deinterlace,
+                        )
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.adjust_video(|v| v.deinterlace = !v.deinterlace, cx)
+                        })),
+                    );
+                for (index, color) in Color::ALL.into_iter().enumerate() {
+                    panel = panel.child(self.color_row(index, color, cx));
+                }
+                if !adjust.is_default() {
+                    panel = panel.child(
+                        div()
+                            .mt_2()
+                            .pt_2()
+                            .px_1()
+                            .pb_1()
+                            .border_t_1()
+                            .border_color(t.border)
+                            .child(self.button(
+                                "video-reset",
+                                Some("rotate-ccw"),
+                                "Reset All",
+                                false,
+                                cx,
+                                |this, _, cx| this.adjust_video(|v| *v = Default::default(), cx),
+                            )),
+                    );
+                }
             }
             Menu::Keys => {
                 let bindings = &self.store.data.shortcuts;

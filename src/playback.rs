@@ -44,6 +44,10 @@ pub struct PlaybackSnapshot {
     pub loop_end: Option<f64>,
     /// Seconds; positive delays audio relative to video.
     pub audio_delay: f64,
+    /// Seconds; positive shows subtitles later.
+    pub sub_delay: f64,
+    /// The video repeats from the start when it ends.
+    pub loop_file: bool,
     /// Waiting for stream data, such as torrent pieces.
     pub buffering: bool,
 }
@@ -69,6 +73,8 @@ impl Default for PlaybackSnapshot {
             loop_start: None,
             loop_end: None,
             audio_delay: 0.0,
+            sub_delay: 0.0,
+            loop_file: false,
             buffering: false,
         }
     }
@@ -526,6 +532,18 @@ fn parse_chapters(json: &str) -> Vec<Chapter> {
     chapters
 }
 
+/// Folders beside a video searched for its subtitles, in mpv's path-list
+/// form, which separates entries with `;` on Windows and `:` elsewhere.
+#[cfg(windows)]
+const SUBTITLE_FOLDERS: &str = "subs;Subs;subtitles;Subtitles;sub;Sub";
+#[cfg(not(windows))]
+const SUBTITLE_FOLDERS: &str = "subs:Subs:subtitles:Subtitles:sub:Sub";
+
+/// Whether an mpv `loop-file` value repeats: `inf`, `yes`, or a count.
+pub fn looping(value: Option<&str>) -> bool {
+    value.is_some_and(|value| !matches!(value, "" | "no" | "0" | "false"))
+}
+
 const OBSERVED_PROPERTIES: &[&str] = &[
     "pause",
     "time-pos",
@@ -537,6 +555,8 @@ const OBSERVED_PROPERTIES: &[&str] = &[
     "ab-loop-a",
     "ab-loop-b",
     "audio-delay",
+    "sub-delay",
+    "loop-file",
     "paused-for-cache",
     "track-list",
     "chapter-list",
@@ -566,6 +586,8 @@ fn update_cached_property(cache: &mut PlaybackSnapshot, name: &str, value: Optio
         "ab-loop-a" => cache.loop_start = point(),
         "ab-loop-b" => cache.loop_end = point(),
         "audio-delay" => cache.audio_delay = number(0.),
+        "sub-delay" => cache.sub_delay = number(0.),
+        "loop-file" => cache.loop_file = looping(value),
         "paused-for-cache" => cache.buffering = flag,
         "track-list" => cache.tracks = parse_tracks(value.unwrap_or_default()),
         "chapter-list" => cache.chapters = parse_chapters(value.unwrap_or_default()),
@@ -703,6 +725,7 @@ impl Player {
             ("ao", "null"),
             ("aid", "no"),
             ("sid", "no"),
+            ("sub-auto", "no"),
             ("mute", "yes"),
         ])
     }
@@ -748,6 +771,10 @@ impl Player {
             ("idle", "yes"),
             ("osd-level", "0"),
             ("video-timing-offset", "0"),
+            // Load subtitles named like the video, such as `Film.en.srt`
+            // beside `Film.mkv`, and those in a Subs folder, as IINA does.
+            ("sub-auto", "fuzzy"),
+            ("sub-file-paths", SUBTITLE_FOLDERS),
         ] {
             player.option(name, value)?;
         }
@@ -956,6 +983,8 @@ impl Player {
             loop_start: point("ab-loop-a"),
             loop_end: point("ab-loop-b"),
             audio_delay: number("audio-delay", 0.0),
+            sub_delay: number("sub-delay", 0.0),
+            loop_file: looping(self.property("loop-file").as_deref()),
             buffering: flag("paused-for-cache"),
         }
     }
@@ -2088,6 +2117,13 @@ mod tests {
         assert_eq!(snapshot.tracks[0].id, 4);
         assert!(snapshot.tracks[0].selected);
         assert_eq!(snapshot.chapters[0].time, 3.);
+        update_cached_property(&mut snapshot, "sub-delay", Some("-0.300000"));
+        update_cached_property(&mut snapshot, "loop-file", Some("inf"));
+        assert_eq!(snapshot.sub_delay, -0.3);
+        assert!(snapshot.loop_file);
+        update_cached_property(&mut snapshot, "loop-file", Some("no"));
+        assert!(!snapshot.loop_file);
+        assert!(looping(Some("3")) && !looping(Some("0")) && !looping(None));
         update_cached_property(&mut snapshot, "time-pos", Some("NaN"));
         update_cached_property(&mut snapshot, "track-list", None);
         update_cached_property(&mut snapshot, "ab-loop-a", Some("no"));
@@ -2478,6 +2514,88 @@ mod tests {
             );
             thread::sleep(Duration::from_millis(150));
         }
+        Ok(())
+    }
+
+    /// Flick's picture adjustments, subtitle delay, repeat, and screenshots
+    /// against real libmpv: every filter chain is accepted, and a quarter
+    /// turn swaps the saved screenshot's sides. The software renderer does
+    /// not rotate, so this also shows the turn comes from the filters.
+    #[test]
+    #[ignore = "requires native libmpv and FLICK_TEST_VIDEO"]
+    fn real_picture_adjustments_repeat_and_screenshot() -> Result<()> {
+        use crate::video_adjust::{ASPECTS, Color, VideoAdjust};
+        let clip = std::env::var("FLICK_TEST_VIDEO")?;
+        let player = Player::new()?;
+        player.load(&clip)?;
+        let render_for = |duration: Duration| -> Result<bool> {
+            let deadline = Instant::now() + duration;
+            let mut rendered = false;
+            while Instant::now() < deadline {
+                for event in player.poll_events() {
+                    if let PlayerEvent::Error(error) = event {
+                        bail!("{error}");
+                    }
+                }
+                rendered |= player.render(320, 180)?.is_some();
+                thread::sleep(Duration::from_millis(16));
+            }
+            Ok(rendered)
+        };
+        ensure!(render_for(Duration::from_secs(2))?, "No initial frame");
+        let (width, height) = player.video_size().context("No video size")?;
+        // Every setting at once, then each rotation, must be accepted.
+        let mut adjust = VideoAdjust::default();
+        adjust.aspect = ASPECTS.len() - 1;
+        adjust.flip = true;
+        adjust.mirror = true;
+        adjust.deinterlace = true;
+        for color in Color::ALL {
+            adjust.step_color(color, 3);
+        }
+        for _ in 0..4 {
+            adjust.rotate();
+            for (name, value) in adjust.properties() {
+                player.set_property(name, &value)?;
+            }
+            ensure!(
+                render_for(Duration::from_millis(400))?,
+                "No frame with {:?}",
+                adjust.filters()
+            );
+        }
+        // A quarter turn with nothing else.
+        let mut turned = VideoAdjust::default();
+        turned.rotate();
+        for (name, value) in turned.properties() {
+            player.set_property(name, &value)?;
+        }
+        player.set_property("sub-delay", "0.3")?;
+        player.set_property("loop-file", "inf")?;
+        render_for(Duration::from_millis(600))?;
+        let snapshot = player.snapshot();
+        ensure!(
+            (snapshot.sub_delay - 0.3).abs() < 1e-6,
+            "Subtitle delay not set"
+        );
+        ensure!(snapshot.loop_file, "Repeat not set");
+        let folder = tempfile::tempdir()?;
+        let shot = crate::screenshot::path(folder.path(), "Flick test", snapshot.position, |p| {
+            p.exists()
+        });
+        player.command(&[
+            "screenshot-to-file",
+            shot.to_str().context("Temporary path is not UTF-8")?,
+            "subtitles",
+        ])?;
+        let png = std::fs::read(&shot)?;
+        ensure!(png.starts_with(b"\x89PNG\r\n\x1a\n"), "Not a PNG");
+        let side = |at: usize| u32::from_be_bytes([png[at], png[at + 1], png[at + 2], png[at + 3]]);
+        assert_eq!(
+            (side(16), side(20)),
+            (height, width),
+            "Screenshot not turned"
+        );
         Ok(())
     }
 
