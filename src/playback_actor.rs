@@ -92,6 +92,8 @@ impl Queue {
 struct Facts {
     hardware_decoder: Option<String>,
     dropped_frames: Option<u64>,
+    media: Vec<(&'static str, String)>,
+    audio_devices: (Vec<crate::playback::AudioDevice>, String),
 }
 
 struct Event {
@@ -197,6 +199,7 @@ impl State {
                     }
                 }
                 "loop-file" => self.snapshot.loop_file = crate::playback::looping(Some(value)),
+                "secondary-sid" => self.snapshot.secondary_sid = value.parse().ok(),
                 "pause" if matches!(value.as_str(), "yes" | "no") => {
                     self.snapshot.paused = value == "yes"
                 }
@@ -395,6 +398,16 @@ impl PlayerProxy {
 
     pub fn dropped_frames(&self) -> Option<u64> {
         self.shared.lock().facts.dropped_frames
+    }
+
+    /// The media information panel's rows, read once a second.
+    pub fn media_rows(&self) -> Vec<(&'static str, String)> {
+        self.shared.lock().facts.media.clone()
+    }
+
+    /// Audio outputs and the one in use, read once a second.
+    pub fn audio_devices(&self) -> (Vec<crate::playback::AudioDevice>, String) {
+        self.shared.lock().facts.audio_devices.clone()
     }
 
     /// An ordered barrier: acknowledge only once mpv has unloaded its file.
@@ -958,6 +971,8 @@ fn run(
             let facts = Facts {
                 hardware_decoder: player.hardware_decoder(),
                 dropped_frames: player.dropped_frames(),
+                media: player.media_rows(),
+                audio_devices: player.audio_devices(),
             };
             let mut state = shared.lock();
             if !state.queue.stopped && active_request == state.requested {

@@ -1,6 +1,6 @@
 //! Picture adjustments for the playing video, as in IINA's Video panel:
-//! aspect ratio, rotation, flip and mirror, deinterlacing, and a color
-//! equalizer. They last until another video opens.
+//! aspect ratio, crop, rotation, flip and mirror, deinterlacing, and a
+//! color equalizer. They last until another video opens.
 //!
 //! Flick draws video through libmpv's software renderer
 //! (`video/out/libmpv_sw.c`), which has no color equalizer and does not
@@ -12,6 +12,12 @@
 //! and with copy-back hardware decoding. They cost CPU time on large videos
 //! while they are on. The aspect ratio and deinterlacing are mpv properties
 //! that need no help from the output.
+//!
+//! Worse, the software renderer aborts the process when a file's rotation
+//! metadata reaches it, in `mp_image_crop`, because mpv sizes the picture
+//! as turned while the frame is not. Every player therefore runs with
+//! `video-rotate=no`, and the file's rotation from `demux-rotation` joins
+//! the user's turns in the same filter.
 
 /// Aspect ratios offered, with their `video-aspect-override` values. The
 /// first keeps the video's own.
@@ -23,6 +29,27 @@ pub const ASPECTS: [(&str, &str); 6] = [
     ("2.35:1", "2.35"),
     ("1:1", "1"),
 ];
+
+/// Crops offered, as width-to-height ratios of the picture shown. The first
+/// keeps the whole picture.
+pub const CROPS: [(&str, Option<f64>); 6] = [
+    ("None", None),
+    ("16:9", Some(16. / 9.)),
+    ("4:3", Some(4. / 3.)),
+    ("2.35:1", Some(2.35)),
+    ("1:1", Some(1.)),
+    ("9:16", Some(9. / 16.)),
+];
+
+/// The filter that turns a picture `degrees` clockwise; None for none.
+pub fn rotation_filter(degrees: u16) -> Option<&'static str> {
+    match degrees % 360 {
+        90 => Some("transpose=clock"),
+        180 => Some("hflip,vflip"),
+        270 => Some("transpose=cclock"),
+        _ => None,
+    }
+}
 
 /// Equalizer steps, in the −100 to 100 range of each color setting.
 pub const COLOR_STEP: i32 = 10;
@@ -60,6 +87,8 @@ impl Color {
 pub struct VideoAdjust {
     /// An index into [`ASPECTS`].
     pub aspect: usize,
+    /// An index into [`CROPS`].
+    pub crop: usize,
     /// Clockwise degrees: 0, 90, 180, or 270.
     pub rotation: u16,
     /// Upside down.
@@ -107,15 +136,21 @@ impl VideoAdjust {
         self.rotation = (self.rotation + 90) % 360;
     }
 
-    /// The `vf` filter chain; empty when nothing needs a filter.
-    pub fn filters(&self) -> String {
+    /// The `vf` filter chain for a file whose metadata asks for
+    /// `file_rotation` clockwise degrees; empty when nothing needs a filter.
+    pub fn filters(&self, file_rotation: u16) -> String {
         let mut filters = Vec::new();
-        // Turn first, so flip and mirror act on the picture as it is shown.
-        match self.rotation {
-            90 => filters.push("transpose=clock".to_owned()),
-            180 => filters.push("hflip,vflip".to_owned()),
-            270 => filters.push("transpose=cclock".to_owned()),
-            _ => {}
+        // Turn first, so crop, flip, and mirror act on the picture as shown.
+        if let Some(turn) = rotation_filter(file_rotation + self.rotation) {
+            filters.push(turn.to_owned());
+        }
+        if let Some((_, Some(ratio))) = CROPS.get(self.crop) {
+            // The largest centered area of that shape; brackets keep the
+            // commas inside FFmpeg's expressions out of mpv's filter list.
+            let ratio = number(*ratio);
+            filters.push(format!(
+                "crop=w=[min(iw,ih*{ratio})]:h=[min(ih,iw/{ratio})]"
+            ));
         }
         if self.flip {
             filters.push("vflip".to_owned());
@@ -145,7 +180,7 @@ impl VideoAdjust {
     }
 
     /// The mpv properties that carry these adjustments, with their values.
-    pub fn properties(&self) -> [(&'static str, String); 3] {
+    pub fn properties(&self, file_rotation: u16) -> [(&'static str, String); 3] {
         [
             (
                 "video-aspect-override",
@@ -158,19 +193,8 @@ impl VideoAdjust {
                 "deinterlace",
                 if self.deinterlace { "yes" } else { "no" }.to_owned(),
             ),
-            ("vf", self.filters()),
+            ("vf", self.filters(file_rotation)),
         ]
-    }
-
-    /// The properties whose values differ from `before`, to send to mpv.
-    pub fn changes_from(&self, before: &Self) -> Vec<(&'static str, String)> {
-        let old = before.properties();
-        self.properties()
-            .into_iter()
-            .zip(old)
-            .filter(|(new, old)| new.1 != old.1)
-            .map(|(new, _)| new)
-            .collect()
     }
 }
 
@@ -189,9 +213,9 @@ mod tests {
     fn default_adjustments_need_no_filters_and_restore_mpv_defaults() {
         let adjust = VideoAdjust::default();
         assert!(adjust.is_default());
-        assert_eq!(adjust.filters(), "");
+        assert_eq!(adjust.filters(0), "");
         assert_eq!(
-            adjust.properties(),
+            adjust.properties(0),
             [
                 ("video-aspect-override", "-1".to_owned()),
                 ("deinterlace", "no".to_owned()),
@@ -210,17 +234,17 @@ mod tests {
         adjust.mirror = true;
         assert_eq!(adjust.color(Color::Contrast), 100);
         assert_eq!(
-            adjust.filters(),
+            adjust.filters(0),
             "vflip,hflip,eq=brightness=0.05:contrast=2:saturation=1:gamma=0.707"
         );
         adjust.step_color(Color::Hue, -11);
         assert_eq!(adjust.color(Color::Hue), -100);
-        assert!(adjust.filters().ends_with(",hue=h=-180"));
+        assert!(adjust.filters(0).ends_with(",hue=h=-180"));
         for color in Color::ALL {
             let value = adjust.color(color);
             adjust.step_color(color, -value / COLOR_STEP);
         }
-        assert_eq!(adjust.filters(), "vflip,hflip");
+        assert_eq!(adjust.filters(0), "vflip,hflip");
     }
 
     #[test]
@@ -232,7 +256,7 @@ mod tests {
         let turns: Vec<_> = (0..4)
             .map(|_| {
                 adjust.rotate();
-                (adjust.rotation, adjust.filters())
+                (adjust.rotation, adjust.filters(0))
             })
             .collect();
         assert_eq!(
@@ -247,21 +271,30 @@ mod tests {
     }
 
     #[test]
-    fn only_changed_properties_are_sent() {
-        let before = VideoAdjust::default();
-        let mut after = before.clone();
-        after.aspect = 2;
-        after.deinterlace = true;
+    fn the_files_rotation_adds_to_the_users() {
+        let mut adjust = VideoAdjust::default();
+        assert_eq!(adjust.filters(270), "transpose=cclock");
+        adjust.rotate();
+        // 270 + 90 is upright again.
+        assert_eq!(adjust.filters(270), "");
+        adjust.rotate();
+        assert_eq!(adjust.filters(270), "transpose=clock");
+        assert_eq!(rotation_filter(450), Some("transpose=clock"));
+        assert_eq!(rotation_filter(45), None);
+    }
+
+    #[test]
+    fn crops_follow_the_turn_and_quote_their_expressions() {
+        let mut adjust = VideoAdjust {
+            crop: 2,
+            ..Default::default()
+        };
         assert_eq!(
-            after.changes_from(&before),
-            [
-                ("video-aspect-override", "4:3".to_owned()),
-                ("deinterlace", "yes".to_owned()),
-            ]
+            adjust.filters(90),
+            "transpose=clock,crop=w=[min(iw,ih*1.333)]:h=[min(ih,iw/1.333)]"
         );
-        assert!(after.changes_from(&after).is_empty());
-        // Resetting sends each changed property back to its default.
-        assert_eq!(VideoAdjust::default().changes_from(&after).len(), 2);
+        adjust.crop = 0;
+        assert_eq!(adjust.filters(0), "");
     }
 
     #[test]

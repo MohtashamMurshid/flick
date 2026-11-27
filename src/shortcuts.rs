@@ -35,12 +35,17 @@ pub enum Shortcut {
     SubtitleDelayUp,
     LoopFile,
     Screenshot,
+    CopyScreenshot,
+    SpeedDown,
+    SpeedUp,
+    SpeedReset,
+    MediaInfo,
     ShowShortcuts,
 }
 
 impl Shortcut {
     /// Every shortcut, in the order the shortcuts page lists them.
-    pub const ALL: [Self; 25] = [
+    pub const ALL: [Self; 30] = [
         Self::PlayPause,
         Self::SeekBack,
         Self::SeekForward,
@@ -65,14 +70,19 @@ impl Shortcut {
         Self::SubtitleDelayUp,
         Self::LoopFile,
         Self::Screenshot,
+        Self::CopyScreenshot,
+        Self::SpeedDown,
+        Self::SpeedUp,
+        Self::SpeedReset,
+        Self::MediaInfo,
         Self::ShowShortcuts,
     ];
 
     pub fn label(self) -> &'static str {
         match self {
             Self::PlayPause => "Play / pause",
-            Self::SeekBack => "Back 10 seconds",
-            Self::SeekForward => "Forward 10 seconds",
+            Self::SeekBack => "Seek back",
+            Self::SeekForward => "Seek forward",
             Self::VolumeUp => "Volume up",
             Self::VolumeDown => "Volume down",
             Self::Mute => "Mute",
@@ -94,6 +104,11 @@ impl Shortcut {
             Self::SubtitleDelayUp => "Subtitles later by 100 ms",
             Self::LoopFile => "Repeat this video",
             Self::Screenshot => "Save a screenshot",
+            Self::CopyScreenshot => "Copy the frame",
+            Self::SpeedDown => "Slower",
+            Self::SpeedUp => "Faster",
+            Self::SpeedReset => "Normal speed",
+            Self::MediaInfo => "Media information",
             Self::ShowShortcuts => "Show shortcuts",
         }
     }
@@ -124,6 +139,11 @@ impl Shortcut {
             Self::SubtitleDelayUp => "x",
             Self::LoopFile => "shift-l",
             Self::Screenshot => "s",
+            Self::CopyScreenshot => "shift-s",
+            Self::SpeedDown => "-",
+            Self::SpeedUp => "=",
+            Self::SpeedReset => "backspace",
+            Self::MediaInfo => "i",
             Self::ShowShortcuts => "?",
         }
     }

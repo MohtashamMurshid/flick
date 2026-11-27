@@ -49,6 +49,11 @@ embedded_icons!(
     "sliders",
     "camera",
     "repeat",
+    "seek-back",
+    "seek-forward",
+    "list",
+    "chevron-up",
+    "chevron-down",
 );
 
 pub struct Assets;

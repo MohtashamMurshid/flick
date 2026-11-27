@@ -3,10 +3,13 @@ mod awake;
 mod benchmark;
 mod input;
 mod library_files;
+mod logs;
 mod model;
 mod notify;
 mod playback;
 mod playback_actor;
+mod player_prefs;
+mod queue;
 mod remote_client;
 mod remote_discovery;
 mod remote_keep;
@@ -34,13 +37,25 @@ actions!(flick, [Quit]);
 use std::path::PathBuf;
 
 fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_writer(std::io::stderr)
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "flick=info".into()),
-        )
-        .init();
+    let filter = || {
+        tracing_subscriber::EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| "flick=info".into())
+    };
+    // Messages go to stderr and, for reporting problems, to a log file.
+    match logs::open() {
+        Some(file) => {
+            use tracing_subscriber::fmt::writer::MakeWriterExt;
+            tracing_subscriber::fmt()
+                .with_ansi(false)
+                .with_writer(std::io::stderr.and(std::sync::Mutex::new(file)))
+                .with_env_filter(filter())
+                .init()
+        }
+        None => tracing_subscriber::fmt()
+            .with_writer(std::io::stderr)
+            .with_env_filter(filter())
+            .init(),
+    }
     let mut args = std::env::args_os().skip(1);
     let first = args.next();
     if first.as_deref().is_some_and(|s| s == "--help" || s == "-h") {

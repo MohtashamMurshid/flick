@@ -324,10 +324,40 @@ impl Flick {
                     Action::Control(Control::Video),
                 ),
                 command(
+                    "list",
+                    "Queue and Chapters",
+                    None,
+                    Action::Control(Control::Queue),
+                ),
+                command(
+                    "info",
+                    "Media Information",
+                    shortcut(Shortcut::MediaInfo),
+                    Action::Control(Control::Info),
+                ),
+                command(
+                    "audio-lines",
+                    "Audio Equalizer",
+                    None,
+                    Action::Control(Control::Equalizer),
+                ),
+                command(
+                    "play",
+                    "Playback Speed",
+                    None,
+                    Action::Control(Control::Speed),
+                ),
+                command(
                     "camera",
                     "Save a Screenshot",
                     shortcut(Shortcut::Screenshot),
                     Action::Control(Control::Shortcut(Shortcut::Screenshot)),
+                ),
+                command(
+                    "copy",
+                    "Copy the Frame",
+                    shortcut(Shortcut::CopyScreenshot),
+                    Action::Control(Control::Shortcut(Shortcut::CopyScreenshot)),
                 ),
                 command(
                     "repeat",
