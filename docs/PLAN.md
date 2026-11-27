@@ -156,17 +156,17 @@ State on 2026-11-11 at `981d26a`: implemented. Loopback tests, the desktop typec
 
 ### 11. IINA parity
 
-[IINA parity](IINA_PARITY.md) compares Flick's player with IINA 1.5.1 area by area and orders the remaining gaps.
+[IINA parity](IINA_PARITY.md) compares Flick's player with IINA 1.5.1 area by area.
 
-- [x] 38. Keep the display awake while a video plays. libmpv's render API leaves this to the application, and nothing did it. macOS holds an IOKit assertion and Windows sets the thread execution state; Linux still lets the display sleep.
-- [x] 39. Subtitle delay with Z and X and in Audio & subtitles; load subtitles named like the video automatically; load an external audio file.
-- [x] 40. A Video panel: aspect ratio, rotation, flip, mirror, deinterlace, and a color equalizer. Rotation and the equalizer are FFmpeg filters because the software renderer has neither.
-- [x] 41. Repeat this video (Shift+L), screenshots (S), go to a typed time from the command center, and scrolling on the video for volume and seeking.
-- [ ] 42. Check portrait phone videos: the software renderer ignores rotation metadata, so they probably show sideways. Fix with `demux-rotation` and a `transpose` filter once confirmed.
-- [ ] 43. Media keys and Now Playing on each platform.
-- [ ] 44. A queue for videos outside Shows, the macOS menu bar's player menus, an inspector, audio output and loudness, a second subtitle track, finer speed and seek steps, crop, Linux display inhibition, and window sizing. See [IINA parity](IINA_PARITY.md#what-to-add-next) for the order.
+- [x] 38. Keep the display awake while a video plays. libmpv's render API leaves this to the application, and nothing did it. macOS holds an IOKit assertion, Windows sets the thread execution state, and Linux asks `org.freedesktop.ScreenSaver`.
+- [x] 39. Fix the abort on videos with rotation metadata, in libmpv's `mp_image_crop`, which also hit the poster worker. Players run with `video-rotate=no`, and a `transpose` filter from `demux-rotation` turns the picture.
+- [x] 40. Subtitles: delay, automatic loading of matching files, a second track, font, outline, shadow, ASS override, and encoding. Audio: external files, output devices, a 10-band equalizer with presets, ReplayGain, volume up to 200%, and Spatial Audio output on macOS.
+- [x] 41. Video: a panel for aspect ratio, crop presets, rotation, flip, mirror, deinterlace, and color, as FFmpeg filters because the software renderer has no equalizer or rotation; custom video and audio filters; screenshots to a file or the clipboard; Live Text on macOS; and media information.
+- [x] 42. Playback: repeat, a speed menu to 16×, the seek step and exact seeking, going to a typed time, scrolling for volume and seeking, and a queue of the show or folder with chapters, Play Next, Add to Queue, reordering, shuffle, and repeat all.
+- [x] 43. System: media keys and Now Playing (MediaPlayer, the System Media Transport Controls, MPRIS), the macOS menu bar, float on top and float while playing, window sizes, streaming web links and `flick://open?url=` links, mpv and VLC keymaps, a choice of controls, extra mpv options, and log files.
+- [ ] 44. Not planned, with reasons in [IINA parity](IINA_PARITY.md): HDR until native GPU presentation (item 13), several player windows, pinch gestures (GPUI has none), plugins, translations, gapless audio, a music library, and the Touch Bar.
 
-State on 2026-11-28: items 38 to 41 pass the `runtime-shaders` typecheck and unit tests, and the macOS display assertion was observed in `pmset`. Nothing in them has played in libmpv yet. See [validation](VALIDATION.md#iina-parity-player-features-on-2026-11-28).
+State on 2026-11-28: items 38 to 43 pass the `runtime-shaders` typecheck and unit tests, and their libmpv parts pass real libmpv tests; the display hold, float while playing, the queue, subtitle loading, and the rotated-video fix were also seen in the running app. The panels were not seen on screen. See [validation](VALIDATION.md#iina-parity-player-features-on-2026-11-28).
 
 Watch folders, remote control of the player, accounts, cloud storage, casting, and a general NDJSON agent interface are outside the first release. Search belongs in the library workflow.
 

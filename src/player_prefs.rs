@@ -101,6 +101,8 @@ pub struct PlayerPreferences {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub screenshot_folder: Option<PathBuf>,
     pub controls: ControlsChoice,
+    /// Keep the window above others while a video plays, as IINA can.
+    pub float_while_playing: bool,
     /// Queue the other videos in a video's folder, as IINA's playlist does.
     pub queue_folder: bool,
     /// Added to mpv's `vf` after Flick's own picture adjustments.
@@ -124,6 +126,7 @@ impl Default for PlayerPreferences {
             screenshot_subtitles: true,
             screenshot_folder: None,
             controls: ControlsChoice::Style,
+            float_while_playing: false,
             queue_folder: true,
             video_filters: String::new(),
             audio_filters: String::new(),

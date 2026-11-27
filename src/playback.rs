@@ -2829,6 +2829,37 @@ mod tests {
         Ok(())
     }
 
+    /// Live Text: Vision reads the burned-in timestamp of the generated
+    /// clip from a screenshot of the frame on screen.
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "requires native libmpv and FLICK_TEST_VIDEO"]
+    fn real_live_text_reads_the_frame() -> Result<()> {
+        let clip = std::env::var("FLICK_TEST_VIDEO")?;
+        let player = Player::new()?;
+        player.load(&clip)?;
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline {
+            player.poll_events();
+            player.render(640, 360)?;
+            thread::sleep(Duration::from_millis(16));
+        }
+        let folder = tempfile::tempdir()?;
+        let shot = folder.path().join("frame.png");
+        player.command(&[
+            "screenshot-to-file",
+            shot.to_str().context("Temporary path is not UTF-8")?,
+            "subtitles",
+        ])?;
+        let lines = crate::live_text::recognize(&shot)?;
+        println!("recognized: {lines:?}");
+        ensure!(
+            lines.iter().any(|line| line.contains("00:00")),
+            "No timestamp among {lines:?}"
+        );
+        Ok(())
+    }
+
     /// A file with rotation metadata, such as a phone video, made by
     /// `ffmpeg -display_rotation:v:0 90 -i clip.mp4 -c copy rotated.mp4`.
     /// The software renderer used to abort the process in `mp_image_crop`

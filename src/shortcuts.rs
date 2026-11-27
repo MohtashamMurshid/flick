@@ -36,6 +36,7 @@ pub enum Shortcut {
     LoopFile,
     Screenshot,
     CopyScreenshot,
+    CopyText,
     SpeedDown,
     SpeedUp,
     SpeedReset,
@@ -45,7 +46,7 @@ pub enum Shortcut {
 
 impl Shortcut {
     /// Every shortcut, in the order the shortcuts page lists them.
-    pub const ALL: [Self; 30] = [
+    pub const ALL: [Self; 31] = [
         Self::PlayPause,
         Self::SeekBack,
         Self::SeekForward,
@@ -71,6 +72,7 @@ impl Shortcut {
         Self::LoopFile,
         Self::Screenshot,
         Self::CopyScreenshot,
+        Self::CopyText,
         Self::SpeedDown,
         Self::SpeedUp,
         Self::SpeedReset,
@@ -105,6 +107,7 @@ impl Shortcut {
             Self::LoopFile => "Repeat this video",
             Self::Screenshot => "Save a screenshot",
             Self::CopyScreenshot => "Copy the frame",
+            Self::CopyText => "Copy text in the frame",
             Self::SpeedDown => "Slower",
             Self::SpeedUp => "Faster",
             Self::SpeedReset => "Normal speed",
@@ -140,6 +143,7 @@ impl Shortcut {
             Self::LoopFile => "shift-l",
             Self::Screenshot => "s",
             Self::CopyScreenshot => "shift-s",
+            Self::CopyText => "shift-t",
             Self::SpeedDown => "-",
             Self::SpeedUp => "=",
             Self::SpeedReset => "backspace",

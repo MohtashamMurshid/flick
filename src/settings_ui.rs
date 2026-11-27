@@ -496,6 +496,12 @@ impl Flick {
         let exact = self.switch("exact-seek", player.exact_seek, cx, |this, _, cx| {
             this.set_player(|p| p.exact_seek = !p.exact_seek, cx)
         });
+        let float = self.switch(
+            "float-while-playing",
+            player.float_while_playing,
+            cx,
+            |this, _, cx| this.set_player(|p| p.float_while_playing = !p.float_while_playing, cx),
+        );
         let controls = self.segmented(
             "controls-layout",
             &[
@@ -524,6 +530,14 @@ impl Flick {
                 "Exact seeking",
                 Some("Off jumps to the nearest keyframe, which is faster on large files".into()),
                 exact,
+            )
+            .into_any_element(),
+            row(
+                &t,
+                Some("picture-in-picture"),
+                "Float on top while playing",
+                Some("The window stays above others until the video pauses or ends".into()),
+                float,
             )
             .into_any_element(),
             row(

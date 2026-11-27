@@ -373,6 +373,12 @@ impl Flick {
                     Action::Control(Control::Shortcut(Shortcut::CopyScreenshot)),
                 ),
                 command(
+                    "copy",
+                    "Copy Text in the Frame",
+                    shortcut(Shortcut::CopyText),
+                    Action::Control(Control::Shortcut(Shortcut::CopyText)),
+                ),
+                command(
                     "repeat",
                     if self.snapshot.loop_file {
                         "Stop Repeating"

@@ -3,6 +3,7 @@ mod awake;
 mod benchmark;
 mod input;
 mod library_files;
+mod live_text;
 mod logs;
 mod menus;
 mod model;

@@ -266,6 +266,15 @@ fn preference_field(
     field
 }
 
+/// What a screenshot is for.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Shot {
+    Save,
+    CopyImage,
+    /// Copy the text in the frame, as IINA's Live Text.
+    CopyText,
+}
+
 /// What a file picker in the player is for.
 #[derive(Clone, Copy)]
 enum Pick {
@@ -446,8 +455,11 @@ pub struct Flick {
     audio_output: Option<&'static str>,
     /// What plays next.
     queue: crate::queue::Queue,
-    /// The window floats above others.
+    /// Float on Top is on.
     floating: bool,
+    /// Whether the window floats now: Float on Top, or Settings' float
+    /// while playing.
+    floated: bool,
     /// Media keys and the system's Now Playing controls.
     now_playing: crate::now_playing::NowPlaying,
     /// Scrolling on the video not yet turned into volume or seeking: whether
@@ -741,6 +753,7 @@ impl Flick {
             scroll_pending: (false, 0.),
             queue: Default::default(),
             floating: false,
+            floated: false,
             now_playing: crate::now_playing::NowPlaying::new(crate::window_ext::win32_handle(
                 window,
             )),
@@ -1578,6 +1591,27 @@ impl Flick {
             .unwrap_or_default()
     }
 
+    /// Floats the window while Float on Top is on, or while a video plays
+    /// with Settings › Playback › Float on top while playing.
+    fn float_window(&mut self, window: &mut Window) {
+        let wanted = self.floating
+            || (self.store.data.player.float_while_playing
+                && self.view == View::Player
+                && self.playing());
+        if wanted == self.floated {
+            return;
+        }
+        match crate::window_ext::set_floating(window, wanted) {
+            Ok(()) => self.floated = wanted,
+            Err(error) => {
+                // Unsupported here; stop asking.
+                self.floating = false;
+                self.floated = wanted;
+                self.error = Some(format!("{error:#}"));
+            }
+        }
+    }
+
     /// Runs media key and Now Playing commands, and shows the playing video
     /// there.
     fn follow_media_keys(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1699,6 +1733,7 @@ impl Flick {
             M::VideoAdjustments => Control::Video,
             M::Screenshot => Control::Shortcut(Shortcut::Screenshot),
             M::CopyFrame => Control::Shortcut(Shortcut::CopyScreenshot),
+            M::CopyText => Control::Shortcut(Shortcut::CopyText),
             M::MediaInfo => Control::Info,
             M::PreviousFrame => Control::Shortcut(Shortcut::FrameBack),
             M::NextFrame => Control::Shortcut(Shortcut::FrameForward),
@@ -1853,10 +1888,11 @@ impl Flick {
     }
 
     /// Saves the frame on screen at the video's own size, with subtitles
-    /// unless Settings say otherwise, to the screenshot folder; or, with
-    /// `clipboard`, copies it as a PNG. Folders are made and files read off
-    /// the UI thread.
-    fn screenshot(&mut self, clipboard: bool, cx: &mut Context<Self>) {
+    /// unless Settings say otherwise, to the screenshot folder; copies it as
+    /// a PNG; or copies the text Vision finds in it, as IINA's Live Text.
+    /// Folders are made, files read, and text recognized off the UI thread.
+    fn screenshot(&mut self, shot: Shot, cx: &mut Context<Self>) {
+        let clipboard = shot != Shot::Save;
         let preferences = &self.store.data.player;
         let folder = if clipboard {
             Some(std::env::temp_dir().join("flick-screenshots"))
@@ -1875,7 +1911,7 @@ impl Flick {
         } else {
             preferences.screenshot_format.extension()
         };
-        let mode = if preferences.screenshot_subtitles {
+        let mode = if preferences.screenshot_subtitles || shot == Shot::CopyText {
             "subtitles"
         } else {
             "video"
@@ -1944,7 +1980,7 @@ impl Flick {
                 return;
             }
             // libmpv writes the file after the command returns; wait for a
-            // whole PNG, then copy it and remove the file.
+            // whole PNG, then copy it, or its text, and remove the file.
             let mut bytes = None;
             for _ in 0..100 {
                 background.timer(Duration::from_millis(50)).await;
@@ -1957,21 +1993,43 @@ impl Flick {
                     break;
                 }
             }
-            let file = path.clone();
+            let file = std::path::PathBuf::from(&path);
+            let text = if shot == Shot::CopyText && bytes.is_some() {
+                let image = file.clone();
+                Some(
+                    background
+                        .spawn(async move { crate::live_text::recognize(&image) })
+                        .await,
+                )
+            } else {
+                None
+            };
             background
                 .spawn(async move {
                     let _ = std::fs::remove_file(file);
                 })
                 .detach();
             let _ = this.update(cx, |this, cx| {
-                match bytes {
-                    Some(bytes) => {
+                match (bytes, text) {
+                    (None, _) => this.error = Some("The frame could not be copied.".into()),
+                    (Some(_), Some(Ok(lines))) if lines.is_empty() => {
+                        this.show_status("No text in this frame")
+                    }
+                    (Some(_), Some(Ok(lines))) => {
+                        cx.write_to_clipboard(gpui::ClipboardItem::new_string(lines.join("\n")));
+                        this.show_status(if lines.len() == 1 {
+                            "Copied 1 line of text".to_owned()
+                        } else {
+                            format!("Copied {} lines of text", lines.len())
+                        });
+                    }
+                    (Some(_), Some(Err(error))) => this.error = Some(format!("{error:#}")),
+                    (Some(bytes), None) => {
                         cx.write_to_clipboard(gpui::ClipboardItem::new_image(
                             &gpui::Image::from_bytes(gpui::ImageFormat::Png, bytes),
                         ));
                         this.show_status("Copied the frame");
                     }
-                    None => this.error = Some("The screenshot could not be copied.".into()),
                 }
                 cx.notify();
             });
@@ -2450,6 +2508,7 @@ impl Flick {
             self.apply_picture(cx);
         }
         self.follow_media_keys(window, cx);
+        self.float_window(window);
         let ended = self.snapshot.eof && self.file_loaded;
         if ended && !self.was_eof {
             self.up_next = self
@@ -2730,17 +2789,14 @@ impl Flick {
             }
             Control::Fullscreen => window.toggle_fullscreen(),
             Control::FloatOnTop => {
-                let on = !self.floating;
-                match crate::window_ext::set_floating(window, on) {
-                    Ok(()) => {
-                        self.floating = on;
-                        self.show_status(if on {
-                            "Floating on top"
-                        } else {
-                            "Not floating"
-                        });
-                    }
-                    Err(error) => self.error = Some(format!("{error:#}")),
+                self.floating = !self.floating;
+                self.float_window(window);
+                if self.error.is_none() {
+                    self.show_status(if self.floating {
+                        "Floating on top"
+                    } else {
+                        "Not floating"
+                    });
                 }
                 cx.notify();
             }
@@ -3134,8 +3190,9 @@ impl Flick {
                     "Repeat off"
                 });
             }
-            Shortcut::Screenshot => self.screenshot(false, cx),
-            Shortcut::CopyScreenshot => self.screenshot(true, cx),
+            Shortcut::Screenshot => self.screenshot(Shot::Save, cx),
+            Shortcut::CopyScreenshot => self.screenshot(Shot::CopyImage, cx),
+            Shortcut::CopyText => self.screenshot(Shot::CopyText, cx),
             Shortcut::SpeedDown | Shortcut::SpeedUp => {
                 let speed = self.snapshot.speed;
                 let next = if shortcut == Shortcut::SpeedUp {
