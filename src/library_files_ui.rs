@@ -389,7 +389,8 @@ impl Flick {
         {
             return;
         }
-        self.card_menu = None;
+        self.close_menus();
+        self.search_menu = false;
         if self.store.data.video(&path).is_none() {
             return;
         }
@@ -813,46 +814,23 @@ impl Flick {
                 |this, window, cx| this.confirm_library_delete(window, cx),
             ));
         }
-        Some(
-            div()
-                .id("library-delete-overlay")
-                .absolute()
-                .inset_0()
-                .size_full()
-                .flex()
-                .items_center()
-                .justify_center()
-                .bg(rgba(0x00000080))
-                .occlude()
-                .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
-                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation())
-                .child(
-                    v_flex()
-                        .w(px(480.))
-                        .max_w_full()
-                        .p_5()
-                        .gap_4()
-                        .rounded(px(t.radius))
-                        .border_1()
-                        .border_color(t.border)
-                        .bg(t.popover)
-                        .shadow_lg()
-                        .child(div().text_size(t.font(18.)).child(if working {
-                            "Moving to Trash"
-                        } else {
-                            "Delete File"
-                        }))
-                        .child(
-                            div()
-                                .text_color(t.muted)
-                                .child(dialog.path.display().to_string()),
-                        )
-                        .child(div().child(message))
-                        .child(actions),
-                )
-                .into_any_element(),
-        )
+        Some(super::chrome_ui::dialog(
+            t,
+            "library-delete-overlay",
+            if working {
+                "Moving to Trash"
+            } else {
+                "Delete File"
+            },
+            vec![
+                div()
+                    .text_color(t.muted)
+                    .child(dialog.path.display().to_string())
+                    .into_any_element(),
+                div().child(message).into_any_element(),
+            ],
+            actions,
+        ))
     }
 }
 

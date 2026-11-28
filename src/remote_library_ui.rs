@@ -133,7 +133,7 @@ pub(super) struct RemoteDelete {
 }
 
 /// What Remove · Keep Files says while the server answers.
-const REMOVING: &str = "Removing…";
+pub(super) const REMOVING: &str = "Removing…";
 
 /// Marks a remote row's Pause, Resume, or Remove as in flight. False when
 /// one already is, so the click does nothing.
@@ -273,6 +273,14 @@ pub(super) fn matches_query(video: &Video, query: &str) -> bool {
             .episode
             .as_ref()
             .is_some_and(|episode| episode.show.to_lowercase().contains(query))
+}
+
+/// A paired machine's video whose title has every search word.
+pub(super) struct RemoteMatch {
+    pub(super) server_id: String,
+    pub(super) server_name: String,
+    pub(super) video_id: String,
+    pub(super) title: String,
 }
 
 /// Groups a listing like the local Shows page: plain videos by title, then
@@ -947,7 +955,7 @@ impl Flick {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.card_menu = None;
+        self.close_menus();
         self.remote_ui.menu = Some(RemoteCardMenu {
             server,
             video,
@@ -2664,6 +2672,9 @@ impl Flick {
                 },
                 result,
             ) => {
+                // The row was Removing… since Confirm, so no second dialog
+                // could take this answer for its own.
+                save_to.busy.remove(&(server_id.clone(), id.clone()));
                 let pending = save_to
                     .delete
                     .as_ref()
@@ -2672,6 +2683,11 @@ impl Flick {
                 let (again, refused) = delete_answered(server_id, id, result);
                 if pending {
                     save_to.delete = again;
+                } else if again.is_some() {
+                    // Closed while waiting: nothing was deleted, so say so.
+                    self.error = Some(format!(
+                        "{name}: Nothing was deleted because its files changed. Try again."
+                    ));
                 }
                 if let Some(message) = refused {
                     self.error = Some(format!("{name}: {}", sentence(&message)));
@@ -3449,18 +3465,22 @@ impl Flick {
             .busy
             .get(&(server.clone(), id.clone()))
             .copied();
-        let removing = busy == Some(REMOVING);
-        let (toggle_server, toggle_id) = (server.clone(), id.clone());
-        let (remove_server, remove_id) = (server.clone(), id.clone());
-        actions = actions
-            .child(self.button(
+        if busy == Some(REMOVING) {
+            // The row is going; only say so.
+            let t = cx.theme();
+            actions = actions.child(
+                div()
+                    .text_size(t.font(12.))
+                    .text_color(t.muted)
+                    .child(REMOVING),
+            );
+        } else {
+            let (toggle_server, toggle_id) = (server.clone(), id.clone());
+            actions = actions.child(self.button(
                 SharedString::from(format!("remote-pause-{key}")),
                 Some(if paused { "play" } else { "pause" }),
-                match busy {
-                    Some(label) if !removing => label,
-                    _ if paused => "Resume",
-                    _ => "Pause",
-                },
+                // Pausing… or Resuming… while the server answers.
+                busy.unwrap_or(if paused { "Resume" } else { "Pause" }),
                 false,
                 cx,
                 move |this, _, cx| {
@@ -3478,98 +3498,118 @@ impl Flick {
                     }
                     cx.notify();
                 },
-            ))
-            .child(self.button(
-                SharedString::from(format!("remote-remove-{key}")),
-                None,
-                if removing {
-                    REMOVING
-                } else {
-                    "Remove · Keep Files"
-                },
-                false,
-                cx,
-                move |this, _, cx| {
-                    let busy = &mut this.remote_ui.save_to.busy;
-                    if !start_row_command(busy, &remove_server, &remove_id, REMOVING) {
-                        return;
-                    }
-                    this.remote.remove(
-                        &this.store.data,
-                        &remove_server,
-                        &remove_id,
-                        false,
-                        Vec::new(),
-                    );
-                    cx.notify();
-                },
             ));
-        if offers_delete(transfer) {
-            let (delete_server, delete_id, delete_list) = (
-                server.clone(),
-                id.clone(),
-                crate::remote_client::confirm_list(transfer),
-            );
-            actions = actions.child(self.button(
-                SharedString::from(format!("remote-delete-{key}")),
-                None,
-                "Remove and Delete Files…",
-                false,
-                cx,
-                move |this, _, cx| {
-                    this.remote_ui.save_to.delete = Some(RemoteDelete {
-                        server_id: delete_server.clone(),
-                        id: delete_id.clone(),
-                        confirm: delete_list.clone(),
-                        changed: None,
-                        sending: false,
-                    });
-                    cx.notify();
-                },
-            ));
-        }
-        let confirmation = self
-            .remote_ui
-            .save_to
-            .delete
-            .as_ref()
-            .filter(|delete| delete.server_id == server && delete.id == id)
-            .map(|delete| {
-                self.delete_confirmation(
-                    &key,
-                    delete.confirm.iter().cloned(),
-                    delete.changed.clone(),
-                    delete.sending,
+            // Remove waits for a Pause or Resume in flight.
+            if busy.is_none() {
+                actions = actions.child(self.transfer_more_button(
+                    SharedString::from(format!("remote-more-{key}")),
+                    TransferTarget::Remote { server, id },
                     cx,
-                    |this, _, cx| {
-                        this.remote_ui.save_to.delete = None;
-                        cx.notify();
-                    },
-                    |this, _, cx| {
-                        let Some(delete) = this.remote_ui.save_to.delete.as_mut() else {
-                            return;
-                        };
-                        if delete.sending {
-                            return;
-                        }
-                        delete.sending = true;
-                        let (server, id, confirm) = (
-                            delete.server_id.clone(),
-                            delete.id.clone(),
-                            delete.confirm.clone(),
-                        );
-                        this.remote
-                            .remove(&this.store.data, &server, &id, true, confirm);
-                        cx.notify();
-                    },
-                )
-            });
+                ));
+            }
+        }
         self.transfer_entry(
             &super::library_ui::RowFigures::remote(transfer),
             actions,
-            confirmation,
             cx,
         )
+    }
+
+    /// Videos on paired machines that match every search word, for the
+    /// search menu, from their last listings.
+    pub(super) fn remote_search_matches(&self, limit: usize) -> Vec<RemoteMatch> {
+        let words = self
+            .query
+            .to_lowercase()
+            .split_whitespace()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        if words.is_empty() {
+            return Vec::new();
+        }
+        let mut found = Vec::new();
+        for server in self.remote.servers(&self.store.data) {
+            let Some(listing) = server.listing.as_deref() else {
+                continue;
+            };
+            for video in &listing.videos {
+                if found.len() == limit {
+                    return found;
+                }
+                if words.iter().all(|word| matches_query(video, word)) {
+                    found.push(RemoteMatch {
+                        server_id: server.id.clone(),
+                        server_name: server.name.clone(),
+                        video_id: video.id.clone(),
+                        title: display_title(video).to_owned(),
+                    });
+                }
+            }
+        }
+        found
+    }
+
+    /// The More menu of a row on another machine: Remove · Keep Files, and
+    /// Remove and Delete Files… unless the row is the owner's own share.
+    pub(super) fn remote_transfer_menu_items(
+        &self,
+        server: &str,
+        id: &str,
+    ) -> Vec<super::library_ui::MenuItem> {
+        let Some(transfer) = self
+            .remote
+            .machine_transfers(&self.store.data)
+            .into_iter()
+            .filter(|machine| machine.server_id == server)
+            .flat_map(|machine| machine.transfers)
+            .find(|row| row.id == id)
+        else {
+            return Vec::new();
+        };
+        let (remove_server, remove_id) = (server.to_owned(), id.to_owned());
+        let mut items: Vec<super::library_ui::MenuItem> = vec![(
+            "x",
+            "Remove · Keep Files".into(),
+            Rc::new(move |this, _, cx| {
+                let busy = &mut this.remote_ui.save_to.busy;
+                if !start_row_command(busy, &remove_server, &remove_id, REMOVING) {
+                    return;
+                }
+                this.remote.remove(
+                    &this.store.data,
+                    &remove_server,
+                    &remove_id,
+                    false,
+                    Vec::new(),
+                );
+                cx.notify();
+            }),
+        )];
+        if offers_delete(&transfer) {
+            let delete = RemoteDelete {
+                server_id: server.to_owned(),
+                id: id.to_owned(),
+                confirm: crate::remote_client::confirm_list(&transfer),
+                changed: None,
+                sending: false,
+            };
+            items.push((
+                "x",
+                "Remove and Delete Files…".into(),
+                Rc::new(move |this, window, cx| {
+                    this.delete_transfer = None;
+                    this.remote_ui.save_to.delete = Some(RemoteDelete {
+                        server_id: delete.server_id.clone(),
+                        id: delete.id.clone(),
+                        confirm: delete.confirm.clone(),
+                        changed: None,
+                        sending: false,
+                    });
+                    this.focus_transfer_delete(window, cx);
+                }),
+            ));
+        }
+        items
     }
 }
 

@@ -89,18 +89,46 @@ impl TextInput {
         self.move_to(self.content.len(), cx);
     }
 
-    fn backspace(&mut self, _: &Backspace, window: &mut Window, cx: &mut Context<Self>) {
+    fn backspace(&mut self, _: &Backspace, _: &mut Window, cx: &mut Context<Self>) {
         if self.selected_range.is_empty() {
             self.select_to(self.previous_boundary(self.cursor_offset()), cx)
         }
-        self.replace_text_in_range(None, "", window, cx)
+        self.edit(self.selected_range.clone(), "", cx)
     }
 
-    fn delete(&mut self, _: &Delete, window: &mut Window, cx: &mut Context<Self>) {
+    fn delete(&mut self, _: &Delete, _: &mut Window, cx: &mut Context<Self>) {
         if self.selected_range.is_empty() {
             self.select_to(self.next_boundary(self.cursor_offset()), cx)
         }
-        self.replace_text_in_range(None, "", window, cx)
+        self.edit(self.selected_range.clone(), "", cx)
+    }
+
+    /// Replaces `range` with `new_text`, places the caret after it, and
+    /// reports the change. An edit that changes nothing, such as Backspace
+    /// at the start, reports nothing, so search results stay.
+    fn edit(&mut self, range: Range<usize>, new_text: &str, cx: &mut Context<Self>) {
+        if self.read_only {
+            return;
+        }
+        let changed = self.content[range.clone()] != *new_text;
+        self.content =
+            (self.content[0..range.start].to_owned() + new_text + &self.content[range.end..])
+                .into();
+        self.selected_range = range.start + new_text.len()..range.start + new_text.len();
+        self.marked_range = None;
+        if changed {
+            cx.emit(InputEvent::Changed);
+        }
+        cx.notify();
+    }
+
+    /// The text a platform edit replaces: the range it names, else the
+    /// text being composed, else the selection.
+    fn platform_range(&self, range_utf16: Option<Range<usize>>) -> Range<usize> {
+        range_utf16
+            .map(|range| self.range_from_utf16(&range))
+            .or(self.marked_range.clone())
+            .unwrap_or(self.selected_range.clone())
     }
 
     fn on_mouse_down(
@@ -153,9 +181,9 @@ impl TextInput {
         window.show_character_palette();
     }
 
-    fn paste(&mut self, _: &Paste, window: &mut Window, cx: &mut Context<Self>) {
+    fn paste(&mut self, _: &Paste, _: &mut Window, cx: &mut Context<Self>) {
         if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
-            self.replace_text_in_range(None, &text.replace("\n", " "), window, cx);
+            self.edit(self.selected_range.clone(), &text.replace("\n", " "), cx);
         }
     }
 
@@ -166,12 +194,12 @@ impl TextInput {
             ));
         }
     }
-    fn cut(&mut self, _: &Cut, window: &mut Window, cx: &mut Context<Self>) {
+    fn cut(&mut self, _: &Cut, _: &mut Window, cx: &mut Context<Self>) {
         if !self.selected_range.is_empty() && !self.read_only {
             cx.write_to_clipboard(ClipboardItem::new_string(
                 self.content[self.selected_range.clone()].to_string(),
             ));
-            self.replace_text_in_range(None, "", window, cx)
+            self.edit(self.selected_range.clone(), "", cx)
         }
     }
 
@@ -330,22 +358,17 @@ impl EntityInputHandler for TextInput {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.read_only {
+        tracing::debug!(
+            ?range_utf16,
+            text = new_text,
+            marked = ?self.marked_range,
+            selected = ?self.selected_range,
+            "Text input: platform insert"
+        );
+        if only_ends_composition(&range_utf16, &self.marked_range, new_text) {
             return;
         }
-        let range = range_utf16
-            .as_ref()
-            .map(|range_utf16| self.range_from_utf16(range_utf16))
-            .or(self.marked_range.clone())
-            .unwrap_or(self.selected_range.clone());
-
-        self.content =
-            (self.content[0..range.start].to_owned() + new_text + &self.content[range.end..])
-                .into();
-        self.selected_range = range.start + new_text.len()..range.start + new_text.len();
-        self.marked_range.take();
-        cx.emit(InputEvent::Changed);
-        cx.notify();
+        self.edit(self.platform_range(range_utf16), new_text, cx);
     }
 
     fn replace_and_mark_text_in_range(
@@ -356,15 +379,18 @@ impl EntityInputHandler for TextInput {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.read_only {
+        tracing::debug!(
+            ?range_utf16,
+            text = new_text,
+            marked = ?self.marked_range,
+            selected = ?self.selected_range,
+            "Text input: platform mark"
+        );
+        if self.read_only || only_ends_composition(&range_utf16, &self.marked_range, new_text) {
+            self.marked_range = None;
             return;
         }
-        let range = range_utf16
-            .as_ref()
-            .map(|range_utf16| self.range_from_utf16(range_utf16))
-            .or(self.marked_range.clone())
-            .unwrap_or(self.selected_range.clone());
-
+        let range = self.platform_range(range_utf16);
         self.content =
             (self.content[0..range.start].to_owned() + new_text + &self.content[range.end..])
                 .into();
@@ -760,6 +786,20 @@ fn word_range(text: &str, index: usize) -> Range<usize> {
         .unwrap_or(0..0)
 }
 
+/// Whether a platform edit only ends a composition and must change no
+/// text. On a double- or triple-click, macOS hands the click to the input
+/// method first, which can answer with an empty insert or mark that names
+/// no range while nothing is being composed. Applied to the selection, that
+/// deleted the word or the whole field. Backspace, Delete, and Cut are key
+/// actions and never come this way.
+fn only_ends_composition(
+    range_utf16: &Option<Range<usize>>,
+    marked: &Option<Range<usize>>,
+    new_text: &str,
+) -> bool {
+    new_text.is_empty() && range_utf16.is_none() && marked.is_none()
+}
+
 fn utf16_range_in(text: &str, range: &Range<usize>) -> Range<usize> {
     let offset = |target| {
         let mut count = 0;
@@ -789,6 +829,17 @@ mod tests {
         assert_eq!(&text[word_range(text, text.len())], "Arrival.mkv");
         assert_eq!(word_range("", 0), 0..0);
         assert_eq!(&"a 😀 b"[word_range("a 😀 b", 2)], "😀");
+    }
+
+    #[test]
+    fn an_empty_platform_edit_without_a_range_keeps_the_selection() {
+        // After a double-click selects a word: the empty insert is ignored.
+        assert!(only_ends_composition(&None, &None, ""));
+        // Ending a composition still removes the composed text.
+        assert!(!only_ends_composition(&None, &Some(3..5), ""));
+        // A named range or real text is an edit.
+        assert!(!only_ends_composition(&Some(0..4), &None, ""));
+        assert!(!only_ends_composition(&None, &None, "a"));
     }
 
     #[test]

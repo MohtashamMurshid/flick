@@ -149,6 +149,19 @@ struct CardMenu {
     continuing: bool,
 }
 
+/// What a Downloads row's More menu acts on.
+#[derive(Clone)]
+enum TransferTarget {
+    Local(String),
+    Remote { server: String, id: String },
+}
+
+/// A Downloads row's More menu, at a window position.
+struct TransferMenu {
+    position: gpui::Point<Pixels>,
+    target: TransferTarget,
+}
+
 #[derive(Clone, Copy, PartialEq)]
 enum Menu {
     Tracks,
@@ -380,6 +393,10 @@ pub struct Flick {
     video_filter: VideoFilter,
     /// GNOME shows search in a bar below the header bar while open.
     search_open: bool,
+    /// The menu of results under the search field is open.
+    search_menu: bool,
+    /// Why the last online search failed, shown in the search menu.
+    search_error: Option<String>,
     search_input: Entity<TextInput>,
     /// The command center, while open, and its search field.
     palette: Option<palette_ui::Palette>,
@@ -475,6 +492,7 @@ pub struct Flick {
     /// The slider being dragged.
     dragging_slider: Option<&'static str>,
     card_menu: Option<CardMenu>,
+    transfer_menu: Option<TransferMenu>,
     /// The show whose episodes the Shows page lists, by show key.
     selected_show: Option<String>,
     /// The next episode, counting down after the current one ends.
@@ -614,16 +632,23 @@ impl Flick {
         cx.subscribe(&search_input, |this, input, event, cx| {
             match event {
                 InputEvent::Changed => {
+                    let value = input.read(cx).value();
+                    if value == this.query {
+                        return;
+                    }
                     let _ = this.services.send(ServiceCommand::CancelSearch);
-                    this.query = input.read(cx).value().to_owned();
+                    this.query = value.to_owned();
                     this.search_generation += 1;
                     this.searching = false;
                     this.search_results = None;
-                    if !this.query.is_empty() && !matches!(this.page, Page::Home | Page::Videos) {
-                        this.page = Page::Videos;
-                    }
+                    this.search_error = None;
+                    // Results open under the field; the page stays put.
+                    this.search_menu = !this.query.trim().is_empty();
                 }
-                InputEvent::Submit => this.search(cx),
+                InputEvent::Submit => {
+                    this.search_menu = !this.query.trim().is_empty();
+                    this.search(cx);
+                }
             }
             cx.notify();
         })
@@ -705,6 +730,8 @@ impl Flick {
             page: Page::Home,
             video_filter: VideoFilter::All,
             search_open: false,
+            search_menu: false,
+            search_error: None,
             search_input,
             palette: None,
             palette_input,
@@ -767,6 +794,7 @@ impl Flick {
             slider_bounds: RefCell::default(),
             dragging_slider: None,
             card_menu: None,
+            transfer_menu: None,
             focused_card: Rc::default(),
             selected_show: None,
             up_next: None,
@@ -2702,6 +2730,8 @@ impl Flick {
             self.remote.refresh(&self.store.data);
         }
         self.page = page;
+        self.search_menu = false;
+        self.close_menus();
         if page == Page::Downloads {
             self.send(ServiceCommand::Load, cx);
         }
@@ -2712,9 +2742,13 @@ impl Flick {
         if self.view == View::Player {
             self.handle(Control::Library, window, cx);
         }
-        if !matches!(self.page, Page::Home | Page::Videos) {
+        // macOS and Windows show search on every page; GNOME only on these.
+        if cx.theme().style == crate::theme::Style::Gnome
+            && !matches!(self.page, Page::Home | Page::Videos)
+        {
             self.page = Page::Home;
         }
+        self.search_menu = !self.query.trim().is_empty();
         self.search_open = true;
         self.search_input.focus_handle(cx).focus(window);
         cx.notify();
@@ -3239,7 +3273,9 @@ impl Flick {
         if self.quitting {
             return;
         }
-        if self.handle_library_delete_key(event, window, cx) {
+        if self.handle_library_delete_key(event, window, cx)
+            || self.handle_transfer_delete_key(event, window, cx)
+        {
             return;
         }
         let key = event.keystroke.key.as_str();
@@ -3317,10 +3353,23 @@ impl Flick {
         {
             return;
         }
-        if key == "escape" && self.card_menu.take().is_some() {
+        if key == "escape" && self.close_menus() {
             self.focus.focus(window);
             cx.stop_propagation();
             cx.notify();
+            return;
+        }
+        if key == "escape" && self.search_menu {
+            self.search_menu = false;
+            cx.stop_propagation();
+            cx.notify();
+            return;
+        }
+        // Down from the search field moves into its menu.
+        if key == "down" && self.search_menu && self.search_input.read(cx).focused(window) {
+            let count = self.library_ui_state.search_menu_rows.borrow().len();
+            self.step_search_menu(1, count, window, cx);
+            cx.stop_propagation();
             return;
         }
         if key == "escape" {
@@ -3655,7 +3704,8 @@ impl Render for Flick {
             .child(content)
             .children(self.card_menu_panel(cx))
             .children(self.palette_view(window, cx))
-            .children(self.library_delete_panel(cx));
+            .children(self.library_delete_panel(cx))
+            .children(self.transfer_delete_panel(cx));
         self.window_frame(root.into_any_element(), window, cx)
     }
 }
