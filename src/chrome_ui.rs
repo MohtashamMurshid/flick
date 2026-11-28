@@ -554,6 +554,7 @@ impl Flick {
         });
         let field = div()
             .id("search-field")
+            .relative()
             .flex()
             .items_center()
             .gap_2()
@@ -562,8 +563,27 @@ impl Flick {
             .cursor_text()
             .on_mouse_down(
                 MouseButton::Left,
-                cx.listener(|this, _, _, _| this.control_pressed = true),
-            );
+                cx.listener(|this, _, _, cx| {
+                    this.control_pressed = true;
+                    // Pressing the field shows its results again.
+                    let open = !this.query.trim().is_empty();
+                    if this.search_menu != open {
+                        this.search_menu = open;
+                        cx.notify();
+                    }
+                }),
+            )
+            // The first Escape, in the field or its menu, closes the results
+            // and keeps the text; the field's own Escape clears it after.
+            .capture_key_down(cx.listener(|this, e: &KeyDownEvent, window, cx| {
+                if e.keystroke.key == "escape" && this.search_menu {
+                    this.search_menu = false;
+                    this.search_input.focus_handle(cx).focus(window);
+                    cx.stop_propagation();
+                    cx.notify();
+                }
+            }))
+            .children(self.search_menu(window, cx));
         match t.style {
             Style::Mac => field
                 .h(px(28.))
@@ -974,6 +994,54 @@ impl Flick {
             )
             .into_any_element()
     }
+}
+
+/// A modal dialog: a dimmed backdrop that takes every click and scroll,
+/// and a centered panel with a title, body, and right-aligned actions.
+pub(super) fn dialog(
+    t: &Theme,
+    id: &'static str,
+    title: impl Into<SharedString>,
+    body: Vec<AnyElement>,
+    actions: Div,
+) -> AnyElement {
+    // Deferred above menus, tooltips, and the command center, which are
+    // deferred too, so nothing can be clicked over a dialog.
+    let overlay = div()
+        .id(id)
+        .absolute()
+        .inset_0()
+        .size_full()
+        .flex()
+        .items_center()
+        .justify_center()
+        .bg(rgba(0x00000080))
+        .occlude()
+        .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
+        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+        .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation())
+        .child(
+            v_flex()
+                .w(t.font(480.))
+                .max_w_full()
+                .p_5()
+                .gap_4()
+                .rounded(px(t.card_radius))
+                .border_1()
+                .border_color(t.border)
+                .bg(t.popover)
+                .shadow_lg()
+                .text_color(t.text)
+                .child(
+                    div()
+                        .text_size(t.font(18.))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .child(title.into()),
+                )
+                .children(body)
+                .child(actions),
+        );
+    deferred(overlay).with_priority(5).into_any_element()
 }
 
 /// A grouped list: a macOS inset group, Windows settings cards, or a GNOME

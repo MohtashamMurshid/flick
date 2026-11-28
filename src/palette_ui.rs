@@ -63,8 +63,8 @@ impl Flick {
             return;
         }
         self.menu = None;
-        self.card_menu = None;
-        self.remote_ui.menu = None;
+        self.close_menus();
+        self.search_menu = false;
         self.palette = Some(Palette {
             selected: 0,
             online: None,
@@ -244,15 +244,24 @@ impl Flick {
                     }
                 }
                 None if searched && self.searching => {}
-                None => items.push(Item {
-                    section: "Online",
-                    icon: "search",
-                    title: format!("Search online for “{query}”").into(),
-                    detail: Some("Find videos to download".into()),
-                    keys: None,
-                    verb: "Search",
-                    action: Action::SearchOnline,
-                }),
+                None => {
+                    let failed = self.search_error.as_ref().filter(|_| searched);
+                    items.push(Item {
+                        section: "Online",
+                        icon: "search",
+                        title: match failed {
+                            Some(_) => "Search online again".into(),
+                            None => format!("Search online for “{query}”").into(),
+                        },
+                        detail: Some(match failed {
+                            Some(error) => error.clone().into(),
+                            None => "Find videos to download".into(),
+                        }),
+                        keys: None,
+                        verb: "Search",
+                        action: Action::SearchOnline,
+                    })
+                }
             }
         }
         items.extend(
@@ -479,16 +488,20 @@ impl Flick {
         };
         let query = self.palette_query(cx);
         if let Action::SearchOnline = item.action {
-            // Results are listed here, and on Home once this closes.
+            // Results are listed here, and under the search field once this closes.
             if let Some(palette) = &mut self.palette {
                 palette.online = Some(query.clone());
             }
             self.search_input
                 .update(cx, |input, cx| input.set_value(query.clone(), cx));
             self.query = query;
+            self.search_menu = true;
             self.search(cx);
             return;
         }
+        // Any other choice acts now; results under the search field would
+        // only cover where it leads.
+        self.search_menu = false;
         self.close_palette(window, cx);
         match item.action {
             Action::Play(path) => self.open(path, window, cx),

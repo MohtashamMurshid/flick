@@ -1,13 +1,13 @@
 //! Library pages, navigation, downloads, and sharing.
 
 use super::{
-    chrome_ui::{group, notice, row, section_title, thumbnail, traffic_light_space},
+    chrome_ui::{dialog, group, notice, row, section_title, thumbnail, traffic_light_space},
     *,
 };
 use crate::store::Sort;
 use flick::library::format_bytes;
 use gpui::{
-    AnyElement, Asset, AssetLogger, FontWeight, ImageAssetLoader, ImageCache, Resource,
+    AnyElement, Asset, AssetLogger, FontWeight, ImageAssetLoader, ImageCache, Resource, Rgba,
     ScrollHandle, ScrollStrategy, UniformListScrollHandle, anchored, deferred, linear_color_stop,
     linear_gradient, point, uniform_list,
 };
@@ -25,6 +25,9 @@ pub(super) struct LibraryUiState {
     scrolls: RefCell<HashMap<String, UniformListScrollHandle>>,
     page_scroll: ScrollHandle,
     search_scroll: ScrollHandle,
+    /// The search menu list's child index of each row, as last drawn.
+    pub(super) search_menu_rows: RefCell<Vec<usize>>,
+    search_menu_scroll: ScrollHandle,
     pub(super) posters: Option<Entity<PosterCache>>,
     visible_posters: RefCell<HashSet<PathBuf>>,
 }
@@ -618,20 +621,19 @@ impl Flick {
             return;
         }
         if is_torrent_link(&query) {
+            // Its files open on Downloads; the menu would cover them.
+            self.search_menu = false;
             self.resolve(flick::torrent::TorrentInput::Magnet(query), cx);
             return;
         }
-        if query.chars().count() < 3 {
-            self.error = Some("Type at least 3 characters to search online.".into());
-            cx.notify();
+        // The search menu says how many characters an online search needs.
+        if query.chars().count() < MIN_ONLINE_QUERY {
             return;
-        }
-        if !matches!(self.page, Page::Home | Page::Videos) {
-            self.page = Page::Home;
         }
         self.search_generation += 1;
         self.searching = true;
         self.search_results = None;
+        self.search_error = None;
         self.error = None;
         self.send(
             ServiceCommand::Search {
@@ -686,9 +688,10 @@ impl Flick {
                     done,
                 } if generation == self.search_generation => {
                     self.searching = !done;
+                    // Shown in the search menu, where the search started.
                     match result {
                         Ok(result) => self.search_results = Some(result),
-                        Err(error) => self.error = Some(error),
+                        Err(error) => self.search_error = Some(error),
                     }
                 }
                 ServiceEvent::Search { .. } => {}
@@ -1412,12 +1415,11 @@ impl Flick {
         self.focusable(el, &id, None, radius, (0., 0.), cx)
     }
 
+    /// Search results live in the search menu, so typing never replaces
+    /// the welcome screen.
     fn first_run(&self) -> bool {
         self.store.data.library.is_empty()
             && self.store.data.recent.is_empty()
-            && self.query.is_empty()
-            && self.search_results.is_none()
-            && !self.searching
             && !self.importing
             && !self.resolving
             && self.pending_torrent.is_none()
@@ -1602,7 +1604,7 @@ impl Flick {
         }
         if has_notices {
             body = body.child(if virtual_page {
-                self.search_pane(notices, false, cx).into_any_element()
+                self.search_pane(notices, cx).into_any_element()
             } else {
                 notices.flex_none().into_any_element()
             });
@@ -1653,9 +1655,9 @@ impl Flick {
             }))
     }
 
-    fn search_pane(&self, content: Div, link: bool, cx: &Context<Self>) -> Stateful<Div> {
+    fn search_pane(&self, content: Div, cx: &Context<Self>) -> Stateful<Div> {
         self.with_scroll_keys(
-            search_pane_layout(content, link),
+            search_pane_layout(content),
             "video-search-scroll",
             &self.library_ui_state.search_scroll,
             cx,
@@ -1756,120 +1758,388 @@ impl Flick {
         is_torrent_link(query) || flick::fetch::web_link(query).is_some()
     }
 
-    /// A download offer for a pasted YouTube, X, web, or magnet link. Enter
-    /// or the button starts it, the same way.
-    fn link_suggestion(&self, cx: &Context<Self>) -> Option<Div> {
-        let t = cx.theme().clone();
-        let query = self.query.trim();
-        let (title, detail): (String, String) = if is_torrent_link(query) {
-            (
+    /// What a pasted YouTube, X, web, or magnet link offers: a title and a
+    /// detail, or why it cannot be downloaded.
+    fn link_offer(&self, query: &str) -> Option<Result<(String, String), String>> {
+        if is_torrent_link(query) {
+            return Some(Ok((
                 "Download this torrent".into(),
-                "Magnet link · Press Enter to see its files".into(),
-            )
-        } else {
-            match flick::fetch::web_link(query)? {
-                Ok(link @ flick::fetch::WebLink::Archive(_)) => (
-                    format!("Download from {}", link.site()),
-                    "Choose files first · Press Enter".into(),
-                ),
-                Ok(link @ flick::fetch::WebLink::Page(_)) => (
-                    format!("Download video from {}", link.site()),
-                    format!("{query} · Press Enter"),
-                ),
-                Err(error) => return Some(notice(&t, true, format!("{error:#}")).mb_6()),
-            }
+                "Magnet link · See its files before downloading".into(),
+            )));
+        }
+        Some(match flick::fetch::web_link(query)? {
+            Ok(link @ flick::fetch::WebLink::Archive(_)) => Ok((
+                format!("Download from {}", link.site()),
+                "Choose files first".into(),
+            )),
+            Ok(link @ flick::fetch::WebLink::Page(_)) => Ok((
+                format!("Download video from {}", link.site()),
+                query.to_owned(),
+            )),
+            Err(error) => Err(format!("{error:#}")),
+        })
+    }
+
+    /// Library videos whose titles contain every search word, newest first.
+    fn search_matches(&self, limit: usize, skip: &HashSet<PathBuf>) -> Vec<(PathBuf, String)> {
+        let words = self
+            .query
+            .to_lowercase()
+            .split_whitespace()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        if words.is_empty() {
+            return Vec::new();
+        }
+        self.store
+            .data
+            .library
+            .iter()
+            .rev()
+            .filter(|video| {
+                let title = self.store.data.normalized_title(&video.path).unwrap_or("");
+                !skip.contains(&video.path)
+                    && words.iter().all(|word| title.contains(word.as_str()))
+            })
+            .take(limit)
+            .map(|video| (video.path.clone(), video.title.clone()))
+            .collect()
+    }
+
+    /// The menu under the search field: a pasted link to download, or
+    /// library matches and online results. Pages underneath never change.
+    pub(super) fn search_menu(&self, window: &Window, cx: &Context<Self>) -> Option<AnyElement> {
+        let query = self.query.trim();
+        // The command center lists the same results while it is open.
+        if !self.search_menu || query.is_empty() || self.palette.is_some() {
+            self.library_ui_state.search_menu_rows.borrow_mut().clear();
+            return None;
+        }
+        let t = cx.theme().clone();
+        let heading = |text: &'static str| {
+            div()
+                .px_2()
+                .pt_2()
+                .pb_1()
+                .text_size(t.font(11.))
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(t.muted)
+                .child(text)
+                .into_any_element()
         };
-        let button = self.button(
-            "download-link",
-            Some("download"),
-            "Download",
-            true,
-            cx,
-            |this, _, cx| this.search(cx),
-        );
+        let note = |text: SharedString, color: Rgba| {
+            div()
+                .px_2()
+                .py_2()
+                .text_size(t.font(12.))
+                .text_color(color)
+                .child(text)
+                .into_any_element()
+        };
+        let tile = |name: &'static str| {
+            div()
+                .flex_none()
+                .flex()
+                .items_center()
+                .justify_center()
+                .size(px(28.))
+                .rounded(px(6.))
+                .bg(t.control)
+                .child(icon(name, 16., t.text))
+        };
+        // Children of the list, and which of them are rows, so arrow keys
+        // can scroll the focused row into view.
+        let mut entries: Vec<AnyElement> = Vec::new();
+        let mut rows: Vec<usize> = Vec::new();
+        let mut item = |entries: &mut Vec<AnyElement>,
+                        leading: Div,
+                        title: SharedString,
+                        detail: Option<SharedString>,
+                        verb: &'static str,
+                        action: Rc<MenuAction>| {
+            let el = self.search_menu_item(rows.len(), leading, title, detail, verb, action, cx);
+            rows.push(entries.len());
+            entries.push(el);
+        };
+        match self.link_offer(query) {
+            Some(Ok((title, detail))) => {
+                entries.push(heading("Download"));
+                item(
+                    &mut entries,
+                    tile("download"),
+                    title.into(),
+                    Some(detail.into()),
+                    "Download",
+                    Rc::new(|this, _, cx| {
+                        this.search_menu = false;
+                        this.search(cx);
+                    }),
+                );
+            }
+            Some(Err(error)) => entries.push(note(error.into(), t.danger)),
+            None => {
+                // All Videos' grid already shows its own matches; list only
+                // what its filter or whole-phrase match leaves out.
+                let shown: HashSet<PathBuf> = if self.page == Page::Videos {
+                    self.filtered_video_paths().iter().cloned().collect()
+                } else {
+                    HashSet::new()
+                };
+                let local = self.search_matches(SEARCH_MENU_MATCHES, &shown);
+                let remote = self.remote_search_matches(SEARCH_MENU_MATCHES);
+                if !local.is_empty() || !remote.is_empty() {
+                    entries.push(heading("In Your Library"));
+                }
+                for (path, title) in local {
+                    let (_, detail) = self.video_detail(&path);
+                    let leading = self.poster(&path, &title, 48., 27., 4., cx);
+                    item(
+                        &mut entries,
+                        leading,
+                        title.into(),
+                        Some(detail.into()),
+                        "Play",
+                        Rc::new(move |this, window, cx| {
+                            this.search_menu = false;
+                            this.open(path.clone(), window, cx);
+                        }),
+                    );
+                }
+                for found in remote {
+                    let (server, video) = (found.server_id, found.video_id);
+                    item(
+                        &mut entries,
+                        tile("monitor"),
+                        found.title.into(),
+                        Some(format!("On {}", found.server_name).into()),
+                        "Play",
+                        Rc::new(move |this, window, cx| {
+                            this.search_menu = false;
+                            this.open_remote_video(&server, &video, window, cx);
+                            // Only Home shows remote notices; a failure sets
+                            // one, so say it here too.
+                            if this.page != Page::Home && this.remote_ui.notice.is_some() {
+                                this.error = this.remote_ui.notice.take();
+                            }
+                        }),
+                    );
+                }
+                entries.push(heading("Online"));
+                match &self.search_results {
+                    None if self.searching => {
+                        entries.push(note("Searching for videos online…".into(), t.muted))
+                    }
+                    None if query.chars().count() < MIN_ONLINE_QUERY => entries.push(note(
+                        "Type at least 3 characters to search online.".into(),
+                        t.muted,
+                    )),
+                    None => {
+                        if let Some(error) = &self.search_error {
+                            entries.push(note(error.clone().into(), t.danger));
+                        }
+                        item(
+                            &mut entries,
+                            tile("search"),
+                            if self.search_error.is_some() {
+                                "Try again".into()
+                            } else {
+                                format!("Search online for “{query}”").into()
+                            },
+                            None,
+                            "Search",
+                            Rc::new(|this, _, cx| this.search(cx)),
+                        );
+                    }
+                    Some(results) => {
+                        if !results.unavailable.is_empty() {
+                            entries.push(note(
+                                format!(
+                                    "Unavailable sources: {}. Try again or paste a magnet link.",
+                                    results.unavailable.join(", ")
+                                )
+                                .into(),
+                                t.muted,
+                            ));
+                        }
+                        if results.items.is_empty() && results.unavailable.is_empty() {
+                            entries
+                                .push(note("No videos found. Try another title.".into(), t.muted));
+                        }
+                        for result in &results.items {
+                            let source = result.clone();
+                            item(
+                                &mut entries,
+                                tile("download"),
+                                result.name.clone().into(),
+                                Some(result_detail(result).into()),
+                                "Download",
+                                Rc::new(move |this, _, cx| {
+                                    this.search_menu = false;
+                                    this.download_result(&source, cx);
+                                }),
+                            );
+                        }
+                        if self.searching {
+                            entries.push(note("Still searching…".into(), t.muted));
+                        }
+                    }
+                }
+            }
+        }
+        let count = rows.len();
+        *self.library_ui_state.search_menu_rows.borrow_mut() = rows;
+        let viewport = window.viewport_size();
+        // Short windows get a shorter list, never one pushed over the field.
+        let max_height = (f32::from(viewport.height) - 96.).clamp(120., 440.);
+        let list = v_flex()
+            .id("search-menu-list")
+            .track_scroll(&self.library_ui_state.search_menu_scroll)
+            .max_h(px(max_height))
+            .overflow_y_scroll()
+            .p_1p5()
+            .children(entries);
+        let panel = v_flex()
+            .id("search-menu")
+            .occlude()
+            .w(t.font(440.))
+            .max_w(px((f32::from(viewport.width) - 16.).max(240.)))
+            .bg(t.popover)
+            .border_1()
+            .border_color(t.border)
+            .rounded(px(t.card_radius))
+            .shadow_lg()
+            .overflow_hidden()
+            .text_color(t.text)
+            .text_size(t.font(t.text_size))
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            // A press on the search field closes this too; the field opens
+            // it again, so the pages beneath only ever see one menu.
+            .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                if this.search_menu {
+                    this.search_menu = false;
+                    cx.notify();
+                }
+            }))
+            // Escape is the search field's, which holds this menu.
+            .on_key_down(cx.listener(move |this, e: &KeyDownEvent, window, cx| {
+                let step = match e.keystroke.key.as_str() {
+                    "down" => 1,
+                    "up" => -1,
+                    _ => return,
+                };
+                cx.stop_propagation();
+                this.step_search_menu(step, count, window, cx);
+            }))
+            .child(list);
+        // Hangs from the field's right edge, as the field sits at the right
+        // of the macOS toolbar.
         Some(
-            v_flex()
-                .mb_8()
-                .child(section_title(&t, "Link"))
-                .child(group(
-                    &t,
-                    vec![
-                        row(&t, Some("download"), title, Some(detail.into()), button)
-                            .into_any_element(),
-                    ],
-                )),
+            div()
+                .absolute()
+                .right_0()
+                .top(relative(1.))
+                .child(
+                    deferred(
+                        anchored()
+                            .anchor(gpui::Corner::TopRight)
+                            .offset(point(px(0.), px(4.)))
+                            .snap_to_window_with_margin(px(8.))
+                            .child(panel),
+                    )
+                    .with_priority(3),
+                )
+                .into_any_element(),
         )
     }
 
-    fn search_section(&self, cx: &Context<Self>) -> Option<Div> {
-        if self.query_is_link() {
-            return self.link_suggestion(cx);
-        }
-        let t = cx.theme().clone();
-        if self.searching && self.search_results.is_none() {
-            return Some(notice(&t, false, "Searching for videos online…").mb_6());
-        }
-        let results = self.search_results.as_ref()?;
-        let mut rows = Vec::new();
-        for (index, result) in results.items.iter().enumerate() {
-            let source = result.clone();
-            let detail = result_detail(result);
-            rows.push(
-                row(
-                    &t,
-                    Some("download"),
-                    result.name.clone(),
-                    Some(detail.into()),
-                    self.button(
-                        ("download-result", index),
-                        None,
-                        "Download",
-                        false,
-                        cx,
-                        move |this, _, cx| this.download_result(&source, cx),
-                    ),
-                )
-                .into_any_element(),
-            );
-        }
-        let mut section = v_flex().mb_8().child(section_title(
-            &t,
-            format!("Online Results · {}", results.items.len()),
-        ));
-        if !results.unavailable.is_empty() {
-            section = section.child(
+    /// One search menu row. Enter, Space, or a click runs its action.
+    #[allow(clippy::too_many_arguments)]
+    fn search_menu_item(
+        &self,
+        index: usize,
+        leading: Div,
+        title: SharedString,
+        detail: Option<SharedString>,
+        verb: &'static str,
+        action: Rc<MenuAction>,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let t = cx.theme();
+        let id = search_menu_id(index);
+        let el = h_flex()
+            .id(id.clone())
+            .relative()
+            .gap_3()
+            .px_2()
+            .min_h(px(44.))
+            .py_1()
+            .rounded(px(t.radius))
+            .cursor_pointer()
+            .hover(|s| s.bg(t.selection))
+            .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                action(this, window, cx);
+                cx.notify();
+            }))
+            .child(leading)
+            .child(
+                v_flex()
+                    .flex_1()
+                    .min_w(px(0.))
+                    .child(div().overflow_hidden().whitespace_nowrap().child(title))
+                    .when_some(detail, |d, detail| {
+                        d.child(
+                            div()
+                                .text_size(t.font(12.))
+                                .text_color(t.muted)
+                                .overflow_hidden()
+                                .whitespace_nowrap()
+                                .child(detail),
+                        )
+                    }),
+            )
+            .child(
                 div()
-                    .mb_2()
+                    .flex_none()
+                    .px_2()
+                    .py_0p5()
+                    .rounded(px(t.radius))
+                    .bg(t.control)
                     .text_size(t.font(12.))
-                    .text_color(t.muted)
-                    .child(format!(
-                        "Unavailable sources: {}. Try again or paste a magnet link.",
-                        results.unavailable.join(", ")
-                    )),
+                    .child(verb),
             );
+        self.focusable(el, &id, None, t.radius, (-2., -2.), cx)
+            .into_any_element()
+    }
+
+    /// Moves keyboard focus through the search menu. Up from the first row
+    /// returns to the search field.
+    pub(super) fn step_search_menu(
+        &mut self,
+        step: isize,
+        count: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if count == 0 {
+            return;
         }
-        if rows.is_empty() {
-            if results.unavailable.is_empty() {
-                section = section.child(empty_state(
-                    &t,
-                    "search",
-                    "No videos found",
-                    "Try another title.",
-                ));
+        let focused = window.focused(cx);
+        let current = (0..count)
+            .find(|index| Some(self.control_handle(&search_menu_id(*index), cx)) == focused);
+        match search_menu_step(current, step, count) {
+            Some(index) => {
+                self.control_handle(&search_menu_id(index), cx)
+                    .focus(window);
+                if let Some(child) = self.library_ui_state.search_menu_rows.borrow().get(index) {
+                    self.library_ui_state
+                        .search_menu_scroll
+                        .scroll_to_item(*child);
+                }
             }
-        } else {
-            section = section.child(group(&t, rows));
+            None => self.search_input.focus_handle(cx).focus(window),
         }
-        if self.searching {
-            section = section.child(
-                div()
-                    .mt_2()
-                    .text_size(t.font(12.))
-                    .text_color(t.muted)
-                    .child("Still searching…"),
-            );
-        }
-        Some(section)
+        self.keyboard_nav = true;
+        cx.notify();
     }
 
     pub(super) fn video_detail(&self, path: &std::path::Path) -> (Option<f32>, String) {
@@ -1918,7 +2188,7 @@ impl Flick {
             .data
             .continue_watching()
             .any(|file| file.path == path);
-        self.remote_ui.menu = None;
+        self.close_menus();
         self.card_menu = Some(CardMenu {
             path,
             position,
@@ -1959,7 +2229,28 @@ impl Flick {
         }))
     }
 
+    /// Closes any context menu: a card's, a remote card's, or a Downloads
+    /// row's. True when one was open.
+    pub(super) fn close_menus(&mut self) -> bool {
+        // A More menu whose row has gone draws nothing, so it is not open.
+        let transfer = self
+            .transfer_menu
+            .as_ref()
+            .is_some_and(|menu| !self.transfer_menu_items(&menu.target).is_empty());
+        let open = self.card_menu.is_some() || self.remote_ui.menu.is_some() || transfer;
+        self.card_menu = None;
+        self.remote_ui.menu = None;
+        self.transfer_menu = None;
+        open
+    }
+
     pub(super) fn card_menu_panel(&self, cx: &Context<Self>) -> Option<AnyElement> {
+        if let Some(menu) = &self.transfer_menu {
+            let items = self.transfer_menu_items(&menu.target);
+            if !items.is_empty() {
+                return Some(self.context_menu(menu.position, items, cx));
+            }
+        }
         let Some(menu) = self.card_menu.as_ref() else {
             let (position, items) = self.remote_card_menu_items()?;
             return Some(self.context_menu(position, items, cx));
@@ -2064,9 +2355,8 @@ impl Flick {
             .text_color(t.text)
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation())
-            // The remote menu is not `card_menu`, which the window's Escape closes.
             .on_key_down(cx.listener(|this, e: &KeyDownEvent, window, cx| {
-                if e.keystroke.key == "escape" && this.remote_ui.menu.take().is_some() {
+                if e.keystroke.key == "escape" && this.close_menus() {
                     cx.stop_propagation();
                     this.focus.focus(window);
                     cx.notify();
@@ -2084,8 +2374,7 @@ impl Flick {
                 .cursor_pointer()
                 .hover(|s| s.bg(t.selection))
                 .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
-                    this.card_menu = None;
-                    this.remote_ui.menu = None;
+                    this.close_menus();
                     this.focus.focus(window);
                     action(this, window, cx);
                     this.persist();
@@ -2103,16 +2392,14 @@ impl Flick {
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(|this, _, _, cx| {
-                        this.card_menu = None;
-                        this.remote_ui.menu = None;
+                        this.close_menus();
                         cx.notify();
                     }),
                 )
                 .on_mouse_down(
                     MouseButton::Right,
                     cx.listener(|this, _, _, cx| {
-                        this.card_menu = None;
-                        this.remote_ui.menu = None;
+                        this.close_menus();
                         cx.notify();
                     }),
                 )
@@ -2472,14 +2759,25 @@ impl Flick {
             .into_any_element()
     }
 
+    /// All Videos narrows to the search words; a pasted link is something
+    /// to download, not words to match.
     fn filtered_video_paths(&self) -> Rc<[PathBuf]> {
+        let query = if self.query_is_link() {
+            ""
+        } else {
+            &self.query
+        };
         self.library_ui_state
-            .video_paths(&self.store.data, &self.query, self.video_filter)
+            .video_paths(&self.store.data, query, self.video_filter)
     }
 
     fn filtered_shows(&self) -> (Rc<[usize]>, Rc<[ElementId]>) {
         let revision = self.store.data.revision();
-        let query = self.query.to_lowercase();
+        let query = if self.query_is_link() {
+            String::new()
+        } else {
+            self.query.to_lowercase()
+        };
         let mut cache = self.library_ui_state.shows.borrow_mut();
         if let Some(cached) = cache.as_ref()
             && cached.revision == revision
@@ -2615,32 +2913,21 @@ impl Flick {
         .into_any_element()
     }
 
+    /// Home always shows everything; search results open in the search menu.
     fn home_page(&self, width: f32, cx: &Context<Self>) -> Div {
         let t = cx.theme().clone();
-        let query = self.query.to_lowercase();
         let gap = 16.;
-        let mut page = v_flex()
-            .w_full()
-            .children(self.remote_notice(cx))
-            .children(self.search_section(cx));
-        if self.query_is_link() {
-            return page;
-        }
+        let mut page = v_flex().w_full().children(self.remote_notice(cx));
         let (continue_cols, _) = columns(width, 220., gap);
         let (cols, card) = columns(width, 220., gap);
         // Remote entries get their own row so local order is unchanged;
         // local history has no timestamps to interleave them by.
-        let remote_continuing = self.remote_continue_cards(&query, cols, (cols, card), cx);
+        let remote_continuing = self.remote_continue_cards("", cols, (cols, card), cx);
         let continuing = self
             .store
             .data
             .continue_watching()
-            .filter(|v| {
-                self.store
-                    .data
-                    .normalized_recent_title(&v.path)
-                    .is_some_and(|title| title.contains(&query))
-            })
+            .filter(|v| self.store.data.normalized_recent_title(&v.path).is_some())
             .take(continue_cols)
             .collect::<Vec<_>>();
         if !continuing.is_empty() || !remote_continuing.is_empty() {
@@ -2668,7 +2955,7 @@ impl Flick {
                 })
                 .child(div().h(px(28.)));
         }
-        let remote = self.remote_sections(width, &query, cx);
+        let remote = self.remote_sections(width, "", cx);
         if self.store.data.library.is_empty() && !self.store.data.remote.servers.is_empty() {
             // Only remote libraries: no empty local section above them.
             return page.children(remote);
@@ -2680,12 +2967,7 @@ impl Flick {
             .library
             .iter()
             .rev()
-            .filter(|v| {
-                self.store
-                    .data
-                    .normalized_title(&v.path)
-                    .is_some_and(|title| title.contains(&query))
-            })
+            .filter(|v| self.store.data.normalized_title(&v.path).is_some())
             .take(cols * 2)
             .collect::<Vec<_>>();
         page = page.child(
@@ -2717,8 +2999,8 @@ impl Flick {
             page = page.child(empty_state(
                 &t,
                 "library",
-                "No matching videos in your library",
-                "Press Enter to search online.",
+                "No videos in your library yet",
+                "Add videos or a folder, or drop them here.",
             ));
         } else {
             let shown = added.len();
@@ -2742,16 +3024,6 @@ impl Flick {
     }
 
     fn videos_page(&self, width: f32, notices: Div, has_notices: bool, cx: &Context<Self>) -> Div {
-        let search = self.search_section(cx);
-        let has_remote = has_notices || search.is_some();
-        let remote = notices.children(search);
-        if self.query_is_link() {
-            return v_flex()
-                .flex_1()
-                .min_h(px(0.))
-                .w_full()
-                .child(self.search_pane(remote, true, cx));
-        }
         let t = cx.theme().clone();
         let gap = 16.;
         let filter = self.segmented(
@@ -2800,7 +3072,7 @@ impl Flick {
             .flex_1()
             .min_h(px(0.))
             .w_full()
-            .when(has_remote, |d| d.child(self.search_pane(remote, false, cx)))
+            .when(has_notices, |d| d.child(self.search_pane(notices, cx)))
             .child(
                 h_flex()
                     .flex_none()
@@ -2831,7 +3103,7 @@ impl Flick {
                     &t,
                     "library",
                     "No matching videos",
-                    "Try another filter or search online.",
+                    "Try another filter, or see online results under the search field.",
                 )
             });
         }
@@ -3361,9 +3633,6 @@ impl Flick {
             ));
         }
         let toggle_id = id.clone();
-        let export_id = id.clone();
-        let remove_id = id.clone();
-        let delete_id = id.clone();
         actions = actions
             .child(self.button(
                 SharedString::from(format!("pause-{id}")),
@@ -3382,78 +3651,87 @@ impl Flick {
                     )
                 },
             ))
-            .child(self.button(
-                SharedString::from(format!("export-{id}")),
-                None,
-                "Export .torrent…",
-                false,
+            .child(self.transfer_more_button(
+                SharedString::from(format!("more-{id}")),
+                TransferTarget::Local(id),
                 cx,
-                move |this, w, cx| this.export_torrent(export_id.clone(), w, cx),
-            ))
-            .child(self.button(
-                SharedString::from(format!("remove-{id}")),
-                None,
-                "Remove · Keep Files",
-                false,
-                cx,
-                move |this, _, cx| {
+            ));
+        self.transfer_entry(&RowFigures::local(download), actions, cx)
+    }
+
+    /// A Downloads row's More button: Export, Remove, and Delete live in
+    /// its menu so each row keeps only Play and Pause beside it.
+    pub(super) fn transfer_more_button(
+        &self,
+        id: SharedString,
+        target: TransferTarget,
+        cx: &Context<Self>,
+    ) -> Stateful<Div> {
+        // The menu opens where the button was clicked, so it needs the event.
+        self.icon_button(id, "more-horizontal", "More Actions", cx, |_, _, _| {})
+            .on_click(cx.listener(move |this, e: &ClickEvent, window, cx| {
+                this.close_menus();
+                this.transfer_menu = Some(TransferMenu {
+                    position: e.position(),
+                    target: target.clone(),
+                });
+                if this.keyboard_nav {
+                    this.control_handle(&ElementId::from(("card-menu", 0usize)), cx)
+                        .focus(window);
+                }
+                cx.notify();
+            }))
+    }
+
+    /// The More menu of a Downloads row on this computer or another one.
+    fn transfer_menu_items(&self, target: &TransferTarget) -> Vec<MenuItem> {
+        let id = match target {
+            TransferTarget::Remote { server, id } => {
+                return self.remote_transfer_menu_items(server, id);
+            }
+            TransferTarget::Local(id) => id,
+        };
+        if !self.downloads.iter().any(|d| &d.infohash == id) {
+            return Vec::new();
+        }
+        let (export, remove, delete) = (id.clone(), id.clone(), id.clone());
+        vec![
+            (
+                "upload",
+                "Export .torrent…".into(),
+                Rc::new(move |this, w, cx| this.export_torrent(export.clone(), w, cx)),
+            ),
+            (
+                "x",
+                "Remove · Keep Files".into(),
+                Rc::new(move |this, _, cx| {
                     this.send(
                         ServiceCommand::Remove {
-                            id: remove_id.clone(),
+                            id: remove.clone(),
                             delete_files: false,
                         },
                         cx,
                     )
-                },
-            ))
-            .child(self.button(
-                SharedString::from(format!("delete-{id}")),
-                None,
-                "Remove and Delete Files…",
-                false,
-                cx,
-                move |this, _, cx| {
-                    this.delete_transfer = Some(delete_id.clone());
-                    cx.notify();
-                },
-            ));
-        let key = id.clone();
-        let confirmation = (self.delete_transfer.as_ref() == Some(&id)).then(|| {
-            self.delete_confirmation(
-                &key,
-                download
-                    .files
-                    .iter()
-                    .map(|file| file.path.display().to_string()),
-                None,
-                false,
-                cx,
-                |this, _, cx| {
-                    this.delete_transfer = None;
-                    cx.notify();
-                },
-                move |this, _, cx| {
-                    this.delete_transfer = None;
-                    this.send(
-                        ServiceCommand::Remove {
-                            id: id.clone(),
-                            delete_files: true,
-                        },
-                        cx,
-                    );
-                },
-            )
-        });
-        self.transfer_entry(&RowFigures::local(download), actions, confirmation, cx)
+                }),
+            ),
+            (
+                "x",
+                "Remove and Delete Files…".into(),
+                Rc::new(move |this, w, cx| {
+                    this.remote_ui.save_to.delete = None;
+                    this.delete_transfer = Some(delete.clone());
+                    this.focus_transfer_delete(w, cx);
+                }),
+            ),
+        ]
     }
 
-    /// One Downloads row, local or on another machine: name, progress,
-    /// state, rates, error, actions, and a deletion confirmation.
+    /// One Downloads row, local or on another machine: name and actions,
+    /// progress, state, rates, and error.
     pub(super) fn transfer_entry(
         &self,
         figures: &RowFigures,
         actions: Div,
-        confirmation: Option<Div>,
         cx: &Context<Self>,
     ) -> AnyElement {
         let t = cx.theme().clone();
@@ -3490,11 +3768,14 @@ impl Flick {
                     ))
                     .child(
                         div()
+                            .flex_1()
+                            .min_w(px(0.))
                             .font_weight(FontWeight::MEDIUM)
                             .overflow_hidden()
                             .whitespace_nowrap()
                             .child(figures.name.clone()),
-                    ),
+                    )
+                    .child(actions.flex_none()),
             )
             .child(
                 div()
@@ -3541,76 +3822,220 @@ impl Flick {
                         .child(error),
                 )
             })
-            .child(actions)
-            .children(confirmation)
             .into_any_element()
     }
 
-    /// "Permanently delete these torrent files?" with the listed paths.
-    /// `key` keeps element ids apart between machines.
-    #[allow(clippy::too_many_arguments)]
-    pub(super) fn delete_confirmation(
-        &self,
-        key: &str,
-        files: impl Iterator<Item = String>,
-        changed: Option<String>,
-        sending: bool,
-        cx: &Context<Self>,
-        on_cancel: impl Fn(&mut Self, &mut Window, &mut Context<Self>) + 'static,
-        on_confirm: impl Fn(&mut Self, &mut Window, &mut Context<Self>) + 'static,
-    ) -> Div {
+    /// The "Remove and Delete Files…" waiting for an answer: this
+    /// computer's, or one on another machine.
+    fn pending_transfer_delete(&self) -> Option<PendingDelete> {
+        // A download that has gone since is no longer asked about.
+        if let Some(download) = self
+            .delete_transfer
+            .as_ref()
+            .and_then(|id| self.downloads.iter().find(|d| &d.infohash == id))
+        {
+            return Some(PendingDelete {
+                name: download.name.clone(),
+                files: download
+                    .files
+                    .iter()
+                    .map(|file| file.path.display().to_string())
+                    .collect(),
+                changed: None,
+                sending: false,
+            });
+        }
+        let delete = self.remote_ui.save_to.delete.as_ref()?;
+        let name = self
+            .remote
+            .machine_transfers(&self.store.data)
+            .into_iter()
+            .filter(|machine| machine.server_id == delete.server_id)
+            .flat_map(|machine| machine.transfers)
+            .find(|row| row.id == delete.id)
+            .map_or_else(|| "This transfer".to_owned(), |row| row.name);
+        Some(PendingDelete {
+            name,
+            files: delete.confirm.clone(),
+            changed: delete.changed.clone(),
+            sending: delete.sending,
+        })
+    }
+
+    /// Opens the deletion dialog with Cancel focused, so Enter is safe.
+    pub(super) fn focus_transfer_delete(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.close_menus();
+        self.search_menu = false;
+        self.control_handle(&ElementId::from(TRANSFER_DELETE_CANCEL), cx)
+            .focus(window);
+        cx.notify();
+    }
+
+    /// Cancel, or Close while another machine has not answered yet; its
+    /// answer then only reports a refusal.
+    fn cancel_transfer_delete(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.delete_transfer = None;
+        self.remote_ui.save_to.delete = None;
+        self.focus.focus(window);
+        cx.notify();
+    }
+
+    fn confirm_transfer_delete(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // Off the buttons, so a list another machine replaces is never
+        // confirmed by the next Enter.
+        self.focus.focus(window);
+        if let Some(id) = self.delete_transfer.take() {
+            self.send(
+                ServiceCommand::Remove {
+                    id,
+                    delete_files: true,
+                },
+                cx,
+            );
+            return;
+        }
+        let Some(delete) = self.remote_ui.save_to.delete.as_mut() else {
+            return;
+        };
+        if delete.sending {
+            return;
+        }
+        let (server, id, confirm) = (
+            delete.server_id.clone(),
+            delete.id.clone(),
+            delete.confirm.clone(),
+        );
+        // The row says Removing… until the server answers, even after Close,
+        // so a new dialog for it cannot open in the meantime.
+        let busy = &mut self.remote_ui.save_to.busy;
+        if !super::remote_library_ui::start_row_command(
+            busy,
+            &server,
+            &id,
+            super::remote_library_ui::REMOVING,
+        ) {
+            return;
+        }
+        // The dialog stays, saying Deleting…, until the server answers.
+        if let Some(delete) = self.remote_ui.save_to.delete.as_mut() {
+            delete.sending = true;
+        }
+        self.remote
+            .remove(&self.store.data, &server, &id, true, confirm);
+        cx.notify();
+    }
+
+    /// Routed at the start of Flick::key so the dialog owns the keyboard:
+    /// Escape cancels, Tab moves between its buttons, and Enter or Space
+    /// presses the focused one.
+    pub(super) fn handle_transfer_delete_key(
+        &mut self,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(pending) = self.pending_transfer_delete() else {
+            return false;
+        };
+        cx.stop_propagation();
+        match event.keystroke.key.as_str() {
+            "escape" => self.cancel_transfer_delete(window, cx),
+            "tab" if !pending.sending => {
+                let cancel = self.control_handle(&ElementId::from(TRANSFER_DELETE_CANCEL), cx);
+                let confirm = self.control_handle(&ElementId::from(TRANSFER_DELETE_CONFIRM), cx);
+                if window.focused(cx).as_ref() == Some(&cancel) {
+                    confirm.focus(window);
+                } else {
+                    cancel.focus(window);
+                }
+                self.keyboard_nav = true;
+                cx.notify();
+            }
+            _ => {}
+        }
+        true
+    }
+
+    /// "Delete these files?" over the window, listing exactly the files
+    /// that will be deleted.
+    pub(super) fn transfer_delete_panel(&self, cx: &Context<Self>) -> Option<AnyElement> {
+        let pending = self.pending_transfer_delete()?;
         let t = cx.theme().clone();
-        let mut confirmation = v_flex()
-            .gap_2()
-            .p_3()
+        let mut files = v_flex()
+            .id("transfer-delete-files")
+            .max_h(px(180.))
+            .overflow_y_scroll()
+            .overflow_x_hidden()
+            .gap_1()
+            .p_2()
             .rounded(px(t.radius))
             .bg(t.control)
-            .when_some(changed, |d, message| {
-                d.child(
-                    div()
-                        .text_size(t.font(12.))
-                        .child(format!("{message} The list below is the current one.")),
-                )
-            })
-            .child(
-                div()
-                    .text_color(t.danger)
-                    .child("Permanently delete these torrent files? This cannot be undone."),
-            );
-        for file in files {
-            confirmation = confirmation.child(div().text_size(t.font(12.)).child(file));
+            .text_size(t.font(12.));
+        for file in &pending.files {
+            files = files.child(div().min_w(px(0.)).child(file.clone()));
         }
-        confirmation
-            .child(
+        let mut body = vec![
+            div()
+                .text_color(t.muted)
+                .overflow_hidden()
+                .whitespace_nowrap()
+                .child(pending.name.clone())
+                .into_any_element(),
+        ];
+        if let Some(message) = pending.changed.clone() {
+            body.push(
                 div()
-                    .text_size(t.font(12.))
-                    .text_color(t.muted)
-                    .child("Only listed files are deleted. Other files and folders are kept."),
-            )
+                    .child(format!("{message} The list below is the current one."))
+                    .into_any_element(),
+            );
+        }
+        body.push(
+            div()
+                .child("The transfer stops and these files are permanently deleted. This cannot be undone.")
+                .into_any_element(),
+        );
+        body.push(files.into_any_element());
+        body.push(
+            div()
+                .text_size(t.font(12.))
+                .text_color(t.muted)
+                .child("Other files and folders are kept.")
+                .into_any_element(),
+        );
+        let actions = h_flex()
+            .gap_2()
+            .justify_end()
+            .child(self.button(
+                TRANSFER_DELETE_CANCEL,
+                None,
+                if pending.sending { "Close" } else { "Cancel" },
+                false,
+                cx,
+                |this, window, cx| this.cancel_transfer_delete(window, cx),
+            ))
+            // Red, not the accent: the safe choice is the one that looks chosen.
             .child(
-                h_flex()
-                    .gap_2()
-                    .child(self.button(
-                        SharedString::from(format!("cancel-delete-{key}")),
-                        None,
-                        "Cancel",
-                        false,
-                        cx,
-                        on_cancel,
-                    ))
-                    .child(self.button(
-                        SharedString::from(format!("confirm-delete-{key}")),
-                        None,
-                        if sending {
-                            "Deleting…"
-                        } else {
-                            "Delete Listed Files"
-                        },
-                        false,
-                        cx,
-                        on_confirm,
-                    )),
-            )
+                self.button(
+                    TRANSFER_DELETE_CONFIRM,
+                    None,
+                    if pending.sending {
+                        "Deleting…"
+                    } else {
+                        "Delete Files"
+                    },
+                    false,
+                    cx,
+                    |this, window, cx| this.confirm_transfer_delete(window, cx),
+                )
+                .text_color(t.danger),
+            );
+        Some(dialog(
+            &t,
+            "transfer-delete-overlay",
+            "Delete Files?",
+            body,
+            actions,
+        ))
     }
 
     fn torrent_sheet(&self, torrent: &flick::torrent::ResolvedTorrent, cx: &Context<Self>) -> Div {
@@ -3747,14 +4172,53 @@ pub(super) type MenuItem = (&'static str, SharedString, Rc<MenuAction>);
 /// Rows inside grouped lists draw their focus ring inside the group.
 pub(super) const RING_INSET: f32 = 4.;
 
-fn search_pane_layout(content: Div, link: bool) -> Stateful<Div> {
+const TRANSFER_DELETE_CANCEL: &str = "transfer-delete-cancel";
+const TRANSFER_DELETE_CONFIRM: &str = "transfer-delete-confirm";
+
+/// A transfer deletion the dialog asks about.
+struct PendingDelete {
+    name: String,
+    /// Exactly the files that will be deleted.
+    files: Vec<String>,
+    /// Why another machine asked again with a new list.
+    changed: Option<String>,
+    /// Sent to another machine and not answered yet.
+    sending: bool,
+}
+
+/// Online search needs this many characters.
+const MIN_ONLINE_QUERY: usize = 3;
+/// Library matches listed under the search field.
+const SEARCH_MENU_MATCHES: usize = 5;
+
+fn search_menu_id(index: usize) -> ElementId {
+    ElementId::from(("search-menu", index))
+}
+
+/// The search menu row an arrow key moves to from `current`, None meaning
+/// the search field. Down from the field enters the first row; the last
+/// row stays put.
+fn search_menu_step(current: Option<usize>, step: isize, count: usize) -> Option<usize> {
+    if count == 0 {
+        return None;
+    }
+    match current {
+        None if step > 0 => Some(0),
+        None => None,
+        Some(index) => index
+            .checked_add_signed(step)
+            .map(|next| next.min(count - 1)),
+    }
+}
+
+fn search_pane_layout(content: Div) -> Stateful<Div> {
     v_flex()
         .id("video-search-scroll")
         .min_h(px(0.))
         .w_full()
         .overflow_y_scroll()
-        .when(link, |d| d.flex_1())
-        .when(!link, |d| d.flex_none().max_h(relative(0.45)))
+        .flex_none()
+        .max_h(relative(0.45))
         // Intrinsic content must overflow the pane, never shrink to its viewport.
         .child(content.flex_none())
 }
@@ -3987,9 +4451,24 @@ impl RowFigures {
 mod tests {
     use super::{
         FocusSlot, GridStep, LibraryUiState, POSTER_CACHE_CAPACITY, PosterLru, VideoFilter,
-        action_id, first_visible_row, grid_row_range, scroll_key_offset, tab_target,
-        validate_library_files, video_id,
+        action_id, first_visible_row, grid_row_range, scroll_key_offset, search_menu_step,
+        tab_target, validate_library_files, video_id,
     };
+
+    #[test]
+    fn search_menu_arrows_enter_move_and_leave_through_the_field() {
+        // Down from the field enters the first row; Up stays in the field.
+        assert_eq!(search_menu_step(None, 1, 3), Some(0));
+        assert_eq!(search_menu_step(None, -1, 3), None);
+        // Rows move by one and stop at the last.
+        assert_eq!(search_menu_step(Some(0), 1, 3), Some(1));
+        assert_eq!(search_menu_step(Some(2), 1, 3), Some(2));
+        // Up from the first row returns to the field.
+        assert_eq!(search_menu_step(Some(1), -1, 3), Some(0));
+        assert_eq!(search_menu_step(Some(0), -1, 3), None);
+        // A menu with only notes has no rows to enter.
+        assert_eq!(search_menu_step(None, 1, 0), None);
+    }
     use crate::store::{Settings, Sort};
     use gpui::{Resource, UniformListScrollHandle, point, px};
     use std::{path::PathBuf, rc::Rc};

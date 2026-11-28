@@ -70,6 +70,7 @@ impl Flick {
                 self.search_input
                     .update(cx, |input, cx| input.set_value("", cx));
                 self.query.clear();
+                self.search_menu = false;
                 self.download_link(link, cx);
             }
             Err(error) => {

@@ -54,6 +54,7 @@ embedded_icons!(
     "list",
     "chevron-up",
     "chevron-down",
+    "more-horizontal",
 );
 
 pub struct Assets;
