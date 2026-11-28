@@ -6,6 +6,35 @@ The audit and implementation artifacts from 2026-10-25 (screenshots, measurement
 
 ## Evidence by revision
 
+### Search menu, delete dialog, and Downloads rows on 2026-11-28
+
+Tested branch `t3/fix-delete-search-download-ux`, rebased onto `2e266b2` after the IINA parity work merged. It fixes four reported problems:
+
+- "Remove and Delete Files…" now opens a centered dialog (deferred above menus) instead of expanding inside the row.
+- Downloads rows keep Play and Pause, and move Export, Remove, and Delete into a More menu.
+- Search results open in a menu under the field, so Home is never filtered or replaced.
+- The search field ignores an empty platform insert or mark that names no range while nothing is being composed. This is the suspected cause of double- and triple-click clearing the field.
+
+Three council reviewers (Claude Opus 5.5, Gemini 4 Neon, Grok 4.7) reviewed it read-only for three rounds. They scored 6, 6, 6, then 8, 8, 7, then 9, 9, 9, and the third round found nothing that must be fixed. Two small items from the third round were applied after it and were not re-reviewed: a failed remote open from the search menu off Home now always reaches the page banner, and a More menu whose row has gone no longer takes an Escape. Same Mac mini as the entries below. Its screen was locked, so the app could not be driven. The checks below ran on the rebased tree unless noted.
+
+- `cargo fmt --all -- --check`, `cargo clippy --locked --no-default-features --all-targets -- -D warnings`, `cargo clippy --locked --features runtime-shaders --all-targets -- -D warnings`: passed.
+- `cargo test --locked --no-default-features --all-targets` and `cargo test --locked --features runtime-shaders --all-targets`: 141 library unit tests (1 ignored), 329 desktop unit tests (17 ignored), 18 HLS, 7 pairing, 23 server, 7 transfer-route, and 9 transfer tests, all passed. The desktop run is the `runtime-shaders` typecheck and unit-test configuration, not a shipping build. New tests cover the empty-edit guard and the search menu's arrow keys.
+- Desktop build: `cargo build --features runtime-shaders --bin flick` launched with a temporary `FLICK_SETTINGS_PATH` and `FLICK_DATA_DIR`. The first screen rendered, with no panic in the log.
+- Rendered states, before the rebase (on `12b5cb7`): a temporary, uncommitted hook in `ui.rs` set state from a command file and forced a frame while the screen was locked. The final tree was then restored and rebuilt. The library held six generated clips, and one was shared with `FLICK_LOCAL_TRANSFERS=1`, so it used only localhost with no trackers or DHT. Screenshots show these states rendering as intended:
+  - the search menu on Home, with Home unfiltered;
+  - the search menu on All Videos, with only the Online section;
+  - a magnet link's Download row;
+  - a Downloads row with Play, Pause, and More;
+  - the More menu;
+  - the Delete Files dialog;
+  - the Move to Trash dialog.
+
+  The hook set this state directly, so the screenshots do not cover input handling. Without libmpv, the libmpv error banner was dismissed and the posters are placeholders.
+- Not done:
+  - Nothing was clicked or typed in the app. The double-click fix, Escape in the search field, and the arrow keys in the menus have not been used interactively.
+  - To confirm the double-click cause on a Mac, run with `RUST_LOG=flick=debug`, then double- and triple-click a word in the search field. The `Text input: platform insert` and `platform mark` lines show what macOS sent. That log includes the typed search text.
+  - No playback. Windows and Linux are unverified.
+
 ### IINA parity review fixes on 2026-11-28
 
 A code review of the merged IINA parity work (`0ded892`) found ten problems, fixed on `t3/iina-parity-review-fixes`. Same machine and the same temporary IINA 1.5.1 libmpv as the entry below.
