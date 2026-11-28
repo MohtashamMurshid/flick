@@ -31,6 +31,42 @@ Tested the `t3/iina-feature-parity` branch, based on `12b5cb7`: plan items 38–
 - Cross-target lint of `src/awake.rs`, `src/now_playing.rs`, and `src/window_ext.rs` in harness crates with a stand-in for GPUI's `Window`: `cargo +1.99.0 clippy --offline --target <target> --tests -- -D warnings` passed for `x86_64-pc-windows-msvc` (with `windows` 0.61.3 and the `Media` and `Win32_System_WinRT` features) and `x86_64-unknown-linux-gnu` (with `zbus` 5.19). The Windows media controls, topmost window, and execution state, and the Linux MPRIS service and screensaver inhibitor, compile; none of them ran.
 - Not done: the app's window could not be driven or seen past its first screen. GPUI does not repaint a window of an app that was never activated, macOS kept another app frontmost, and synthetic clicks from a new helper were not delivered. So the new panels, buttons, menus, and settings rows, scrolling, the command center rows, and the controls layouts were not seen on screen; media keys were not pressed; and streaming a web link, Spatial Audio, and output switching were not tried. GitHub Actions is still locked on the account, so Windows and Linux were not built.
 
+### Loopback speed measurements on 2026-11-26
+
+Tested commit `12b5cb7` on the Mac mini: Apple M6, 12 cores, 24 GB, macOS 27.2, Command Line Tools only, no libmpv, FFmpeg 7.0 in `~/.local/bin` with `h264_videotoolbox`. Everything ran on 127.0.0.1, so these numbers measure Flick's server and torrent engine, not a network. Other work was running on the machine (one-minute load about 1.3 before and 6.5 after). No video was played, and no desktop app was built or launched.
+
+Builds: `cargo build --locked --release --no-default-features --bin flick-serve` passed (49 s), then `--bin flick-transfer` passed (10 s). These are the backend binaries, not the desktop app.
+
+Fixtures, generated locally and deleted afterwards: 90-second `testsrc2` clips with a 440 Hz AAC tone, H.264 by `h264_videotoolbox`, `+faststart`. The 1920×1080 clip is 12 Mbit/s (136,740,956 bytes) and the 3840×2160 clip is 45 Mbit/s (508,794,207 bytes).
+
+Server: `flick-serve --folder <fixtures> --bind 127.0.0.1:47199 --state-dir <temp> --ffmpeg ~/.local/bin/ffmpeg --no-wake-info`, separate from the launchd agent on the Tailscale address, which kept running. The server log had no warnings or errors.
+
+| Measurement, `curl` with the token | Result |
+| --- | --- |
+| `GET /v1/library`, 20 requests | 0.40–0.54 ms for 18; 0.81 and 2.13 ms for the other two |
+| 4K original, first 1 MiB by range, 20 requests | all 206; time to first byte 0.29–0.48 ms, total 0.54–1.40 ms; one outlier at 52 ms |
+| 4K original, last 1 MiB by range, 20 requests | all 206; total 0.56–0.73 ms |
+| 4K original, whole 509 MB file, 3 requests | 0.17, 0.27, 0.18 s (1.9–3.0 GB/s) |
+
+HLS cold start: before every run a fresh server was started with an empty transcode folder. Each run requested the playlist, `init.mp4`, and `0.m4s` in turn, then `15.m4s` (60 s in, which restarts FFmpeg there). Three runs per video and tier:
+
+| Source | Tier | Playlist + init + segment 0 | Seek to segment 15 |
+| --- | --- | --- | --- |
+| 1080p | 1080p High | 0.73 s each run | 0.71 s |
+| 1080p | 1080p | 0.64–0.74 s | 0.70–0.71 s |
+| 1080p | 720p | 0.44–0.55 s | 0.40–0.41 s |
+| 1080p | 480p | 0.34–0.47 s | 0.31–0.40 s |
+| 4K | 1080p High | 0.74–0.85 s | 0.71–0.75 s |
+| 4K | 1080p | 0.74–0.77 s | 0.70–0.81 s |
+| 4K | 720p | 0.74–0.75 s | 0.61–0.71 s |
+| 4K | 480p | 0.53–0.67 s | 0.50–0.61 s |
+
+Almost all of each cold start is waiting on `init.mp4`, which arrives with FFmpeg's first output (0.30–0.80 s). The playlist answered in under 0.5 ms in 22 of 24 runs, and in 9 and 25 ms in the other two. Segment 0 was then already finished, and served in 0.5–7.5 ms. The times fall in steps of about 0.1 s, which matches how often a run checks its folder for finished segments.
+
+Torrent transfer: `flick-transfer --listen 127.0.0.1:47231 share` seeded the 4K clip, without `--public`, so no trackers, DHT, or UPnP. Three fresh sessions ran `flick-transfer download <torrent> --peer 127.0.0.1:47231`, each with new state and download folders. From process start to all pieces verified: 2.25, 2.16, and 1.84 s for 508,794,207 bytes (226, 236, and 277 MB/s). Each downloaded file was byte-identical to the source by `cmp`.
+
+Not measured: anything over Tailscale or Wi-Fi (the 2026-11-10 MacBook entry below has those), first frame in the desktop app, CPU or memory while playing, and public swarms.
+
 ### Remote library polish: review fixes and final checks on 2026-11-11
 
 Tested commit `eeb7237`, after the entry below. Two review passes ran on the polish: an independent Claude review (one medium-high finding: a tailnet peer could answer a pairing code with a pairing string for a different host and overwrite an already paired server's token; one medium: two kept copies with the same file name shared one part file, reproduced; and eight smaller items) and a four-round GPT Sol loop (a blocker: the asleep-machine queue was unreachable because offline machines could not be chosen and torrents needed a remote resolve first; three shoulds: the Continue Watching merge ignored server progress newer by up to a minute, a transfer that finished between polls never notified, and the server timestamp used as a merge guard is not monotonic; two nits). Every finding was fixed with a test, and Sol's final verdict was approve. The in-flight fixes also replaced macOS's placeholder MAC with the real Ethernet and Wi-Fi addresses from `networksetup`, capped the hardware lists, bounded the pairing rate limiter's memory, and added a per-video revision to progress saves so a server clock far ahead cannot keep re-applying one stale position.
